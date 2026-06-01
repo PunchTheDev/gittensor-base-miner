@@ -1,0 +1,349 @@
+diff --git a/CHANGELOG.md b/CHANGELOG.md
+index 9c25f4d..43dfddb 100644
+--- a/CHANGELOG.md
++++ b/CHANGELOG.md
+@@ -53,6 +53,26 @@ All notable changes to vouch are documented here. Format follows
+   with between `import_check` and the apply re-open is rejected
+   before anything reaches disk and the audit log does not record
+   a `bundle.import` event.
++- `Claim.evidence` now enforces "at least one citation" at the model
++  layer via a `@field_validator` (#81). Previously the
++  README-documented guarantee ("Claims must cite sources … a claim
++  without at least one Source/Evidence id is a validation error")
++  was enforced only in `proposals.propose_claim`, so every other
++  write path — direct `store.put_claim`, `store.update_claim`, and
++  `bundle.import_apply` via `_validate_content` — silently accepted
++  `evidence: []` and landed an uncited claim. The validator closes
++  all three paths at once; `store.update_claim` additionally
++  re-validates via `Claim.model_validate(...)` before persisting so
++  in-place mutation (`c.evidence = []; store.update_claim(c)`)
++  also raises before the YAML hits disk. **Migration note:** because
++  the validator also fires when claims are read back, a KB that
++  already has an uncited `claims/<id>.yaml` on disk from before this
++  fix would otherwise crash `vouch lint` / `vouch doctor` with a
++  `pydantic.ValidationError`. `vouch lint` now iterates `claims/`
++  per-file and surfaces unparseable / uncited YAMLs as
++  `invalid_claim` findings ("edit the YAML to add a citation, or
++  delete the file") instead of bailing out — so existing KBs get a
++  clean repair list rather than a traceback.
+ - Close the review-gate bypass in `sessions.crystallize` (#76). The
+   durable session-summary page wrote `sess.task`, `sess.note`, and
+   `sess.agent` verbatim into rendered markdown, letting an agent
+diff --git a/src/vouch/health.py b/src/vouch/health.py
+index ac3fe51..6c6dfcf 100644
+--- a/src/vouch/health.py
++++ b/src/vouch/health.py
+@@ -10,11 +10,14 @@
+ from dataclasses import dataclass, field
+ from datetime import UTC, datetime, timedelta
+ from pathlib import Path
++from typing import Any
++
++from pydantic import ValidationError
+ 
+ from . import index_db
+ from .audit import count_events
+-from .models import ClaimStatus, ProposalStatus
+-from .storage import KBStore, sha256_hex
++from .models import Claim, ClaimStatus, ProposalStatus
++from .storage import KBStore, _yaml_load, sha256_hex
+ from .verify import verify_all
+ 
+ 
+@@ -30,10 +33,15 @@ class Finding:
+ class HealthReport:
+     ok: bool
+     findings: list[Finding] = field(default_factory=list)
+-    counts: dict[str, int] = field(default_factory=dict)
++    # Mixed value types (str/int/bool) — `claims` etc. are ints,
++    # `kb_dir` is a str, `index_present` is a bool. Was `dict[str, int]`
++    # but `status()` already returned the mixed dict via an untyped
++    # `dict` return annotation; the narrow type was effectively never
++    # checked. Widened to match runtime reality.
++    counts: dict[str, Any] = field(default_factory=dict)
+ 
+ 
+-def status(store: KBStore) -> dict:
++def status(store: KBStore) -> dict[str, Any]:
+     """Quick, machine-readable summary. No deep checks."""
+     return {
+         "kb_dir": str(store.kb_dir),
+@@ -50,9 +58,41 @@ def status(store: KBStore) -> dict:
+     }
+ 
+ 
+-def lint(store: KBStore, *, stale_after_days: int = 180) -> HealthReport:
++def _load_claims_for_lint(store: KBStore) -> tuple[list[Claim], list[Finding]]:
++    """Iterate `claims/*.yaml` one file at a time so a single invalid
++    YAML can't crash the whole lint sweep — surface it as a finding
++    and keep going. This is the repair hint for KBs that have legacy
++    uncited claims from before the Claim.evidence min-citation
++    validator landed (#81): `vouch lint` lists them as
++    `invalid_claim` findings so the user can fix or delete the file
++    rather than seeing a bare `pydantic.ValidationError` traceback."""
++    valid: list[Claim] = []
+     findings: list[Finding] = []
+-    claims = store.list_claims()
++    cdir = store.kb_dir / "claims"
++    if not cdir.is_dir():
++        return valid, findings
++    for p in sorted(cdir.glob("*.yaml")):
++        cid = p.stem
++        try:
++            valid.append(Claim.model_validate(_yaml_load(p.read_text())))
++        except ValidationError as e:
++            tail = str(e).splitlines()[-1].strip() if str(e) else "validation failed"
++            findings.append(Finding(
++                "error", "invalid_claim",
++                f"claim {cid} ({p}) fails model validation: {tail} — "
++                "edit the YAML to add a citation, or delete the file",
++                [cid],
++            ))
++        except Exception as e:
++            findings.append(Finding(
++                "error", "unreadable_claim",
++                f"claim {cid} ({p}) could not be loaded: {e}", [cid],
++            ))
++    return valid, findings
++
++
++def lint(store: KBStore, *, stale_after_days: int = 180) -> HealthReport:
++    claims, findings = _load_claims_for_lint(store)
+     sources_present = {s.id for s in store.list_sources()}
+     evidence_present = {e.id for e in store.list_evidence()}
+ 
+@@ -106,7 +146,24 @@ def lint(store: KBStore, *, stale_after_days: int = 180) -> HealthReport:
+                 ))
+ 
+     ok = not any(f.severity == "error" for f in findings)
+-    return HealthReport(ok=ok, findings=findings, counts=status(store))
++    # Build counts inline rather than calling status(), because status()
++    # calls store.list_claims() which is strict and would re-raise on the
++    # same invalid YAMLs we just surfaced as findings. Use the safely-
++    # loaded `claims` list so the report is self-consistent.
++    counts = {
++        "kb_dir": str(store.kb_dir),
++        "claims": len(claims),
++        "pages": len(store.list_pages()),
++        "sources": len(sources_present),
++        "entities": len(store.list_entities()),
++        "relations": len(store.list_relations()),
++        "evidence": len(evidence_present),
++        "sessions": len(store.list_sessions()),
++        "pending_proposals": len(store.list_proposals(ProposalStatus.PENDING)),
++        "audit_events": count_events(store.kb_dir),
++        "index_present": (store.kb_dir / index_db.DB_FILENAME).exists(),
++    }
++    return HealthReport(ok=ok, findings=findings, counts=counts)
+ 
+ 
+ def doctor(store: KBStore) -> HealthReport:
+diff --git a/src/vouch/models.py b/src/vouch/models.py
+index a4d1961..1b340d8 100644
+--- a/src/vouch/models.py
++++ b/src/vouch/models.py
+@@ -185,6 +185,22 @@ class Claim(BaseModel):
+         default_factory=list,
+         description="Source ids OR Evidence ids — both are valid citations",
+     )
++
++    @field_validator("evidence")
++    @classmethod
++    def _at_least_one_citation(cls, v: list[str]) -> list[str]:
++        # The "claims must cite sources" guarantee (README §"Why this exists"
++        # point 3; CONTRIBUTING §"Things we won't merge") used to live only
++        # in proposals.propose_claim, so every other write path —
++        # store.put_claim, store.update_claim, and bundle.import_apply via
++        # _validate_content — accepted evidence=[] and silently landed an
++        # uncited claim. Enforcing on the model closes all paths at once.
++        if not v:
++            raise ValueError(
++                "claim must cite at least one Source or Evidence id "
++                "(README §'Object model'; CONTRIBUTING §'Things we won't merge')"
++            )
++        return v
+     entities: list[str] = Field(default_factory=list)
+     supersedes: list[str] = Field(default_factory=list)
+     superseded_by: str | None = None
+diff --git a/src/vouch/storage.py b/src/vouch/storage.py
+index 797f9a1..6f6a666 100644
+--- a/src/vouch/storage.py
++++ b/src/vouch/storage.py
+@@ -325,6 +325,12 @@ def list_claims(self) -> list[Claim]:
+     def update_claim(self, claim: Claim) -> Claim:
+         if not self._claim_path(claim.id).exists():
+             raise ArtifactNotFoundError(f"claim {claim.id}")
++        # Re-validate the in-memory Claim before persisting so model
++        # invariants (e.g. evidence must be non-empty — see #81) hold
++        # even when a caller mutated fields in place after get_claim().
++        # The Claim model's field validators only run at construction
++        # time; mutation alone bypasses them unless we round-trip.
++        Claim.model_validate(claim.model_dump(mode="json"))
+         self._claim_path(claim.id).write_text(_yaml_dump(claim.model_dump(mode="json")))
+         self._embed_and_store(kind="claim", id=claim.id, text=claim.text)
+         return claim
+diff --git a/tests/test_bundle.py b/tests/test_bundle.py
+index 20e8d08..a851204 100644
+--- a/tests/test_bundle.py
++++ b/tests/test_bundle.py
+@@ -299,6 +299,51 @@ def test_import_treats_missing_manifest_sha256_as_mismatch(
+     assert not (store.kb_dir / "claims" / "c1.yaml").exists()
+ 
+ 
++def test_import_rejects_uncited_claim(store: KBStore, tmp_path: Path) -> None:
++    """Regression for #81: a bundle whose claim YAML has evidence: []
++    must be rejected by import_check / import_apply because the Claim
++    model now enforces the 'must cite at least one' invariant. Before
++    this fix, _validate_content deferred to pydantic, which accepted
++    evidence=[] and silently landed an uncited claim."""
++    uncited_yaml = (
++        b"id: bundle-uncited\n"
++        b'text: "shipped via bundle, no citations"\n'
++        b"type: fact\n"
++        b"status: stable\n"
++        b"confidence: 1.0\n"
++        b"evidence: []\n"
++    )
++    bundle_path = tmp_path / "uncited.tar.gz"
++    manifest = {
++        "spec": bundle.SPEC_VERSION,
++        "bundle_id": "deadbeef",
++        "files": [{
++            "path": "claims/bundle-uncited.yaml",
++            "size": len(uncited_yaml),
++            "sha256": hashlib.sha256(uncited_yaml).hexdigest(),
++        }],
++        "counts": {},
++        "safety": {"has_proposed": False, "has_state_db": False,
++                   "has_audit_log": False},
++    }
++    with tarfile.open(bundle_path, "w:gz") as tar:
++        info = tarfile.TarInfo("claims/bundle-uncited.yaml")
++        info.size = len(uncited_yaml)
++        tar.addfile(info, io.BytesIO(uncited_yaml))
++        mf_bytes = json.dumps(manifest).encode()
++        mf_info = tarfile.TarInfo(bundle.MANIFEST_NAME)
++        mf_info.size = len(mf_bytes)
++        tar.addfile(mf_info, io.BytesIO(mf_bytes))
++
++    diff = bundle.import_check(store.kb_dir, bundle_path)
++    assert not diff.ok
++    assert any("schema validation failed" in i for i in diff.issues), diff.issues
++
++    with pytest.raises(RuntimeError, match="schema validation failed"):
++        bundle.import_apply(store.kb_dir, bundle_path)
++    assert not (store.kb_dir / "claims" / "bundle-uncited.yaml").exists()
++
++
+ def test_import_check_passes_when_member_matches_manifest(
+     store: KBStore, tmp_path: Path
+ ) -> None:
+diff --git a/tests/test_health.py b/tests/test_health.py
+index 659b913..ee4c356 100644
+--- a/tests/test_health.py
++++ b/tests/test_health.py
+@@ -44,6 +44,47 @@ def test_doctor_runs_full_sweep(store: KBStore) -> None:
+     assert report.ok is True
+ 
+ 
++def test_lint_surfaces_legacy_uncited_claim_yaml_without_crashing(
++    store: KBStore,
++) -> None:
++    """Regression for the #82 review: after the Claim.evidence min-citation
++    validator landed (#81), a KB that already had an uncited claim on
++    disk from before the fix would crash `vouch lint` / `vouch doctor`
++    with a bare pydantic.ValidationError. Lint now skips invalid YAMLs
++    per-file and surfaces them as `invalid_claim` findings so the user
++    has a clear repair hint (edit the YAML to add a citation, or delete
++    the file)."""
++    src = store.put_source(b"e")
++    store.put_claim(Claim(id="good", text="t", evidence=[src.id]))
++
++    # Hand-craft an uncited claim YAML that the *current* model rejects —
++    # matches the on-disk shape an older buggy write path could have left.
++    legacy_uncited = (
++        "id: legacy\n"
++        'text: "shipped before the validator existed"\n'
++        "type: fact\n"
++        "status: stable\n"
++        "confidence: 1.0\n"
++        "evidence: []\n"
++    )
++    (store.kb_dir / "claims" / "legacy.yaml").write_text(legacy_uncited)
++
++    report = health.lint(store)
++    codes = {f.code for f in report.findings}
++    assert "invalid_claim" in codes, [f.message for f in report.findings]
++    invalid = next(f for f in report.findings if f.code == "invalid_claim")
++    assert "legacy" in invalid.object_ids
++    assert "delete the file" in invalid.message or "add a citation" in invalid.message
++    assert report.ok is False  # invalid_claim is severity=error
++
++    # The good claim is still discoverable — lint didn't bail out at the
++    # bad one, so the rest of the sweep still ran.
++    good_findings = [f for f in report.findings if "good" in f.object_ids]
++    # No errors about the good claim itself (it's well-formed and cites a
++    # present source).
++    assert all(f.severity != "error" for f in good_findings), good_findings
++
++
+ def test_list_claims_filtered_by_status(store: KBStore) -> None:
+     src = store.put_source(b"e")
+     store.put_claim(Claim(id="c1", text="x", evidence=[src.id],
+diff --git a/tests/test_storage.py b/tests/test_storage.py
+index 1f3dd8a..46eeb73 100644
+--- a/tests/test_storage.py
++++ b/tests/test_storage.py
+@@ -5,6 +5,7 @@
+ from pathlib import Path
+ 
+ import pytest
++from pydantic import ValidationError
+ 
+ from vouch import audit, lifecycle
+ from vouch.models import (
+@@ -108,6 +109,44 @@ def test_claim_can_be_updated(store: KBStore) -> None:
+     assert store.get_claim("c1").status == ClaimStatus.STABLE
+ 
+ 
++def test_claim_model_rejects_empty_evidence() -> None:
++    """Regression for #81: the 'claims must cite sources' guarantee
++    (README §'Why this exists' point 3; CONTRIBUTING §'Things we
++    won't merge') is now enforced on the Claim model itself, so
++    every write path inherits the check instead of relying on
++    proposals.propose_claim alone."""
++    with pytest.raises(ValidationError, match="cite at least one"):
++        Claim(id="c1", text="uncited", evidence=[])
++
++
++def test_put_claim_rejects_empty_evidence(store: KBStore) -> None:
++    """Regression for #81: store.put_claim is a direct write path
++    that used to silently accept Claim(evidence=[]) because the
++    only existence-check loop iterated zero times. The model-level
++    validator now fires before put_claim is even called."""
++    with pytest.raises(ValidationError, match="cite at least one"):
++        store.put_claim(Claim(id="c1", text="uncited", evidence=[]))
++    assert not (store.kb_dir / "claims" / "c1.yaml").exists()
++
++
++def test_update_claim_rejects_empty_evidence(store: KBStore) -> None:
++    """Regression for #81: a previously-cited claim cannot be mutated
++    down to evidence=[] and silently re-persisted. The model's field
++    validator only fires at construction time, so update_claim
++    re-validates via Claim.model_validate(claim.model_dump()) before
++    writing — otherwise in-place mutation would bypass the gate."""
++    src = store.put_source(b"e")
++    store.put_claim(Claim(id="c1", text="cited", evidence=[src.id]))
++    persisted_before = (store.kb_dir / "claims" / "c1.yaml").read_text()
++
++    c = store.get_claim("c1")
++    c.evidence = []  # in-place mutation alone doesn't trigger validation
++
++    with pytest.raises(ValidationError, match="cite at least one"):
++        store.update_claim(c)
++    assert (store.kb_dir / "claims" / "c1.yaml").read_text() == persisted_before
++
++
+ # --- pages ----------------------------------------------------------------
+ 
+ 

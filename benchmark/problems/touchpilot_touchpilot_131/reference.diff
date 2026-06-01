@@ -1,0 +1,570 @@
+diff --git a/app/src/main/java/dev/touchpilot/app/MainActivity.kt b/app/src/main/java/dev/touchpilot/app/MainActivity.kt
+index 53000f8..a14e5ee 100644
+--- a/app/src/main/java/dev/touchpilot/app/MainActivity.kt
++++ b/app/src/main/java/dev/touchpilot/app/MainActivity.kt
+@@ -6,6 +6,7 @@ import android.content.Context
+ import android.content.Intent
+ import android.content.SharedPreferences
+ import android.graphics.Color
++import android.graphics.Rect
+ import android.graphics.Typeface
+ import android.graphics.drawable.GradientDrawable
+ import android.os.Bundle
+@@ -13,6 +14,7 @@ import android.provider.Settings
+ import android.view.Gravity
+ import android.view.View
+ import android.view.ViewGroup
++import android.view.ViewTreeObserver
+ import android.view.animation.DecelerateInterpolator
+ import android.text.InputType
+ import android.view.inputmethod.EditorInfo
+@@ -733,7 +735,9 @@ class MainActivity : Activity() {
+ 
+         contentRoot.addView(selectorRow)
+         contentRoot.addView(focusInputField)
+-        contentRoot.addView(
++
++        val focusDismissRow = LinearLayout(this).apply { orientation = LinearLayout.HORIZONTAL }
++        focusDismissRow.addView(
+             secondaryButton("Focus Input Field") {
+                 hideKeyboard(focusInputField)
+                 val args = mapOf(focusInputSelectorKey(focusSelectorIndex) to focusInputField.text.toString())
+@@ -743,8 +747,18 @@ class MainActivity : Activity() {
+                 } else {
+                     lastFocusInputArgs = null
+                 }
+-            }.apply { id = R.id.focus_input_button }
++            }.apply { id = R.id.focus_input_button },
++            rowButtonParams()
++        )
++        focusDismissRow.addView(
++            secondaryButton("Dismiss Keyboard") {
++                executeAndRender("dismiss_keyboard", emptyMap())
++                showSection(Section.TOOLS)
++            }.apply { id = R.id.dismiss_keyboard_button },
++            rowButtonParams()
+         )
++        contentRoot.addView(focusDismissRow)
++
+         contentRoot.addView(
+             secondaryButton("Clear Focused Field") {
+                 executeAndRender("clear_text", emptyMap())
+@@ -804,6 +818,48 @@ class MainActivity : Activity() {
+         )
+ 
+         contentRoot.addView(latestResultCard())
++
++        // Tail spacer so the Focus / Dismiss row can scroll above the soft
++        // keyboard when an input is focused (adjustResize alone leaves them
++        // flush against the IME). The spacer is 0 dp tall when the keyboard
++        // is hidden and grows only while the IME is visible, so it does not
++        // add visible whitespace in the resting layout.
++        val keyboardScrollSpacer = View(this).apply {
++            layoutParams = LinearLayout.LayoutParams(
++                ViewGroup.LayoutParams.MATCH_PARENT,
++                0
++            )
++        }
++        contentRoot.addView(keyboardScrollSpacer)
++        bindKeyboardScrollSpacer(keyboardScrollSpacer)
++    }
++
++    private fun bindKeyboardScrollSpacer(spacer: View) {
++        val rootView = window.decorView
++        val expandedHeight = (320 * resources.displayMetrics.density).toInt()
++        val visibleRect = Rect()
++        val listener = ViewTreeObserver.OnGlobalLayoutListener {
++            rootView.getWindowVisibleDisplayFrame(visibleRect)
++            val screenHeight = rootView.height
++            if (screenHeight <= 0) return@OnGlobalLayoutListener
++            val occluded = screenHeight - visibleRect.bottom
++            // Anything above ~15% of screen height is conservatively treated
++            // as the soft keyboard rather than a tall status/nav bar.
++            val keyboardVisible = occluded > screenHeight * 0.15
++            val target = if (keyboardVisible) expandedHeight else 0
++            val params = spacer.layoutParams as? LinearLayout.LayoutParams ?: return@OnGlobalLayoutListener
++            if (params.height != target) {
++                params.height = target
++                spacer.layoutParams = params
++            }
++        }
++        rootView.viewTreeObserver.addOnGlobalLayoutListener(listener)
++        spacer.addOnAttachStateChangeListener(object : View.OnAttachStateChangeListener {
++            override fun onViewAttachedToWindow(v: View) = Unit
++            override fun onViewDetachedFromWindow(v: View) {
++                rootView.viewTreeObserver.removeOnGlobalLayoutListener(listener)
++            }
++        })
+     }
+ 
+     private fun renderMcpPanel() {
+diff --git a/app/src/main/java/dev/touchpilot/app/androidcontrol/AccessibilityBridge.kt b/app/src/main/java/dev/touchpilot/app/androidcontrol/AccessibilityBridge.kt
+index c3161fc..c9d39d1 100644
+--- a/app/src/main/java/dev/touchpilot/app/androidcontrol/AccessibilityBridge.kt
++++ b/app/src/main/java/dev/touchpilot/app/androidcontrol/AccessibilityBridge.kt
+@@ -78,6 +78,14 @@ object AccessibilityBridge {
+         return service?.pressHome() ?: false
+     }
+ 
++    fun isKeyboardVisible(): Boolean {
++        return service?.isKeyboardVisible() ?: false
++    }
++
++    fun dismissKeyboard(timeoutMs: Long): DismissKeyboardOutcome {
++        return service?.dismissKeyboard(timeoutMs) ?: DismissKeyboardOutcome.NotConnected
++    }
++
+     fun waitForText(text: String, timeoutMs: Long): Boolean {
+         if (text.isBlank()) return false
+         return service?.waitForText(text, timeoutMs) ?: false
+diff --git a/app/src/main/java/dev/touchpilot/app/androidcontrol/DismissKeyboardOutcome.kt b/app/src/main/java/dev/touchpilot/app/androidcontrol/DismissKeyboardOutcome.kt
+new file mode 100644
+index 0000000..14371a8
+--- /dev/null
++++ b/app/src/main/java/dev/touchpilot/app/androidcontrol/DismissKeyboardOutcome.kt
+@@ -0,0 +1,31 @@
++package dev.touchpilot.app.androidcontrol
++
++/**
++ * Result of [TouchPilotAccessibilityService.dismissKeyboard].
++ *
++ * The tool deliberately distinguishes "already hidden" from "hidden" so
++ * agents can tell when they spent a Back dispatch versus when the keyboard
++ * was never showing in the first place.
++ */
++sealed class DismissKeyboardOutcome {
++    abstract val wasVisibleBefore: Boolean
++    abstract val stillVisibleAfter: Boolean
++
++    /** Keyboard was not visible when the tool ran. No system action dispatched. */
++    data object AlreadyHidden : DismissKeyboardOutcome() {
++        override val wasVisibleBefore = false
++        override val stillVisibleAfter = false
++    }
++
++    /** Keyboard was visible and the IME show mode has been flipped to hidden. */
++    data object Hidden : DismissKeyboardOutcome() {
++        override val wasVisibleBefore = true
++        override val stillVisibleAfter = false
++    }
++
++    /** The accessibility service is not connected. */
++    data object NotConnected : DismissKeyboardOutcome() {
++        override val wasVisibleBefore = false
++        override val stillVisibleAfter = false
++    }
++}
+diff --git a/app/src/main/java/dev/touchpilot/app/androidcontrol/TouchPilotAccessibilityService.kt b/app/src/main/java/dev/touchpilot/app/androidcontrol/TouchPilotAccessibilityService.kt
+index c1a36aa..a9aecf8 100644
+--- a/app/src/main/java/dev/touchpilot/app/androidcontrol/TouchPilotAccessibilityService.kt
++++ b/app/src/main/java/dev/touchpilot/app/androidcontrol/TouchPilotAccessibilityService.kt
+@@ -7,6 +7,7 @@ import android.graphics.Rect
+ import android.os.Bundle
+ import android.view.accessibility.AccessibilityEvent
+ import android.view.accessibility.AccessibilityNodeInfo
++import android.view.accessibility.AccessibilityWindowInfo
+ import dev.touchpilot.app.screen.ScreenContext
+ import dev.touchpilot.app.screen.ScreenContextBuilder
+ import java.util.concurrent.CountDownLatch
+@@ -251,6 +252,44 @@ class TouchPilotAccessibilityService : AccessibilityService() {
+         return performGlobalAction(GLOBAL_ACTION_HOME)
+     }
+ 
++    fun isKeyboardVisible(): Boolean {
++        // flagRetrieveInteractiveWindows is already declared in the service
++        // config, so getWindows() surfaces the IME window when it is showing.
++        return windows?.any { it?.type == AccessibilityWindowInfo.TYPE_INPUT_METHOD } == true
++    }
++
++    /**
++     * Hides the soft keyboard when it is visible. The implementation
++     * deliberately avoids [GLOBAL_ACTION_BACK]: a stale window-list
++     * observation paired with Back would silently navigate the foreground
++     * app. Instead the soft keyboard show mode is flipped to
++     * [AccessibilityService.SHOW_MODE_HIDDEN], which routes through
++     * InputMethodManagerService and cannot navigate.
++     *
++     * The previous show mode is restored after a brief settle so subsequent
++     * taps on an editable field bring the keyboard back as usual.
++     *
++     * Note: we deliberately do not gate success on [getWindows] returning a
++     * cleared window list. `TYPE_INPUT_METHOD` can linger in that list for
++     * seconds after the IME has visibly hidden — especially on emulators —
++     * so polling it would produce false negatives. The show-mode change
++     * itself is synchronous in IMMS, so we trust the action.
++     */
++    fun dismissKeyboard(timeoutMs: Long): DismissKeyboardOutcome {
++        if (!isKeyboardVisible()) {
++            return DismissKeyboardOutcome.AlreadyHidden
++        }
++        val controller = softKeyboardController
++        val previousMode = controller.showMode
++        controller.showMode = SHOW_MODE_HIDDEN
++        // Brief settle so the IME hide animation can complete before the
++        // tool returns and the agent inspects the screen.
++        val settle = timeoutMs.coerceIn(50L, 5_000L).coerceAtMost(500L)
++        Thread.sleep(settle)
++        controller.showMode = previousMode
++        return DismissKeyboardOutcome.Hidden
++    }
++
+     fun waitForText(text: String, timeoutMs: Long): Boolean {
+         val deadline = System.currentTimeMillis() + timeoutMs.coerceIn(250L, 30_000L)
+         while (System.currentTimeMillis() < deadline) {
+diff --git a/app/src/main/java/dev/touchpilot/app/tools/AndroidToolExecutor.kt b/app/src/main/java/dev/touchpilot/app/tools/AndroidToolExecutor.kt
+index 1a60e0d..f16135f 100644
+--- a/app/src/main/java/dev/touchpilot/app/tools/AndroidToolExecutor.kt
++++ b/app/src/main/java/dev/touchpilot/app/tools/AndroidToolExecutor.kt
+@@ -4,6 +4,7 @@ import android.content.Context
+ import android.content.Intent
+ import android.content.pm.ResolveInfo
+ import dev.touchpilot.app.androidcontrol.AccessibilityBridge
++import dev.touchpilot.app.androidcontrol.DismissKeyboardOutcome
+ import dev.touchpilot.app.androidcontrol.ForegroundAppInfo
+ import dev.touchpilot.app.security.DefaultActionPolicy
+ import dev.touchpilot.app.security.PolicyDecision
+@@ -191,6 +192,9 @@ class AndroidToolExecutor(
+                 record(name, selectorLog, result.ok, result.message)
+                 ToolResult(result.ok, result.message)
+             }
++            "dismiss_keyboard" -> {
++                executeDismissKeyboard(args)
++            }
+             "get_foreground_app" -> {
+                 val info = AccessibilityBridge.getForegroundApp()
+                 val ok = info.accessibilityConnected
+@@ -411,6 +415,35 @@ class AndroidToolExecutor(
+ 
+     private data class ScrollVerification(val changed: Boolean)
+ 
++    private fun executeDismissKeyboard(args: Map<String, String>): ToolResult {
++        val timeoutMs = args["timeout_ms"]?.toLongOrNull() ?: 500L
++        val outcome = AccessibilityBridge.dismissKeyboard(timeoutMs)
++        val ok = when (outcome) {
++            is DismissKeyboardOutcome.Hidden,
++            is DismissKeyboardOutcome.AlreadyHidden -> true
++            is DismissKeyboardOutcome.NotConnected -> false
++        }
++        val message = when (outcome) {
++            is DismissKeyboardOutcome.Hidden -> "dismissKeyboard"
++            is DismissKeyboardOutcome.AlreadyHidden -> "Keyboard already hidden"
++            is DismissKeyboardOutcome.NotConnected -> "TouchPilot Control is not enabled."
++        }
++        record(
++            "dismiss_keyboard",
++            "timeout_ms=$timeoutMs",
++            ok,
++            "${outcome.javaClass.simpleName}",
++        )
++        return ToolResult(
++            ok = ok,
++            message = message,
++            data = mapOf(
++                "was_visible_before" to outcome.wasVisibleBefore.toString(),
++                "still_visible_after" to outcome.stillVisibleAfter.toString(),
++            )
++        )
++    }
++
+     private fun foregroundAppData(info: ForegroundAppInfo): Map<String, String> {
+         return buildMap {
+             put("accessibility_connected", info.accessibilityConnected.toString())
+diff --git a/app/src/main/java/dev/touchpilot/app/tools/RetryPolicy.kt b/app/src/main/java/dev/touchpilot/app/tools/RetryPolicy.kt
+index 8048c09..1279740 100644
+--- a/app/src/main/java/dev/touchpilot/app/tools/RetryPolicy.kt
++++ b/app/src/main/java/dev/touchpilot/app/tools/RetryPolicy.kt
+@@ -94,6 +94,14 @@ class AndroidToolRetryPolicy(
+                 "wait_for_ui" to action.copy(waitForIdleAfterSuccess = false),
+                 "focus_input" to action,
+                 "get_foreground_app" to ToolRetryConfig(maxAttempts = 1, retryable = false),
++                // Single attempt only. The tool flips the IME show mode via
++                // softKeyboardController, which is idempotent and has no
++                // navigation hazard, but retrying would still spend extra
++                // wall-clock time for no behavioral benefit.
++                "dismiss_keyboard" to ToolRetryConfig(
++                    maxAttempts = 1,
++                    retryable = false,
++                ),
+             )
+         }
+     }
+diff --git a/app/src/main/java/dev/touchpilot/app/tools/ToolModels.kt b/app/src/main/java/dev/touchpilot/app/tools/ToolModels.kt
+index 27015ea..0294c24 100644
+--- a/app/src/main/java/dev/touchpilot/app/tools/ToolModels.kt
++++ b/app/src/main/java/dev/touchpilot/app/tools/ToolModels.kt
+@@ -130,6 +130,15 @@ object AndroidToolCatalog {
+                 ClearTextTarget.TargetContentDescriptionArg to "Input content description to focus and clear.",
+             ),
+             requiredArguments = emptySet()
++        ),
++        ToolSpec(
++            name = "dismiss_keyboard",
++            description = "Hide the soft keyboard when it is visible. No-op when it is already hidden.",
++            risk = ToolRisk.LOW,
++            arguments = mapOf(
++                "timeout_ms" to "Maximum wait for the keyboard to disappear after dismissal."
++            ),
++            requiredArguments = emptySet()
+         )
+     )
+ 
+diff --git a/app/src/main/java/dev/touchpilot/app/tools/ToolVerification.kt b/app/src/main/java/dev/touchpilot/app/tools/ToolVerification.kt
+index 8572a71..4b80274 100644
+--- a/app/src/main/java/dev/touchpilot/app/tools/ToolVerification.kt
++++ b/app/src/main/java/dev/touchpilot/app/tools/ToolVerification.kt
+@@ -35,6 +35,7 @@ class ToolVerifier {
+                 )
+             )
+             "clear_text" -> verifyClearText(after)
++            "dismiss_keyboard" -> verifyDismissKeyboard(result)
+             else -> ToolVerificationResult.Skipped("no verifier for $toolName")
+         }
+     }
+@@ -197,6 +198,28 @@ class ToolVerifier {
+         }
+     }
+ 
++    private fun verifyDismissKeyboard(result: ToolResult): ToolVerificationResult {
++        val stillVisible = result.data["still_visible_after"]?.toBooleanStrictOrNull() ?: false
++        val wasVisible = result.data["was_visible_before"]?.toBooleanStrictOrNull() ?: false
++        return if (!stillVisible) {
++            ToolVerificationResult.Passed(
++                reason = if (wasVisible) "soft keyboard is no longer visible" else "soft keyboard was already hidden",
++                data = mapOf(
++                    "was_visible_before" to wasVisible.toString(),
++                    "still_visible_after" to "false",
++                )
++            )
++        } else {
++            ToolVerificationResult.Failed(
++                reason = "soft keyboard is still visible after dismiss",
++                data = mapOf(
++                    "was_visible_before" to wasVisible.toString(),
++                    "still_visible_after" to "true",
++                )
++            )
++        }
++    }
++
+     private fun sameSnapshot(a: ScreenContext, b: ScreenContext): Boolean {
+         if (a.nodes.size != b.nodes.size) return false
+         return a.toRedactedJson() == b.toRedactedJson()
+diff --git a/app/src/main/res/values/ids.xml b/app/src/main/res/values/ids.xml
+index 0fad3f9..88f1b5c 100644
+--- a/app/src/main/res/values/ids.xml
++++ b/app/src/main/res/values/ids.xml
+@@ -10,6 +10,7 @@
+     <item name="tap_text_button" type="id" />
+     <item name="type_text_input" type="id" />
+     <item name="type_text_button" type="id" />
++    <item name="dismiss_keyboard_button" type="id" />
+     <item name="back_button" type="id" />
+     <item name="home_button" type="id" />
+     <item name="scroll_down_button" type="id" />
+diff --git a/app/src/test/java/dev/touchpilot/app/tools/DismissKeyboardCatalogTest.kt b/app/src/test/java/dev/touchpilot/app/tools/DismissKeyboardCatalogTest.kt
+new file mode 100644
+index 0000000..97d3916
+--- /dev/null
++++ b/app/src/test/java/dev/touchpilot/app/tools/DismissKeyboardCatalogTest.kt
+@@ -0,0 +1,77 @@
++package dev.touchpilot.app.tools
++
++import kotlin.test.Test
++import kotlin.test.assertContains
++import kotlin.test.assertEquals
++import kotlin.test.assertNotNull
++import kotlin.test.assertNull
++import kotlin.test.assertTrue
++
++class DismissKeyboardCatalogTest {
++    @Test
++    fun dismissKeyboardIsRegisteredAsLowRisk() {
++        val spec = assertNotNull(AndroidToolCatalog.find("dismiss_keyboard"))
++        assertEquals(ToolRisk.LOW, spec.risk)
++    }
++
++    @Test
++    fun dismissKeyboardExposesOnlyTimeoutArg() {
++        val spec = AndroidToolCatalog.find("dismiss_keyboard")!!
++        assertEquals(setOf("timeout_ms"), spec.arguments.keys)
++        assertTrue(spec.requiredArguments.isEmpty())
++    }
++
++    @Test
++    fun dismissKeyboardDoesNotAcceptATextPayload() {
++        // The tool only hides UI; accepting a text arg would suggest it
++        // submits or modifies input content.
++        val spec = AndroidToolCatalog.find("dismiss_keyboard")!!
++        assertTrue(!spec.arguments.containsKey("text"))
++    }
++
++    @Test
++    fun validateAcceptsEmptyArgs() {
++        assertNull(AndroidToolCatalog.validate("dismiss_keyboard", emptyMap()))
++    }
++
++    @Test
++    fun validateAcceptsTimeoutMs() {
++        assertNull(
++            AndroidToolCatalog.validate(
++                "dismiss_keyboard",
++                mapOf("timeout_ms" to "750")
++            )
++        )
++    }
++
++    @Test
++    fun validateRejectsNonNumericTimeout() {
++        val error = AndroidToolCatalog.validate(
++            "dismiss_keyboard",
++            mapOf("timeout_ms" to "soon")
++        )
++        assertNotNull(error)
++        assertContains(error, "timeout_ms")
++    }
++
++    @Test
++    fun validateRejectsUnknownArgs() {
++        val error = AndroidToolCatalog.validate(
++            "dismiss_keyboard",
++            mapOf("force" to "true")
++        )
++        assertNotNull(error)
++        assertContains(error, "Unknown argument")
++    }
++
++    @Test
++    fun retryPolicyTreatsDismissKeyboardAsSingleAttempt() {
++        val policy = AndroidToolRetryPolicy()
++        val config = policy.configFor("dismiss_keyboard")
++        // Single attempt is intentional: any second action could compound on
++        // a stale window-list observation. The tool flips the IME show mode
++        // via softKeyboardController, which is itself idempotent.
++        assertEquals(1, config.maxAttempts)
++        assertEquals(false, config.retryable)
++    }
++}
+diff --git a/app/src/test/java/dev/touchpilot/app/tools/ToolVerifierTest.kt b/app/src/test/java/dev/touchpilot/app/tools/ToolVerifierTest.kt
+index aea343a..4dbbcf5 100644
+--- a/app/src/test/java/dev/touchpilot/app/tools/ToolVerifierTest.kt
++++ b/app/src/test/java/dev/touchpilot/app/tools/ToolVerifierTest.kt
+@@ -124,6 +124,75 @@ class ToolVerifierTest {
+         assertIs<ToolVerificationResult.Passed>(result)
+     }
+ 
++    @Test
++    fun dismissKeyboardPassesWhenKeyboardWasHidden() {
++        val result = verifier.verify(
++            toolName = "dismiss_keyboard",
++            args = emptyMap(),
++            result = ToolResult(
++                ok = true,
++                message = "dismissKeyboard",
++                data = mapOf(
++                    "was_visible_before" to "true",
++                    "still_visible_after" to "false",
++                )
++            ),
++            before = screen(),
++            after = screen(),
++        )
++
++        val passed = assertIs<ToolVerificationResult.Passed>(result)
++        assertEquals("true", passed.data["was_visible_before"])
++        assertEquals("false", passed.data["still_visible_after"])
++    }
++
++    @Test
++    fun dismissKeyboardPassesWhenKeyboardWasAlreadyHidden() {
++        val result = verifier.verify(
++            toolName = "dismiss_keyboard",
++            args = emptyMap(),
++            result = ToolResult(
++                ok = true,
++                message = "Keyboard already hidden",
++                data = mapOf(
++                    "was_visible_before" to "false",
++                    "still_visible_after" to "false",
++                )
++            ),
++            before = screen(),
++            after = screen(),
++        )
++
++        val passed = assertIs<ToolVerificationResult.Passed>(result)
++        assertTrue(passed.reason.contains("already hidden"))
++    }
++
++    @Test
++    fun dismissKeyboardVerifierFailsDefensivelyIfStillVisibleSurfaces() {
++        // The executor cannot currently produce still_visible_after=true:
++        // softKeyboardController.showMode = HIDDEN is synchronous in IMMS
++        // and the action does not poll for window-list confirmation.
++        // The verifier branch is kept defensively so a future regression
++        // that resurrects a polled-failure code path is still surfaced.
++        val result = verifier.verify(
++            toolName = "dismiss_keyboard",
++            args = emptyMap(),
++            result = ToolResult(
++                ok = true,
++                message = "dismissKeyboard",
++                data = mapOf(
++                    "was_visible_before" to "true",
++                    "still_visible_after" to "true",
++                )
++            ),
++            before = screen(),
++            after = screen(),
++        )
++
++        val failed = assertIs<ToolVerificationResult.Failed>(result)
++        assertTrue(failed.reason.contains("still visible"))
++    }
++
+     @Test
+     fun skippedWhenToolAlreadyFailed() {
+         val result = verifier.verify(
+diff --git a/docs/LIVE_TESTING.md b/docs/LIVE_TESTING.md
+index e4ed840..988862b 100644
+--- a/docs/LIVE_TESTING.md
++++ b/docs/LIVE_TESTING.md
+@@ -43,6 +43,11 @@ Launch TouchPilot:
+ - [x] `Type Into Focused Field` enters text into a focused field.
+ - [x] `Scroll Down` and `Scroll Up` work on a scrollable screen.
+ - [x] `Back` and `Home` work.
++- [ ] `dismiss_keyboard` hides the soft keyboard when it is visible.
++- [ ] `dismiss_keyboard` is a no-op when the keyboard is not visible and does
++      not navigate the foreground app.
++- [ ] `dismiss_keyboard` reports `was_visible_before` and
++      `still_visible_after` in the tool log.
+ - [x] Medium-risk model-selected tools show inline approval prompts.
+ - [x] Denied approvals stop execution and log the denial.
+ - [x] Active skill allowlists deny disallowed tools.
+diff --git a/docs/TOOL_SPEC.md b/docs/TOOL_SPEC.md
+index c45d940..b95435d 100644
+--- a/docs/TOOL_SPEC.md
++++ b/docs/TOOL_SPEC.md
+@@ -28,10 +28,21 @@ Tools are the only way an agent may affect the Android device.
+ - `wait_for_ui`: wait for a screen change or expected text.
+ - `focus_input`: focus a visible editable input field without typing.
+ - `clear_text`: clear the focused or resolved editable input field.
++- `dismiss_keyboard`: hide the soft keyboard if it is visible.
+ 
+ The app implements `observe_screen`, `open_app`, `tap`, `type_text`, `scroll`,
+-`press_back`, `press_home`, `wait_for_ui`, `focus_input`, and `clear_text` from
+-the Android Tools screen and the agent command-provider loop.
++`press_back`, `press_home`, `wait_for_ui`, `focus_input`, `clear_text`, and
++`dismiss_keyboard` from the Android Tools screen and the agent command-provider
++loop.
++
++`dismiss_keyboard` is observation-gated: it inspects the accessibility window
++list for a `TYPE_INPUT_METHOD` window first. If the keyboard is already hidden,
++the tool is a no-op and reports `was_visible_before=false`. If it is visible,
++the accessibility service flips `softKeyboardController.showMode` to
++`SHOW_MODE_HIDDEN` (which routes through InputMethodManagerService and cannot
++navigate the foreground app), waits briefly for the IME to settle, and then
++restores the prior show mode so subsequent taps on an editable field bring the
++keyboard back. The tool is single-attempt and never accepts or logs text input.
+ 
+ All command providers return one JSON command at a time:
+ 

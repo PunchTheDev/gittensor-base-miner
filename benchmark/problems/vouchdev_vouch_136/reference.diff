@@ -1,0 +1,556 @@
+diff --git a/CHANGELOG.md b/CHANGELOG.md
+index eb178b1..65832cf 100644
+--- a/CHANGELOG.md
++++ b/CHANGELOG.md
+@@ -7,6 +7,10 @@ All notable changes to vouch are documented here. Format follows
+ ## [Unreleased]
+ 
+ ### Added
++- `vouch expire` garbage-collects stale pending proposals: dry-run by default,
++  `--apply` moves them to `decided/` with `decision_reason: expired`, emits
++  `proposal.expire` audit events, and honors `review.expire_pending_after_days`
++  in `config.yaml` (default 90; `0` disables). `kb.expire` on MCP/JSONL.
+ - `vouch init --template <name>` seeds a domain starter pack. The default `starter` template is unchanged; the new `gittensor` template seeds a small, cited, approved KB about Gittensor (SN74) contribution scoring (1 source, 1 entity, 7 claims — merged-PR rewards, PAT verification, scoring factors, sybil-resistance, repo allow-list policy, issue-solving multiplier, and emission split) so a fresh KB in a Gittensor repo has retrievable context on day one. Templates are an in-code registry — future packs plug in the same way.
+ 
+ ## [0.1.0] — 2026-05-26
+diff --git a/README.md b/README.md
+index 034fa19..596e85d 100644
+--- a/README.md
++++ b/README.md
+@@ -64,6 +64,7 @@ vouch show <id>                  # full details
+ vouch approve <id>               # → durable artifact
+ vouch approve <id> <id> ...    # approve several reviewed proposals at once
+ vouch reject <id> --reason "..."
++vouch expire --apply                  # optional: clear stale pending proposals
+ 
+ # 4. commit
+ git add .vouch/ && git commit -m "kb: approve auth-uses-jwt"
+@@ -150,6 +151,7 @@ vouch review [--limit N] [--type KIND]      # guided proposal review queue
+ vouch show <proposal-id>
+ vouch approve <proposal-id>... [--reason ...] [--keep-going]
+ vouch reject <proposal-id> --reason "..."
++vouch expire [--apply] [--days N] [--json]   # GC stale pending proposals
+ 
+ vouch propose-claim --text ... --source ... [--type ...] [--confidence X]
+ vouch propose-page --title ... [--body -] [--claim ID ...]
+diff --git a/src/vouch/capabilities.py b/src/vouch/capabilities.py
+index 9abcc68..04fc36a 100644
+--- a/src/vouch/capabilities.py
++++ b/src/vouch/capabilities.py
+@@ -36,6 +36,7 @@
+     "kb.propose_relation",
+     "kb.approve",
+     "kb.reject",
++    "kb.expire",
+     "kb.supersede",
+     "kb.contradict",
+     "kb.archive",
+diff --git a/src/vouch/cli.py b/src/vouch/cli.py
+index fe6ab12..b846c38 100644
+--- a/src/vouch/cli.py
++++ b/src/vouch/cli.py
+@@ -37,8 +37,10 @@
+     seed_starter_kb,
+ )
+ from .proposals import (
++    EXPIRE_ACTOR,
+     ProposalError,
+     check_approvable,
++    expire_pending,
+     propose_claim,
+     propose_entity,
+     propose_page,
+@@ -488,6 +490,68 @@ def reject(proposal_id: str, reason: str) -> None:
+     click.echo(f"Rejected {proposal_id}")
+ 
+ 
++def _expire_row(proposal: Proposal) -> dict[str, Any]:
++    return {
++        "id": proposal.id,
++        "kind": proposal.kind.value,
++        "proposed_by": proposal.proposed_by,
++        "proposed_at": proposal.proposed_at.isoformat(),
++    }
++
++
++@cli.command()
++@click.option("--apply", is_flag=True, help="Expire stale proposals (default is dry-run).")
++@click.option("--days", type=int, default=None,
++              help="Override review.expire_pending_after_days for this run.")
++@click.option("--json", "as_json", is_flag=True, help="Emit JSON instead of text.")
++def expire(apply: bool, days: int | None, as_json: bool) -> None:
++    """Garbage-collect pending proposals older than the configured threshold."""
++    store = _load_store()
++    result = expire_pending(
++        store, apply=apply, expired_by=EXPIRE_ACTOR, days=days,
++    )
++    if as_json:
++        payload: dict[str, Any] = {
++            "threshold_days": result.threshold_days,
++            "enabled": result.threshold_days > 0,
++            "dry_run": not apply,
++            "would_expire": [_expire_row(p) for p in result.would_expire],
++            "expired": [_expire_row(p) for p in result.expired],
++        }
++        _emit_json(payload)
++        return
++
++    if result.threshold_days <= 0:
++        click.echo("expire disabled (review.expire_pending_after_days is 0)")
++        return
++
++    if not result.would_expire:
++        click.echo(
++            f"no stale pending proposals (threshold: {result.threshold_days} days)"
++        )
++        return
++
++    if not apply:
++        click.echo(
++            f"dry-run: {len(result.would_expire)} proposal(s) would expire "
++            f"(threshold: {result.threshold_days} days)"
++        )
++        for pr in result.would_expire:
++            click.echo(
++                f"  {pr.id}  [{pr.kind.value}]  by {pr.proposed_by}  "
++                f"proposed {pr.proposed_at.date().isoformat()}"
++            )
++        click.echo("rerun with --apply to expire")
++        return
++
++    click.echo(
++        f"expired {len(result.expired)} proposal(s) "
++        f"(threshold: {result.threshold_days} days)"
++    )
++    for pr in result.expired:
++        click.echo(f"  {pr.id}  [{pr.kind.value}]")
++
++
+ # --- proposal-from-CLI shortcuts -----------------------------------------
+ 
+ 
+diff --git a/src/vouch/jsonl_server.py b/src/vouch/jsonl_server.py
+index b3536f6..6415b14 100644
+--- a/src/vouch/jsonl_server.py
++++ b/src/vouch/jsonl_server.py
+@@ -33,8 +33,10 @@
+ from .context import build_context_pack
+ from .models import ProposalStatus
+ from .proposals import (
++    EXPIRE_ACTOR,
+     ProposalError,
+     approve,
++    expire_pending,
+     propose_claim,
+     propose_entity,
+     propose_page,
+@@ -295,6 +297,22 @@ def _h_reject(p: dict) -> dict:
+     return {"proposal_id": p["proposal_id"], "status": "rejected"}
+ 
+ 
++def _h_expire(p: dict) -> dict:
++    result = expire_pending(
++        _store(),
++        apply=bool(p.get("apply")),
++        expired_by=EXPIRE_ACTOR,
++        days=p.get("days"),
++    )
++    return {
++        "threshold_days": result.threshold_days,
++        "enabled": result.threshold_days > 0,
++        "dry_run": not bool(p.get("apply")),
++        "would_expire": [pr.id for pr in result.would_expire],
++        "expired": [pr.id for pr in result.expired],
++    }
++
++
+ def _h_supersede(p: dict) -> dict:
+     old, new = life.supersede(
+         _store(), old_claim_id=p["old_claim_id"],
+@@ -491,6 +509,7 @@ def _h_embeddings_stats(_: dict) -> dict:
+     "kb.propose_relation": _h_propose_relation,
+     "kb.approve": _h_approve,
+     "kb.reject": _h_reject,
++    "kb.expire": _h_expire,
+     "kb.supersede": _h_supersede,
+     "kb.contradict": _h_contradict,
+     "kb.archive": _h_archive,
+diff --git a/src/vouch/proposals.py b/src/vouch/proposals.py
+index 47592e7..4186544 100644
+--- a/src/vouch/proposals.py
++++ b/src/vouch/proposals.py
+@@ -8,9 +8,12 @@
+ 
+ import time
+ import uuid
+-from datetime import UTC, datetime
++from dataclasses import dataclass, field
++from datetime import UTC, datetime, timedelta
+ from typing import Any
+ 
++import yaml
++
+ from . import audit, index_db
+ from .models import (
+     Claim,
+@@ -28,6 +31,20 @@ class ProposalError(RuntimeError):
+     pass
+ 
+ 
++EXPIRE_REASON = "expired"
++EXPIRE_ACTOR = "vouch-expire"
++_DEFAULT_EXPIRE_PENDING_DAYS = 90
++
++
++@dataclass
++class ExpireResult:
++    """Outcome of `expire_pending` (dry-run or apply)."""
++
++    threshold_days: int
++    would_expire: list[Proposal] = field(default_factory=list)
++    expired: list[Proposal] = field(default_factory=list)
++
++
+ def new_proposal_id() -> str:
+     # Sortable timestamped id: '20260517-143052-<short>'. Sorted listings
+     # naturally show oldest pending first, which matches review intuition.
+@@ -224,7 +241,6 @@ def _approval_block_reason(
+     if approved_by == proposal.proposed_by:
+         cfg: dict[str, Any] = {}
+         try:
+-            import yaml
+             loaded = yaml.safe_load((store.kb_dir / "config.yaml").read_text())
+             if isinstance(loaded, dict):
+                 cfg = loaded
+@@ -352,6 +368,97 @@ def reject(
+     return proposal
+ 
+ 
++def expire_pending_after_days(store: KBStore, *, override: int | None = None) -> int:
++    """Resolve GC threshold from config (`review.expire_pending_after_days`)."""
++    if override is not None:
++        return override
++    try:
++        loaded = yaml.safe_load(store.config_path.read_text())
++    except Exception:
++        return _DEFAULT_EXPIRE_PENDING_DAYS
++    if not isinstance(loaded, dict):
++        return _DEFAULT_EXPIRE_PENDING_DAYS
++    review_cfg = loaded.get("review")
++    if not isinstance(review_cfg, dict):
++        return _DEFAULT_EXPIRE_PENDING_DAYS
++    days = review_cfg.get("expire_pending_after_days")
++    if isinstance(days, int) and days >= 0:
++        return days
++    return _DEFAULT_EXPIRE_PENDING_DAYS
++
++
++def _utc(dt: datetime) -> datetime:
++    if dt.tzinfo is None:
++        return dt.replace(tzinfo=UTC)
++    return dt.astimezone(UTC)
++
++
++def list_stale_pending(store: KBStore, *, days: int) -> list[Proposal]:
++    """Pending proposals older than `days` (by `proposed_at`). `days <= 0` → none."""
++    if days <= 0:
++        return []
++    cutoff = datetime.now(UTC) - timedelta(days=days)
++    stale: list[Proposal] = []
++    for proposal in store.list_proposals(ProposalStatus.PENDING):
++        if _utc(proposal.proposed_at) < cutoff:
++            stale.append(proposal)
++    return stale
++
++
++def expire_one(
++    store: KBStore,
++    proposal_id: str,
++    *,
++    expired_by: str = EXPIRE_ACTOR,
++) -> Proposal:
++    """Expire a single pending proposal (terminal reject + audit)."""
++    proposal = store.get_proposal(proposal_id)
++    if proposal.status != ProposalStatus.PENDING:
++        if (
++            proposal.status == ProposalStatus.REJECTED
++            and proposal.decision_reason == EXPIRE_REASON
++        ):
++            return proposal
++        raise ProposalError(
++            f"proposal {proposal_id} is {proposal.status.value}, not pending"
++        )
++    proposal.status = ProposalStatus.REJECTED
++    proposal.decided_at = datetime.now(UTC)
++    proposal.decided_by = expired_by
++    proposal.decision_reason = EXPIRE_REASON
++    store.move_proposal_to_decided(proposal)
++    audit.log_event(
++        store.kb_dir,
++        event="proposal.expire",
++        actor=expired_by,
++        object_ids=[proposal.id],
++        data={"kind": proposal.kind.value},
++    )
++    return proposal
++
++
++def expire_pending(
++    store: KBStore,
++    *,
++    apply: bool = False,
++    expired_by: str = EXPIRE_ACTOR,
++    days: int | None = None,
++) -> ExpireResult:
++    """Garbage-collect stale pending proposals per review-gate spec."""
++    threshold = expire_pending_after_days(store, override=days)
++    stale = list_stale_pending(store, days=threshold)
++    if not apply:
++        return ExpireResult(threshold_days=threshold, would_expire=stale)
++    expired = [
++        expire_one(store, proposal.id, expired_by=expired_by) for proposal in stale
++    ]
++    return ExpireResult(
++        threshold_days=threshold,
++        would_expire=stale,
++        expired=expired,
++    )
++
++
+ _ARTIFACT_GETTERS = {
+     ProposalKind.CLAIM: "get_claim",
+     ProposalKind.PAGE: "get_page",
+diff --git a/src/vouch/server.py b/src/vouch/server.py
+index db907cc..7f37042 100644
+--- a/src/vouch/server.py
++++ b/src/vouch/server.py
+@@ -25,8 +25,10 @@
+ from .context import build_context_pack
+ from .models import ProposalStatus
+ from .proposals import (
++    EXPIRE_ACTOR,
+     ProposalError,
+     approve,
++    expire_pending,
+     propose_claim,
+     propose_entity,
+     propose_page,
+@@ -421,6 +423,24 @@ def kb_reject(proposal_id: str, reason: str) -> dict[str, Any]:
+     return {"proposal_id": proposal_id, "status": "rejected", "reason": reason}
+ 
+ 
++@mcp.tool()
++def kb_expire(apply: bool = False, days: int | None = None) -> dict[str, Any]:
++    """Expire stale pending proposals (dry-run unless apply=True)."""
++    try:
++        result = expire_pending(
++            _store(), apply=apply, expired_by=EXPIRE_ACTOR, days=days,
++        )
++    except (ArtifactNotFoundError, ValueError, ProposalError) as e:
++        raise ValueError(str(e)) from e
++    return {
++        "threshold_days": result.threshold_days,
++        "enabled": result.threshold_days > 0,
++        "dry_run": not apply,
++        "would_expire": [p.id for p in result.would_expire],
++        "expired": [p.id for p in result.expired],
++    }
++
++
+ # === lifecycle ============================================================
+ 
+ 
+diff --git a/src/vouch/storage.py b/src/vouch/storage.py
+index d90c8c1..e6e7ada 100644
+--- a/src/vouch/storage.py
++++ b/src/vouch/storage.py
+@@ -67,7 +67,10 @@ class ArtifactNotFoundError(KeyError):
+ def _starter_config() -> dict[str, Any]:
+     return {
+         "version": 1,
+-        "review": {"require_human_approval": True},
++        "review": {
++            "require_human_approval": True,
++            "expire_pending_after_days": 90,
++        },
+         "retrieval": {
+             # auto = embedding -> fts5 -> substring; or pin one of
+             # embedding | fts5 | substring. See context._retrieve.
+diff --git a/tests/test_expire.py b/tests/test_expire.py
+new file mode 100644
+index 0000000..05b821b
+--- /dev/null
++++ b/tests/test_expire.py
+@@ -0,0 +1,172 @@
++"""Proposal expiry — stale pending GC."""
++
++from __future__ import annotations
++
++from datetime import UTC, datetime, timedelta
++from pathlib import Path
++
++import pytest
++import yaml
++from click.testing import CliRunner
++
++from vouch import audit
++from vouch.cli import cli
++from vouch.jsonl_server import handle_request
++from vouch.models import ProposalStatus
++from vouch.proposals import (
++    EXPIRE_ACTOR,
++    EXPIRE_REASON,
++    expire_one,
++    expire_pending,
++    expire_pending_after_days,
++    list_stale_pending,
++    propose_claim,
++)
++from vouch.storage import KBStore
++
++
++@pytest.fixture
++def store(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> KBStore:
++    s = KBStore.init(tmp_path)
++    monkeypatch.chdir(s.root)
++    return s
++
++
++def _set_expire_days(store: KBStore, days: int) -> None:
++    cfg = yaml.safe_load(store.config_path.read_text())
++    assert isinstance(cfg, dict)
++    review = cfg.setdefault("review", {})
++    assert isinstance(review, dict)
++    review["expire_pending_after_days"] = days
++    store.config_path.write_text(yaml.safe_dump(cfg, sort_keys=False))
++
++
++def _age_proposal(store: KBStore, proposal_id: str, *, days: int) -> None:
++    path = store.kb_dir / "proposed" / f"{proposal_id}.yaml"
++    raw = yaml.safe_load(path.read_text())
++    raw["proposed_at"] = (datetime.now(UTC) - timedelta(days=days)).isoformat()
++    path.write_text(yaml.safe_dump(raw, sort_keys=False))
++
++
++def test_expire_pending_after_days_default(store: KBStore) -> None:
++    assert expire_pending_after_days(store) == 90
++
++
++def test_expire_pending_after_days_from_config(store: KBStore) -> None:
++    _set_expire_days(store, 30)
++    assert expire_pending_after_days(store) == 30
++    assert expire_pending_after_days(store, override=7) == 7
++
++
++def test_list_stale_pending_respects_threshold(store: KBStore) -> None:
++    src = store.put_source(b"evidence")
++    fresh = propose_claim(store, text="fresh", evidence=[src.id], proposed_by="a")
++    stale_pr = propose_claim(store, text="stale", evidence=[src.id], proposed_by="b")
++    _age_proposal(store, stale_pr.id, days=100)
++
++    stale = list_stale_pending(store, days=90)
++    assert [p.id for p in stale] == [stale_pr.id]
++    assert fresh.id not in {p.id for p in stale}
++
++
++def test_expire_pending_dry_run(store: KBStore) -> None:
++    src = store.put_source(b"x")
++    pr = propose_claim(store, text="old", evidence=[src.id], proposed_by="agent")
++    _age_proposal(store, pr.id, days=120)
++
++    result = expire_pending(store, apply=False, days=90)
++    assert len(result.would_expire) == 1
++    assert result.expired == []
++    assert store.get_proposal(pr.id).status == ProposalStatus.PENDING
++
++
++def test_expire_pending_apply_moves_to_decided(store: KBStore) -> None:
++    src = store.put_source(b"x")
++    pr = propose_claim(store, text="old", evidence=[src.id], proposed_by="agent")
++    _age_proposal(store, pr.id, days=120)
++
++    result = expire_pending(store, apply=True, days=90)
++    assert len(result.expired) == 1
++    decided = store.get_proposal(pr.id)
++    assert decided.status == ProposalStatus.REJECTED
++    assert decided.decision_reason == EXPIRE_REASON
++    assert decided.decided_by == EXPIRE_ACTOR
++    assert not (store.kb_dir / "proposed" / f"{pr.id}.yaml").exists()
++    assert (store.kb_dir / "decided" / f"{pr.id}.yaml").exists()
++
++
++def test_expire_pending_disabled_when_days_zero(store: KBStore) -> None:
++    src = store.put_source(b"x")
++    pr = propose_claim(store, text="old", evidence=[src.id], proposed_by="agent")
++    _age_proposal(store, pr.id, days=500)
++
++    result = expire_pending(store, apply=True, days=0)
++    assert result.would_expire == []
++    assert store.get_proposal(pr.id).status == ProposalStatus.PENDING
++
++
++def test_expire_one_idempotent_on_already_expired(store: KBStore) -> None:
++    src = store.put_source(b"x")
++    pr = propose_claim(store, text="old", evidence=[src.id], proposed_by="agent")
++    expire_one(store, pr.id)
++    again = expire_one(store, pr.id)
++    assert again.decision_reason == EXPIRE_REASON
++
++
++def test_expire_writes_audit_event(store: KBStore) -> None:
++    src = store.put_source(b"x")
++    pr = propose_claim(store, text="old", evidence=[src.id], proposed_by="agent")
++    _age_proposal(store, pr.id, days=200)
++    expire_pending(store, apply=True, days=90)
++
++    events = [e for e in audit.read_events(store.kb_dir) if e.event == "proposal.expire"]
++    assert len(events) == 1
++    assert events[0].object_ids == [pr.id]
++    assert events[0].actor == EXPIRE_ACTOR
++
++
++def test_cli_expire_dry_run_json(store: KBStore) -> None:
++    src = store.put_source(b"x")
++    pr = propose_claim(store, text="old", evidence=[src.id], proposed_by="agent")
++    _age_proposal(store, pr.id, days=100)
++
++    result = CliRunner().invoke(cli, ["expire", "--json", "--days", "90"])
++    assert result.exit_code == 0, result.output
++    import json
++    payload = json.loads(result.output)
++    assert payload["dry_run"] is True
++    assert payload["would_expire"][0]["id"] == pr.id
++    assert payload["expired"] == []
++
++
++def test_cli_expire_apply(store: KBStore) -> None:
++    src = store.put_source(b"x")
++    pr = propose_claim(store, text="old", evidence=[src.id], proposed_by="agent")
++    _age_proposal(store, pr.id, days=100)
++
++    result = CliRunner().invoke(cli, ["expire", "--apply", "--days", "90"])
++    assert result.exit_code == 0, result.output
++    assert "expired 1" in result.output
++    assert store.get_proposal(pr.id).status == ProposalStatus.REJECTED
++
++
++def test_jsonl_kb_expire(store: KBStore) -> None:
++    src = store.put_source(b"x")
++    pr = propose_claim(store, text="old", evidence=[src.id], proposed_by="agent")
++    _age_proposal(store, pr.id, days=100)
++
++    dry = handle_request({
++        "id": "1",
++        "method": "kb.expire",
++        "params": {"apply": False, "days": 90},
++    })
++    assert dry["ok"] is True
++    assert pr.id in dry["result"]["would_expire"]
++
++    applied = handle_request({
++        "id": "2",
++        "method": "kb.expire",
++        "params": {"apply": True, "days": 90},
++    })
++    assert applied["ok"] is True
++    assert pr.id in applied["result"]["expired"]

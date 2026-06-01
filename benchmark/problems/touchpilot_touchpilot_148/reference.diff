@@ -1,0 +1,447 @@
+diff --git a/app/src/main/assets/skills/settings/SKILL.md b/app/src/main/assets/skills/settings/SKILL.md
+index 36ec32e..2a4b5b0 100644
+--- a/app/src/main/assets/skills/settings/SKILL.md
++++ b/app/src/main/assets/skills/settings/SKILL.md
+@@ -6,6 +6,7 @@ user explicitly asks to change a setting.
+ Allowed initial tools:
+ 
+ - `open_app`
++- `open_settings_panel`
+ - `observe_screen`
+ - `tap`
+ - `scroll`
+diff --git a/app/src/main/java/dev/touchpilot/app/MainActivity.kt b/app/src/main/java/dev/touchpilot/app/MainActivity.kt
+index d69141f..a0a429f 100644
+--- a/app/src/main/java/dev/touchpilot/app/MainActivity.kt
++++ b/app/src/main/java/dev/touchpilot/app/MainActivity.kt
+@@ -1040,6 +1040,21 @@ class MainActivity : Activity() {
+             }.apply { id = R.id.open_app_button }
+         )
+ 
++        val settingsPanelInput = editText(
++            "Settings panel: wifi, bluetooth, accessibility, app_info, notifications, system_settings"
++        ).apply { id = R.id.open_settings_panel_input }
++        contentRoot.addView(settingsPanelInput)
++        contentRoot.addView(
++            secondaryButton("Open Settings Panel") {
++                hideKeyboard(settingsPanelInput)
++                executeAndRender(
++                    "open_settings_panel",
++                    mapOf("panel" to settingsPanelInput.text.toString())
++                )
++                showSection(Section.TOOLS)
++            }.apply { id = R.id.open_settings_panel_button }
++        )
++
+         val waitAppInput = editText("App package or launcher label to wait for").apply {
+             id = R.id.wait_for_app_input
+         }
+diff --git a/app/src/main/java/dev/touchpilot/app/agent/AgentCommandProvider.kt b/app/src/main/java/dev/touchpilot/app/agent/AgentCommandProvider.kt
+index c91d174..39cab40 100644
+--- a/app/src/main/java/dev/touchpilot/app/agent/AgentCommandProvider.kt
++++ b/app/src/main/java/dev/touchpilot/app/agent/AgentCommandProvider.kt
+@@ -1,6 +1,7 @@
+ package dev.touchpilot.app.agent
+ 
+ import dev.touchpilot.app.memory.Skill
++import dev.touchpilot.app.tools.SettingsPanelIntent
+ 
+ fun interface AgentCommandProvider {
+     fun complete(systemPrompt: String, context: String): String
+@@ -80,6 +81,10 @@ class LocalRouterCommandProvider(
+             return LocalRoute("scroll", mapOf("direction" to "forward"))
+         }
+ 
++        SettingsPanelIntent.panelFromTask(normalized)?.let { panel ->
++            return LocalRoute("open_settings_panel", mapOf(SettingsPanelIntent.PanelArg to panel))
++        }
++
+         Regex("(?:open|launch)\\s+([\\w .-]+)")
+             .find(normalized)
+             ?.groupValues
+diff --git a/app/src/main/java/dev/touchpilot/app/agent/IntentGate.kt b/app/src/main/java/dev/touchpilot/app/agent/IntentGate.kt
+index 8af2dab..5a286fa 100644
+--- a/app/src/main/java/dev/touchpilot/app/agent/IntentGate.kt
++++ b/app/src/main/java/dev/touchpilot/app/agent/IntentGate.kt
+@@ -1,6 +1,7 @@
+ package dev.touchpilot.app.agent
+ 
+ import dev.touchpilot.app.memory.Skill
++import dev.touchpilot.app.tools.SettingsPanelIntent
+ 
+ /**
+  * Classifies a user task before the local reasoning core decides what to do
+@@ -138,6 +139,13 @@ class IntentGate : IntentClassifier {
+                 reason = "home phrase"
+             )
+         }
++        SettingsPanelIntent.panelFromTask(normalized)?.let { panel ->
++            return IntentDecision.ExactCommand(
++                tool = "open_settings_panel",
++                args = mapOf(SettingsPanelIntent.PanelArg to panel),
++                reason = "settings panel phrase"
++            )
++        }
+         OpenAppPattern.find(normalized)?.groupValues?.getOrNull(1)?.trim()?.takeIf { it.isNotBlank() }
+             ?.let { target ->
+                 return IntentDecision.ExactCommand(
+diff --git a/app/src/main/java/dev/touchpilot/app/tools/AndroidToolExecutor.kt b/app/src/main/java/dev/touchpilot/app/tools/AndroidToolExecutor.kt
+index f167956..5267fc0 100644
+--- a/app/src/main/java/dev/touchpilot/app/tools/AndroidToolExecutor.kt
++++ b/app/src/main/java/dev/touchpilot/app/tools/AndroidToolExecutor.kt
+@@ -2,7 +2,9 @@ package dev.touchpilot.app.tools
+ 
+ import android.content.Context
+ import android.content.Intent
++import android.content.ActivityNotFoundException
+ import android.content.pm.ResolveInfo
++import android.net.Uri
+ import dev.touchpilot.app.androidcontrol.AccessibilityBridge
+ import dev.touchpilot.app.androidcontrol.DismissKeyboardOutcome
+ import dev.touchpilot.app.androidcontrol.ForegroundAppInfo
+@@ -141,6 +143,9 @@ class AndroidToolExecutor(
+                 record(name, "target=\"$target\"", ok, "openApp")
+                 ToolResult(ok, "openApp")
+             }
++            "open_settings_panel" -> {
++                executeOpenSettingsPanel(args)
++            }
+             "tap" -> {
+                 executeTap(args)
+             }
+@@ -730,6 +735,43 @@ class AndroidToolExecutor(
+         return true
+     }
+ 
++    private fun executeOpenSettingsPanel(args: Map<String, String>): ToolResult {
++        val panel = args[SettingsPanelIntent.PanelArg].orEmpty()
++        val spec = SettingsPanelIntent.resolve(panel)
++            ?: return ToolResult(false, SettingsPanelIntent.unsupportedMessage(panel))
++        val packageName = context.packageName
++        val intent = Intent(spec.action).apply {
++            addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
++            spec.dataUri
++                ?.replace(SettingsPanelIntent.AppPackagePlaceholder, packageName)
++                ?.let { data = Uri.parse(it) }
++            spec.extras.forEach { (key, value) ->
++                putExtra(key, value.replace(SettingsPanelIntent.AppPackagePlaceholder, packageName))
++            }
++        }
++        return try {
++            context.startActivity(intent)
++            record(
++                "open_settings_panel",
++                "panel=\"${spec.panel}\"",
++                true,
++                "opened ${spec.panel} settings panel"
++            )
++            ToolResult(
++                ok = true,
++                message = "Opened ${spec.panel} settings panel",
++                data = mapOf(
++                    "panel" to spec.panel,
++                    "action" to spec.action,
++                )
++            )
++        } catch (_: ActivityNotFoundException) {
++            val message = "No settings activity found for panel: ${spec.panel}"
++            record("open_settings_panel", "panel=\"${spec.panel}\"", false, message)
++            ToolResult(false, message, data = mapOf("panel" to spec.panel, "action" to spec.action))
++        }
++    }
++
+     private fun ResolveInfo.launcherLabel(): String {
+         return loadLabel(context.packageManager)?.toString().orEmpty()
+     }
+diff --git a/app/src/main/java/dev/touchpilot/app/tools/RetryPolicy.kt b/app/src/main/java/dev/touchpilot/app/tools/RetryPolicy.kt
+index 09ddfd3..8a19d76 100644
+--- a/app/src/main/java/dev/touchpilot/app/tools/RetryPolicy.kt
++++ b/app/src/main/java/dev/touchpilot/app/tools/RetryPolicy.kt
+@@ -86,6 +86,7 @@ class AndroidToolRetryPolicy(
+             return mapOf(
+                 "observe_screen" to ToolRetryConfig(maxAttempts = 1, retryable = false),
+                 "open_app" to action,
++                "open_settings_panel" to action,
+                 "tap" to action,
+                 "type_text" to action,
+                 "scroll" to action,
+diff --git a/app/src/main/java/dev/touchpilot/app/tools/SettingsPanelIntent.kt b/app/src/main/java/dev/touchpilot/app/tools/SettingsPanelIntent.kt
+new file mode 100644
+index 0000000..478166e
+--- /dev/null
++++ b/app/src/main/java/dev/touchpilot/app/tools/SettingsPanelIntent.kt
+@@ -0,0 +1,67 @@
++package dev.touchpilot.app.tools
++
++import android.provider.Settings
++
++data class SettingsPanelIntentSpec(
++    val panel: String,
++    val action: String,
++    val dataUri: String? = null,
++    val extras: Map<String, String> = emptyMap()
++)
++
++object SettingsPanelIntent {
++    const val PanelArg = "panel"
++    const val AppPackagePlaceholder = "{app_package}"
++
++    private val panels = mapOf(
++        "wifi" to SettingsPanelIntentSpec(
++            panel = "wifi",
++            action = Settings.ACTION_WIFI_SETTINGS,
++        ),
++        "bluetooth" to SettingsPanelIntentSpec(
++            panel = "bluetooth",
++            action = Settings.ACTION_BLUETOOTH_SETTINGS,
++        ),
++        "accessibility" to SettingsPanelIntentSpec(
++            panel = "accessibility",
++            action = Settings.ACTION_ACCESSIBILITY_SETTINGS,
++        ),
++        "app_info" to SettingsPanelIntentSpec(
++            panel = "app_info",
++            action = Settings.ACTION_APPLICATION_DETAILS_SETTINGS,
++            dataUri = "package:$AppPackagePlaceholder",
++        ),
++        "notifications" to SettingsPanelIntentSpec(
++            panel = "notifications",
++            action = Settings.ACTION_APP_NOTIFICATION_SETTINGS,
++            extras = mapOf(Settings.EXTRA_APP_PACKAGE to AppPackagePlaceholder),
++        ),
++        "system_settings" to SettingsPanelIntentSpec(
++            panel = "system_settings",
++            action = Settings.ACTION_SETTINGS,
++        ),
++    )
++
++    val supportedPanels: Set<String> = panels.keys
++
++    fun resolve(panel: String): SettingsPanelIntentSpec? {
++        return panels[panel.trim().lowercase()]
++    }
++
++    fun panelFromTask(normalizedTask: String): String? {
++        if ("settings" !in normalizedTask) return null
++        return when {
++            "wi-fi" in normalizedTask || "wifi" in normalizedTask -> "wifi"
++            "bluetooth" in normalizedTask -> "bluetooth"
++            "accessibility" in normalizedTask -> "accessibility"
++            "app info" in normalizedTask || "app details" in normalizedTask -> "app_info"
++            "notification" in normalizedTask -> "notifications"
++            "system settings" in normalizedTask -> "system_settings"
++            else -> null
++        }
++    }
++
++    fun unsupportedMessage(panel: String): String {
++        return "Unsupported settings panel: $panel. Supported panels: ${supportedPanels.joinToString()}"
++    }
++}
+diff --git a/app/src/main/java/dev/touchpilot/app/tools/ToolModels.kt b/app/src/main/java/dev/touchpilot/app/tools/ToolModels.kt
+index f76b67c..816461f 100644
+--- a/app/src/main/java/dev/touchpilot/app/tools/ToolModels.kt
++++ b/app/src/main/java/dev/touchpilot/app/tools/ToolModels.kt
+@@ -39,6 +39,15 @@ object AndroidToolCatalog {
+             risk = ToolRisk.MEDIUM,
+             arguments = mapOf("target" to "Package name or launcher label.")
+         ),
++        ToolSpec(
++            name = "open_settings_panel",
++            description = "Open an allowlisted Android Settings panel using a Settings intent. Does not toggle settings.",
++            risk = ToolRisk.MEDIUM,
++            arguments = mapOf(
++                SettingsPanelIntent.PanelArg to
++                    "Panel name: ${SettingsPanelIntent.supportedPanels.joinToString()}."
++            )
++        ),
+         ToolSpec(
+             name = "tap",
+             description = "Tap a visible UI target resolved from text, node_id, or bounds. " +
+@@ -225,6 +234,13 @@ object AndroidToolCatalog {
+             }
+         }
+ 
++        if (name == "open_settings_panel") {
++            val panel = args[SettingsPanelIntent.PanelArg].orEmpty()
++            if (SettingsPanelIntent.resolve(panel) == null) {
++                return SettingsPanelIntent.unsupportedMessage(panel)
++            }
++        }
++
+         if (name == "wait_for_idle") {
+             return WaitForIdle.validate(args)
+         }
+diff --git a/app/src/main/res/values/ids.xml b/app/src/main/res/values/ids.xml
+index 587e195..f019337 100644
+--- a/app/src/main/res/values/ids.xml
++++ b/app/src/main/res/values/ids.xml
+@@ -6,6 +6,8 @@
+     <item name="get_foreground_app_button" type="id" />
+     <item name="open_app_input" type="id" />
+     <item name="open_app_button" type="id" />
++    <item name="open_settings_panel_input" type="id" />
++    <item name="open_settings_panel_button" type="id" />
+     <item name="wait_for_app_input" type="id" />
+     <item name="wait_for_app_button" type="id" />
+     <item name="tap_text_input" type="id" />
+diff --git a/app/src/test/java/dev/touchpilot/app/agent/IntentGateTest.kt b/app/src/test/java/dev/touchpilot/app/agent/IntentGateTest.kt
+index 0127279..3450f84 100644
+--- a/app/src/test/java/dev/touchpilot/app/agent/IntentGateTest.kt
++++ b/app/src/test/java/dev/touchpilot/app/agent/IntentGateTest.kt
+@@ -43,6 +43,13 @@ class IntentGateTest {
+         assertEquals("settings", command.args["target"])
+     }
+ 
++    @Test
++    fun classifiesOpenWifiSettingsAsSettingsPanel() {
++        val command = assertIs<IntentDecision.ExactCommand>(gate.classify("Open Wi-Fi settings"))
++        assertEquals("open_settings_panel", command.tool)
++        assertEquals("wifi", command.args["panel"])
++    }
++
+     @Test
+     fun classifiesLaunchAppAsExactOpenApp() {
+         val command = assertIs<IntentDecision.ExactCommand>(gate.classify("launch maps"))
+diff --git a/app/src/test/java/dev/touchpilot/app/tools/OpenSettingsPanelCatalogTest.kt b/app/src/test/java/dev/touchpilot/app/tools/OpenSettingsPanelCatalogTest.kt
+new file mode 100644
+index 0000000..caf77d4
+--- /dev/null
++++ b/app/src/test/java/dev/touchpilot/app/tools/OpenSettingsPanelCatalogTest.kt
+@@ -0,0 +1,72 @@
++package dev.touchpilot.app.tools
++
++import android.provider.Settings
++import kotlin.test.Test
++import kotlin.test.assertContains
++import kotlin.test.assertEquals
++import kotlin.test.assertNotNull
++import kotlin.test.assertNull
++import kotlin.test.assertTrue
++
++class OpenSettingsPanelCatalogTest {
++    @Test
++    fun openSettingsPanelIsRegisteredAsMediumRisk() {
++        val spec = assertNotNull(AndroidToolCatalog.find("open_settings_panel"))
++        assertEquals(ToolRisk.MEDIUM, spec.risk)
++        assertEquals(setOf("panel"), spec.arguments.keys)
++        assertEquals(setOf("panel"), spec.requiredArguments)
++    }
++
++    @Test
++    fun supportsInitialSettingsPanelAllowlist() {
++        assertEquals(
++            setOf("wifi", "bluetooth", "accessibility", "app_info", "notifications", "system_settings"),
++            SettingsPanelIntent.supportedPanels
++        )
++    }
++
++    @Test
++    fun mapsPanelsToAndroidSettingsIntents() {
++        assertEquals(Settings.ACTION_WIFI_SETTINGS, SettingsPanelIntent.resolve("wifi")?.action)
++        assertEquals(Settings.ACTION_BLUETOOTH_SETTINGS, SettingsPanelIntent.resolve("bluetooth")?.action)
++        assertEquals(Settings.ACTION_ACCESSIBILITY_SETTINGS, SettingsPanelIntent.resolve("accessibility")?.action)
++        assertEquals(Settings.ACTION_APPLICATION_DETAILS_SETTINGS, SettingsPanelIntent.resolve("app_info")?.action)
++        assertEquals(Settings.ACTION_APP_NOTIFICATION_SETTINGS, SettingsPanelIntent.resolve("notifications")?.action)
++        assertEquals(Settings.ACTION_SETTINGS, SettingsPanelIntent.resolve("system_settings")?.action)
++    }
++
++    @Test
++    fun appSpecificPanelsUseTouchPilotPackagePlaceholder() {
++        val appInfo = assertNotNull(SettingsPanelIntent.resolve("app_info"))
++        assertEquals("package:${SettingsPanelIntent.AppPackagePlaceholder}", appInfo.dataUri)
++
++        val notifications = assertNotNull(SettingsPanelIntent.resolve("notifications"))
++        assertEquals(
++            SettingsPanelIntent.AppPackagePlaceholder,
++            notifications.extras[Settings.EXTRA_APP_PACKAGE]
++        )
++    }
++
++    @Test
++    fun validateAcceptsSupportedPanelsCaseInsensitively() {
++        assertNull(AndroidToolCatalog.validate("open_settings_panel", mapOf("panel" to "WiFi")))
++        assertNull(AndroidToolCatalog.validate("open_settings_panel", mapOf("panel" to "bluetooth")))
++    }
++
++    @Test
++    fun validateRejectsUnsupportedPanelsClearly() {
++        val error = AndroidToolCatalog.validate("open_settings_panel", mapOf("panel" to "developer_options"))
++        assertNotNull(error)
++        assertContains(error, "Unsupported settings panel: developer_options")
++        assertContains(error, "wifi")
++        assertContains(error, "system_settings")
++    }
++
++    @Test
++    fun retryPolicyTreatsOpenSettingsPanelLikeNavigation() {
++        val config = AndroidToolRetryPolicy().configFor("open_settings_panel")
++        assertEquals(3, config.maxAttempts)
++        assertTrue(config.retryable)
++        assertTrue(config.waitForIdleAfterSuccess)
++    }
++}
+diff --git a/docs/LIVE_TESTING.md b/docs/LIVE_TESTING.md
+index 1563883..e275fc9 100644
+--- a/docs/LIVE_TESTING.md
++++ b/docs/LIVE_TESTING.md
+@@ -39,6 +39,13 @@ Launch TouchPilot:
+ - [x] Accessibility status shows connected.
+ - [x] `Observe Current Screen` returns a non-empty UI tree.
+ - [x] `Open App` opens Settings by label.
++- [ ] `open_settings_panel({panel=wifi})` opens Wi-Fi Settings directly.
++- [ ] `open_settings_panel({panel=bluetooth})` opens Bluetooth Settings directly.
++- [ ] `open_settings_panel({panel=accessibility})` opens Accessibility Settings directly.
++- [ ] `open_settings_panel({panel=app_info})` opens TouchPilot app details.
++- [ ] `open_settings_panel({panel=notifications})` opens TouchPilot notification settings.
++- [ ] `open_settings_panel({panel=system_settings})` opens top-level Android Settings.
++- [ ] `open_settings_panel` rejects unsupported panel names before launching an intent.
+ - [ ] `Open App` followed by `wait_for_idle` settles after launch.
+ - [ ] `Open App` followed by `wait_for_app({label=Settings})` confirms
+   Settings is foreground before follow-up actions.
+diff --git a/docs/TOOL_SPEC.md b/docs/TOOL_SPEC.md
+index 45f21ff..c54ec8b 100644
+--- a/docs/TOOL_SPEC.md
++++ b/docs/TOOL_SPEC.md
+@@ -20,6 +20,7 @@ Tools are the only way an agent may affect the Android device.
+ 
+ - `observe_screen`: serialize the current accessibility tree.
+ - `open_app`: launch an installed app by package name or label.
++- `open_settings_panel`: open an allowlisted Android Settings panel by intent.
+ - `tap`: tap a semantic target by visible text, stable `node_id`, or bounds.
+ - `type_text`: type text into the focused field or selected target.
+ - `scroll`: scroll the current view.
+@@ -32,10 +33,17 @@ Tools are the only way an agent may affect the Android device.
+ - `clear_text`: clear the focused or resolved editable input field.
+ - `dismiss_keyboard`: hide the soft keyboard if it is visible.
+ 
+-The app implements `observe_screen`, `open_app`, `tap`, `type_text`, `scroll`,
+-`press_back`, `press_home`, `wait_for_ui`, `wait_for_idle`, `wait_for_app`,
+-`focus_input`, `clear_text`, and `dismiss_keyboard` from the Android Tools
+-screen and the agent command-provider loop.
++The app implements `observe_screen`, `open_app`, `open_settings_panel`, `tap`,
++`type_text`, `scroll`, `press_back`, `press_home`, `wait_for_ui`,
++`wait_for_idle`, `wait_for_app`, `focus_input`, `clear_text`, and
++`dismiss_keyboard` from the Android Tools screen and the agent command-provider
++loop.
++
++`open_settings_panel` accepts `panel` and only supports the explicit allowlist
++`wifi`, `bluetooth`, `accessibility`, `app_info`, `notifications`, and
++`system_settings`. Unsupported panel names fail validation with the supported
++panel list. The tool only opens Android Settings intents; it never toggles a
++setting.
+ 
+ `dismiss_keyboard` is observation-gated: it inspects the accessibility window
+ list for a `TYPE_INPUT_METHOD` window first. If the keyboard is already hidden,
+diff --git a/skills/settings/SKILL.md b/skills/settings/SKILL.md
+index 36ec32e..2a4b5b0 100644
+--- a/skills/settings/SKILL.md
++++ b/skills/settings/SKILL.md
+@@ -6,6 +6,7 @@ user explicitly asks to change a setting.
+ Allowed initial tools:
+ 
+ - `open_app`
++- `open_settings_panel`
+ - `observe_screen`
+ - `tap`
+ - `scroll`

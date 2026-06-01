@@ -1,0 +1,673 @@
+diff --git a/app/src/main/java/dev/touchpilot/app/MainActivity.kt b/app/src/main/java/dev/touchpilot/app/MainActivity.kt
+index 8032197..d69141f 100644
+--- a/app/src/main/java/dev/touchpilot/app/MainActivity.kt
++++ b/app/src/main/java/dev/touchpilot/app/MainActivity.kt
+@@ -29,15 +29,18 @@ import androidx.core.content.ContextCompat
+ import com.google.android.material.button.MaterialButton
+ import com.google.android.material.card.MaterialCardView
+ import com.google.android.material.tabs.TabLayout
++import dev.touchpilot.app.agent.AgentEvent
+ import dev.touchpilot.app.agent.AgentEventListener
+ import dev.touchpilot.app.agent.AgentProviderMode
+ import dev.touchpilot.app.agent.AgentRunDetailFormatter
+ import dev.touchpilot.app.agent.AgentRunDisplayStep
+ import dev.touchpilot.app.agent.AgentRunIds
+ import dev.touchpilot.app.agent.AgentRunRecord
++import dev.touchpilot.app.agent.AgentRunResult
+ import dev.touchpilot.app.agent.AgentRunStepStatus
+ import dev.touchpilot.app.agent.AgentStep
+ import dev.touchpilot.app.agent.AgentStepStatus
++import dev.touchpilot.app.agent.AgentStepStopReason
+ import dev.touchpilot.app.agent.AgentStepTimelineBuilder
+ import dev.touchpilot.app.agent.timelineChipAccent
+ import dev.touchpilot.app.agent.timelineChipLabel
+@@ -97,6 +100,7 @@ class MainActivity : Activity() {
+     private val conversation = mutableListOf<ChatEvent>()
+     private val agentRunHistory = mutableListOf<AgentRunRecord>()
+     private var activeRunDetailId: String? = null
++    private var pendingClarification: PendingClarification? = null
+ 
+     override fun onCreate(savedInstanceState: Bundle?) {
+         super.onCreate(savedInstanceState)
+@@ -471,6 +475,7 @@ class MainActivity : Activity() {
+             is ChatEvent.StepTimeline -> stepTimelineCard(event)
+             is ChatEvent.ToolCall -> toolCallCard(event.card)
+             is ChatEvent.ApprovalPrompt -> approvalCard(event)
++            is ChatEvent.ClarificationPrompt -> clarificationCard(event)
+         }
+     }
+ 
+@@ -609,16 +614,121 @@ class MainActivity : Activity() {
+         showSection(Section.CHAT)
+     }
+ 
++    private fun clarificationCard(event: ChatEvent.ClarificationPrompt): View {
++        val card = MaterialCardView(this).apply {
++            setCardBackgroundColor(Theme.Card)
++            strokeColor = when (event.state) {
++                ClarificationState.PENDING -> Theme.Accent
++                ClarificationState.ANSWERED -> Theme.StrokeDark
++            }
++            strokeWidth = 2
++            radius = 8f
++            cardElevation = 0f
++        }
++        val content = LinearLayout(this).apply {
++            orientation = LinearLayout.VERTICAL
++            setPadding(20, 18, 20, 18)
++        }
++
++        val statusLabel = when (event.state) {
++            ClarificationState.PENDING -> "Clarification needed"
++            ClarificationState.ANSWERED -> "Answered"
++        }
++        content.addView(
++            TextView(this).apply {
++                text = statusLabel
++                textSize = 13f
++                typeface = Typeface.DEFAULT_BOLD
++                setTextColor(Color.WHITE)
++            }
++        )
++        content.addView(
++            TextView(this).apply {
++                text = event.question
++                textSize = 14f
++                setTextColor(Color.WHITE)
++                setPadding(0, 8, 0, 0)
++            }
++        )
++        if (event.detail.isNotBlank()) {
++            content.addView(
++                TextView(this).apply {
++                    text = SensitiveTextRedactor.redact(event.detail)
++                    textSize = 12.5f
++                    setTextColor(Theme.BodyText)
++                    setPadding(0, 6, 0, 0)
++                }
++            )
++        }
++
++        if (event.state == ClarificationState.PENDING && event.choices.isNotEmpty()) {
++            event.choices.forEach { choice ->
++                val label = SensitiveTextRedactor.redact(choice)
++                content.addView(
++                    secondaryButton(label) {
++                        resolveClarification(event, label)
++                    }.apply {
++                        layoutParams = LinearLayout.LayoutParams(
++                            ViewGroup.LayoutParams.MATCH_PARENT,
++                            ViewGroup.LayoutParams.WRAP_CONTENT
++                        ).apply {
++                            topMargin = 10
++                        }
++                    }
++                )
++            }
++        } else if (event.state == ClarificationState.ANSWERED) {
++            content.addView(
++                TextView(this).apply {
++                    text = "You: ${event.selectedAnswer.orEmpty()}"
++                    textSize = 12.5f
++                    setTextColor(Theme.Accent)
++                    setPadding(0, 10, 0, 0)
++                }
++            )
++        } else if (event.state == ClarificationState.PENDING) {
++            content.addView(
++                TextView(this).apply {
++                    text = "Reply in the chat box below."
++                    textSize = 12.5f
++                    setTextColor(Theme.MutedText)
++                    setPadding(0, 10, 0, 0)
++                }
++            )
++        }
++
++        card.addView(content)
++        return card.withMargins(top = 8, bottom = 8)
++    }
++
++    private fun resolveClarification(event: ChatEvent.ClarificationPrompt, answer: String) {
++        if (event.state != ClarificationState.PENDING) return
++        event.state = ClarificationState.ANSWERED
++        event.selectedAnswer = answer
++        event.onAnswer(answer)
++        showSection(Section.CHAT)
++    }
++
+     private fun runAgentFromChat(task: String) {
++        val pending = pendingClarification
++        val originalTask = pending?.originalTask
++        val agentTask = if (pending != null) {
++            pendingClarification = null
++            "${pending.originalTask}\n\nUser clarification: $task"
++        } else {
++            task
++        }
++
+         conversation += ChatEvent.User(task)
+ 
+-        val conversationalResponse = ConversationalGate.respond(task)
++        val conversationalResponse = ConversationalGate.respond(agentTask)
+         if (conversationalResponse != null) {
+             conversation += ChatEvent.Agent(conversationalResponse.message, "")
+             showSection(Section.CHAT)
+             return
+         }
+ 
++        val workingIndex = conversation.size
+         conversation += ChatEvent.Working("Working on it.", "Runtime: ${currentProviderMode().label()}")
+         val stepTimeline = ChatEvent.StepTimeline()
+         conversation += stepTimeline
+@@ -626,12 +736,13 @@ class MainActivity : Activity() {
+ 
+         val runId = AgentRunIds.next()
+         val startedAtMillis = System.currentTimeMillis()
++        val taskForRecord = originalTask ?: task
+ 
+         Thread {
+             val timelineBuilder = AgentStepTimelineBuilder()
+             val runOutcome = runCatching {
+                 reasoningCore.run(
+-                    task = task,
++                    task = agentTask,
+                     timeline = timelineBuilder,
+                     listener = AgentEventListener {
+                         runOnUiThread {
+@@ -644,7 +755,7 @@ class MainActivity : Activity() {
+             val record = if (runOutcome.isSuccess) {
+                 AgentRunRecord(
+                     id = runId,
+-                    task = task,
++                    task = taskForRecord,
+                     startedAtMillis = startedAtMillis,
+                     completedAtMillis = completedAtMillis,
+                     result = runOutcome.getOrThrow()
+@@ -652,7 +763,7 @@ class MainActivity : Activity() {
+             } else {
+                 AgentRunRecord(
+                     id = runId,
+-                    task = task,
++                    task = taskForRecord,
+                     startedAtMillis = startedAtMillis,
+                     completedAtMillis = completedAtMillis,
+                     result = null,
+@@ -669,9 +780,71 @@ class MainActivity : Activity() {
+                     timelineBuilder.snapshot
+                 }
+                 refreshStepTimeline(stepTimeline, steps, complete = true)
+-                agentRunHistory += record
+-                val workingIdx = conversation.indexOfLast { it is ChatEvent.Working }
+-                if (workingIdx >= 0) conversation.removeAt(workingIdx)
++                finishAgentChatRun(
++                    record = record,
++                    runOutcome = runOutcome,
++                    workingIndex = workingIndex,
++                    resumeOriginalTask = originalTask,
++                    timelineSteps = steps,
++                )
++            }
++        }.start()
++    }
++
++    private fun finishAgentChatRun(
++        record: AgentRunRecord,
++        runOutcome: Result<AgentRunResult>,
++        workingIndex: Int,
++        resumeOriginalTask: String?,
++        timelineSteps: List<AgentStep> = emptyList(),
++    ) {
++        removeWorkingIndicator(workingIndex)
++        agentRunHistory += record
++        refreshExecutionLog()
++        refreshStatus()
++
++        val result = runOutcome.getOrNull()
++        when {
++            result?.stopReason == AgentStepStopReason.CLARIFICATION_NEEDED -> {
++                val structured = result.events.filterIsInstance<AgentEvent.Clarification>().lastOrNull()
++                val assistant = result.events.filterIsInstance<AgentEvent.AssistantMessage>().lastOrNull()
++                val prompt = when {
++                    structured != null -> ClarificationChatPrompt(
++                        question = structured.question,
++                        detail = structured.detail,
++                        choices = structured.candidates.map {
++                            SensitiveTextRedactor.redact(it.displayLabel)
++                        },
++                    )
++                    assistant != null -> ClarificationChatPrompt(
++                        question = assistant.text,
++                        detail = assistant.detail,
++                        choices = assistant.choices,
++                    )
++                    else -> null
++                }
++                if (prompt != null) {
++                    val originalTask = resumeOriginalTask ?: record.task
++                    pendingClarification = PendingClarification(originalTask = originalTask)
++                    conversation += ChatEvent.ClarificationPrompt(
++                        question = prompt.question,
++                        detail = prompt.detail,
++                        choices = prompt.choices,
++                        onAnswer = { answer -> runAgentFromChat(answer) }
++                    )
++                } else {
++                    conversation += ChatEvent.Agent(
++                        "TouchPilot needs clarification before continuing.",
++                        result.stopMessage
++                    )
++                }
++            }
++            result?.stopReason == AgentStepStopReason.COMPLETED &&
++                isInformationalAssistantRun(result) -> {
++                val assistant = result.events.filterIsInstance<AgentEvent.AssistantMessage>().last()
++                conversation += ChatEvent.Agent(assistant.text, assistant.detail)
++            }
++            runOutcome.isSuccess -> {
+                 record.result?.events
+                     ?.let(ToolCallCardModel::fromEvents)
+                     ?.forEach { card ->
+@@ -680,21 +853,40 @@ class MainActivity : Activity() {
+                 conversation += ChatEvent.Timeline(
+                     title = "Action timeline",
+                     body = AgentRunDetailFormatter.compactSummary(record),
+-                    runId = runId
++                    runId = record.id
+                 )
+-                val finalAnswer = runOutcome.getOrNull()?.finalAnswer
++                val finalAnswer = result?.finalAnswer
+                 val doneDetail = when {
+                     finalAnswer != null -> finalAnswer
+-                    runOutcome.isFailure -> record.errorMessage ?: "Agent failed."
+-                    steps.isEmpty() -> "No steps recorded."
++                    timelineSteps.isEmpty() -> "No steps recorded."
+                     else -> "Tap the timeline card to inspect tool calls, verification, and stop reason."
+                 }
+                 conversation += ChatEvent.Agent("Done.", doneDetail)
+-                refreshExecutionLog()
+-                refreshStatus()
+-                showSection(Section.CHAT)
+             }
+-        }.start()
++            else -> {
++                conversation += ChatEvent.Agent(
++                    "Run failed.",
++                    record.errorMessage ?: "Unknown agent error"
++                )
++            }
++        }
++        showSection(Section.CHAT)
++    }
++
++    private fun removeWorkingIndicator(workingIndex: Int) {
++        if (workingIndex in conversation.indices &&
++            conversation[workingIndex] is ChatEvent.Working
++        ) {
++            conversation.removeAt(workingIndex)
++        }
++    }
++
++    private fun isInformationalAssistantRun(result: AgentRunResult): Boolean {
++        val hasAssistant = result.events.any { it is AgentEvent.AssistantMessage }
++        val invokedTools = result.events.any {
++            it is AgentEvent.ToolRequested || it is AgentEvent.ToolRunning
++        }
++        return hasAssistant && !invokedTools
+     }
+ 
+     private fun refreshStepTimeline(
+@@ -2418,6 +2610,16 @@ class MainActivity : Activity() {
+         return file
+     }
+ 
++    private data class PendingClarification(
++        val originalTask: String,
++    )
++
++    private data class ClarificationChatPrompt(
++        val question: String,
++        val detail: String,
++        val choices: List<String>,
++    )
++
+     private sealed class ChatEvent {
+         data class User(val text: String) : ChatEvent()
+         data class Agent(val text: String, val detail: String) : ChatEvent()
+@@ -2443,9 +2645,19 @@ class MainActivity : Activity() {
+         ) : ChatEvent() {
+             var state: ApprovalState = ApprovalState.PENDING
+         }
++        class ClarificationPrompt(
++            val question: String,
++            val detail: String,
++            val choices: List<String>,
++            val onAnswer: (String) -> Unit
++        ) : ChatEvent() {
++            var state: ClarificationState = ClarificationState.PENDING
++            var selectedAnswer: String? = null
++        }
+     }
+ 
+     private enum class ApprovalState { PENDING, APPROVED, REJECTED }
++    private enum class ClarificationState { PENDING, ANSWERED }
+ 
+     private enum class Section(val label: String, @DrawableRes val iconRes: Int) {
+         CHAT("Chat", R.drawable.ic_chat),
+diff --git a/app/src/main/java/dev/touchpilot/app/agent/AgentEvent.kt b/app/src/main/java/dev/touchpilot/app/agent/AgentEvent.kt
+index 8f13807..c0d2318 100644
+--- a/app/src/main/java/dev/touchpilot/app/agent/AgentEvent.kt
++++ b/app/src/main/java/dev/touchpilot/app/agent/AgentEvent.kt
+@@ -5,6 +5,7 @@ import dev.touchpilot.app.security.SensitiveTextRedactor
+ import dev.touchpilot.app.security.ToolApprovalRequest
+ import dev.touchpilot.app.security.ToolSource
+ import dev.touchpilot.app.tools.ToolResult
++import org.json.JSONArray
+ import org.json.JSONObject
+ 
+ sealed class AgentEvent(
+@@ -38,6 +39,7 @@ sealed class AgentEvent(
+     data class AssistantMessage(
+         val text: String,
+         val detail: String = "",
++        val choices: List<String> = emptyList(),
+         override val id: String = nextId(),
+         override val timestampMillis: Long = System.currentTimeMillis()
+     ) : AgentEvent(id, timestampMillis) {
+@@ -46,7 +48,10 @@ sealed class AgentEvent(
+         override fun payload(redactSensitive: Boolean): Map<String, Any?> {
+             return mapOf(
+                 "text" to text.redacted(redactSensitive),
+-                "detail" to detail.redacted(redactSensitive)
++                "detail" to detail.redacted(redactSensitive),
++                "choices" to JSONArray().apply {
++                    choices.forEach { put(it.redacted(redactSensitive)) }
++                }
+             )
+         }
+     }
+diff --git a/app/src/main/java/dev/touchpilot/app/agent/BoundedLocalAgentLoop.kt b/app/src/main/java/dev/touchpilot/app/agent/BoundedLocalAgentLoop.kt
+index 80bf7ac..4249945 100644
+--- a/app/src/main/java/dev/touchpilot/app/agent/BoundedLocalAgentLoop.kt
++++ b/app/src/main/java/dev/touchpilot/app/agent/BoundedLocalAgentLoop.kt
+@@ -332,7 +332,12 @@ class BoundedLocalAgentLoop(
+                 stepNumber = stepIndex,
+                 previousCommand = command,
+                 previousToolResult = result,
+-                failureReason = if (result.ok) null else result.message
++                failureReason = if (result.ok) null else result.message,
++                candidateTargets = if (result.ok) {
++                    emptyList()
++                } else {
++                    ClarificationFromToolResult.candidatesFromResult(result)
++                },
+             )
+         }
+ 
+diff --git a/app/src/main/java/dev/touchpilot/app/agent/ClarificationFromToolResult.kt b/app/src/main/java/dev/touchpilot/app/agent/ClarificationFromToolResult.kt
+new file mode 100644
+index 0000000..4d68a3d
+--- /dev/null
++++ b/app/src/main/java/dev/touchpilot/app/agent/ClarificationFromToolResult.kt
+@@ -0,0 +1,61 @@
++package dev.touchpilot.app.agent
++
++import dev.touchpilot.app.security.SensitiveTextRedactor
++import dev.touchpilot.app.tools.ToolResult
++
++/**
++ * Parses tool failures that need user disambiguation before the agent can continue.
++ */
++object ClarificationFromToolResult {
++    data class Prompt(
++        val question: String,
++        val choices: List<String>,
++    )
++
++    fun parse(result: ToolResult): Prompt? {
++        if (!result.message.startsWith("Ambiguous", ignoreCase = true) &&
++            result.data["clarification_needed"] != "true"
++        ) {
++            return null
++        }
++
++        val choices = readCandidateLabels(result.data)
++        val question = when {
++            result.message.contains("scroll", ignoreCase = true) ->
++                "Which area should I scroll?"
++            result.message.contains("input", ignoreCase = true) ->
++                "Which field should I use?"
++            else -> "Which item should I tap?"
++        }
++        return Prompt(
++            question = question,
++            choices = choices.map { SensitiveTextRedactor.redact(it) },
++        )
++    }
++
++    fun dataFromCandidateLabels(labels: List<String>): Map<String, String> {
++        return buildMap {
++            put("clarification_needed", "true")
++            put("candidate_count", labels.size.toString())
++            labels.forEachIndexed { index, label ->
++                put("candidate_label_$index", label)
++            }
++        }
++    }
++
++    fun readCandidateLabels(data: Map<String, String>): List<String> {
++        val count = data["candidate_count"]?.toIntOrNull() ?: 0
++        if (count <= 0) return emptyList()
++        return (0 until count).mapNotNull { index -> data["candidate_label_$index"] }
++    }
++
++    fun candidatesFromResult(result: ToolResult): List<NextStepCandidate> {
++        return readCandidateLabels(result.data).map { label ->
++            NextStepCandidate(
++                nodeId = null,
++                displayLabel = SensitiveTextRedactor.redact(label),
++                sensitive = SensitiveTextRedactor.containsSensitiveText(label),
++            )
++        }
++    }
++}
+diff --git a/app/src/main/java/dev/touchpilot/app/agent/IntentGate.kt b/app/src/main/java/dev/touchpilot/app/agent/IntentGate.kt
+index 9e68b39..8af2dab 100644
+--- a/app/src/main/java/dev/touchpilot/app/agent/IntentGate.kt
++++ b/app/src/main/java/dev/touchpilot/app/agent/IntentGate.kt
+@@ -46,7 +46,8 @@ sealed class IntentDecision {
+      */
+     data class ClarificationNeeded(
+         override val reason: String,
+-        val clarification: String
++        val clarification: String,
++        val candidateLabels: List<String> = emptyList()
+     ) : IntentDecision()
+ 
+     /**
+diff --git a/app/src/main/java/dev/touchpilot/app/agent/LocalReasoningCore.kt b/app/src/main/java/dev/touchpilot/app/agent/LocalReasoningCore.kt
+index 28bf541..d6e6201 100644
+--- a/app/src/main/java/dev/touchpilot/app/agent/LocalReasoningCore.kt
++++ b/app/src/main/java/dev/touchpilot/app/agent/LocalReasoningCore.kt
+@@ -7,6 +7,7 @@ import dev.touchpilot.app.screen.ScreenContext
+ import dev.touchpilot.app.screen.ScreenContextSummarizer
+ import dev.touchpilot.app.screen.ScreenSummary
+ import dev.touchpilot.app.security.ActionPolicy
++import dev.touchpilot.app.security.SensitiveTextRedactor
+ import dev.touchpilot.app.security.DefaultActionPolicy
+ import dev.touchpilot.app.security.ToolApprovalProvider
+ import dev.touchpilot.app.security.ToolSource
+@@ -187,7 +188,8 @@ class DefaultLocalReasoningCore(
+         val userEvent = AgentEvent.UserMessage(task)
+         val assistant = AgentEvent.AssistantMessage(
+             text = intent.clarification,
+-            detail = intent.reason
++            detail = intent.reason,
++            choices = intent.candidateLabels.map { SensitiveTextRedactor.redact(it) }
+         )
+         forward(userEvent)
+         timeline?.requestClarification(intent.clarification)
+diff --git a/app/src/main/java/dev/touchpilot/app/tools/AndroidToolExecutor.kt b/app/src/main/java/dev/touchpilot/app/tools/AndroidToolExecutor.kt
+index 4b942b1..f167956 100644
+--- a/app/src/main/java/dev/touchpilot/app/tools/AndroidToolExecutor.kt
++++ b/app/src/main/java/dev/touchpilot/app/tools/AndroidToolExecutor.kt
+@@ -15,10 +15,12 @@ import dev.touchpilot.app.tools.targets.ClearTextTarget
+ import dev.touchpilot.app.tools.targets.ScrollResolution
+ import dev.touchpilot.app.tools.targets.ScrollResolver
+ import dev.touchpilot.app.tools.targets.ScrollTarget
++import dev.touchpilot.app.agent.ClarificationFromToolResult
+ import dev.touchpilot.app.tools.targets.TargetResolutionResult
+ import dev.touchpilot.app.tools.targets.TargetResolver
+ import dev.touchpilot.app.tools.targets.TargetSelector
+ import dev.touchpilot.app.tools.targets.TargetSelectorBuilder
++import dev.touchpilot.app.tools.targets.displayLabels
+ import dev.touchpilot.app.tools.targets.TypeTextTarget
+ 
+ class AndroidToolExecutor(
+@@ -345,7 +347,9 @@ class AndroidToolExecutor(
+                 ToolResult(
+                     ok = false,
+                     message = message,
+-                    data = mapOf("candidate_count" to resolution.candidates.size.toString())
++                    data = ClarificationFromToolResult.dataFromCandidateLabels(
++                        resolution.candidates.displayLabels()
++                    )
+                 )
+             }
+             is TargetResolutionResult.NotFound -> {
+@@ -419,7 +423,9 @@ class AndroidToolExecutor(
+                 ToolResult(
+                     ok = false,
+                     message = message,
+-                    data = mapOf("candidate_count" to resolution.candidates.size.toString())
++                    data = ClarificationFromToolResult.dataFromCandidateLabels(
++                        resolution.candidates.displayLabels()
++                    )
+                 )
+             }
+             is TargetResolutionResult.NotFound -> {
+@@ -488,7 +494,9 @@ class AndroidToolExecutor(
+                 ToolResult(
+                     ok = false,
+                     message = message,
+-                    data = mapOf("candidate_count" to resolution.candidates.size.toString())
++                    data = ClarificationFromToolResult.dataFromCandidateLabels(
++                        resolution.candidates.displayLabels()
++                    )
+                 )
+             }
+             is ScrollResolution.NotFound -> {
+@@ -653,7 +661,9 @@ class AndroidToolExecutor(
+                 ToolResult(
+                     ok = false,
+                     message = message,
+-                    data = mapOf("candidate_count" to resolution.candidates.size.toString())
++                    data = ClarificationFromToolResult.dataFromCandidateLabels(
++                        resolution.candidates.displayLabels()
++                    )
+                 )
+             }
+             is TargetResolutionResult.NotFound -> {
+diff --git a/app/src/main/java/dev/touchpilot/app/tools/targets/TargetCandidateLabels.kt b/app/src/main/java/dev/touchpilot/app/tools/targets/TargetCandidateLabels.kt
+new file mode 100644
+index 0000000..f06bdf4
+--- /dev/null
++++ b/app/src/main/java/dev/touchpilot/app/tools/targets/TargetCandidateLabels.kt
+@@ -0,0 +1,14 @@
++package dev.touchpilot.app.tools.targets
++
++/**
++ * Display-safe labels for ambiguous target candidates shown in clarification UI.
++ */
++fun TargetCandidate.displayLabel(): String {
++    return selector.text?.displaySafe?.takeIf { it.isNotBlank() }
++        ?: selector.contentDescription?.displaySafe?.takeIf { it.isNotBlank() }
++        ?: selector.viewIdResourceName?.substringAfterLast('/')
++        ?: selector.nodeId?.let { "Node $it" }
++        ?: "Option"
++}
++
++fun List<TargetCandidate>.displayLabels(): List<String> = map { it.displayLabel() }
+diff --git a/app/src/test/java/dev/touchpilot/app/agent/AgentEventTest.kt b/app/src/test/java/dev/touchpilot/app/agent/AgentEventTest.kt
+index 129d30a..6ba38c7 100644
+--- a/app/src/test/java/dev/touchpilot/app/agent/AgentEventTest.kt
++++ b/app/src/test/java/dev/touchpilot/app/agent/AgentEventTest.kt
+@@ -27,6 +27,16 @@ class AgentEventTest {
+         assertEquals("assistant_message", assistantJson.getString("type"))
+         assertEquals("Done.", assistantJson.getJSONObject("payload").getString("text"))
+         assertEquals("Local router", assistantJson.getJSONObject("payload").getString("detail"))
++
++        val withChoices = AgentEvent.AssistantMessage(
++            text = "Which item should I tap?",
++            detail = "ambiguous",
++            choices = listOf("Save", "Cancel")
++        )
++        val choicesJson = withChoices.toJson().getJSONObject("payload").getJSONArray("choices")
++        assertEquals(2, choicesJson.length())
++        assertEquals("Save", choicesJson.getString(0))
++        assertEquals("Cancel", choicesJson.getString(1))
+     }
+ 
+     @Test
+diff --git a/app/src/test/java/dev/touchpilot/app/agent/ClarificationFromToolResultTest.kt b/app/src/test/java/dev/touchpilot/app/agent/ClarificationFromToolResultTest.kt
+new file mode 100644
+index 0000000..ea84b2e
+--- /dev/null
++++ b/app/src/test/java/dev/touchpilot/app/agent/ClarificationFromToolResultTest.kt
+@@ -0,0 +1,56 @@
++package dev.touchpilot.app.agent
++
++import dev.touchpilot.app.tools.ToolResult
++import kotlin.test.Test
++import kotlin.test.assertEquals
++import kotlin.test.assertFalse
++import kotlin.test.assertNotNull
++import kotlin.test.assertNull
++
++class ClarificationFromToolResultTest {
++    @Test
++    fun parsesAmbiguousToolResultWithCandidateLabels() {
++        val result = ToolResult(
++            ok = false,
++            message = "Ambiguous input target: multiple matches",
++            data = mapOf(
++                "clarification_needed" to "true",
++                "candidate_count" to "2",
++                "candidate_label_0" to "Save",
++                "candidate_label_1" to "password=hunter2",
++            )
++        )
++
++        val prompt = assertNotNull(ClarificationFromToolResult.parse(result))
++        assertEquals("Which field should I use?", prompt.question)
++        assertEquals(listOf("Save", "password=[REDACTED]"), prompt.choices)
++        assertFalse(prompt.choices.any { it.contains("hunter2") })
++    }
++
++    @Test
++    fun ignoresNonAmbiguousFailures() {
++        val result = ToolResult(ok = false, message = "Input target not found")
++        assertNull(ClarificationFromToolResult.parse(result))
++    }
++
++    @Test
++    fun dataFromCandidateLabelsRoundTrips() {
++        val data = ClarificationFromToolResult.dataFromCandidateLabels(listOf("A", "B"))
++        val parsed = ClarificationFromToolResult.parse(
++            ToolResult(ok = false, message = "Ambiguous scroll target: tied", data = data)
++        )
++        assertNotNull(parsed)
++        assertEquals(listOf("A", "B"), parsed.choices)
++    }
++
++    @Test
++    fun redactsSensitiveChoiceLabels() {
++        val data = ClarificationFromToolResult.dataFromCandidateLabels(listOf("password=secret-value"))
++        val parsed = assertNotNull(
++            ClarificationFromToolResult.parse(
++                ToolResult(ok = false, message = "Ambiguous input target: tied", data = data)
++            )
++        )
++        assertFalse(parsed.choices.any { it.contains("secret-value") })
++    }
++}

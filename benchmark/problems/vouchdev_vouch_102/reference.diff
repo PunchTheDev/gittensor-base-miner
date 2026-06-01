@@ -1,0 +1,273 @@
+diff --git a/CHANGELOG.md b/CHANGELOG.md
+index 92d5cc7..cdd71d4 100644
+--- a/CHANGELOG.md
++++ b/CHANGELOG.md
+@@ -29,6 +29,12 @@ All notable changes to vouch are documented here. Format follows
+   the same tarball. `import_apply`, `import_check`, and `export_check`
+   now validate every member path and raise on unsafe names.
+ - Fix `vouch search` CLI: assign backend label per code path so substring fallback results are no longer mislabelled as `fts5`; update stale docstring to reflect multi-backend search surface (#52).
++- `context._retrieve` now honors `retrieval.backend` in `config.yaml`
++  instead of always running embeddings first (#92). Accepts `auto`
++  (default — embedding → FTS5 → substring), `embedding`, `fts5`, or
++  `substring`; a legacy `retrieval.backends` list is still read for
++  back-compat. `vouch init` now writes `retrieval.backend: auto`, and the
++  README/ROADMAP describe the actual behavior.
+ - `vouch crystallize` now indexes its session-summary page into FTS5 so it
+   surfaces from `vouch search` / `kb.search` / `kb.context` without a
+   `vouch index` rebuild. Previously the summary was written via
+diff --git a/README.md b/README.md
+index 60d351a..9d6ac77 100644
+--- a/README.md
++++ b/README.md
+@@ -258,7 +258,7 @@ vouch import-apply kb.tar.gz --on-conflict skip  # apply (default skip; never de
+ | Tool servers | MCP over stdio + JSONL over stdin/stdout, same `kb.*` surface across both transports, capabilities + knowledge-capability descriptor |
+ | Schemas | 13 JSON Schemas (Draft 2020-12) generated from pydantic in [schemas/](schemas/), plus hand-maintained `bundle.manifest` and `jsonl-envelope` schemas |
+ | Write safety | review-gated writes via [proposed/](spec/review-gate.md), `dry_run:true` previews, host trust required for `approve`/`reject`, atomic exclusive-create storage, path-traversal blocked on source intake and bundle import |
+-| Retrieval | SQLite FTS5 + substring fallback; optional semantic backends (`all-mpnet-base-v2`, `MiniLM-L6`, fastembed-BGE) behind install extras; context packs with citations + quality gate |
++| Retrieval | `retrieval.backend` in `config.yaml` selects the path: `auto` (default — embedding → FTS5 → substring), `embedding`, `fts5`, or `substring`. Semantic backends (`all-mpnet-base-v2`, `MiniLM-L6`, fastembed-BGE) ship behind install extras; `auto` degrades to FTS5 when they aren't installed. Context packs with citations + quality gate |
+ | Lifecycle | `supersede`, `contradict`, `archive`, `confirm`, `cite` — direct mutations, all audited |
+ | Portability | tar.gz bundles with per-file sha256 `manifest.json`, `export-check`, `import-check`, `import-apply` with skip/overwrite/fail conflict modes |
+ | Audit | append-only `audit.log.jsonl`, per-event actor (`VOUCH_AGENT`), object ids, dry-run flag, reversible flag |
+@@ -268,7 +268,7 @@ vouch import-apply kb.tar.gz --on-conflict skip  # apply (default skip; never de
+ 
+ ## Status
+ 
+-Pre-1.0. What's *not* in this implementation: vector embeddings (BM25/FTS5 only), per-runtime adapter templates, benchmark fixtures, multi-agent sync, scopes beyond a single field on Claim/Source. If a hole matters to you, file an issue.
++Pre-1.0. What's *not* in this implementation: per-runtime adapter templates, benchmark fixtures, multi-agent sync, scopes beyond a single field on Claim/Source. If a hole matters to you, file an issue.
+ 
+ ## License
+ 
+diff --git a/ROADMAP.md b/ROADMAP.md
+index 4e5e661..46101d1 100644
+--- a/ROADMAP.md
++++ b/ROADMAP.md
+@@ -6,8 +6,11 @@ promise. Items marked **[VEP]** require a written proposal in
+ 
+ ## 0.1 — surface stabilises (next)
+ 
+-- Vector embeddings as an *optional* retrieval backend alongside FTS5.
+-  Default stays FTS5; embeddings opt-in via `config.yaml`. **[VEP]**
++- Vector embeddings as a retrieval backend alongside FTS5 (shipped).
++  Retrieval is controlled by `retrieval.backend` in `config.yaml`:
++  `auto` (default) tries embedding → FTS5 → substring, gracefully
++  degrading to FTS5 when the embeddings extras aren't installed; set
++  `embedding`, `fts5`, or `substring` to pin a single path.
+ - `vouch diff <id-old> <id-new>` for claim/page revisions.
+ - `vouch approve --batch` for reviewing N proposals in one transaction.
+ - HTTP transport (`vouch serve --transport http`) behind a localhost
+diff --git a/src/vouch/context.py b/src/vouch/context.py
+index 667fb51..988dee0 100644
+--- a/src/vouch/context.py
++++ b/src/vouch/context.py
+@@ -16,30 +16,77 @@
+ import sqlite3
+ from typing import Any, Literal, cast
+ 
++import yaml
++
+ from . import index_db
+ from .models import ContextItem, ContextPack, ContextQuality
+ from .storage import ArtifactNotFoundError, KBStore
+ 
+ ContextItemKind = Literal["claim", "page", "entity", "relation", "source"]
+ 
++_VALID_BACKENDS = ("auto", "embedding", "fts5", "substring")
++
++
++def _configured_backend(store: KBStore) -> str:
++    """Resolve the retrieval backend from `config.yaml`, defaulting to "auto".
++
++    Reads the singular `retrieval.backend` string. For KBs initialised
++    before this knob existed, a legacy `retrieval.backends` list is honoured
++    by taking its first recognised entry. Anything unreadable or unrecognised
++    falls back to "auto".
++    """
++    try:
++        loaded = yaml.safe_load(store.config_path.read_text())
++    except (OSError, yaml.YAMLError):
++        return "auto"
++    if not isinstance(loaded, dict):
++        return "auto"
++    retrieval = loaded.get("retrieval")
++    if not isinstance(retrieval, dict):
++        return "auto"
++    backend = retrieval.get("backend")
++    if isinstance(backend, str) and backend in _VALID_BACKENDS:
++        return backend
++    legacy = retrieval.get("backends")
++    if isinstance(legacy, list):
++        for entry in legacy:
++            if isinstance(entry, str) and entry in _VALID_BACKENDS:
++                return entry
++    return "auto"
++
+ 
+ def _retrieve(store: KBStore, query: str, limit: int
+               ) -> list[tuple[str, str, str, float, str]]:
+     """Return list of (kind, id, summary, score, backend).
+ 
+-    Dispatch order: embedding (semantic) -> FTS5 -> substring.
++    The backend is chosen by `retrieval.backend` in config.yaml:
++      - "auto" (default): embedding -> FTS5 -> substring
++      - "embedding": semantic search only
++      - "fts5": lexical FTS5 only
++      - "substring": substring scan only
+     """
+-    raw = index_db.search_semantic(store.kb_dir, query, limit=limit)
+-    if raw:
+-        return [(k, i, s, sc, "embedding") for k, i, s, sc in raw]
+-    try:
+-        hits = index_db.search(store.kb_dir, query, limit=limit)
+-        if hits:
+-            return [(k, i, s, sc, "fts5") for k, i, s, sc in hits]
+-    except sqlite3.Error:
+-        # FTS5 unavailable, db missing, or schema mismatch — fall through
+-        # to substring scan. Other exceptions are real bugs and propagate.
+-        pass
++    backend = _configured_backend(store)
++
++    if backend in ("auto", "embedding"):
++        raw = index_db.search_semantic(store.kb_dir, query, limit=limit)
++        if raw:
++            return [(k, i, s, sc, "embedding") for k, i, s, sc in raw]
++        if backend == "embedding":
++            return []
++
++    if backend in ("auto", "fts5"):
++        try:
++            hits = index_db.search(store.kb_dir, query, limit=limit)
++            if hits:
++                return [(k, i, s, sc, "fts5") for k, i, s, sc in hits]
++        except sqlite3.Error:
++            # FTS5 unavailable, db missing, or schema mismatch — fall through
++            # to substring scan (auto) or empty (explicit fts5). Other
++            # exceptions are real bugs and propagate.
++            pass
++        if backend == "fts5":
++            return []
++
+     return [
+         (k, i, s, sc, "substring")
+         for k, i, s, sc in store.search_substring(query, limit=limit)
+diff --git a/src/vouch/storage.py b/src/vouch/storage.py
+index 797f9a1..a67bf6f 100644
+--- a/src/vouch/storage.py
++++ b/src/vouch/storage.py
+@@ -69,7 +69,9 @@ def _starter_config() -> dict[str, Any]:
+         "version": 1,
+         "review": {"require_human_approval": True},
+         "retrieval": {
+-            "backends": ["fts5", "substring"],
++            # auto = embedding -> fts5 -> substring; or pin one of
++            # embedding | fts5 | substring. See context._retrieve.
++            "backend": "auto",
+             "default_limit": 10,
+         },
+         "agents": {
+diff --git a/tests/test_retrieval_backend.py b/tests/test_retrieval_backend.py
+new file mode 100644
+index 0000000..2dc30cd
+--- /dev/null
++++ b/tests/test_retrieval_backend.py
+@@ -0,0 +1,101 @@
++"""`context._retrieve` honors `retrieval.backend` in config.yaml (#92).
++
++These tests monkeypatch `index_db.search_semantic` so they exercise the
++dispatch logic without needing the optional embeddings extras (numpy /
++sentence-transformers), and therefore run under the base CI install.
++"""
++
++from __future__ import annotations
++
++from pathlib import Path
++
++import pytest
++import yaml
++
++from vouch import context, health
++from vouch.models import Claim
++from vouch.storage import KBStore
++
++
++@pytest.fixture
++def store(tmp_path: Path) -> KBStore:
++    s = KBStore.init(tmp_path)
++    src = s.put_source(b"e")
++    s.put_claim(Claim(id="c1", text="JWT token rotation", evidence=[src.id]))
++    health.rebuild_index(s)
++    return s
++
++
++def _set_backend(store: KBStore, backend: str) -> None:
++    cfg = yaml.safe_load(store.config_path.read_text())
++    cfg.setdefault("retrieval", {})["backend"] = backend
++    store.config_path.write_text(yaml.safe_dump(cfg))
++
++
++def _force_semantic_hit(monkeypatch: pytest.MonkeyPatch) -> None:
++    """Make the embedding path always return a hit, so a backend label of
++    "embedding" appears iff `_retrieve` actually consulted semantic search."""
++    monkeypatch.setattr(
++        context.index_db, "search_semantic",
++        lambda *a, **k: [("claim", "c1", "JWT token rotation", 0.99)],
++    )
++
++
++def _backends(pack: dict) -> set[str]:
++    return {item["backend"] for item in pack["items"]}
++
++
++def test_backend_fts5_skips_embedding(
++    store: KBStore, monkeypatch: pytest.MonkeyPatch
++) -> None:
++    """Regression for #92: with retrieval.backend=fts5, the embedding path
++    must not run even when it would return hits."""
++    _force_semantic_hit(monkeypatch)
++    _set_backend(store, "fts5")
++    pack = context.build_context_pack(store, query="JWT")
++    assert pack["items"]
++    assert "embedding" not in _backends(pack)
++    assert _backends(pack) <= {"fts5", "substring"}
++
++
++def test_backend_embedding_is_recognized(
++    store: KBStore, monkeypatch: pytest.MonkeyPatch
++) -> None:
++    """`embedding` is an accepted value and forces the semantic path."""
++    _force_semantic_hit(monkeypatch)
++    _set_backend(store, "embedding")
++    pack = context.build_context_pack(store, query="JWT")
++    assert pack["items"]
++    assert _backends(pack) == {"embedding"}
++
++
++def test_backend_substring_only(
++    store: KBStore, monkeypatch: pytest.MonkeyPatch
++) -> None:
++    _force_semantic_hit(monkeypatch)
++    _set_backend(store, "substring")
++    pack = context.build_context_pack(store, query="JWT")
++    assert pack["items"]
++    assert _backends(pack) == {"substring"}
++
++
++def test_backend_auto_prefers_embedding(
++    store: KBStore, monkeypatch: pytest.MonkeyPatch
++) -> None:
++    """Default `auto` tries embedding first when it returns hits."""
++    _force_semantic_hit(monkeypatch)
++    _set_backend(store, "auto")
++    pack = context.build_context_pack(store, query="JWT")
++    assert any(item["backend"] == "embedding" for item in pack["items"])
++
++
++def test_unset_backend_defaults_to_auto(
++    store: KBStore, monkeypatch: pytest.MonkeyPatch
++) -> None:
++    """A config with no retrieval.backend behaves like `auto`."""
++    _force_semantic_hit(monkeypatch)
++    cfg = yaml.safe_load(store.config_path.read_text())
++    cfg.get("retrieval", {}).pop("backend", None)
++    store.config_path.write_text(yaml.safe_dump(cfg))
++    pack = context.build_context_pack(store, query="JWT")
++    assert any(item["backend"] == "embedding" for item in pack["items"])

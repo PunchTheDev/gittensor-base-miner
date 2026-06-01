@@ -1,0 +1,605 @@
+import React, { useState, useMemo } from 'react';
+import {
+  Card,
+  Typography,
+  Box,
+  Table,
+  TableBody,
+  TableCell,
+  TableContainer,
+  TableHead,
+  TableRow,
+  CircularProgress,
+  Avatar,
+  Chip,
+  Button,
+  useTheme,
+  alpha,
+} from '@mui/material';
+import { useMinerPRs, useReposAndWeights } from '../../api';
+import { useNavigate } from 'react-router-dom';
+
+interface MinerPRsTableProps {
+  githubId: string;
+  /** When set, only PRs in repositories of this tier are shown (e.g. "Bronze", "Silver", "Gold"). */
+  tierFilter?: string;
+}
+
+const MinerPRsTable: React.FC<MinerPRsTableProps> = ({
+  githubId,
+  tierFilter,
+}) => {
+  const theme = useTheme();
+  const navigate = useNavigate();
+  const { data: prs, isLoading } = useMinerPRs(githubId);
+  const { data: repos } = useReposAndWeights();
+
+  const headerCellStyle = {
+    backgroundColor: theme.palette.surface.elevated,
+    backdropFilter: 'blur(8px)',
+    color: alpha(theme.palette.text.primary, 0.7),
+    fontFamily: '"JetBrains Mono", monospace',
+    fontWeight: 500,
+    fontSize: { xs: '0.65rem', sm: '0.75rem' },
+    borderBottom: `1px solid ${theme.palette.border.light}`,
+    height: { xs: '48px', sm: '56px' },
+    py: { xs: 1, sm: 1.5 },
+    px: { xs: 0.5, sm: 2 },
+    textTransform: 'uppercase' as const,
+    letterSpacing: '0.5px',
+  };
+
+  const bodyCellStyle = {
+    color: theme.palette.text.primary,
+    fontFamily: '"JetBrains Mono", monospace',
+    borderBottom: `1px solid ${theme.palette.border.light}`,
+    fontSize: '0.85rem',
+    py: { xs: 0.75, sm: 1 },
+    px: { xs: 0.5, sm: 2 },
+    height: { xs: '52px', sm: '60px' },
+  };
+
+  const [selectedRepo, setSelectedRepo] = useState<string | null>(null);
+  const [selectedAuthor, setSelectedAuthor] = useState<string | null>(null);
+  const [statusFilter, setStatusFilter] = useState<
+    'all' | 'open' | 'merged' | 'closed'
+  >('all');
+
+  const repoTiers = useMemo(() => {
+    const map = new Map<string, string>();
+    if (Array.isArray(repos)) {
+      repos.forEach((repo) => {
+        if (repo?.fullName) map.set(repo.fullName, repo.tier || '');
+      });
+    }
+    return map;
+  }, [repos]);
+
+  const tierFilterLower = tierFilter?.toLowerCase();
+
+  const prsInTier = useMemo(() => {
+    if (!prs || !tierFilterLower) return prs;
+    return prs.filter((pr) => {
+      const prTier = pr.tier?.toLowerCase();
+      const repoTier = repoTiers.get(pr.repository)?.toLowerCase();
+      return prTier === tierFilterLower || repoTier === tierFilterLower;
+    });
+  }, [prs, tierFilterLower, repoTiers]);
+
+  // Filter PRs by selected repository, author, and status (and tier when tierFilter is set)
+  const filteredPRs = useMemo(() => {
+    if (!prsInTier) return [];
+    let filtered = prsInTier;
+    if (selectedRepo) {
+      filtered = filtered.filter((pr) => pr.repository === selectedRepo);
+    }
+    if (selectedAuthor) {
+      filtered = filtered.filter((pr) => pr.author === selectedAuthor);
+    }
+    if (statusFilter === 'open') {
+      filtered = filtered.filter(
+        (pr) => pr.prState === 'OPEN' || (!pr.prState && !pr.mergedAt),
+      );
+    } else if (statusFilter === 'merged') {
+      filtered = filtered.filter(
+        (pr) => pr.mergedAt || pr.prState === 'MERGED',
+      );
+    } else if (statusFilter === 'closed') {
+      filtered = filtered.filter(
+        (pr) => pr.prState === 'CLOSED' && !pr.mergedAt,
+      );
+    }
+    return filtered;
+  }, [prsInTier, selectedRepo, selectedAuthor, statusFilter]);
+
+  const statusCounts = useMemo(() => {
+    if (!prsInTier) return { all: 0, open: 0, merged: 0, closed: 0 };
+    return {
+      all: prsInTier.length,
+      open: prsInTier.filter(
+        (pr) => pr.prState === 'OPEN' || (!pr.prState && !pr.mergedAt),
+      ).length,
+      merged: prsInTier.filter((pr) => pr.mergedAt || pr.prState === 'MERGED')
+        .length,
+      closed: prsInTier.filter((pr) => pr.prState === 'CLOSED' && !pr.mergedAt)
+        .length,
+    };
+  }, [prsInTier]);
+
+  if (isLoading) {
+    return (
+      <Card
+        sx={{
+          borderRadius: 3,
+          border: '1px solid',
+          borderColor: 'border.light',
+          backgroundColor: 'transparent',
+          p: 4,
+          textAlign: 'center',
+        }}
+        elevation={0}
+      >
+        <CircularProgress size={40} sx={{ color: 'primary.main' }} />
+      </Card>
+    );
+  }
+
+  return (
+    <Card
+      sx={{
+        borderRadius: 3,
+        border: '1px solid',
+        borderColor: 'border.light',
+        backgroundColor: 'transparent',
+        p: 0,
+        display: 'flex',
+        flexDirection: 'column',
+        overflow: 'hidden',
+      }}
+      elevation={0}
+    >
+      <Box
+        sx={{
+          p: { xs: 2, sm: 3 },
+          borderBottom: '1px solid',
+          borderColor: 'border.light',
+        }}
+      >
+        <Box
+          sx={{
+            display: 'flex',
+            alignItems: 'center',
+            justifyContent: 'space-between',
+            flexWrap: 'wrap',
+            gap: 2,
+          }}
+        >
+          <Box sx={{ display: 'flex', alignItems: 'baseline', gap: 1.5 }}>
+            <Typography
+              variant="h6"
+              sx={{
+                color: 'text.primary',
+                fontFamily: '"JetBrains Mono", monospace',
+                fontSize: { xs: '0.95rem', sm: '1.1rem' },
+                fontWeight: 500,
+              }}
+            >
+              Pull Requests
+            </Typography>
+            <Typography
+              sx={{
+                color: (t) => alpha(t.palette.text.primary, 0.5),
+                fontFamily: '"JetBrains Mono", monospace',
+                fontSize: '0.75rem',
+              }}
+            >
+              ({filteredPRs.length}
+              {selectedRepo ||
+              selectedAuthor ||
+              statusFilter !== 'all' ||
+              tierFilter
+                ? ` of ${(tierFilter ? (prsInTier ?? []) : prs)?.length || 0}`
+                : ''}
+              )
+            </Typography>
+          </Box>
+          <Box
+            sx={{
+              display: 'flex',
+              gap: 1,
+              flexWrap: 'wrap',
+              alignItems: 'center',
+            }}
+          >
+            {selectedRepo && (
+              <Chip
+                variant="filter"
+                label={`Repo: ${selectedRepo}`}
+                onDelete={() => setSelectedRepo(null)}
+              />
+            )}
+            {selectedAuthor && (
+              <Chip
+                variant="filter"
+                label={`Author: ${selectedAuthor}`}
+                onDelete={() => setSelectedAuthor(null)}
+              />
+            )}
+
+            {/* Status Filter Buttons */}
+            <Box sx={{ display: 'flex', gap: 0.5 }}>
+              <FilterButton
+                label="All"
+                count={statusCounts.all}
+                color={theme.palette.status.neutral}
+                selected={statusFilter === 'all'}
+                onClick={() => setStatusFilter('all')}
+              />
+              <FilterButton
+                label="Open"
+                count={statusCounts.open}
+                color={theme.palette.status.open}
+                selected={statusFilter === 'open'}
+                onClick={() => setStatusFilter('open')}
+              />
+              <FilterButton
+                label="Merged"
+                count={statusCounts.merged}
+                color={theme.palette.status.merged}
+                selected={statusFilter === 'merged'}
+                onClick={() => setStatusFilter('merged')}
+              />
+              <FilterButton
+                label="Closed"
+                count={statusCounts.closed}
+                color={theme.palette.status.closed}
+                selected={statusFilter === 'closed'}
+                onClick={() => setStatusFilter('closed')}
+              />
+            </Box>
+          </Box>
+        </Box>
+      </Box>
+
+      {/* Table */}
+      {!prs || prs.length === 0 ? (
+        <Box sx={{ textAlign: 'center', py: 8 }}>
+          <Typography
+            sx={{
+              color: (t) => alpha(t.palette.text.primary, 0.5),
+              fontFamily: '"JetBrains Mono", monospace',
+              fontSize: '0.9rem',
+            }}
+          >
+            No PRs found
+          </Typography>
+        </Box>
+      ) : tierFilter && (prsInTier ?? []).length === 0 ? (
+        <Box sx={{ textAlign: 'center', py: 8 }}>
+          <Typography
+            sx={{
+              color: (t) => alpha(t.palette.text.primary, 0.5),
+              fontFamily: '"JetBrains Mono", monospace',
+              fontSize: '0.9rem',
+            }}
+          >
+            No PRs in this tier
+          </Typography>
+        </Box>
+      ) : filteredPRs.length === 0 ? (
+        <Box sx={{ textAlign: 'center', py: 8 }}>
+          <Typography
+            sx={{
+              color: (t) => alpha(t.palette.text.primary, 0.5),
+              fontFamily: '"JetBrains Mono", monospace',
+              fontSize: '0.9rem',
+            }}
+          >
+            No PRs found for the selected filters
+          </Typography>
+        </Box>
+      ) : (
+        <TableContainer
+          sx={{
+            maxHeight: { xs: '400px', sm: '500px' },
+            overflowY: 'auto',
+            overflowX: { xs: 'hidden', sm: 'auto' },
+            '&::-webkit-scrollbar': {
+              width: { xs: '6px', sm: '8px' },
+              height: { xs: '6px', sm: '8px' },
+            },
+            '&::-webkit-scrollbar-track': {
+              backgroundColor: 'transparent',
+            },
+            '&::-webkit-scrollbar-thumb': {
+              backgroundColor: (t) => t.palette.border.light,
+              borderRadius: '4px',
+              '&:hover': {
+                backgroundColor: (t) => t.palette.border.medium,
+              },
+            },
+          }}
+        >
+          <Table
+            stickyHeader
+            sx={{ tableLayout: 'fixed', minWidth: { xs: '100%', sm: '800px' } }}
+          >
+            <TableHead>
+              <TableRow>
+                <TableCell sx={headerCellStyle}>PR #</TableCell>
+                <TableCell sx={headerCellStyle}>Title</TableCell>
+                <TableCell
+                  sx={{
+                    ...headerCellStyle,
+                    display: { xs: 'none', sm: 'table-cell' },
+                  }}
+                >
+                  Repository
+                </TableCell>
+                <TableCell
+                  align="right"
+                  sx={{
+                    ...headerCellStyle,
+                    display: { xs: 'none', md: 'table-cell' },
+                  }}
+                >
+                  +/-
+                </TableCell>
+                <TableCell align="right" sx={headerCellStyle}>
+                  Score
+                </TableCell>
+                <TableCell
+                  align="right"
+                  sx={{
+                    ...headerCellStyle,
+                    display: { xs: 'none', sm: 'table-cell' },
+                  }}
+                >
+                  Merged
+                </TableCell>
+              </TableRow>
+            </TableHead>
+            <TableBody>
+              {filteredPRs.map((pr, index) => (
+                <TableRow
+                  key={`${pr.repository}-${pr.pullRequestNumber}-${index}`}
+                  onClick={() => {
+                    navigate(
+                      `/miners/pr?repo=${encodeURIComponent(pr.repository)}&number=${pr.pullRequestNumber}`,
+                      {
+                        state: {
+                          backLabel: `Back to ${prs?.[0]?.author || githubId}`,
+                        },
+                      },
+                    );
+                  }}
+                  sx={{
+                    cursor: 'pointer',
+                    '&:hover': {
+                      backgroundColor: 'surface.light',
+                    },
+                    transition: 'all 0.2s',
+                  }}
+                >
+                  <TableCell
+                    sx={{
+                      ...bodyCellStyle,
+                      width: { xs: '20%', sm: '10%' },
+                      fontSize: { xs: '0.75rem', sm: '0.85rem' },
+                    }}
+                  >
+                    <Box
+                      component="a"
+                      href={`https://github.com/${pr.repository}/pull/${pr.pullRequestNumber}`}
+                      target="_blank"
+                      rel="noopener noreferrer"
+                      sx={{
+                        color: 'text.primary',
+                        textDecoration: 'none',
+                        fontWeight: 500,
+                      }}
+                    >
+                      #{pr.pullRequestNumber}
+                    </Box>
+                  </TableCell>
+                  <TableCell
+                    sx={{
+                      ...bodyCellStyle,
+                      width: { xs: '55%', sm: '30%' },
+                      fontSize: { xs: '0.75rem', sm: '0.85rem' },
+                    }}
+                  >
+                    <Box
+                      sx={{
+                        overflow: 'hidden',
+                        textOverflow: 'ellipsis',
+                        whiteSpace: 'nowrap',
+                      }}
+                    >
+                      {pr.pullRequestTitle}
+                    </Box>
+                  </TableCell>
+                  <TableCell
+                    sx={{
+                      ...bodyCellStyle,
+                      width: '20%',
+                      display: { xs: 'none', sm: 'table-cell' },
+                    }}
+                  >
+                    <Box
+                      onClick={(e) => {
+                        e.stopPropagation();
+                        setSelectedRepo(pr.repository);
+                      }}
+                      sx={{
+                        display: 'flex',
+                        alignItems: 'center',
+                        gap: 1.5,
+                        cursor: 'pointer',
+                        '&:hover': {
+                          color: 'primary.main',
+                        },
+                        transition: 'color 0.2s',
+                      }}
+                    >
+                      <Avatar
+                        src={`https://avatars.githubusercontent.com/${pr.repository.split('/')[0]}`}
+                        alt={pr.repository.split('/')[0]}
+                        sx={{
+                          width: 20,
+                          height: 20,
+                          border: '1px solid',
+                          borderColor: 'border.medium',
+                          backgroundColor:
+                            pr.repository.split('/')[0] === 'opentensor'
+                              ? 'text.primary'
+                              : pr.repository.split('/')[0] === 'bitcoin'
+                                ? 'status.warning'
+                                : 'transparent',
+                        }}
+                      />
+                      {pr.repository}
+                    </Box>
+                  </TableCell>
+                  <TableCell
+                    align="right"
+                    sx={{
+                      ...bodyCellStyle,
+                      width: '15%',
+                      display: { xs: 'none', md: 'table-cell' },
+                    }}
+                  >
+                    <Box
+                      component="span"
+                      sx={{
+                        color: theme.palette.diff.additions,
+                        mr: 1,
+                        fontFamily: '"JetBrains Mono", monospace',
+                      }}
+                    >
+                      +{pr.additions}
+                    </Box>
+                    <Box
+                      component="span"
+                      sx={{
+                        color: theme.palette.diff.deletions,
+                        fontFamily: '"JetBrains Mono", monospace',
+                      }}
+                    >
+                      -{pr.deletions}
+                    </Box>
+                  </TableCell>
+                  <TableCell
+                    align="right"
+                    sx={{ ...bodyCellStyle, width: { xs: '25%', sm: '10%' } }}
+                  >
+                    <Box>
+                      {pr.prState === 'CLOSED' && !pr.mergedAt ? (
+                        <Typography
+                          sx={{
+                            fontFamily: '"JetBrains Mono", monospace',
+                            fontSize: { xs: '0.7rem', sm: '0.75rem' },
+                            fontWeight: 600,
+                            color: (t) => alpha(t.palette.text.primary, 0.3),
+                          }}
+                        >
+                          -
+                        </Typography>
+                      ) : !pr.mergedAt && pr.collateralScore ? (
+                        <Typography
+                          sx={{
+                            fontFamily: '"JetBrains Mono", monospace',
+                            fontSize: { xs: '0.7rem', sm: '0.75rem' },
+                            fontWeight: 600,
+                            color: 'status.warning',
+                          }}
+                        >
+                          {parseFloat(pr.collateralScore).toFixed(4)}
+                        </Typography>
+                      ) : (
+                        <Typography
+                          sx={{
+                            fontFamily: '"JetBrains Mono", monospace',
+                            fontSize: { xs: '0.7rem', sm: '0.75rem' },
+                            fontWeight: 600,
+                          }}
+                        >
+                          {parseFloat(pr.score).toFixed(4)}
+                        </Typography>
+                      )}
+                      {!pr.mergedAt &&
+                        pr.collateralScore &&
+                        pr.prState !== 'CLOSED' && (
+                          <Typography
+                            sx={{
+                              fontFamily: '"JetBrains Mono", monospace',
+                              fontSize: '0.6rem',
+                              color: (t) => alpha(t.palette.text.primary, 0.5),
+                            }}
+                          >
+                            Collateral
+                          </Typography>
+                        )}
+                    </Box>
+                  </TableCell>
+                  <TableCell
+                    align="right"
+                    sx={{
+                      ...bodyCellStyle,
+                      width: '15%',
+                      display: { xs: 'none', sm: 'table-cell' },
+                      fontSize: { xs: '0.75rem', sm: '0.85rem' },
+                      color: (t) => alpha(t.palette.text.primary, 0.7),
+                    }}
+                  >
+                    {pr.mergedAt
+                      ? new Date(pr.mergedAt).toLocaleDateString()
+                      : pr.prState === 'CLOSED'
+                        ? 'Closed'
+                        : 'Open'}
+                  </TableCell>
+                </TableRow>
+              ))}
+            </TableBody>
+          </Table>
+        </TableContainer>
+      )}
+    </Card>
+  );
+};
+
+const FilterButton: React.FC<{
+  label: string;
+  count: number;
+  color: string;
+  selected: boolean;
+  onClick: () => void;
+}> = ({ label, count, color, selected, onClick }) => (
+  <Button
+    size="small"
+    onClick={onClick}
+    sx={{
+      color: selected
+        ? 'text.primary'
+        : (t) => alpha(t.palette.text.primary, 0.5),
+      backgroundColor: selected ? 'surface.light' : 'transparent',
+      borderRadius: '6px',
+      px: 1.5,
+      minWidth: 'auto',
+      textTransform: 'none',
+      fontFamily: '"JetBrains Mono", monospace',
+      fontSize: '0.75rem',
+      border: selected ? `1px solid ${color}` : '1px solid transparent',
+      '&:hover': {
+        backgroundColor: (t) => alpha(t.palette.text.primary, 0.15),
+      },
+    }}
+  >
+    {label}{' '}
+    <span style={{ opacity: 0.6, marginLeft: '6px', fontSize: '0.7rem' }}>
+      {count}
+    </span>
+  </Button>
+);
+
+export default MinerPRsTable;

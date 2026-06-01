@@ -1,0 +1,652 @@
+diff --git a/CHANGELOG.md b/CHANGELOG.md
+index 83eacb3..92d5cc7 100644
+--- a/CHANGELOG.md
++++ b/CHANGELOG.md
+@@ -7,6 +7,9 @@ All notable changes to vouch are documented here. Format follows
+ ## [Unreleased]
+ 
+ ### Added
++- `vouch sync-check` and `vouch sync-apply` reconcile another `.vouch`
++  directory or bundle by importing only non-conflicting durable artifacts and
++  reporting conflicts without overwriting reviewed knowledge.
+ - `vouch pending --json` emits pending proposals as structured JSON for shell
+   scripts, CI checks, and multi-agent review dashboards.
+ - `vouch diff <id-old> <id-new>` shows what changed between two claim revisions or two page revisions — field-level changes plus a line-diff of the long text/body. Auto-detects the artifact kind and hides always-churning metadata. Read-only; supports `--json`.
+diff --git a/README.md b/README.md
+index 6397afd..60d351a 100644
+--- a/README.md
++++ b/README.md
+@@ -174,6 +174,8 @@ vouch export --out path.tar.gz
+ vouch export-check path.tar.gz
+ vouch import-check path.tar.gz
+ vouch import-apply path.tar.gz [--on-conflict skip|overwrite|fail]
++vouch sync-check PATH_OR_BUNDLE
++vouch sync-apply PATH_OR_BUNDLE [--on-conflict fail|skip|propose]
+ 
+ vouch serve [--transport stdio|jsonl]
+ ```
+diff --git a/docs/multi-agent.md b/docs/multi-agent.md
+index b4918de..65c8cdb 100644
+--- a/docs/multi-agent.md
++++ b/docs/multi-agent.md
+@@ -94,13 +94,26 @@ vouch session start --task "implement password reset" \
+                     --note "tag:agent:claude-code-anna"
+ ```
+ 
++## Distributed sync
++
++When two teammates each have their own `.vouch/` directory, use the
++sync workflow to reconcile them deterministically:
++
++```bash
++vouch sync-check ../other-repo
++vouch sync-apply ../other-repo --on-conflict fail
++```
++
++`sync-check` accepts either another repo / `.vouch` directory or a
++bundle. It reports new files, identical files, and conflicts without
++writing anything. `sync-apply` imports non-conflicting files only; it
++never overwrites reviewed knowledge. Use `--on-conflict skip` to leave
++conflicts untouched, or `--on-conflict propose` to write a local conflict
++report under `proposed/sync-reports/` for human review. `config.yaml`
++stays local to each KB and is not synced.
++
+ ## What doesn't work yet
+ 
+-- **Distributed `.vouch/` directories that sync.** Today it's one
+-  filesystem. If two teammates each have their own `.vouch/` and want
+-  them to merge, the path is bundle export + import-check, manually,
+-  for now. See [bundles.md](bundles.md) and the multi-agent-sync
+-  roadmap item.
+ - **Live merge conflicts.** Two agents editing the same proposal at
+   once isn't a scenario vouch addresses — agents create proposals,
+   they don't edit existing ones.
+diff --git a/src/vouch/cli.py b/src/vouch/cli.py
+index 8b57771..02210b2 100644
+--- a/src/vouch/cli.py
++++ b/src/vouch/cli.py
+@@ -13,6 +13,7 @@
+ import sys
+ from collections.abc import Iterator
+ from contextlib import contextmanager
++from dataclasses import asdict
+ from pathlib import Path
+ 
+ import click
+@@ -22,6 +23,7 @@
+ from . import audit as audit_mod
+ from . import lifecycle as life
+ from . import sessions as sess_mod
++from . import sync as sync_mod
+ from . import verify as verify_mod
+ from .capabilities import capabilities as build_caps
+ from .context import build_context_pack
+@@ -870,6 +872,41 @@ def import_apply_cmd(bundle_path: str, on_conflict: str) -> None:
+     _emit_json(r)
+ 
+ 
++# --- sync ------------------------------------------------------------------
++
++
++@cli.command("sync-check")
++@click.argument("source_path", type=click.Path(exists=True))
++def sync_check_cmd(source_path: str) -> None:
++    """Compare another .vouch directory or bundle without writing."""
++    store = _load_store()
++    try:
++        r = sync_mod.sync_check(store.kb_dir, Path(source_path))
++    except RuntimeError as e:
++        raise click.ClickException(str(e)) from e
++    _emit_json(asdict(r))
++
++
++@cli.command("sync-apply")
++@click.argument("source_path", type=click.Path(exists=True))
++@click.option("--on-conflict", default="fail", show_default=True,
++              type=click.Choice(["fail", "skip", "propose"]))
++def sync_apply_cmd(source_path: str, on_conflict: str) -> None:
++    """Apply non-conflicting files from another .vouch directory or bundle."""
++    store = _load_store()
++    try:
++        r = sync_mod.sync_apply(
++            store.kb_dir,
++            Path(source_path),
++            on_conflict=on_conflict,
++            actor=_whoami(),
++        )
++    except (RuntimeError, ValueError) as e:
++        raise click.ClickException(str(e)) from e
++    health.rebuild_index(store)
++    _emit_json(r)
++
++
+ # --- diff -----------------------------------------------------------------
+ 
+ 
+@@ -880,8 +917,6 @@ def import_apply_cmd(bundle_path: str, on_conflict: str) -> None:
+               help="Emit the diff as JSON.")
+ def diff(old_id: str, new_id: str, as_json: bool) -> None:
+     """Show what changed between two claim or two page revisions."""
+-    from dataclasses import asdict
+-
+     from .diff import diff_artifacts
+     store = _load_store()
+     with _cli_errors():
+diff --git a/src/vouch/storage.py b/src/vouch/storage.py
+index 388e53e..797f9a1 100644
+--- a/src/vouch/storage.py
++++ b/src/vouch/storage.py
+@@ -119,6 +119,7 @@ def _serialize_page(page: Page) -> str:
+ 
+ 
+ def _deserialize_page(text: str) -> Page:
++    text = text.replace("\r\n", "\n")
+     m = _FRONTMATTER_RE.match(text)
+     if not m:
+         raise ValueError("page file missing YAML frontmatter")
+@@ -151,8 +152,14 @@ def read_under_root(self, path: str | Path) -> tuple[Path, bytes]:
+             raise ValueError(
+                 f"path must be inside project root ({self.root}): {resolved}"
+             )
++        if resolved.is_dir():
++            raise ValueError(f"not a regular file: {resolved}")
++        flags = os.O_RDONLY
++        # POSIX can reject a symlink swapped in after resolve(); Windows has
++        # no O_NOFOLLOW, so it falls back to the regular-file check below.
++        flags |= getattr(os, "O_NOFOLLOW", 0)
+         try:
+-            fd = os.open(resolved, os.O_RDONLY | os.O_NOFOLLOW)
++            fd = os.open(resolved, flags)
+         except OSError as e:
+             raise ValueError(f"cannot read {resolved}: {e}") from e
+         try:
+diff --git a/src/vouch/sync.py b/src/vouch/sync.py
+new file mode 100644
+index 0000000..a3ccc89
+--- /dev/null
++++ b/src/vouch/sync.py
+@@ -0,0 +1,347 @@
++"""Deterministic sync for reconciling another vouch KB or bundle.
++
++The sync surface is deliberately conservative: it imports files that are
++absent locally, reports identical files, and never overwrites divergent
++reviewed knowledge. Conflicts can fail the operation, be skipped, or be
++captured in a local conflict report under ``proposed/sync-reports/``.
++"""
++
++from __future__ import annotations
++
++import json
++import tarfile
++from dataclasses import asdict, dataclass
++from pathlib import Path
++from typing import Any
++
++from . import audit, bundle
++from .storage import sha256_hex
++
++_SYNC_EXCLUDED_PATHS = {"config.yaml"}
++
++
++@dataclass
++class IncomingFile:
++    path: str
++    size: int
++    sha256: str
++
++
++@dataclass
++class SyncConflict:
++    path: str
++    kind: str
++    artifact_id: str | None
++    reason: str
++    local_sha256: str
++    incoming_sha256: str
++
++
++@dataclass
++class SyncCheckResult:
++    ok: bool
++    source_type: str
++    source_id: str
++    source: str
++    new_files: list[str]
++    identical: list[str]
++    conflicts: list[SyncConflict]
++    semantic_conflicts: list[SyncConflict]
++    decided_conflicts: list[SyncConflict]
++    issues: list[str]
++
++
++@dataclass
++class _SyncSource:
++    source_type: str
++    source_id: str
++    display: str
++    files: dict[str, IncomingFile]
++    root: Path | None = None
++    bundle_path: Path | None = None
++
++
++def _artifact_kind(path: str) -> tuple[str, str | None]:
++    if path == "config.yaml":
++        return "config", None
++    parts = path.split("/")
++    top = parts[0]
++    if top == "sources" and len(parts) >= 3:
++        return "source", parts[1]
++    if len(parts) < 2:
++        return top, None
++    artifact_id = Path(parts[-1]).stem
++    singular = {
++        "claims": "claim",
++        "pages": "page",
++        "entities": "entity",
++        "relations": "relation",
++        "evidence": "evidence",
++        "sessions": "session",
++        "decided": "decided-proposal",
++    }.get(top, top)
++    return singular, artifact_id
++
++
++def _conflict(path: str, local_sha: str, incoming_sha: str) -> SyncConflict:
++    kind, artifact_id = _artifact_kind(path)
++    if kind == "config":
++        reason = "local config differs from incoming config"
++    elif kind == "decided-proposal":
++        reason = f"decided proposal {artifact_id} differs"
++    elif artifact_id is not None:
++        reason = f"{kind} {artifact_id} exists with different content"
++    else:
++        reason = f"{kind} file exists with different content"
++    return SyncConflict(
++        path=path,
++        kind=kind,
++        artifact_id=artifact_id,
++        reason=reason,
++        local_sha256=local_sha,
++        incoming_sha256=incoming_sha,
++    )
++
++
++def _source_id(files: dict[str, IncomingFile]) -> str:
++    h = sha256_hex(
++        "\n".join(
++            f"{path}\0{file.sha256}" for path, file in sorted(files.items())
++        ).encode()
++    )
++    return h
++
++
++def _syncable_files(files: dict[str, IncomingFile]) -> dict[str, IncomingFile]:
++    return {
++        path: file
++        for path, file in files.items()
++        if path not in _SYNC_EXCLUDED_PATHS
++    }
++
++
++def _resolve_kb_dir(source_path: Path) -> Path:
++    if (source_path / ".vouch").is_dir():
++        return source_path / ".vouch"
++    if source_path.name == ".vouch" and source_path.is_dir():
++        return source_path
++    raise RuntimeError(f"sync source is not a vouch KB or bundle: {source_path}")
++
++
++def _load_directory_source(source_path: Path) -> _SyncSource:
++    kb_dir = _resolve_kb_dir(source_path)
++    files: dict[str, IncomingFile] = {}
++    for rel, abs_path in bundle._iter_export_files(kb_dir):
++        path = rel.as_posix()
++        data = abs_path.read_bytes()
++        files[path] = IncomingFile(path=path, size=len(data), sha256=sha256_hex(data))
++    files = _syncable_files(files)
++    return _SyncSource(
++        source_type="kb",
++        source_id=_source_id(files),
++        display=str(source_path),
++        files=files,
++        root=kb_dir,
++    )
++
++
++def _load_bundle_source(source_path: Path) -> _SyncSource:
++    with tarfile.open(source_path, "r:gz") as tar:
++        try:
++            member = tar.getmember(bundle.MANIFEST_NAME)
++        except KeyError as exc:
++            raise RuntimeError("bundle missing manifest.json") from exc
++        manifest = json.loads(tar.extractfile(member).read().decode())  # type: ignore[union-attr]
++    files = {
++        f["path"]: IncomingFile(
++            path=f["path"],
++            size=int(f.get("size", 0)),
++            sha256=str(f.get("sha256", "")),
++        )
++        for f in manifest.get("files", [])
++    }
++    files = _syncable_files(files)
++    return _SyncSource(
++        source_type="bundle",
++        source_id=_source_id(files),
++        display=str(source_path),
++        files=files,
++        bundle_path=source_path,
++    )
++
++
++def _load_source(source_path: Path) -> _SyncSource:
++    source_path = source_path.resolve()
++    if source_path.is_dir():
++        return _load_directory_source(source_path)
++    if source_path.is_file():
++        return _load_bundle_source(source_path)
++    raise RuntimeError(f"sync source does not exist: {source_path}")
++
++
++def _read_source_file(src: _SyncSource, path: str) -> bytes:
++    if src.root is not None:
++        return (src.root / path).read_bytes()
++    if src.bundle_path is None:
++        raise RuntimeError("sync source has no readable backing store")
++    with tarfile.open(src.bundle_path, "r:gz") as tar:
++        return tar.extractfile(tar.getmember(path)).read()  # type: ignore[union-attr]
++
++
++def _validation_issues_for_source(src: _SyncSource) -> list[str]:
++    issues: list[str] = []
++    if src.bundle_path is not None:
++        check = bundle.export_check(src.bundle_path)
++        issues.extend(check.issues)
++    for path, incoming in sorted(src.files.items()):
++        reason = bundle._unsafe_name_reason(path)
++        if reason is not None:
++            issues.append(reason)
++            continue
++        try:
++            data = _read_source_file(src, path)
++        except Exception as exc:
++            issues.append(f"cannot read sync source member {path}: {exc}")
++            continue
++        if sha256_hex(data) != incoming.sha256:
++            issues.append(f"hash mismatch: {path}")
++            continue
++        bundle._validate_content(path, data, issues)
++    return issues
++
++
++def sync_check(kb_dir: Path, source_path: Path) -> SyncCheckResult:
++    """Compare another KB or bundle with ``kb_dir`` without writing."""
++    src = _load_source(source_path)
++    issues = _validation_issues_for_source(src)
++    new_files: list[str] = []
++    identical: list[str] = []
++    conflicts: list[SyncConflict] = []
++
++    for path, incoming in sorted(src.files.items()):
++        try:
++            dest = bundle._safe_member_path(kb_dir, path)
++        except RuntimeError as exc:
++            issues.append(str(exc))
++            continue
++        if not dest.exists():
++            new_files.append(path)
++            continue
++        local_sha = sha256_hex(dest.read_bytes())
++        if local_sha == incoming.sha256:
++            identical.append(path)
++        else:
++            conflicts.append(_conflict(path, local_sha, incoming.sha256))
++
++    semantic_conflicts = [
++        c for c in conflicts
++        if c.kind in {"claim", "page", "entity", "relation", "evidence", "session"}
++    ]
++    decided_conflicts = [c for c in conflicts if c.kind == "decided-proposal"]
++    return SyncCheckResult(
++        ok=not issues,
++        source_type=src.source_type,
++        source_id=src.source_id,
++        source=src.display,
++        new_files=new_files,
++        identical=identical,
++        conflicts=conflicts,
++        semantic_conflicts=semantic_conflicts,
++        decided_conflicts=decided_conflicts,
++        issues=issues,
++    )
++
++
++def _write_conflict_report(
++    kb_dir: Path,
++    check: SyncCheckResult,
++    *,
++    on_conflict: str,
++) -> str:
++    report_dir = kb_dir / "proposed" / "sync-reports"
++    report_dir.mkdir(parents=True, exist_ok=True)
++    report_path = report_dir / f"{check.source_id}.json"
++    report = asdict(check)
++    report["on_conflict"] = on_conflict
++    report_path.write_text(json.dumps(report, indent=2, sort_keys=True))
++    return str(report_path.relative_to(kb_dir))
++
++
++def sync_apply(
++    kb_dir: Path,
++    source_path: Path,
++    *,
++    on_conflict: str = "fail",
++    actor: str = "vouch-sync",
++) -> dict[str, Any]:
++    """Apply non-conflicting incoming files from another KB or bundle.
++
++    ``on_conflict`` may be:
++    - ``fail``: abort if any incoming path conflicts.
++    - ``skip``: import new files and leave conflicts untouched.
++    - ``propose``: import new files and write a local sync conflict report.
++    """
++    if on_conflict not in {"fail", "skip", "propose"}:
++        raise ValueError(f"on_conflict must be fail|skip|propose, got {on_conflict}")
++
++    src = _load_source(source_path)
++    check = sync_check(kb_dir, source_path)
++    if check.issues:
++        raise RuntimeError(f"refusing to sync: {check.issues[0]}")
++    if on_conflict == "fail" and check.conflicts:
++        raise RuntimeError(f"refusing to sync: {len(check.conflicts)} conflicts")
++
++    written: list[str] = []
++    skipped_conflicts: list[str] = []
++    for path, incoming in sorted(src.files.items()):
++        dest = bundle._safe_member_path(kb_dir, path)
++        if dest.exists():
++            local_sha = sha256_hex(dest.read_bytes())
++            if local_sha == incoming.sha256:
++                continue
++            if on_conflict == "fail":
++                raise RuntimeError(f"refusing to sync conflicting path: {path}")
++            skipped_conflicts.append(path)
++            continue
++
++        data = _read_source_file(src, path)
++        if sha256_hex(data) != incoming.sha256:
++            raise RuntimeError(f"refusing to sync: hash mismatch at write time: {path}")
++        val_issues: list[str] = []
++        bundle._validate_content(path, data, val_issues)
++        if val_issues:
++            raise RuntimeError(f"refusing to sync: {val_issues[0]}")
++        dest.parent.mkdir(parents=True, exist_ok=True)
++        dest.write_bytes(data)
++        written.append(path)
++
++    report_path = None
++    if on_conflict == "propose" and check.conflicts:
++        report_path = _write_conflict_report(
++            kb_dir, check, on_conflict=on_conflict,
++        )
++
++    result = {
++        "source_type": check.source_type,
++        "source_id": check.source_id,
++        "written": written,
++        "skipped_conflicts": skipped_conflicts,
++        "identical": check.identical,
++        "conflicts": [asdict(c) for c in check.conflicts],
++        "conflict_report": report_path,
++        "on_conflict": on_conflict,
++    }
++    audit.log_event(
++        kb_dir,
++        event="sync.apply",
++        actor=actor,
++        object_ids=[check.source_id],
++        data={
++            "source_type": check.source_type,
++            "written": len(written),
++            "skipped_conflicts": len(skipped_conflicts),
++            "on_conflict": on_conflict,
++            "conflict_report": report_path,
++        },
++    )
++    return result
+diff --git a/tests/test_sync.py b/tests/test_sync.py
+new file mode 100644
+index 0000000..28245cf
+--- /dev/null
++++ b/tests/test_sync.py
+@@ -0,0 +1,131 @@
++"""Deterministic sync / merge workflow."""
++
++from __future__ import annotations
++
++import json
++from pathlib import Path
++
++import pytest
++from click.testing import CliRunner
++
++from vouch import bundle, sync
++from vouch.cli import cli
++from vouch.models import Claim
++from vouch.storage import KBStore
++
++
++def _store(root: Path) -> KBStore:
++    return KBStore.init(root)
++
++
++def _claim(store: KBStore, claim_id: str, text: str) -> None:
++    src = store.put_source(b"shared evidence", title="evidence")
++    store.put_claim(Claim(id=claim_id, text=text, evidence=[src.id]))
++
++
++def test_sync_check_and_apply_from_kb_directory(tmp_path: Path) -> None:
++    incoming = _store(tmp_path / "incoming")
++    _claim(incoming, "c1", "alpha")
++    dest = _store(tmp_path / "dest")
++
++    report = sync.sync_check(dest.kb_dir, incoming.root)
++
++    assert report.ok
++    assert report.source_type == "kb"
++    assert "claims/c1.yaml" in report.new_files
++    assert not report.conflicts
++
++    result = sync.sync_apply(dest.kb_dir, incoming.root, actor="tester")
++
++    assert "claims/c1.yaml" in result["written"]
++    assert dest.get_claim("c1").text == "alpha"
++
++
++def test_sync_excludes_config_yaml(tmp_path: Path) -> None:
++    incoming = _store(tmp_path / "incoming")
++    incoming.config_path.write_text("version: 1\nsync: incoming\n")
++    _claim(incoming, "c1", "alpha")
++    dest = _store(tmp_path / "dest")
++    dest.config_path.write_text("version: 1\nsync: local\n")
++
++    report = sync.sync_check(dest.kb_dir, incoming.root)
++
++    assert "config.yaml" not in report.new_files
++    assert "config.yaml" not in report.identical
++    assert not any(c.path == "config.yaml" for c in report.conflicts)
++
++    sync.sync_apply(dest.kb_dir, incoming.root)
++    assert dest.config_path.read_text() == "version: 1\nsync: local\n"
++
++
++def test_sync_check_classifies_claim_conflicts(tmp_path: Path) -> None:
++    incoming = _store(tmp_path / "incoming")
++    _claim(incoming, "c1", "incoming text")
++    dest = _store(tmp_path / "dest")
++    _claim(dest, "c1", "local text")
++
++    report = sync.sync_check(dest.kb_dir, incoming.root)
++
++    assert report.ok
++    assert any(c.path == "claims/c1.yaml" for c in report.conflicts)
++    assert any(
++        c.kind == "claim" and c.artifact_id == "c1"
++        for c in report.semantic_conflicts
++    )
++
++
++def test_sync_apply_fails_on_conflicts_by_default(tmp_path: Path) -> None:
++    incoming = _store(tmp_path / "incoming")
++    _claim(incoming, "c1", "incoming text")
++    dest = _store(tmp_path / "dest")
++    _claim(dest, "c1", "local text")
++
++    with pytest.raises(RuntimeError, match="conflicts"):
++        sync.sync_apply(dest.kb_dir, incoming.root)
++
++    assert dest.get_claim("c1").text == "local text"
++
++
++def test_sync_apply_propose_writes_conflict_report(tmp_path: Path) -> None:
++    incoming = _store(tmp_path / "incoming")
++    _claim(incoming, "c1", "incoming text")
++    dest = _store(tmp_path / "dest")
++    _claim(dest, "c1", "local text")
++
++    result = sync.sync_apply(dest.kb_dir, incoming.root, on_conflict="propose")
++
++    assert dest.get_claim("c1").text == "local text"
++    assert "claims/c1.yaml" in result["skipped_conflicts"]
++    report_path = dest.kb_dir / result["conflict_report"]
++    report = json.loads(report_path.read_text())
++    assert any(c["path"] == "claims/c1.yaml" for c in report["conflicts"])
++
++
++def test_sync_check_accepts_bundle_source(tmp_path: Path) -> None:
++    incoming = _store(tmp_path / "incoming")
++    _claim(incoming, "c1", "alpha")
++    bundle_path = tmp_path / "incoming.tar.gz"
++    bundle.export(incoming.kb_dir, dest=bundle_path)
++    dest = _store(tmp_path / "dest")
++
++    report = sync.sync_check(dest.kb_dir, bundle_path)
++
++    assert report.ok
++    assert report.source_type == "bundle"
++    assert "claims/c1.yaml" in report.new_files
++
++
++def test_sync_check_cli_outputs_report(
++    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
++) -> None:
++    incoming = _store(tmp_path / "incoming")
++    _claim(incoming, "c1", "alpha")
++    dest = _store(tmp_path / "dest")
++    monkeypatch.chdir(dest.root)
++
++    result = CliRunner().invoke(cli, ["sync-check", str(incoming.root)])
++
++    assert result.exit_code == 0, result.output
++    payload = json.loads(result.output)
++    assert payload["source_type"] == "kb"
++    assert "claims/c1.yaml" in payload["new_files"]

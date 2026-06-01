@@ -1,0 +1,269 @@
+diff --git a/CHANGELOG.md b/CHANGELOG.md
+index 1dd0a57..ae389c7 100644
+--- a/CHANGELOG.md
++++ b/CHANGELOG.md
+@@ -10,6 +10,8 @@ All notable changes to vouch are documented here. Format follows
+ - `vouch diff <id-old> <id-new>` shows what changed between two claim revisions or two page revisions — field-level changes plus a line-diff of the long text/body. Auto-detects the artifact kind and hides always-churning metadata. Read-only; supports `--json`.
+ - Seed a cited starter source and claim during `vouch init`, print first-run
+   next steps, and document a 30-second onboarding tour (#54).
++- Add `vouch review`, a guided CLI queue for approving, rejecting, skipping,
++  or dry-running pending proposals without bypassing the review gate.
+ 
+ ### Fixed
+ - Add `put_relation_idempotent()` to `KBStore` and use it in `supersede()` and `contradict()` so retrying after a partial failure converges to a consistent state instead of raising `ValueError`.
+diff --git a/README.md b/README.md
+index 7df46d1..6397afd 100644
+--- a/README.md
++++ b/README.md
+@@ -142,6 +142,7 @@ vouch lint [--stale-days N]                 # user-actionable problems
+ vouch doctor                                # full sweep incl. source verification
+ 
+ vouch pending                               # list pending proposals
++vouch review [--limit N] [--type KIND]      # guided proposal review queue
+ vouch show <proposal-id>
+ vouch approve <proposal-id> [--reason ...]
+ vouch reject <proposal-id> --reason "..."
+diff --git a/src/vouch/cli.py b/src/vouch/cli.py
+index 7e7a6b4..27d1eb9 100644
+--- a/src/vouch/cli.py
++++ b/src/vouch/cli.py
+@@ -26,7 +26,7 @@
+ from .capabilities import capabilities as build_caps
+ from .context import build_context_pack
+ from .lifecycle import LifecycleError
+-from .models import ProposalStatus
++from .models import Proposal, ProposalKind, ProposalStatus
+ from .onboarding import seed_starter_kb
+ from .proposals import (
+     ProposalError,
+@@ -207,6 +207,104 @@ def pending() -> None:
+         click.echo(f"    {str(preview).strip()[:120]}")
+ 
+ 
++def _proposal_preview(pr: Proposal) -> str:
++    preview = (
++        pr.payload.get("text")
++        or pr.payload.get("title")
++        or pr.payload.get("name")
++        or pr.payload.get("id")
++        or "-"
++    )
++    return str(preview).strip()
++
++
++def _show_review_proposal(pr: Proposal, index: int, total: int) -> None:
++    click.echo(f"\n[{index}/{total}] {pr.id}  [{pr.kind.value}]  by {pr.proposed_by}")
++    click.echo(_proposal_preview(pr))
++    if pr.rationale:
++        click.echo(f"rationale: {pr.rationale}")
++    click.echo()
++    click.echo(yaml.safe_dump(pr.model_dump(mode="json"), sort_keys=False).rstrip())
++
++
++@cli.command()
++@click.option(
++    "--limit",
++    type=click.IntRange(min=1),
++    default=None,
++    help="Review at most N proposals.",
++)
++@click.option(
++    "--type",
++    "kind",
++    type=click.Choice([k.value for k in ProposalKind]),
++    default=None,
++    help="Only review proposals of this kind.",
++)
++@click.option("--dry-run", is_flag=True, help="Show decisions without mutating proposals.")
++def review(limit: int | None, kind: str | None, dry_run: bool) -> None:
++    """Walk pending proposals one at a time for approval or rejection."""
++    store = _load_store()
++    proposals = store.list_proposals(ProposalStatus.PENDING)
++    if kind is not None:
++        proposals = [pr for pr in proposals if pr.kind.value == kind]
++    if limit is not None:
++        proposals = proposals[:limit]
++    if not proposals:
++        click.echo("no pending proposals")
++        return
++
++    decided = 0
++    skipped = 0
++    actor = _whoami()
++    total = len(proposals)
++    for index, pr in enumerate(proposals, start=1):
++        _show_review_proposal(pr, index, total)
++        action = click.prompt(
++            "Action [a=approve, r=reject, s=skip, q=quit]",
++            type=click.Choice(["a", "r", "s", "q"], case_sensitive=False),
++            default="s",
++            show_choices=False,
++        ).lower()
++        if action == "q":
++            click.echo("Stopped review")
++            break
++        if action == "s":
++            click.echo(f"Skipped {pr.id}")
++            skipped += 1
++            continue
++        if action == "r":
++            reason = click.prompt("Rejection reason").strip()
++            with _cli_errors():
++                if not reason:
++                    raise ProposalError("rejection must include a reason (future agent context)")
++                if not dry_run:
++                    do_reject(store, pr.id, rejected_by=actor, reason=reason)
++            if dry_run:
++                click.echo(f"Would reject {pr.id}")
++            else:
++                click.echo(f"Rejected {pr.id}")
++            decided += 1
++            continue
++
++        reason = (
++            click.prompt("Approval reason", default="", show_default=False).strip()
++            or None
++        )
++        if dry_run:
++            click.echo(f"Would approve {pr.id}")
++        else:
++            with _cli_errors():
++                artifact = do_approve(store, pr.id, approved_by=actor, reason=reason)
++            click.echo(f"Approved -> {type(artifact).__name__.lower()}/{artifact.id}")
++        decided += 1
++
++    if dry_run:
++        click.echo(f"Review complete: {decided} selected, {skipped} skipped, no changes made")
++    else:
++        click.echo(f"Review complete: {decided} decided, {skipped} skipped")
++
++
+ @cli.command()
+ @click.argument("proposal_id")
+ def show(proposal_id: str) -> None:
+diff --git a/tests/test_cli.py b/tests/test_cli.py
+index ac904c7..c4c1723 100644
+--- a/tests/test_cli.py
++++ b/tests/test_cli.py
+@@ -18,6 +18,7 @@
+ 
+ from vouch import sessions as sess_mod
+ from vouch.cli import cli
++from vouch.models import ProposalStatus
+ from vouch.proposals import propose_claim
+ from vouch.storage import KBStore
+ 
+@@ -82,6 +83,113 @@ def test_show_missing_proposal_shows_clean_error(store: KBStore) -> None:
+     _assert_clean_error(result, "proposal no-such-proposal")
+ 
+ 
++def test_review_approves_pending_proposal(
++    store: KBStore, monkeypatch: pytest.MonkeyPatch
++) -> None:
++    monkeypatch.delenv("VOUCH_AGENT", raising=False)
++    monkeypatch.setenv("VOUCH_USER", "reviewer")
++    src = store.put_source(b"e")
++    pr = propose_claim(
++        store,
++        text="review can approve",
++        evidence=[src.id],
++        proposed_by="agent",
++    )
++
++    result = CliRunner().invoke(cli, ["review"], input="a\n\n")
++
++    assert result.exit_code == 0, result.output
++    assert "Approved -> claim/review-can-approve" in result.output
++    assert store.get_claim("review-can-approve").text == "review can approve"
++    assert store.get_proposal(pr.id).status == ProposalStatus.APPROVED
++
++
++def test_review_rejects_with_reason(
++    store: KBStore, monkeypatch: pytest.MonkeyPatch
++) -> None:
++    monkeypatch.delenv("VOUCH_AGENT", raising=False)
++    monkeypatch.setenv("VOUCH_USER", "reviewer")
++    src = store.put_source(b"e")
++    pr = propose_claim(
++        store,
++        text="review can reject",
++        evidence=[src.id],
++        proposed_by="agent",
++    )
++
++    result = CliRunner().invoke(cli, ["review"], input="r\nnot true\n")
++
++    assert result.exit_code == 0, result.output
++    assert f"Rejected {pr.id}" in result.output
++    decided = store.get_proposal(pr.id)
++    assert decided.status == ProposalStatus.REJECTED
++    assert decided.decision_reason == "not true"
++
++
++def test_review_skip_and_quit_leave_proposals_pending(store: KBStore) -> None:
++    src = store.put_source(b"e")
++    first = propose_claim(
++        store,
++        text="review can skip",
++        evidence=[src.id],
++        proposed_by="agent",
++    )
++    second = propose_claim(
++        store,
++        text="review can quit",
++        evidence=[src.id],
++        proposed_by="agent",
++    )
++
++    result = CliRunner().invoke(cli, ["review"], input="s\nq\n")
++
++    assert result.exit_code == 0, result.output
++    assert "Skipped " in result.output
++    assert "Stopped review" in result.output
++    assert store.get_proposal(first.id).status == ProposalStatus.PENDING
++    assert store.get_proposal(second.id).status == ProposalStatus.PENDING
++
++
++def test_review_dry_run_does_not_mutate(
++    store: KBStore, monkeypatch: pytest.MonkeyPatch
++) -> None:
++    monkeypatch.delenv("VOUCH_AGENT", raising=False)
++    monkeypatch.setenv("VOUCH_USER", "reviewer")
++    src = store.put_source(b"e")
++    pr = propose_claim(
++        store,
++        text="review dry run",
++        evidence=[src.id],
++        proposed_by="agent",
++    )
++
++    result = CliRunner().invoke(cli, ["review", "--dry-run"], input="a\n\n")
++
++    assert result.exit_code == 0, result.output
++    assert f"Would approve {pr.id}" in result.output
++    assert store.get_proposal(pr.id).status == ProposalStatus.PENDING
++    with pytest.raises(KeyError):
++        store.get_claim("review-dry-run")
++
++
++def test_review_dry_run_reject_does_not_mutate(store: KBStore) -> None:
++    src = store.put_source(b"e")
++    pr = propose_claim(
++        store,
++        text="review dry run reject",
++        evidence=[src.id],
++        proposed_by="agent",
++    )
++
++    result = CliRunner().invoke(cli, ["review", "--dry-run"], input="r\nnot true\n")
++
++    assert result.exit_code == 0, result.output
++    assert f"Would reject {pr.id}" in result.output
++    pending = store.get_proposal(pr.id)
++    assert pending.status == ProposalStatus.PENDING
++    assert pending.decision_reason is None
++
++
+ def test_search_fts5_backend_label(
+     store: KBStore, monkeypatch: pytest.MonkeyPatch
+ ) -> None:

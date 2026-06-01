@@ -1,0 +1,1074 @@
+diff --git a/app/src/main/java/dev/touchpilot/app/MainActivity.kt b/app/src/main/java/dev/touchpilot/app/MainActivity.kt
+index a14e5ee..83c44ab 100644
+--- a/app/src/main/java/dev/touchpilot/app/MainActivity.kt
++++ b/app/src/main/java/dev/touchpilot/app/MainActivity.kt
+@@ -27,6 +27,11 @@ import com.google.android.material.button.MaterialButton
+ import com.google.android.material.card.MaterialCardView
+ import com.google.android.material.tabs.TabLayout
+ import dev.touchpilot.app.agent.AgentProviderMode
++import dev.touchpilot.app.agent.AgentRunDetailFormatter
++import dev.touchpilot.app.agent.AgentRunDisplayStep
++import dev.touchpilot.app.agent.AgentRunIds
++import dev.touchpilot.app.agent.AgentRunRecord
++import dev.touchpilot.app.agent.AgentRunStepStatus
+ import dev.touchpilot.app.agent.ConversationalGate
+ import dev.touchpilot.app.agent.DefaultLocalReasoningCore
+ import dev.touchpilot.app.agent.LocalReasoningContext
+@@ -77,6 +82,8 @@ class MainActivity : Activity() {
+     private var lastFocusInputArgs: Map<String, String>? = null
+     private var focusSelectorIndex: Int = 0
+     private val conversation = mutableListOf<ChatEvent>()
++    private val agentRunHistory = mutableListOf<AgentRunRecord>()
++    private var activeRunDetailId: String? = null
+ 
+     override fun onCreate(savedInstanceState: Bundle?) {
+         super.onCreate(savedInstanceState)
+@@ -242,6 +249,9 @@ class MainActivity : Activity() {
+     }
+ 
+     private fun showSection(section: Section) {
++        if (section != Section.CHAT && section != Section.LOGS) {
++            activeRunDetailId = null
++        }
+         activeSection = section
+         updateBottomNav()
+         chatInputBar.visibility = if (section == Section.CHAT) View.VISIBLE else View.GONE
+@@ -381,6 +391,11 @@ class MainActivity : Activity() {
+     }
+ 
+     private fun renderChatScreen() {
++        if (activeRunDetailId != null) {
++            renderAgentRunDetailScreen()
++            return
++        }
++
+         contentRoot.addView(sectionTitle("Chat"))
+         contentRoot.addView(statusPill())
+         contentRoot.addView(skillPill())
+@@ -410,7 +425,12 @@ class MainActivity : Activity() {
+         return when (event) {
+             is ChatEvent.User -> userBubble(event.text)
+             is ChatEvent.Agent -> agentBubble(event.text, event.detail)
+-            is ChatEvent.Timeline -> timelineCard(event.title, event.body)
++            is ChatEvent.Timeline -> timelineCard(
++                title = event.title,
++                body = event.body,
++                actionHint = event.runId?.let { "Tap for run details" },
++                onClick = event.runId?.let { runId -> { openRunDetail(runId) } }
++            )
+             is ChatEvent.ApprovalPrompt -> approvalCard(event)
+         }
+     }
+@@ -500,16 +520,42 @@ class MainActivity : Activity() {
+         conversation += ChatEvent.Agent("Working on it.", "Runtime: ${currentProviderMode().label()}")
+         showSection(Section.CHAT)
+ 
++        val runId = AgentRunIds.next()
++        val startedAtMillis = System.currentTimeMillis()
++
+         Thread {
+-            val transcript = runCatching {
+-                reasoningCore.run(task).transcript
+-            }.getOrElse { error ->
+-                "Agent failed: ${error.message}"
++            val runOutcome = runCatching { reasoningCore.run(task) }
++            val completedAtMillis = System.currentTimeMillis()
++            val record = if (runOutcome.isSuccess) {
++                AgentRunRecord(
++                    id = runId,
++                    task = task,
++                    startedAtMillis = startedAtMillis,
++                    completedAtMillis = completedAtMillis,
++                    result = runOutcome.getOrThrow()
++                )
++            } else {
++                AgentRunRecord(
++                    id = runId,
++                    task = task,
++                    startedAtMillis = startedAtMillis,
++                    completedAtMillis = completedAtMillis,
++                    result = null,
++                    errorMessage = runOutcome.exceptionOrNull()?.message ?: "Unknown agent error"
++                )
+             }
+ 
+             runOnUiThread {
+-                conversation += ChatEvent.Timeline("Action timeline", transcript.trim())
+-                conversation += ChatEvent.Agent("Done.", "Review the timeline for tool calls and results.")
++                agentRunHistory += record
++                conversation += ChatEvent.Timeline(
++                    title = "Action timeline",
++                    body = AgentRunDetailFormatter.compactSummary(record),
++                    runId = runId
++                )
++                conversation += ChatEvent.Agent(
++                    "Done.",
++                    "Tap the timeline card to inspect tool calls, verification, and stop reason."
++                )
+                 refreshExecutionLog()
+                 refreshStatus()
+                 showSection(Section.CHAT)
+@@ -958,6 +1004,11 @@ class MainActivity : Activity() {
+     }
+ 
+     private fun renderLogsScreen() {
++        if (activeRunDetailId != null) {
++            renderAgentRunDetailScreen()
++            return
++        }
++
+         contentRoot.addView(sectionTitle("Logs"))
+         contentRoot.addView(
+             primaryButton("Export Debug Trace") {
+@@ -966,6 +1017,7 @@ class MainActivity : Activity() {
+                 showSection(Section.LOGS)
+             }.apply { id = R.id.export_debug_trace_button }
+         )
++        renderRecentAgentRuns()
+         contentRoot.addView(timelineCard("Latest result", outputText))
+         executionLogView = TextView(this).apply {
+             id = R.id.execution_log_view
+@@ -1439,13 +1491,23 @@ class MainActivity : Activity() {
+         return withoutScheme.substringBefore('/').ifBlank { trimmed }
+     }
+ 
+-    private fun timelineCard(title: String, body: String): View {
++    private fun timelineCard(
++        title: String,
++        body: String,
++        actionHint: String? = null,
++        onClick: (() -> Unit)? = null
++    ): View {
+         val card = MaterialCardView(this).apply {
+             setCardBackgroundColor(Theme.Card)
+-            strokeColor = Theme.StrokeDark
+-            strokeWidth = 1
++            strokeColor = if (onClick != null) Theme.Accent else Theme.StrokeDark
++            strokeWidth = if (onClick != null) 2 else 1
+             radius = 8f
+             cardElevation = 0f
++            if (onClick != null) {
++                isClickable = true
++                isFocusable = true
++                setOnClickListener { onClick() }
++            }
+         }
+         val content = LinearLayout(this).apply {
+             orientation = LinearLayout.VERTICAL
+@@ -1467,6 +1529,16 @@ class MainActivity : Activity() {
+                 setPadding(0, 8, 0, 0)
+             }
+         )
++        if (actionHint != null) {
++            content.addView(
++                TextView(this).apply {
++                    text = actionHint
++                    textSize = 11.5f
++                    setTextColor(Theme.Accent)
++                    setPadding(0, 8, 0, 0)
++                }
++            )
++        }
+         card.addView(content)
+         return card.withMargins(top = 8, bottom = 8)
+     }
+@@ -1598,6 +1670,213 @@ class MainActivity : Activity() {
+         """.trimIndent()
+     }
+ 
++    private fun openRunDetail(runId: String) {
++        activeRunDetailId = runId
++        showSection(activeSection)
++    }
++
++    private fun closeRunDetail() {
++        activeRunDetailId = null
++        showSection(activeSection)
++    }
++
++    private fun findAgentRun(runId: String): AgentRunRecord? {
++        return agentRunHistory.lastOrNull { it.id == runId }
++    }
++
++    private fun renderRecentAgentRuns() {
++        contentRoot.addView(
++            TextView(this).apply {
++                text = "Recent agent runs"
++                textSize = 13f
++                typeface = Typeface.DEFAULT_BOLD
++                setTextColor(Color.WHITE)
++                setPadding(0, 12, 0, 4)
++            }
++        )
++        if (agentRunHistory.isEmpty()) {
++            contentRoot.addView(
++                timelineCard(
++                    title = "No agent runs yet",
++                    body = "Run a task from Chat to inspect structured run details here."
++                )
++            )
++            return
++        }
++
++        agentRunHistory.asReversed().forEach { record ->
++            contentRoot.addView(
++                timelineCard(
++                    title = record.task,
++                    body = AgentRunDetailFormatter.compactSummary(record),
++                    actionHint = "Tap for run details",
++                    onClick = { openRunDetail(record.id) }
++                )
++            )
++        }
++    }
++
++    private fun renderAgentRunDetailScreen() {
++        val runId = activeRunDetailId
++        contentRoot.addView(sectionTitle("Run details"))
++        contentRoot.addView(
++            secondaryButton("Go Back") {
++                closeRunDetail()
++            }.apply {
++                id = R.id.run_detail_back_button
++                minHeight = 46
++            }.withMargins(bottom = 12)
++        )
++
++        val record = runId?.let(::findAgentRun)
++        if (record == null) {
++            contentRoot.addView(
++                timelineCard(
++                    title = "Run unavailable",
++                    body = "This run is no longer available. It may have been cleared when the app restarted."
++                )
++            )
++            return
++        }
++
++        contentRoot.addView(
++            summaryCard(
++                title = "Task",
++                value = SensitiveTextRedactor.redact(record.task),
++                chipText = record.id,
++                chipAccent = true
++            )
++        )
++        contentRoot.addView(
++            timelineCard(
++                title = "Timing",
++                body = buildString {
++                    append("Started: ${AgentRunDetailFormatter.formatTimestamp(record.startedAtMillis)}")
++                    appendLine()
++                    append("Completed: ${AgentRunDetailFormatter.formatTimestamp(record.completedAtMillis)}")
++                }
++            )
++        )
++        contentRoot.addView(
++            timelineCard(
++                title = "Stop reason",
++                body = AgentRunDetailFormatter.deriveStopReason(record)
++            )
++        )
++        contentRoot.addView(
++            primaryButton("Export Run Trace") {
++                val file = exportRunTrace(record)
++                outputText = "Run trace exported: ${file.absolutePath}"
++                showSection(activeSection)
++            }.apply { id = R.id.export_run_trace_button }
++        )
++
++        val steps = AgentRunDetailFormatter.formatSteps(record)
++        contentRoot.addView(
++            TextView(this).apply {
++                text = if (steps.isEmpty()) "Steps" else "Steps (${steps.size})"
++                textSize = 13f
++                typeface = Typeface.DEFAULT_BOLD
++                setTextColor(Color.WHITE)
++                setPadding(0, 12, 0, 4)
++            }
++        )
++        if (steps.isEmpty()) {
++            contentRoot.addView(
++                timelineCard(
++                    title = "No step data",
++                    body = record.errorMessage?.let { error ->
++                        "Run failed before structured events were recorded: ${SensitiveTextRedactor.redact(error)}"
++                    } ?: "Structured run events are unavailable for this run."
++                )
++            )
++            return
++        }
++
++        steps.forEach { step ->
++            contentRoot.addView(runDetailStepCard(step))
++        }
++    }
++
++    private fun runDetailStepCard(step: AgentRunDisplayStep): View {
++        val card = MaterialCardView(this).apply {
++            setCardBackgroundColor(Theme.Card)
++            strokeColor = stepStatusColor(step.status)
++            strokeWidth = 2
++            radius = 8f
++            cardElevation = 0f
++        }
++        val content = LinearLayout(this).apply {
++            orientation = LinearLayout.VERTICAL
++            setPadding(18, 14, 18, 14)
++        }
++        val header = LinearLayout(this).apply {
++            orientation = LinearLayout.HORIZONTAL
++            gravity = Gravity.CENTER_VERTICAL
++        }
++        header.addView(
++            TextView(this).apply {
++                text = "Step ${step.index}"
++                textSize = 12f
++                typeface = Typeface.DEFAULT_BOLD
++                setTextColor(Color.WHITE)
++            },
++            LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f)
++        )
++        header.addView(statusChip(step.status.label, accent = step.status != AgentRunStepStatus.INFO))
++        content.addView(header)
++        content.addView(
++            TextView(this).apply {
++                text = step.title
++                textSize = 13f
++                typeface = Typeface.DEFAULT_BOLD
++                setTextColor(Color.WHITE)
++                setPadding(0, 8, 0, 0)
++            }
++        )
++        content.addView(
++            TextView(this).apply {
++                text = AgentRunDetailFormatter.formatTimestamp(step.timestampMillis)
++                textSize = 11f
++                setTextColor(Theme.MutedText)
++                setPadding(0, 4, 0, 0)
++            }
++        )
++        content.addView(
++            TextView(this).apply {
++                text = step.detail
++                textSize = 12.5f
++                setTextColor(Theme.BodyText)
++                setPadding(0, 8, 0, 0)
++            }
++        )
++        card.addView(content)
++        return card.withMargins(top = 6, bottom = 6)
++    }
++
++    private fun stepStatusColor(status: AgentRunStepStatus): Int {
++        return when (status) {
++            AgentRunStepStatus.SUCCESS,
++            AgentRunStepStatus.COMPLETE -> Theme.Accent
++            AgentRunStepStatus.FAILED,
++            AgentRunStepStatus.BLOCKED -> Theme.StrokeDark
++            AgentRunStepStatus.RUNNING,
++            AgentRunStepStatus.WAITING,
++            AgentRunStepStatus.PENDING -> Color.rgb(255, 196, 86)
++            AgentRunStepStatus.INFO -> Theme.StrokeDark
++        }
++    }
++
++    private fun exportRunTrace(record: AgentRunRecord): File {
++        val directory = File(getExternalFilesDir(null), "debug-traces").apply {
++            mkdirs()
++        }
++        val timestamp = SimpleDateFormat("yyyyMMdd-HHmmss", Locale.US).format(Date())
++        val file = File(directory, "touchpilot-run-${record.id}-$timestamp.txt")
++        file.writeText(AgentRunDetailFormatter.exportRedactedTrace(record))
++        return file
++    }
++
+     private fun exportDebugTrace(): File {
+         val directory = File(getExternalFilesDir(null), "debug-traces").apply {
+             mkdirs()
+@@ -1624,7 +1903,7 @@ class MainActivity : Activity() {
+     private sealed class ChatEvent {
+         data class User(val text: String) : ChatEvent()
+         data class Agent(val text: String, val detail: String) : ChatEvent()
+-        data class Timeline(val title: String, val body: String) : ChatEvent()
++        data class Timeline(val title: String, val body: String, val runId: String? = null) : ChatEvent()
+         class ApprovalPrompt(
+             val request: ToolApprovalRequest,
+             val onDecision: (Boolean) -> Unit
+diff --git a/app/src/main/java/dev/touchpilot/app/agent/AgentRunDetailFormatter.kt b/app/src/main/java/dev/touchpilot/app/agent/AgentRunDetailFormatter.kt
+new file mode 100644
+index 0000000..01bd26b
+--- /dev/null
++++ b/app/src/main/java/dev/touchpilot/app/agent/AgentRunDetailFormatter.kt
+@@ -0,0 +1,413 @@
++package dev.touchpilot.app.agent
++
++import dev.touchpilot.app.security.SensitiveTextRedactor
++import org.json.JSONObject
++import java.text.SimpleDateFormat
++import java.util.Date
++import java.util.Locale
++
++enum class AgentRunStepStatus(val label: String) {
++    INFO("info"),
++    PENDING("pending"),
++    RUNNING("running"),
++    SUCCESS("success"),
++    FAILED("failed"),
++    WAITING("waiting"),
++    BLOCKED("blocked"),
++    COMPLETE("complete")
++}
++
++data class AgentRunDisplayStep(
++    val index: Int,
++    val status: AgentRunStepStatus,
++    val title: String,
++    val detail: String,
++    val timestampMillis: Long
++)
++
++object AgentRunDetailFormatter {
++    private val timestampFormat = SimpleDateFormat("HH:mm:ss.SSS", Locale.US)
++
++    fun compactSummary(record: AgentRunRecord): String {
++        if (record.errorMessage != null) {
++            return "Run failed: ${SensitiveTextRedactor.redact(record.errorMessage)}"
++        }
++        val result = record.result
++        if (result == null) {
++            return "Run data unavailable."
++        }
++        val stopReason = deriveStopReason(record)
++        return if (result.steps.isNotEmpty()) {
++            val toolResults = result.steps.count {
++                it.type == AgentStepType.ACT && it.toolCall?.result != null
++            }
++            buildString {
++                append("${result.steps.size} step(s)")
++                if (toolResults > 0) append(" · $toolResults tool result(s)")
++                appendLine()
++                append("Stop: $stopReason")
++                appendLine()
++                append("Tap to inspect full run details.")
++            }
++        } else {
++            val toolCount = result.events.count {
++                it.type == AgentEventType.TOOL_SUCCEEDED || it.type == AgentEventType.TOOL_FAILED
++            }
++            buildString {
++                append("${result.events.size} event(s)")
++                if (toolCount > 0) append(" · $toolCount tool result(s)")
++                appendLine()
++                append("Stop: $stopReason")
++                appendLine()
++                append("Tap to inspect full run details.")
++            }
++        }
++    }
++
++    fun deriveStopReason(record: AgentRunRecord): String {
++        record.errorMessage?.let { error ->
++            return "Error: ${SensitiveTextRedactor.redact(error)}"
++        }
++        val result = record.result ?: return "Run data unavailable"
++        deriveStopReasonFromResult(result)?.let { return it }
++        return deriveStopReasonFromEvents(result)
++    }
++
++    fun formatSteps(record: AgentRunRecord): List<AgentRunDisplayStep> {
++        val result = record.result ?: return emptyList()
++        if (result.steps.isNotEmpty()) {
++            return formatStepsFromStructured(result.steps)
++        }
++        return formatStepsFromEvents(result.events)
++    }
++
++    fun formatTimestamp(timestampMillis: Long): String {
++        return timestampFormat.format(Date(timestampMillis))
++    }
++
++    fun exportRedactedTrace(record: AgentRunRecord): String {
++        return buildString {
++            appendLine("TouchPilot agent run trace")
++            appendLine("run_id=${record.id}")
++            appendLine("task=${SensitiveTextRedactor.redact(record.task)}")
++            appendLine("started_at=${formatTimestamp(record.startedAtMillis)}")
++            appendLine("completed_at=${formatTimestamp(record.completedAtMillis)}")
++            appendLine("derived_stop_reason=${deriveStopReason(record)}")
++            appendLine()
++            record.errorMessage?.let { error ->
++                appendLine("error=${SensitiveTextRedactor.redact(error)}")
++                appendLine()
++            }
++            val result = record.result
++            if (result == null) {
++                appendLine("No run result recorded.")
++                return@buildString
++            }
++            appendLine("canonical_stop_reason=${result.stopReason?.wireName ?: "none"}")
++            appendLine(
++                "canonical_stop_message=${
++                    SensitiveTextRedactor.redact(
++                        result.stopMessage.ifBlank {
++                            result.stopReason?.userMessage.orEmpty()
++                        }
++                    )
++                }"
++            )
++            appendLine()
++            if (result.steps.isEmpty()) {
++                appendLine("steps: none")
++            } else {
++                appendLine("steps:")
++                result.steps.forEach { step ->
++                    appendLine(step.toJson(redactSensitive = true).toString())
++                }
++            }
++            appendLine()
++            if (result.events.isEmpty()) {
++                appendLine("events: none")
++            } else {
++                appendLine("events:")
++                result.events.forEach { event ->
++                    appendLine(event.toJson(redactSensitive = true).toString())
++                }
++            }
++        }
++    }
++
++    private fun deriveStopReasonFromResult(result: AgentRunResult): String? {
++        val reason = result.stopReason ?: return null
++        val message = result.stopMessage.ifBlank { reason.userMessage }
++        return SensitiveTextRedactor.redact(message)
++    }
++
++    private fun deriveStopReasonFromEvents(result: AgentRunResult): String {
++        val events = result.events
++        if (events.isEmpty()) return "No run data recorded"
++
++        result.finalAnswer?.let { answer ->
++            return "Completed: ${SensitiveTextRedactor.redact(answer)}"
++        }
++        return when (val last = events.last()) {
++            is AgentEvent.PolicyBlocked -> "Blocked: ${SensitiveTextRedactor.redact(last.reason)}"
++            is AgentEvent.ToolFailed -> "Tool failed: ${SensitiveTextRedactor.redact(last.message)}"
++            is AgentEvent.AssistantMessage -> "Awaiting clarification"
++            is AgentEvent.FinalAnswer -> "Completed: ${SensitiveTextRedactor.redact(last.text)}"
++            else -> "Run ended without final answer"
++        }
++    }
++
++    private fun formatStepsFromStructured(steps: List<AgentStep>): List<AgentRunDisplayStep> {
++        return steps.map { step ->
++            AgentRunDisplayStep(
++                index = step.sequenceNumber,
++                status = statusFor(step),
++                title = titleFor(step),
++                detail = detailFor(step),
++                timestampMillis = step.startedAtMillis
++            )
++        }
++    }
++
++    private fun formatStepsFromEvents(events: List<AgentEvent>): List<AgentRunDisplayStep> {
++        if (events.isEmpty()) return emptyList()
++        return events.mapIndexed { index, event ->
++            AgentRunDisplayStep(
++                index = index + 1,
++                status = statusFor(event),
++                title = titleFor(event),
++                detail = detailFor(event),
++                timestampMillis = event.timestampMillis
++            )
++        }
++    }
++
++    private fun statusFor(step: AgentStep): AgentRunStepStatus {
++        return when (step.status) {
++            AgentStepStatus.PENDING -> AgentRunStepStatus.PENDING
++            AgentStepStatus.RUNNING -> AgentRunStepStatus.RUNNING
++            AgentStepStatus.OK -> when (step.type) {
++                AgentStepType.STOP -> AgentRunStepStatus.COMPLETE
++                else -> AgentRunStepStatus.SUCCESS
++            }
++            AgentStepStatus.FAILED -> AgentRunStepStatus.FAILED
++            AgentStepStatus.BLOCKED -> AgentRunStepStatus.BLOCKED
++            AgentStepStatus.CLARIFIED -> AgentRunStepStatus.WAITING
++            AgentStepStatus.STOPPED -> AgentRunStepStatus.COMPLETE
++        }
++    }
++
++    private fun titleFor(step: AgentStep): String {
++        return when (step.type) {
++            AgentStepType.OBSERVE -> "Observe"
++            AgentStepType.DECIDE -> "Decide"
++            AgentStepType.ACT -> "Act: ${step.toolCall?.tool.orEmpty()}"
++            AgentStepType.VERIFY -> "Verify"
++            AgentStepType.CLARIFY -> "Clarify"
++            AgentStepType.STOP -> "Stop: ${step.stopReason?.wireName ?: "ended"}"
++        }
++    }
++
++    private fun detailFor(step: AgentStep): String {
++        return buildString {
++            if (step.inputSummary.isNotBlank()) {
++                appendLine("input: ${step.inputSummary}")
++            }
++            if (step.outputSummary.isNotBlank()) {
++                appendLine("output: ${step.outputSummary}")
++            }
++            step.toolCall?.let { call ->
++                appendLine("tool: ${call.tool}")
++                appendLine("source: ${call.source}")
++                if (call.args.isNotEmpty()) {
++                    append("args:")
++                    appendLine(formatStringMap(call.args))
++                }
++                call.result?.let { result ->
++                    appendLine("result: ${if (result.ok) "ok" else "failed"}")
++                    appendLine("message: ${result.message}")
++                    if (result.data.isNotEmpty()) {
++                        append("data:")
++                        appendLine(formatStringMap(result.data))
++                    }
++                }
++            }
++            step.verification?.let { verification ->
++                appendLine("verification: ${verification.status}")
++                appendLine("verification reason: ${verification.reason}")
++                if (verification.data.isNotEmpty()) {
++                    append("verification data:")
++                    appendLine(formatStringMap(verification.data))
++                }
++            }
++            step.clarification?.let { clarification ->
++                appendLine("clarification: ${clarification.reason.wireName}")
++                appendLine("question: ${clarification.question}")
++                if (clarification.detail.isNotBlank()) {
++                    appendLine("detail: ${clarification.detail}")
++                }
++                if (clarification.candidateLabels.isNotEmpty()) {
++                    appendLine("candidates: ${clarification.candidateLabels.joinToString(", ")}")
++                }
++            }
++            step.stopReason?.let { reason ->
++                appendLine("stop: ${reason.wireName}")
++            }
++            step.durationMillis?.let { duration ->
++                appendLine("duration: ${duration}ms")
++            }
++        }.trimEnd()
++    }
++
++    private fun statusFor(event: AgentEvent): AgentRunStepStatus {
++        return when (event) {
++            is AgentEvent.UserMessage -> AgentRunStepStatus.INFO
++            is AgentEvent.AssistantMessage -> AgentRunStepStatus.INFO
++            is AgentEvent.ToolRequested -> AgentRunStepStatus.PENDING
++            is AgentEvent.ToolRunning -> AgentRunStepStatus.RUNNING
++            is AgentEvent.ToolSucceeded -> AgentRunStepStatus.SUCCESS
++            is AgentEvent.ToolFailed -> AgentRunStepStatus.FAILED
++            is AgentEvent.ApprovalRequired -> AgentRunStepStatus.WAITING
++            is AgentEvent.PolicyBlocked -> AgentRunStepStatus.BLOCKED
++            is AgentEvent.FinalAnswer -> AgentRunStepStatus.COMPLETE
++        }
++    }
++
++    private fun titleFor(event: AgentEvent): String {
++        return when (event) {
++            is AgentEvent.UserMessage -> "User message"
++            is AgentEvent.AssistantMessage -> "Assistant message"
++            is AgentEvent.ToolRequested -> "Tool requested: ${event.tool}"
++            is AgentEvent.ToolRunning -> "Tool running: ${event.tool}"
++            is AgentEvent.ToolSucceeded -> "Tool succeeded: ${event.tool}"
++            is AgentEvent.ToolFailed -> "Tool failed: ${event.tool}"
++            is AgentEvent.ApprovalRequired -> "Approval required: ${event.tool}"
++            is AgentEvent.PolicyBlocked -> {
++                val tool = event.tool?.let { " ($it)" }.orEmpty()
++                "Policy blocked$tool"
++            }
++            is AgentEvent.FinalAnswer -> "Final answer"
++        }
++    }
++
++    private fun detailFor(event: AgentEvent): String {
++        val payload = event.toJson(redactSensitive = true).getJSONObject("payload")
++        return when (event) {
++            is AgentEvent.UserMessage -> payload.getString("text")
++            is AgentEvent.AssistantMessage -> buildString {
++                append(payload.getString("text"))
++                val detail = payload.optString("detail")
++                if (detail.isNotBlank()) {
++                    appendLine()
++                    append(detail)
++                }
++            }
++            is AgentEvent.ToolRequested,
++            is AgentEvent.ToolRunning -> formatToolArgs(payload)
++            is AgentEvent.ToolSucceeded,
++            is AgentEvent.ToolFailed -> formatToolResult(payload)
++            is AgentEvent.ApprovalRequired -> formatApproval(payload)
++            is AgentEvent.PolicyBlocked -> formatPolicyBlock(payload)
++            is AgentEvent.FinalAnswer -> payload.getString("text")
++        }
++    }
++
++    private fun formatToolArgs(payload: JSONObject): String {
++        val tool = payload.getString("tool")
++        val args = payload.optJSONObject("args")
++        val source = payload.optString("source")
++        return buildString {
++            appendLine("tool: $tool")
++            if (source.isNotBlank()) appendLine("source: $source")
++            append("args:")
++            appendLine(formatJsonMap(args))
++        }.trimEnd()
++    }
++
++    private fun formatToolResult(payload: JSONObject): String {
++        val message = payload.getString("message")
++        val data = payload.optJSONObject("data")
++        return buildString {
++            appendLine("message: $message")
++            appendVerificationDetails(data)
++            val remaining = remainingData(data)
++            if (remaining.isNotEmpty()) {
++                appendLine("data:")
++                append(formatStringMap(remaining))
++            }
++        }.trimEnd()
++    }
++
++    private fun formatApproval(payload: JSONObject): String {
++        return buildString {
++            appendLine("reason: ${payload.getString("reason")}")
++            appendLine("data affected: ${payload.getString("data_affected")}")
++            appendLine("if approved: ${payload.getString("if_approved")}")
++            append("args:")
++            appendLine(formatJsonMap(payload.optJSONObject("args")))
++        }.trimEnd()
++    }
++
++    private fun formatPolicyBlock(payload: JSONObject): String {
++        return buildString {
++            payload.optString("tool").takeIf { it.isNotBlank() }?.let { appendLine("tool: $it") }
++            appendLine("reason: ${payload.getString("reason")}")
++            append("user message: ${payload.getString("user_message")}")
++        }
++    }
++
++    private fun StringBuilder.appendVerificationDetails(data: JSONObject?) {
++        if (data == null) return
++        val status = data.optString("verification_status")
++        if (status.isBlank()) return
++        appendLine("verification: $status")
++        val reason = data.optString("verification_reason")
++        if (reason.isNotBlank()) appendLine("verification reason: $reason")
++        data.optString("screen_changed").takeIf { it.isNotBlank() }?.let {
++            appendLine("screen changed: $it")
++        }
++    }
++
++    private fun remainingData(data: JSONObject?): Map<String, String> {
++        if (data == null) return emptyMap()
++        val keys = data.keys()
++        val remaining = linkedMapOf<String, String>()
++        while (keys.hasNext()) {
++            val key = keys.next()
++            if (key in verificationKeys) continue
++            remaining[key] = data.optString(key)
++        }
++        return remaining
++    }
++
++    private fun formatJsonMap(json: JSONObject?): String {
++        if (json == null || json.length() == 0) return " none"
++        return buildString {
++            appendLine()
++            json.keys().asSequence().forEach { key ->
++                append("  ")
++                append(key)
++                append(": ")
++                appendLine(json.optString(key))
++            }
++        }.trimEnd()
++    }
++
++    private fun formatStringMap(values: Map<String, String>): String {
++        if (values.isEmpty()) return " none"
++        return buildString {
++            appendLine()
++            values.forEach { (key, value) ->
++                append("  ")
++                append(key)
++                append(": ")
++                appendLine(value)
++            }
++        }.trimEnd()
++    }
++
++    private val verificationKeys = setOf(
++        "verification_status",
++        "verification_reason",
++        "screen_changed"
++    )
++}
+diff --git a/app/src/main/java/dev/touchpilot/app/agent/AgentRunRecord.kt b/app/src/main/java/dev/touchpilot/app/agent/AgentRunRecord.kt
+new file mode 100644
+index 0000000..fadfc7a
+--- /dev/null
++++ b/app/src/main/java/dev/touchpilot/app/agent/AgentRunRecord.kt
+@@ -0,0 +1,22 @@
++package dev.touchpilot.app.agent
++
++data class AgentRunRecord(
++    val id: String,
++    val task: String,
++    val startedAtMillis: Long,
++    val completedAtMillis: Long,
++    val result: AgentRunResult?,
++    val errorMessage: String? = null
++) {
++    val events: List<AgentEvent>
++        get() = result?.events.orEmpty()
++}
++
++object AgentRunIds {
++    private var sequence = 0L
++
++    fun next(): String {
++        sequence += 1
++        return "run-$sequence"
++    }
++}
+diff --git a/app/src/main/res/values/ids.xml b/app/src/main/res/values/ids.xml
+index 88f1b5c..18e7ed0 100644
+--- a/app/src/main/res/values/ids.xml
++++ b/app/src/main/res/values/ids.xml
+@@ -44,5 +44,6 @@
+     <item name="settings_panel_cloud_button" type="id" />
+     <item name="settings_panel_runtime_button" type="id" />
+     <item name="save_cloud_api_button" type="id" />
+-    <item name="save_skill_button" type="id" />
++    <item name="export_run_trace_button" type="id" />
++    <item name="run_detail_back_button" type="id" />
+ </resources>
+diff --git a/app/src/test/java/dev/touchpilot/app/agent/AgentRunDetailFormatterTest.kt b/app/src/test/java/dev/touchpilot/app/agent/AgentRunDetailFormatterTest.kt
+new file mode 100644
+index 0000000..173c289
+--- /dev/null
++++ b/app/src/test/java/dev/touchpilot/app/agent/AgentRunDetailFormatterTest.kt
+@@ -0,0 +1,212 @@
++package dev.touchpilot.app.agent
++
++import dev.touchpilot.app.security.ToolSource
++import dev.touchpilot.app.tools.ToolResult
++import dev.touchpilot.app.tools.ToolVerificationResult
++import kotlin.test.Test
++import kotlin.test.assertContains
++import kotlin.test.assertEquals
++import kotlin.test.assertFalse
++import kotlin.test.assertTrue
++
++class AgentRunDetailFormatterTest {
++    @Test
++    fun compactSummaryPrefersStructuredSteps() {
++        val record = sampleRecord(
++            steps = listOf(
++                AgentStepFactory.act(
++                    sequenceNumber = 1,
++                    tool = "observe_screen",
++                    args = emptyMap(),
++                    source = "local_router",
++                    result = ToolResult(ok = true, message = "Settings screen"),
++                ),
++                AgentStepFactory.stop(
++                    sequenceNumber = 2,
++                    reason = AgentStepStopReason.MAX_STEPS,
++                    outputSummary = "step limit reached",
++                ),
++            ),
++            stopReason = AgentStepStopReason.MAX_STEPS,
++            stopMessage = AgentStepStopReason.MAX_STEPS.userMessage,
++        )
++
++        val summary = AgentRunDetailFormatter.compactSummary(record)
++
++        assertContains(summary, "2 step(s)")
++        assertContains(summary, "1 tool result(s)")
++        assertContains(summary, AgentStepStopReason.MAX_STEPS.userMessage)
++        assertFalse(summary.contains("event(s)"))
++    }
++
++    @Test
++    fun deriveStopReasonUsesCanonicalStopMessage() {
++        val record = sampleRecord(
++            steps = listOf(
++                AgentStepFactory.stop(
++                    sequenceNumber = 1,
++                    reason = AgentStepStopReason.POLICY_BLOCKED,
++                    outputSummary = "blocked",
++                ),
++            ),
++            stopReason = AgentStepStopReason.POLICY_BLOCKED,
++            stopMessage = "TouchPilot stopped because policy blocked the next action.",
++        )
++
++        assertEquals(
++            "TouchPilot stopped because policy blocked the next action.",
++            AgentRunDetailFormatter.deriveStopReason(record),
++        )
++    }
++
++    @Test
++    fun formatStepsFromStructuredIncludesVerificationDetails() {
++        val record = sampleRecord(
++            steps = listOf(
++                AgentStepFactory.verify(
++                    sequenceNumber = 1,
++                    verification = ToolVerificationResult.Passed("screen changed"),
++                ),
++            ),
++        )
++
++        val steps = AgentRunDetailFormatter.formatSteps(record)
++
++        assertEquals(1, steps.size)
++        assertEquals("Verify", steps.single().title)
++        assertContains(steps.single().detail, "verification: passed")
++        assertContains(steps.single().detail, "verification reason: screen changed")
++    }
++
++    @Test
++    fun exportIncludesStructuredStepsAndEvents() {
++        val record = sampleRecord(
++            steps = listOf(
++                AgentStepFactory.act(
++                    sequenceNumber = 1,
++                    tool = "type_text",
++                    args = mapOf("text" to "password=hunter2"),
++                    source = "local_router",
++                ),
++            ),
++            events = listOf(
++                AgentEvent.ToolRequested(
++                    tool = "type_text",
++                    args = mapOf("text" to "password=hunter2"),
++                    source = ToolSource.LOCAL_ROUTER,
++                ),
++            ),
++            stopReason = AgentStepStopReason.NO_VALID_ACTION,
++            stopMessage = "custom stop message",
++        )
++
++        val trace = AgentRunDetailFormatter.exportRedactedTrace(record)
++
++        assertContains(trace, "canonical_stop_reason=no_valid_action")
++        assertContains(trace, "canonical_stop_message=custom stop message")
++        assertContains(trace, "steps:")
++        assertContains(trace, "\"sequence_number\":1")
++        assertContains(trace, "events:")
++        assertContains(trace, "tool_requested")
++        assertFalse("hunter2" in trace)
++    }
++
++    @Test
++    fun eventsFallbackWhenNoStructuredSteps() {
++        val record = sampleRecord(
++            events = listOf(
++                AgentEvent.UserMessage("Open settings"),
++                AgentEvent.FinalAnswer("Done."),
++            ),
++            finalAnswer = "Done.",
++        )
++
++        val summary = AgentRunDetailFormatter.compactSummary(record)
++
++        assertContains(summary, "2 event(s)")
++        assertContains(summary, "Completed: Done.")
++        assertEquals(2, AgentRunDetailFormatter.formatSteps(record).size)
++    }
++
++    @Test
++    fun deriveStopReasonFallsBackToPolicyBlockEvent() {
++        val record = sampleRecord(
++            events = listOf(
++                AgentEvent.UserMessage("Type password"),
++                AgentEvent.PolicyBlocked(
++                    tool = "type_text",
++                    reason = "password or secret entry is blocked",
++                    userMessage = "TouchPilot will not enter secrets.",
++                ),
++            ),
++        )
++
++        assertEquals(
++            "Blocked: password or secret entry is blocked",
++            AgentRunDetailFormatter.deriveStopReason(record),
++        )
++    }
++
++    @Test
++    fun formatStepsFromEventsIncludesVerificationDetails() {
++        val record = sampleRecord(
++            events = listOf(
++                AgentEvent.UserMessage("Tap save"),
++                AgentEvent.ToolSucceeded(
++                    tool = "tap",
++                    message = "Tapped target",
++                    data = mapOf(
++                        "verification_status" to "passed",
++                        "verification_reason" to "screen changed",
++                        "screen_changed" to "true",
++                    ),
++                ),
++            ),
++        )
++
++        val steps = AgentRunDetailFormatter.formatSteps(record)
++
++        assertEquals(2, steps.size)
++        assertEquals(AgentRunStepStatus.SUCCESS, steps[1].status)
++        assertContains(steps[1].detail, "verification: passed")
++        assertContains(steps[1].detail, "verification reason: screen changed")
++    }
++
++    @Test
++    fun unavailableRunDataProducesEmptyStepsAndReason() {
++        val record = AgentRunRecord(
++            id = "run-missing",
++            task = "Open settings",
++            startedAtMillis = 1L,
++            completedAtMillis = 2L,
++            result = null,
++            errorMessage = "Agent failed: timeout",
++        )
++
++        assertTrue(AgentRunDetailFormatter.formatSteps(record).isEmpty())
++        assertEquals("Error: Agent failed: timeout", AgentRunDetailFormatter.deriveStopReason(record))
++    }
++
++    private fun sampleRecord(
++        events: List<AgentEvent> = emptyList(),
++        steps: List<AgentStep> = emptyList(),
++        finalAnswer: String? = null,
++        stopReason: AgentStepStopReason? = null,
++        stopMessage: String = "",
++    ): AgentRunRecord {
++        return AgentRunRecord(
++            id = "run-1",
++            task = "Open settings",
++            startedAtMillis = 1_000L,
++            completedAtMillis = 2_000L,
++            result = AgentRunResult(
++                transcript = "transcript",
++                finalAnswer = finalAnswer,
++                events = events,
++                steps = steps,
++                stopReason = stopReason,
++                stopMessage = stopMessage,
++            ),
++        )
++    }
++}

@@ -1,0 +1,476 @@
+diff --git a/app/src/main/java/dev/touchpilot/app/MainActivity.kt b/app/src/main/java/dev/touchpilot/app/MainActivity.kt
+index a0a429f..2c6bf83 100644
+--- a/app/src/main/java/dev/touchpilot/app/MainActivity.kt
++++ b/app/src/main/java/dev/touchpilot/app/MainActivity.kt
+@@ -38,6 +38,7 @@ import dev.touchpilot.app.agent.AgentRunIds
+ import dev.touchpilot.app.agent.AgentRunRecord
+ import dev.touchpilot.app.agent.AgentRunResult
+ import dev.touchpilot.app.agent.AgentRunStepStatus
++import dev.touchpilot.app.agent.AgentScreenRecord
+ import dev.touchpilot.app.agent.AgentStep
+ import dev.touchpilot.app.agent.AgentStepStatus
+ import dev.touchpilot.app.agent.AgentStepStopReason
+@@ -737,6 +738,12 @@ class MainActivity : Activity() {
+         val runId = AgentRunIds.next()
+         val startedAtMillis = System.currentTimeMillis()
+         val taskForRecord = originalTask ?: task
++        val initialScreenRecord = AgentScreenRecord.capture(
++            sequenceNumber = 0,
++            phase = "initial",
++            timestampMillis = startedAtMillis,
++            context = AccessibilityBridge.observeScreenContext()
++        )
+ 
+         Thread {
+             val timelineBuilder = AgentStepTimelineBuilder()
+@@ -752,13 +759,23 @@ class MainActivity : Activity() {
+                 )
+             }
+             val completedAtMillis = System.currentTimeMillis()
++            val screenRecords = listOf(
++                initialScreenRecord,
++                AgentScreenRecord.capture(
++                    sequenceNumber = 1,
++                    phase = "final",
++                    timestampMillis = completedAtMillis,
++                    context = AccessibilityBridge.observeScreenContext()
++                )
++            )
+             val record = if (runOutcome.isSuccess) {
+                 AgentRunRecord(
+                     id = runId,
+                     task = taskForRecord,
+                     startedAtMillis = startedAtMillis,
+                     completedAtMillis = completedAtMillis,
+-                    result = runOutcome.getOrThrow()
++                    result = runOutcome.getOrThrow(),
++                    screenRecords = screenRecords
+                 )
+             } else {
+                 AgentRunRecord(
+@@ -767,7 +784,8 @@ class MainActivity : Activity() {
+                     startedAtMillis = startedAtMillis,
+                     completedAtMillis = completedAtMillis,
+                     result = null,
+-                    errorMessage = runOutcome.exceptionOrNull()?.message ?: "Unknown agent error"
++                    errorMessage = runOutcome.exceptionOrNull()?.message ?: "Unknown agent error",
++                    screenRecords = screenRecords
+                 )
+             }
+ 
+@@ -1023,6 +1041,13 @@ class MainActivity : Activity() {
+             }.apply { id = R.id.observe_screen_button }
+         )
+ 
++        contentRoot.addView(
++            secondaryButton("Observe Screen Context") {
++                executeAndRender("observe_screen_context", emptyMap())
++                showSection(Section.TOOLS)
++            }.apply { id = R.id.observe_screen_context_button }
++        )
++
+         contentRoot.addView(
+             secondaryButton("Get Foreground App") {
+                 executeAndRender("get_foreground_app", emptyMap())
+diff --git a/app/src/main/java/dev/touchpilot/app/agent/AgentRunDetailFormatter.kt b/app/src/main/java/dev/touchpilot/app/agent/AgentRunDetailFormatter.kt
+index f6b9894..a032074 100644
+--- a/app/src/main/java/dev/touchpilot/app/agent/AgentRunDetailFormatter.kt
++++ b/app/src/main/java/dev/touchpilot/app/agent/AgentRunDetailFormatter.kt
+@@ -131,6 +131,15 @@ object AgentRunDetailFormatter {
+                     appendLine(event.toJson(redactSensitive = true).toString())
+                 }
+             }
++            appendLine()
++            if (record.screenRecords.isEmpty()) {
++                appendLine("screen_records: none")
++            } else {
++                appendLine("screen_records:")
++                record.screenRecords.forEach { screenRecord ->
++                    appendLine(screenRecord.toJson().toString())
++                }
++            }
+         }
+     }
+ 
+diff --git a/app/src/main/java/dev/touchpilot/app/agent/AgentRunRecord.kt b/app/src/main/java/dev/touchpilot/app/agent/AgentRunRecord.kt
+index fadfc7a..c2c008e 100644
+--- a/app/src/main/java/dev/touchpilot/app/agent/AgentRunRecord.kt
++++ b/app/src/main/java/dev/touchpilot/app/agent/AgentRunRecord.kt
+@@ -1,17 +1,59 @@
+ package dev.touchpilot.app.agent
+ 
++import dev.touchpilot.app.screen.ScreenContext
++import org.json.JSONObject
++
+ data class AgentRunRecord(
+     val id: String,
+     val task: String,
+     val startedAtMillis: Long,
+     val completedAtMillis: Long,
+     val result: AgentRunResult?,
+-    val errorMessage: String? = null
++    val errorMessage: String? = null,
++    val screenRecords: List<AgentScreenRecord> = emptyList()
+ ) {
+     val events: List<AgentEvent>
+         get() = result?.events.orEmpty()
+ }
+ 
++data class AgentScreenRecord(
++    val sequenceNumber: Int,
++    val phase: String,
++    val timestampMillis: Long,
++    val contextJson: String,
++    val nodeCount: Int,
++    val containsSensitiveContent: Boolean
++) {
++    fun toJson(): JSONObject {
++        return JSONObject().apply {
++            put("sequence_number", sequenceNumber)
++            put("phase", phase)
++            put("timestamp_millis", timestampMillis)
++            put("node_count", nodeCount)
++            put("contains_sensitive_content", containsSensitiveContent)
++            put("context", JSONObject(contextJson))
++        }
++    }
++
++    companion object {
++        fun capture(
++            sequenceNumber: Int,
++            phase: String,
++            timestampMillis: Long,
++            context: ScreenContext
++        ): AgentScreenRecord {
++            return AgentScreenRecord(
++                sequenceNumber = sequenceNumber,
++                phase = phase,
++                timestampMillis = timestampMillis,
++                contextJson = context.toRedactedJson(),
++                nodeCount = context.nodes.size,
++                containsSensitiveContent = context.containsSensitiveContent
++            )
++        }
++    }
++}
++
+ object AgentRunIds {
+     private var sequence = 0L
+ 
+diff --git a/app/src/main/java/dev/touchpilot/app/tools/AndroidToolExecutor.kt b/app/src/main/java/dev/touchpilot/app/tools/AndroidToolExecutor.kt
+index 5267fc0..fb42cb3 100644
+--- a/app/src/main/java/dev/touchpilot/app/tools/AndroidToolExecutor.kt
++++ b/app/src/main/java/dev/touchpilot/app/tools/AndroidToolExecutor.kt
+@@ -110,7 +110,7 @@ class AndroidToolExecutor(
+     private fun executeOnceVerified(name: String, args: Map<String, String>): ToolResult {
+         val before = AccessibilityBridge.observeScreenContext()
+         val result = executeOnce(name, args)
+-        val after = if (name == "observe_screen") {
++        val after = if (name == "observe_screen" || name == "observe_screen_context") {
+             before
+         } else {
+             AccessibilityBridge.observeScreenContext()
+@@ -137,6 +137,20 @@ class AndroidToolExecutor(
+                 record(name, "", AccessibilityBridge.isConnected(), "snapshot length=${snapshot.length}")
+                 ToolResult(AccessibilityBridge.isConnected(), SensitiveTextRedactor.redact(snapshot))
+             }
++            "observe_screen_context" -> {
++                val connected = AccessibilityBridge.isConnected()
++                val screenContext = AccessibilityBridge.observeScreenContext()
++                val json = screenContext.toRedactedJson()
++                record(name, "", connected, "context nodes=${screenContext.nodes.size}")
++                ToolResult(
++                    ok = connected,
++                    message = json,
++                    data = mapOf(
++                        "nodes" to screenContext.nodes.size.toString(),
++                        "contains_sensitive_content" to screenContext.containsSensitiveContent.toString()
++                    )
++                )
++            }
+             "open_app" -> {
+                 val target = args["target"].orEmpty()
+                 val ok = openApp(target)
+diff --git a/app/src/main/java/dev/touchpilot/app/tools/RetryPolicy.kt b/app/src/main/java/dev/touchpilot/app/tools/RetryPolicy.kt
+index 8a19d76..b67219a 100644
+--- a/app/src/main/java/dev/touchpilot/app/tools/RetryPolicy.kt
++++ b/app/src/main/java/dev/touchpilot/app/tools/RetryPolicy.kt
+@@ -85,6 +85,7 @@ class AndroidToolRetryPolicy(
+             )
+             return mapOf(
+                 "observe_screen" to ToolRetryConfig(maxAttempts = 1, retryable = false),
++                "observe_screen_context" to ToolRetryConfig(maxAttempts = 1, retryable = false),
+                 "open_app" to action,
+                 "open_settings_panel" to action,
+                 "tap" to action,
+diff --git a/app/src/main/java/dev/touchpilot/app/tools/ToolModels.kt b/app/src/main/java/dev/touchpilot/app/tools/ToolModels.kt
+index 816461f..6e01ad9 100644
+--- a/app/src/main/java/dev/touchpilot/app/tools/ToolModels.kt
++++ b/app/src/main/java/dev/touchpilot/app/tools/ToolModels.kt
+@@ -33,6 +33,13 @@ object AndroidToolCatalog {
+             risk = ToolRisk.LOW,
+             arguments = emptyMap()
+         ),
++        ToolSpec(
++            name = "observe_screen_context",
++            description = "Serialize the current screen as a normalized ScreenContext " +
++                "with sensitive text redacted. Prefer this over observe_screen for agent decisions.",
++            risk = ToolRisk.LOW,
++            arguments = emptyMap()
++        ),
+         ToolSpec(
+             name = "open_app",
+             description = "Launch an installed app by package name or visible label.",
+diff --git a/app/src/main/res/values/ids.xml b/app/src/main/res/values/ids.xml
+index f019337..dac8afa 100644
+--- a/app/src/main/res/values/ids.xml
++++ b/app/src/main/res/values/ids.xml
+@@ -3,6 +3,7 @@
+     <item name="touchpilot_status" type="id" />
+     <item name="open_accessibility_settings_button" type="id" />
+     <item name="observe_screen_button" type="id" />
++    <item name="observe_screen_context_button" type="id" />
+     <item name="get_foreground_app_button" type="id" />
+     <item name="open_app_input" type="id" />
+     <item name="open_app_button" type="id" />
+diff --git a/app/src/test/java/dev/touchpilot/app/agent/AgentRunDetailFormatterTest.kt b/app/src/test/java/dev/touchpilot/app/agent/AgentRunDetailFormatterTest.kt
+index 173c289..ec5ff77 100644
+--- a/app/src/test/java/dev/touchpilot/app/agent/AgentRunDetailFormatterTest.kt
++++ b/app/src/test/java/dev/touchpilot/app/agent/AgentRunDetailFormatterTest.kt
+@@ -1,5 +1,9 @@
+ package dev.touchpilot.app.agent
+ 
++import dev.touchpilot.app.screen.NodeRole
++import dev.touchpilot.app.screen.ScreenContext
++import dev.touchpilot.app.screen.ScreenNode
++import dev.touchpilot.app.screen.ScreenText
+ import dev.touchpilot.app.security.ToolSource
+ import dev.touchpilot.app.tools.ToolResult
+ import dev.touchpilot.app.tools.ToolVerificationResult
+@@ -111,6 +115,38 @@ class AgentRunDetailFormatterTest {
+         assertFalse("hunter2" in trace)
+     }
+ 
++    @Test
++    fun exportIncludesRedactedScreenRecords() {
++        val record = sampleRecord(
++            screenRecords = listOf(
++                AgentScreenRecord.capture(
++                    sequenceNumber = 0,
++                    phase = "initial",
++                    timestampMillis = 1_000L,
++                    context = ScreenContext(
++                        packageName = "com.example.bank",
++                        nodes = listOf(
++                            ScreenNode(
++                                nodeId = "0.1",
++                                role = NodeRole.INPUT,
++                                text = ScreenText.of("password: hunter2"),
++                                isInputField = true
++                            )
++                        )
++                    )
++                )
++            )
++        )
++
++        val trace = AgentRunDetailFormatter.exportRedactedTrace(record)
++
++        assertContains(trace, "screen_records:")
++        assertContains(trace, "\"phase\":\"initial\"")
++        assertContains(trace, "\"contains_sensitive_content\":true")
++        assertContains(trace, "[REDACTED]")
++        assertFalse("hunter2" in trace)
++    }
++
+     @Test
+     fun eventsFallbackWhenNoStructuredSteps() {
+         val record = sampleRecord(
+@@ -190,6 +226,7 @@ class AgentRunDetailFormatterTest {
+     private fun sampleRecord(
+         events: List<AgentEvent> = emptyList(),
+         steps: List<AgentStep> = emptyList(),
++        screenRecords: List<AgentScreenRecord> = emptyList(),
+         finalAnswer: String? = null,
+         stopReason: AgentStepStopReason? = null,
+         stopMessage: String = "",
+@@ -207,6 +244,7 @@ class AgentRunDetailFormatterTest {
+                 stopReason = stopReason,
+                 stopMessage = stopMessage,
+             ),
++            screenRecords = screenRecords,
+         )
+     }
+ }
+diff --git a/app/src/test/java/dev/touchpilot/app/tools/ObserveScreenContextToolTest.kt b/app/src/test/java/dev/touchpilot/app/tools/ObserveScreenContextToolTest.kt
+new file mode 100644
+index 0000000..ea68eec
+--- /dev/null
++++ b/app/src/test/java/dev/touchpilot/app/tools/ObserveScreenContextToolTest.kt
+@@ -0,0 +1,106 @@
++package dev.touchpilot.app.tools
++
++import dev.touchpilot.app.screen.NodeRole
++import dev.touchpilot.app.screen.ScreenContext
++import dev.touchpilot.app.screen.ScreenNode
++import dev.touchpilot.app.screen.ScreenText
++import org.json.JSONObject
++import kotlin.test.Test
++import kotlin.test.assertEquals
++import kotlin.test.assertFalse
++import kotlin.test.assertNotNull
++import kotlin.test.assertNull
++import kotlin.test.assertTrue
++
++class ObserveScreenContextToolTest {
++    @Test
++    fun registersObserveScreenContextAsLowRiskObservation() {
++        val spec = assertNotNull(AndroidToolCatalog.find("observe_screen_context"))
++        assertEquals(ToolRisk.LOW, spec.risk)
++        assertTrue(spec.arguments.isEmpty())
++        assertTrue(spec.requiredArguments.isEmpty())
++    }
++
++    @Test
++    fun keepsObserveScreenForDebugCompatibility() {
++        assertNotNull(AndroidToolCatalog.find("observe_screen"))
++        assertNotNull(AndroidToolCatalog.find("observe_screen_context"))
++    }
++
++    @Test
++    fun validateAcceptsNoArguments() {
++        assertNull(AndroidToolCatalog.validate("observe_screen_context", emptyMap()))
++    }
++
++    @Test
++    fun retryPolicyTreatsObserveScreenContextAsSingleAttemptReadOnly() {
++        val config = AndroidToolRetryPolicy().configFor("observe_screen_context")
++        assertEquals(1, config.maxAttempts)
++        assertFalse(config.retryable)
++        assertFalse(config.waitForIdleAfterSuccess)
++    }
++
++    @Test
++    fun serializesStableStructuredJson() {
++        val context = ScreenContext(
++            appLabel = "Gmail",
++            packageName = "com.google.android.gm",
++            windowTitle = "Inbox",
++            nodes = listOf(
++                ScreenNode(
++                    nodeId = "0.0",
++                    role = NodeRole.BUTTON,
++                    text = ScreenText.of("Compose"),
++                    clickable = true
++                )
++            )
++        )
++
++        val json = JSONObject(context.toRedactedJson())
++
++        assertEquals("Gmail", json.getString("appLabel"))
++        assertEquals("com.google.android.gm", json.getString("packageName"))
++        assertEquals("Inbox", json.getString("windowTitle"))
++        assertEquals(1, json.getJSONArray("nodes").length())
++        assertFalse(json.getBoolean("containsSensitiveContent"))
++
++        val node = json.getJSONArray("nodes").getJSONObject(0)
++        assertEquals("0.0", node.getString("nodeId"))
++        assertEquals("BUTTON", node.getString("role"))
++        assertTrue(node.getBoolean("clickable"))
++        assertTrue(node.has("bounds"))
++    }
++
++    @Test
++    fun redactsSensitiveTextByDefault() {
++        val context = ScreenContext(
++            packageName = "com.example.bank",
++            windowTitle = "Login",
++            nodes = listOf(
++                ScreenNode(
++                    nodeId = "0.1",
++                    role = NodeRole.INPUT,
++                    text = ScreenText.of("password: hunter2"),
++                    isInputField = true
++                )
++            )
++        )
++
++        val json = context.toRedactedJson()
++
++        assertTrue(json.contains("[REDACTED]"), json)
++        assertFalse(json.contains("hunter2"), json)
++        assertTrue(JSONObject(json).getBoolean("containsSensitiveContent"))
++    }
++
++    @Test
++    fun serializesEmptyContext() {
++        val json = JSONObject(ScreenContext.Empty.toRedactedJson())
++
++        assertTrue(json.isNull("appLabel"))
++        assertTrue(json.isNull("packageName"))
++        assertTrue(json.isNull("windowTitle"))
++        assertEquals(0, json.getJSONArray("nodes").length())
++        assertFalse(json.getBoolean("containsSensitiveContent"))
++    }
++}
+diff --git a/docs/TOOL_SPEC.md b/docs/TOOL_SPEC.md
+index c54ec8b..06e5bce 100644
+--- a/docs/TOOL_SPEC.md
++++ b/docs/TOOL_SPEC.md
+@@ -18,7 +18,9 @@ Tools are the only way an agent may affect the Android device.
+ 
+ ## Initial Tools
+ 
+-- `observe_screen`: serialize the current accessibility tree.
++- `observe_screen`: serialize the current accessibility tree (raw debug dump).
++- `observe_screen_context`: serialize the current screen as a normalized
++  `ScreenContext` with sensitive text redacted.
+ - `open_app`: launch an installed app by package name or label.
+ - `open_settings_panel`: open an allowlisted Android Settings panel by intent.
+ - `tap`: tap a semantic target by visible text, stable `node_id`, or bounds.
+@@ -33,8 +35,9 @@ Tools are the only way an agent may affect the Android device.
+ - `clear_text`: clear the focused or resolved editable input field.
+ - `dismiss_keyboard`: hide the soft keyboard if it is visible.
+ 
+-The app implements `observe_screen`, `open_app`, `open_settings_panel`, `tap`,
+-`type_text`, `scroll`, `press_back`, `press_home`, `wait_for_ui`,
++The app implements `observe_screen`, `observe_screen_context`, `open_app`,
++`open_settings_panel`, `tap`, `type_text`, `scroll`, `press_back`,
++`press_home`, `wait_for_ui`,
+ `wait_for_idle`, `wait_for_app`, `focus_input`, `clear_text`, and
+ `dismiss_keyboard` from the Android Tools screen and the agent command-provider
+ loop.
+@@ -45,6 +48,32 @@ loop.
+ panel list. The tool only opens Android Settings intents; it never toggles a
+ setting.
+ 
++## Structured vs. raw observation
++
++Two observation tools exist:
++
++- `observe_screen` returns the raw accessibility tree as a flat string. It is
++  retained for debugging and backward compatibility.
++- `observe_screen_context` returns a normalized `ScreenContext` serialized as
++  stable JSON: app/package/window metadata, visible nodes with semantic roles
++  and bounds, and per-node action flags (`clickable`, `isInputField`,
++  `scrollable`, etc.).
++
++Prefer `observe_screen_context` for agent decision-making. Structured context
++lets the agent reason over roles, bounds, and action flags before choosing a
++tool, and it is more reliable than parsing a raw dump. Use `observe_screen`
++when debugging the raw tree.
++
++`observe_screen_context` output is redacted by default: sensitive visible text
++(passwords, tokens, OTPs, emails, card numbers) is replaced with `[REDACTED]`,
++and any redacted node is flagged. The top-level `containsSensitiveContent` flag
++indicates whether the screen held sensitive text. Both observation tools are
++LOW risk and require no approval.
++
++Exported agent run traces include redacted `screen_records` for the initial and
++final screen contexts so a run can be inspected without leaking raw sensitive
++screen text.
++
+ `dismiss_keyboard` is observation-gated: it inspects the accessibility window
+ list for a `TYPE_INPUT_METHOD` window first. If the keyboard is already hidden,
+ the tool is a no-op and reports `was_visible_before=false`. If it is visible,

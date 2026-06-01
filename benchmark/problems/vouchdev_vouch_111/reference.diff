@@ -1,0 +1,1044 @@
+diff --git a/CHANGELOG.md b/CHANGELOG.md
+index 4797af3..88e2e87 100644
+--- a/CHANGELOG.md
++++ b/CHANGELOG.md
+@@ -22,6 +22,14 @@ All notable changes to vouch are documented here. Format follows
+   (`rebuild_index`, `doctor`, bundle `export`/`import_apply`) surfaced as
+   status lines on interactive terminals; and `vouch index` / `vouch export`
+   now report a clean `Error:` instead of a traceback on a malformed artifact.
++- `vouch approve <id1> <id2> …` approves multiple proposals in one
++  non-interactive call for CI and backlog clearing (#93). Default is
++  all-or-nothing: every id is validated as an approvable pending proposal
++  before any is written, so a typo or already-decided id aborts the batch
++  without approving anything. `--keep-going` switches to best-effort
++  (approve what you can, report the rest, exit non-zero on partial failure).
++  One audit event is still recorded per approved artifact. Complements the
++  interactive `vouch review` queue.
+ - `vouch sync-check` and `vouch sync-apply` reconcile another `.vouch`
+   directory or bundle by importing only non-conflicting durable artifacts and
+   reporting conflicts without overwriting reviewed knowledge.
+@@ -44,6 +52,23 @@ All notable changes to vouch are documented here. Format follows
+   the same tarball. `import_apply`, `import_check`, and `export_check`
+   now validate every member path and raise on unsafe names.
+ - Fix `vouch search` CLI: assign backend label per code path so substring fallback results are no longer mislabelled as `fts5`; update stale docstring to reflect multi-backend search surface (#52).
++- Close the review-gate bypass in `sessions.crystallize` (#76). The
++  durable session-summary page wrote `sess.task`, `sess.note`, and
++  `sess.agent` verbatim into rendered markdown, letting an agent
++  land arbitrary content into `pages/` by calling
++  `kb.session_start(task=...)` and getting any one claim approved
++  via crystallize. The summary body now contains only fields the
++  proposing agent cannot influence (session id, server-clock
++  timestamps, list of approved artifact ids). The
++  `session.crystallize` audit event now also includes the summary
++  page id in `object_ids` when a page is written, so `vouch audit`
++  truthfully attributes the write.
++- `context._retrieve` now honors `retrieval.backend` in `config.yaml`
++  instead of always running embeddings first (#92). Accepts `auto`
++  (default — embedding → FTS5 → substring), `embedding`, `fts5`, or
++  `substring`; a legacy `retrieval.backends` list is still read for
++  back-compat. `vouch init` now writes `retrieval.backend: auto`, and the
++  README/ROADMAP describe the actual behavior.
+ - `vouch crystallize` now indexes its session-summary page into FTS5 so it
+   surfaces from `vouch search` / `kb.search` / `kb.context` without a
+   `vouch index` rebuild. Previously the summary was written via
+@@ -68,6 +93,26 @@ All notable changes to vouch are documented here. Format follows
+   with between `import_check` and the apply re-open is rejected
+   before anything reaches disk and the audit log does not record
+   a `bundle.import` event.
++- `Claim.evidence` now enforces "at least one citation" at the model
++  layer via a `@field_validator` (#81). Previously the
++  README-documented guarantee ("Claims must cite sources … a claim
++  without at least one Source/Evidence id is a validation error")
++  was enforced only in `proposals.propose_claim`, so every other
++  write path — direct `store.put_claim`, `store.update_claim`, and
++  `bundle.import_apply` via `_validate_content` — silently accepted
++  `evidence: []` and landed an uncited claim. The validator closes
++  all three paths at once; `store.update_claim` additionally
++  re-validates via `Claim.model_validate(...)` before persisting so
++  in-place mutation (`c.evidence = []; store.update_claim(c)`)
++  also raises before the YAML hits disk. **Migration note:** because
++  the validator also fires when claims are read back, a KB that
++  already has an uncited `claims/<id>.yaml` on disk from before this
++  fix would otherwise crash `vouch lint` / `vouch doctor` with a
++  `pydantic.ValidationError`. `vouch lint` now iterates `claims/`
++  per-file and surfaces unparseable / uncited YAMLs as
++  `invalid_claim` findings ("edit the YAML to add a citation, or
++  delete the file") instead of bailing out — so existing KBs get a
++  clean repair list rather than a traceback.
+ 
+ ## [0.0.1] — 2026-05-17
+ 
+diff --git a/README.md b/README.md
+index 21bba4c..034fa19 100644
+--- a/README.md
++++ b/README.md
+@@ -62,6 +62,7 @@ vouch status                     # one-line summary
+ vouch pending                    # list pending proposals
+ vouch show <id>                  # full details
+ vouch approve <id>               # → durable artifact
++vouch approve <id> <id> ...    # approve several reviewed proposals at once
+ vouch reject <id> --reason "..."
+ 
+ # 4. commit
+@@ -147,7 +148,7 @@ vouch doctor                                # full sweep incl. source verificati
+ vouch pending                               # list pending proposals
+ vouch review [--limit N] [--type KIND]      # guided proposal review queue
+ vouch show <proposal-id>
+-vouch approve <proposal-id> [--reason ...]
++vouch approve <proposal-id>... [--reason ...] [--keep-going]
+ vouch reject <proposal-id> --reason "..."
+ 
+ vouch propose-claim --text ... --source ... [--type ...] [--confidence X]
+@@ -261,7 +262,7 @@ vouch import-apply kb.tar.gz --on-conflict skip  # apply (default skip; never de
+ | Tool servers | MCP over stdio + JSONL over stdin/stdout, same `kb.*` surface across both transports, capabilities + knowledge-capability descriptor |
+ | Schemas | 13 JSON Schemas (Draft 2020-12) generated from pydantic in [schemas/](schemas/), plus hand-maintained `bundle.manifest` and `jsonl-envelope` schemas |
+ | Write safety | review-gated writes via [proposed/](spec/review-gate.md), `dry_run:true` previews, host trust required for `approve`/`reject`, atomic exclusive-create storage, path-traversal blocked on source intake and bundle import |
+-| Retrieval | SQLite FTS5 + substring fallback; optional semantic backends (`all-mpnet-base-v2`, `MiniLM-L6`, fastembed-BGE) behind install extras; context packs with citations + quality gate |
++| Retrieval | `retrieval.backend` in `config.yaml` selects the path: `auto` (default — embedding → FTS5 → substring), `embedding`, `fts5`, or `substring`. Semantic backends (`all-mpnet-base-v2`, `MiniLM-L6`, fastembed-BGE) ship behind install extras; `auto` degrades to FTS5 when they aren't installed. Context packs with citations + quality gate |
+ | Lifecycle | `supersede`, `contradict`, `archive`, `confirm`, `cite` — direct mutations, all audited |
+ | Portability | tar.gz bundles with per-file sha256 `manifest.json`, `export-check`, `import-check`, `import-apply` with skip/overwrite/fail conflict modes |
+ | Audit | append-only `audit.log.jsonl`, per-event actor (`VOUCH_AGENT`), object ids, dry-run flag, reversible flag |
+@@ -271,7 +272,7 @@ vouch import-apply kb.tar.gz --on-conflict skip  # apply (default skip; never de
+ 
+ ## Status
+ 
+-Pre-1.0. What's *not* in this implementation: vector embeddings (BM25/FTS5 only), per-runtime adapter templates, benchmark fixtures, multi-agent sync, scopes beyond a single field on Claim/Source. If a hole matters to you, file an issue.
++Pre-1.0. What's *not* in this implementation: per-runtime adapter templates, benchmark fixtures, multi-agent sync, scopes beyond a single field on Claim/Source. If a hole matters to you, file an issue.
+ 
+ ## License
+ 
+diff --git a/ROADMAP.md b/ROADMAP.md
+index 4e5e661..46101d1 100644
+--- a/ROADMAP.md
++++ b/ROADMAP.md
+@@ -6,8 +6,11 @@ promise. Items marked **[VEP]** require a written proposal in
+ 
+ ## 0.1 — surface stabilises (next)
+ 
+-- Vector embeddings as an *optional* retrieval backend alongside FTS5.
+-  Default stays FTS5; embeddings opt-in via `config.yaml`. **[VEP]**
++- Vector embeddings as a retrieval backend alongside FTS5 (shipped).
++  Retrieval is controlled by `retrieval.backend` in `config.yaml`:
++  `auto` (default) tries embedding → FTS5 → substring, gracefully
++  degrading to FTS5 when the embeddings extras aren't installed; set
++  `embedding`, `fts5`, or `substring` to pin a single path.
+ - `vouch diff <id-old> <id-new>` for claim/page revisions.
+ - `vouch approve --batch` for reviewing N proposals in one transaction.
+ - HTTP transport (`vouch serve --transport http`) behind a localhost
+diff --git a/docs/review-gate.md b/docs/review-gate.md
+index 9aff9bb..29e75a2 100644
+--- a/docs/review-gate.md
++++ b/docs/review-gate.md
+@@ -40,6 +40,7 @@ vouch status               # snapshot
+ vouch pending              # what's waiting
+ vouch show <id>            # full proposal details
+ vouch approve <id>         # → durable artifact + decided/
++vouch approve <id> <id>    # approve several reviewed proposals at once
+ vouch reject  <id> --reason "duplicates auth-uses-jwt"
+ ```
+ 
+@@ -151,10 +152,14 @@ next review; you can remove the entries with `git rm` afterwards.
+ Update your local `.gitignore` so it stops happening.
+ 
+ **Q: Can I approve in bulk?**
+-Today, one at a time. `--batch` is planned for 0.1
+-([ROADMAP](../ROADMAP.md)). Until then,
+-`vouch pending --json | jq -r '.[].id' | xargs -n1 vouch approve` is
+-the workaround — read what you're approving first.
++Yes. Review proposals, then approve them together:
++
++```bash
++vouch approve <id> <id> --reason "reviewed together"
++```
++
++Default is all-or-nothing: if any id is invalid or already decided,
++nothing is approved. Use `--keep-going` for best-effort approval.
+ 
+ **Q: What if I want a *softer* gate — "warn, don't block"?**
+ You don't. If you want soft, use a tool without a gate. vouch's
+diff --git a/src/vouch/cli.py b/src/vouch/cli.py
+index 2944d4b..d5b79c3 100644
+--- a/src/vouch/cli.py
++++ b/src/vouch/cli.py
+@@ -33,6 +33,7 @@
+ from .onboarding import seed_starter_kb
+ from .proposals import (
+     ProposalError,
++    check_approvable,
+     propose_claim,
+     propose_entity,
+     propose_page,
+@@ -395,14 +396,60 @@ def show(proposal_id: str) -> None:
+ 
+ 
+ @cli.command()
+-@click.argument("proposal_id")
++@click.argument("proposal_ids", nargs=-1, required=True)
+ @click.option("--reason", default=None)
+-def approve(proposal_id: str, reason: str | None) -> None:
+-    """Approve a proposal — converts it into a durable artifact."""
++@click.option(
++    "--keep-going", is_flag=True,
++    help="Best-effort: approve every id that can be approved and report the "
++         "rest, instead of the default all-or-nothing precheck.",
++)
++def approve(proposal_ids: tuple[str, ...], reason: str | None, keep_going: bool) -> None:
++    """Approve one or more proposals — converts each into a durable artifact.
++
++    Pass several ids to approve a batch in one call (useful for CI and
++    clearing a review backlog). One audit event is recorded per approved
++    artifact.
++
++    Semantics:
++
++    \b
++    - default (all-or-nothing): every id is validated as an approvable
++      pending proposal before any is written; a typo or already-decided id
++      aborts the whole batch and nothing is approved.
++    - --keep-going (best-effort): approve each id independently, report the
++      failures, and exit non-zero if any failed.
++    """
+     store = _load_store()
+-    with _cli_errors():
+-        artifact = do_approve(store, proposal_id, approved_by=_whoami(), reason=reason)
+-    click.echo(f"Approved → {type(artifact).__name__.lower()}/{artifact.id}")
++    approver = _whoami()
++
++    if not keep_going:
++        blocked = [
++            (pid, reason_blocked)
++            for pid in proposal_ids
++            if (reason_blocked := check_approvable(store, pid, approved_by=approver))
++        ]
++        if blocked:
++            for pid, why in blocked:
++                click.echo(f"✗ {pid}: {why}", err=True)
++            raise click.ClickException(
++                f"refusing to approve: {len(blocked)} of {len(proposal_ids)} not "
++                "approvable — nothing was approved (use --keep-going for best-effort)"
++            )
++
++    failures = 0
++    for pid in proposal_ids:
++        try:
++            artifact = do_approve(store, pid, approved_by=approver, reason=reason)
++        except (ArtifactNotFoundError, ValueError, ProposalError, LifecycleError) as e:
++            failures += 1
++            click.echo(f"✗ {pid}: {e}", err=True)
++            continue
++        click.echo(f"Approved → {type(artifact).__name__.lower()}/{artifact.id}")
++
++    if failures:
++        raise click.ClickException(
++            f"{failures} of {len(proposal_ids)} proposal(s) failed to approve"
++        )
+ 
+ 
+ @cli.command()
+diff --git a/src/vouch/context.py b/src/vouch/context.py
+index 667fb51..988dee0 100644
+--- a/src/vouch/context.py
++++ b/src/vouch/context.py
+@@ -16,30 +16,77 @@
+ import sqlite3
+ from typing import Any, Literal, cast
+ 
++import yaml
++
+ from . import index_db
+ from .models import ContextItem, ContextPack, ContextQuality
+ from .storage import ArtifactNotFoundError, KBStore
+ 
+ ContextItemKind = Literal["claim", "page", "entity", "relation", "source"]
+ 
++_VALID_BACKENDS = ("auto", "embedding", "fts5", "substring")
++
++
++def _configured_backend(store: KBStore) -> str:
++    """Resolve the retrieval backend from `config.yaml`, defaulting to "auto".
++
++    Reads the singular `retrieval.backend` string. For KBs initialised
++    before this knob existed, a legacy `retrieval.backends` list is honoured
++    by taking its first recognised entry. Anything unreadable or unrecognised
++    falls back to "auto".
++    """
++    try:
++        loaded = yaml.safe_load(store.config_path.read_text())
++    except (OSError, yaml.YAMLError):
++        return "auto"
++    if not isinstance(loaded, dict):
++        return "auto"
++    retrieval = loaded.get("retrieval")
++    if not isinstance(retrieval, dict):
++        return "auto"
++    backend = retrieval.get("backend")
++    if isinstance(backend, str) and backend in _VALID_BACKENDS:
++        return backend
++    legacy = retrieval.get("backends")
++    if isinstance(legacy, list):
++        for entry in legacy:
++            if isinstance(entry, str) and entry in _VALID_BACKENDS:
++                return entry
++    return "auto"
++
+ 
+ def _retrieve(store: KBStore, query: str, limit: int
+               ) -> list[tuple[str, str, str, float, str]]:
+     """Return list of (kind, id, summary, score, backend).
+ 
+-    Dispatch order: embedding (semantic) -> FTS5 -> substring.
++    The backend is chosen by `retrieval.backend` in config.yaml:
++      - "auto" (default): embedding -> FTS5 -> substring
++      - "embedding": semantic search only
++      - "fts5": lexical FTS5 only
++      - "substring": substring scan only
+     """
+-    raw = index_db.search_semantic(store.kb_dir, query, limit=limit)
+-    if raw:
+-        return [(k, i, s, sc, "embedding") for k, i, s, sc in raw]
+-    try:
+-        hits = index_db.search(store.kb_dir, query, limit=limit)
+-        if hits:
+-            return [(k, i, s, sc, "fts5") for k, i, s, sc in hits]
+-    except sqlite3.Error:
+-        # FTS5 unavailable, db missing, or schema mismatch — fall through
+-        # to substring scan. Other exceptions are real bugs and propagate.
+-        pass
++    backend = _configured_backend(store)
++
++    if backend in ("auto", "embedding"):
++        raw = index_db.search_semantic(store.kb_dir, query, limit=limit)
++        if raw:
++            return [(k, i, s, sc, "embedding") for k, i, s, sc in raw]
++        if backend == "embedding":
++            return []
++
++    if backend in ("auto", "fts5"):
++        try:
++            hits = index_db.search(store.kb_dir, query, limit=limit)
++            if hits:
++                return [(k, i, s, sc, "fts5") for k, i, s, sc in hits]
++        except sqlite3.Error:
++            # FTS5 unavailable, db missing, or schema mismatch — fall through
++            # to substring scan (auto) or empty (explicit fts5). Other
++            # exceptions are real bugs and propagate.
++            pass
++        if backend == "fts5":
++            return []
++
+     return [
+         (k, i, s, sc, "substring")
+         for k, i, s, sc in store.search_substring(query, limit=limit)
+diff --git a/src/vouch/health.py b/src/vouch/health.py
+index 3f9a2d1..1123913 100644
+--- a/src/vouch/health.py
++++ b/src/vouch/health.py
+@@ -11,11 +11,14 @@
+ from dataclasses import dataclass, field
+ from datetime import UTC, datetime, timedelta
+ from pathlib import Path
++from typing import Any
++
++from pydantic import ValidationError
+ 
+ from . import index_db
+ from .audit import count_events
+-from .models import ClaimStatus, ProposalStatus
+-from .storage import KBStore, sha256_hex
++from .models import Claim, ClaimStatus, ProposalStatus
++from .storage import KBStore, _yaml_load, sha256_hex
+ from .verify import verify_all
+ 
+ 
+@@ -31,10 +34,15 @@ class Finding:
+ class HealthReport:
+     ok: bool
+     findings: list[Finding] = field(default_factory=list)
+-    counts: dict[str, int] = field(default_factory=dict)
++    # Mixed value types (str/int/bool) — `claims` etc. are ints,
++    # `kb_dir` is a str, `index_present` is a bool. Was `dict[str, int]`
++    # but `status()` already returned the mixed dict via an untyped
++    # `dict` return annotation; the narrow type was effectively never
++    # checked. Widened to match runtime reality.
++    counts: dict[str, Any] = field(default_factory=dict)
+ 
+ 
+-def status(store: KBStore) -> dict:
++def status(store: KBStore) -> dict[str, Any]:
+     """Quick, machine-readable summary. No deep checks."""
+     return {
+         "kb_dir": str(store.kb_dir),
+@@ -51,9 +59,41 @@ def status(store: KBStore) -> dict:
+     }
+ 
+ 
+-def lint(store: KBStore, *, stale_after_days: int = 180) -> HealthReport:
++def _load_claims_for_lint(store: KBStore) -> tuple[list[Claim], list[Finding]]:
++    """Iterate `claims/*.yaml` one file at a time so a single invalid
++    YAML can't crash the whole lint sweep — surface it as a finding
++    and keep going. This is the repair hint for KBs that have legacy
++    uncited claims from before the Claim.evidence min-citation
++    validator landed (#81): `vouch lint` lists them as
++    `invalid_claim` findings so the user can fix or delete the file
++    rather than seeing a bare `pydantic.ValidationError` traceback."""
++    valid: list[Claim] = []
+     findings: list[Finding] = []
+-    claims = store.list_claims()
++    cdir = store.kb_dir / "claims"
++    if not cdir.is_dir():
++        return valid, findings
++    for p in sorted(cdir.glob("*.yaml")):
++        cid = p.stem
++        try:
++            valid.append(Claim.model_validate(_yaml_load(p.read_text())))
++        except ValidationError as e:
++            tail = str(e).splitlines()[-1].strip() if str(e) else "validation failed"
++            findings.append(Finding(
++                "error", "invalid_claim",
++                f"claim {cid} ({p}) fails model validation: {tail} — "
++                "edit the YAML to add a citation, or delete the file",
++                [cid],
++            ))
++        except Exception as e:
++            findings.append(Finding(
++                "error", "unreadable_claim",
++                f"claim {cid} ({p}) could not be loaded: {e}", [cid],
++            ))
++    return valid, findings
++
++
++def lint(store: KBStore, *, stale_after_days: int = 180) -> HealthReport:
++    claims, findings = _load_claims_for_lint(store)
+     sources_present = {s.id for s in store.list_sources()}
+     evidence_present = {e.id for e in store.list_evidence()}
+ 
+@@ -107,7 +147,24 @@ def lint(store: KBStore, *, stale_after_days: int = 180) -> HealthReport:
+                 ))
+ 
+     ok = not any(f.severity == "error" for f in findings)
+-    return HealthReport(ok=ok, findings=findings, counts=status(store))
++    # Build counts inline rather than calling status(), because status()
++    # calls store.list_claims() which is strict and would re-raise on the
++    # same invalid YAMLs we just surfaced as findings. Use the safely-
++    # loaded `claims` list so the report is self-consistent.
++    counts = {
++        "kb_dir": str(store.kb_dir),
++        "claims": len(claims),
++        "pages": len(store.list_pages()),
++        "sources": len(sources_present),
++        "entities": len(store.list_entities()),
++        "relations": len(store.list_relations()),
++        "evidence": len(evidence_present),
++        "sessions": len(store.list_sessions()),
++        "pending_proposals": len(store.list_proposals(ProposalStatus.PENDING)),
++        "audit_events": count_events(store.kb_dir),
++        "index_present": (store.kb_dir / index_db.DB_FILENAME).exists(),
++    }
++    return HealthReport(ok=ok, findings=findings, counts=counts)
+ 
+ 
+ def doctor(
+diff --git a/src/vouch/models.py b/src/vouch/models.py
+index a4d1961..1b340d8 100644
+--- a/src/vouch/models.py
++++ b/src/vouch/models.py
+@@ -185,6 +185,22 @@ class Claim(BaseModel):
+         default_factory=list,
+         description="Source ids OR Evidence ids — both are valid citations",
+     )
++
++    @field_validator("evidence")
++    @classmethod
++    def _at_least_one_citation(cls, v: list[str]) -> list[str]:
++        # The "claims must cite sources" guarantee (README §"Why this exists"
++        # point 3; CONTRIBUTING §"Things we won't merge") used to live only
++        # in proposals.propose_claim, so every other write path —
++        # store.put_claim, store.update_claim, and bundle.import_apply via
++        # _validate_content — accepted evidence=[] and silently landed an
++        # uncited claim. Enforcing on the model closes all paths at once.
++        if not v:
++            raise ValueError(
++                "claim must cite at least one Source or Evidence id "
++                "(README §'Object model'; CONTRIBUTING §'Things we won't merge')"
++            )
++        return v
+     entities: list[str] = Field(default_factory=list)
+     supersedes: list[str] = Field(default_factory=list)
+     superseded_by: str | None = None
+diff --git a/src/vouch/proposals.py b/src/vouch/proposals.py
+index dbca926..47592e7 100644
+--- a/src/vouch/proposals.py
++++ b/src/vouch/proposals.py
+@@ -210,23 +210,17 @@ def propose_relation(
+ # --- decisions ------------------------------------------------------------
+ 
+ 
+-def approve(
+-    store: KBStore,
+-    proposal_id: str,
+-    *,
+-    approved_by: str,
+-    reason: str | None = None,
+-) -> Claim | Page | Entity | Relation:
+-    """Approve a pending proposal and write it as a durable artifact.
+-
+-    Raises ProposalError if the proposal is not pending or if
+-    approved_by matches proposed_by (forbidden_self_approval).
++def _approval_block_reason(
++    store: KBStore, proposal: Proposal, approved_by: str
++) -> str | None:
++    """Why `approved_by` cannot approve `proposal` right now, or None.
++
++    Covers the deterministic pre-write gates — not-pending and
++    forbidden_self_approval. Shared by `approve()` and `check_approvable()`
++    so the single-approve path and the batch CLI's precheck never drift.
+     """
+-    proposal = store.get_proposal(proposal_id)
+     if proposal.status != ProposalStatus.PENDING:
+-        raise ProposalError(
+-            f"proposal {proposal_id} is {proposal.status.value}, not pending"
+-        )
++        return f"proposal {proposal.id} is {proposal.status.value}, not pending"
+     if approved_by == proposal.proposed_by:
+         cfg: dict[str, Any] = {}
+         try:
+@@ -241,10 +235,45 @@ def approve(
+             review_cfg.get("approver_role") if isinstance(review_cfg, dict) else None
+         )
+         if approver_role != "trusted-agent":
+-            raise ProposalError(
++            return (
+                 f"forbidden_self_approval: {approved_by} cannot approve their own "
+                 "proposal (set review.approver_role: trusted-agent in config.yaml to opt out)"
+             )
++    return None
++
++
++def check_approvable(
++    store: KBStore, proposal_id: str, *, approved_by: str
++) -> str | None:
++    """Return why `proposal_id` can't be approved by `approved_by`, or None.
++
++    Read-only. `None` means the deterministic gates pass; the actual write in
++    `approve()` can still fail on a pre-existing artifact or an I/O error.
++    Used by the batch CLI to validate a whole set before mutating anything.
++    """
++    try:
++        proposal = store.get_proposal(proposal_id)
++    except ArtifactNotFoundError:
++        return f"proposal {proposal_id} not found"
++    return _approval_block_reason(store, proposal, approved_by)
++
++
++def approve(
++    store: KBStore,
++    proposal_id: str,
++    *,
++    approved_by: str,
++    reason: str | None = None,
++) -> Claim | Page | Entity | Relation:
++    """Approve a pending proposal and write it as a durable artifact.
++
++    Raises ProposalError if the proposal is not pending or if
++    approved_by matches proposed_by (forbidden_self_approval).
++    """
++    proposal = store.get_proposal(proposal_id)
++    block = _approval_block_reason(store, proposal, approved_by)
++    if block:
++        raise ProposalError(block)
+     payload = dict(proposal.payload)
+     # Refuse to overwrite an existing artifact. Without this guard a retry
+     # after a crash between put_<kind>() and move_proposal_to_decided() would
+diff --git a/src/vouch/sessions.py b/src/vouch/sessions.py
+index d27d633..71fcaa9 100644
+--- a/src/vouch/sessions.py
++++ b/src/vouch/sessions.py
+@@ -114,9 +114,12 @@ def crystallize(
+             )
+         summary_page_id = page.id
+ 
++    crystallize_object_ids = [sess.id, *approved_artifact_ids]
++    if summary_page_id is not None:
++        crystallize_object_ids.append(summary_page_id)
+     audit.log_event(
+         store.kb_dir, event="session.crystallize", actor=approver,
+-        object_ids=[sess.id, *approved_artifact_ids],
++        object_ids=crystallize_object_ids,
+         data={"approved": len(approved_artifact_ids), "failed": len(failures)},
+     )
+     return {
+@@ -128,11 +131,17 @@ def crystallize(
+ 
+ 
+ def _build_summary_body(sess: Session, ids: list[str]) -> str:
+-    lines = [f"# Session {sess.id}", ""]
+-    if sess.task:
+-        lines += [f"**Task:** {sess.task}", ""]
+-    lines += [
+-        f"**Agent:** {sess.agent}",
++    # The summary page is durable and surfaces in kb.read_page / kb.search /
++    # kb.context, but never goes through propose_page + approve. The body is
++    # therefore restricted to fields the proposing agent cannot influence —
++    # session id (server-generated), timestamps (set from server clock at
++    # session_start / session_end), and the list of artifact ids that did go
++    # through the review gate. Anything agent-controlled (sess.task,
++    # sess.note, sess.agent) is omitted to keep the review-gate guarantee
++    # intact for the Page artifact kind. See #76.
++    lines = [
++        f"# Session {sess.id}",
++        "",
+         f"**Started:** {sess.started_at.isoformat()}",
+         f"**Ended:** {(sess.ended_at or datetime.now(UTC)).isoformat()}",
+         "",
+diff --git a/src/vouch/storage.py b/src/vouch/storage.py
+index 797f9a1..d90c8c1 100644
+--- a/src/vouch/storage.py
++++ b/src/vouch/storage.py
+@@ -69,7 +69,9 @@ def _starter_config() -> dict[str, Any]:
+         "version": 1,
+         "review": {"require_human_approval": True},
+         "retrieval": {
+-            "backends": ["fts5", "substring"],
++            # auto = embedding -> fts5 -> substring; or pin one of
++            # embedding | fts5 | substring. See context._retrieve.
++            "backend": "auto",
+             "default_limit": 10,
+         },
+         "agents": {
+@@ -325,6 +327,12 @@ def list_claims(self) -> list[Claim]:
+     def update_claim(self, claim: Claim) -> Claim:
+         if not self._claim_path(claim.id).exists():
+             raise ArtifactNotFoundError(f"claim {claim.id}")
++        # Re-validate the in-memory Claim before persisting so model
++        # invariants (e.g. evidence must be non-empty — see #81) hold
++        # even when a caller mutated fields in place after get_claim().
++        # The Claim model's field validators only run at construction
++        # time; mutation alone bypasses them unless we round-trip.
++        Claim.model_validate(claim.model_dump(mode="json"))
+         self._claim_path(claim.id).write_text(_yaml_dump(claim.model_dump(mode="json")))
+         self._embed_and_store(kind="claim", id=claim.id, text=claim.text)
+         return claim
+diff --git a/tests/test_bundle.py b/tests/test_bundle.py
+index 20e8d08..a851204 100644
+--- a/tests/test_bundle.py
++++ b/tests/test_bundle.py
+@@ -299,6 +299,51 @@ def test_import_treats_missing_manifest_sha256_as_mismatch(
+     assert not (store.kb_dir / "claims" / "c1.yaml").exists()
+ 
+ 
++def test_import_rejects_uncited_claim(store: KBStore, tmp_path: Path) -> None:
++    """Regression for #81: a bundle whose claim YAML has evidence: []
++    must be rejected by import_check / import_apply because the Claim
++    model now enforces the 'must cite at least one' invariant. Before
++    this fix, _validate_content deferred to pydantic, which accepted
++    evidence=[] and silently landed an uncited claim."""
++    uncited_yaml = (
++        b"id: bundle-uncited\n"
++        b'text: "shipped via bundle, no citations"\n'
++        b"type: fact\n"
++        b"status: stable\n"
++        b"confidence: 1.0\n"
++        b"evidence: []\n"
++    )
++    bundle_path = tmp_path / "uncited.tar.gz"
++    manifest = {
++        "spec": bundle.SPEC_VERSION,
++        "bundle_id": "deadbeef",
++        "files": [{
++            "path": "claims/bundle-uncited.yaml",
++            "size": len(uncited_yaml),
++            "sha256": hashlib.sha256(uncited_yaml).hexdigest(),
++        }],
++        "counts": {},
++        "safety": {"has_proposed": False, "has_state_db": False,
++                   "has_audit_log": False},
++    }
++    with tarfile.open(bundle_path, "w:gz") as tar:
++        info = tarfile.TarInfo("claims/bundle-uncited.yaml")
++        info.size = len(uncited_yaml)
++        tar.addfile(info, io.BytesIO(uncited_yaml))
++        mf_bytes = json.dumps(manifest).encode()
++        mf_info = tarfile.TarInfo(bundle.MANIFEST_NAME)
++        mf_info.size = len(mf_bytes)
++        tar.addfile(mf_info, io.BytesIO(mf_bytes))
++
++    diff = bundle.import_check(store.kb_dir, bundle_path)
++    assert not diff.ok
++    assert any("schema validation failed" in i for i in diff.issues), diff.issues
++
++    with pytest.raises(RuntimeError, match="schema validation failed"):
++        bundle.import_apply(store.kb_dir, bundle_path)
++    assert not (store.kb_dir / "claims" / "bundle-uncited.yaml").exists()
++
++
+ def test_import_check_passes_when_member_matches_manifest(
+     store: KBStore, tmp_path: Path
+ ) -> None:
+diff --git a/tests/test_cli.py b/tests/test_cli.py
+index 9a11255..4a2f7af 100644
+--- a/tests/test_cli.py
++++ b/tests/test_cli.py
+@@ -316,3 +316,74 @@ def _side_effect(store, proposal_id, **kwargs):
+     assert result.exit_code == 0
+     assert "warning:" in result.stderr
+     assert "1/2 proposal(s) failed" in result.stderr
++
++
++# --- batch approval (#93) -------------------------------------------------
++
++
++def _propose_n(store: KBStore, n: int) -> list[str]:
++    src = store.put_source(b"e")
++    ids = []
++    for i in range(n):
++        pr = propose_claim(
++            store, text=f"batch claim {i}", evidence=[src.id], proposed_by="agent"
++        )
++        ids.append(pr.id)
++    return ids
++
++
++def test_approve_batch_approves_all(
++    store: KBStore, monkeypatch: pytest.MonkeyPatch
++) -> None:
++    monkeypatch.delenv("VOUCH_AGENT", raising=False)
++    ids = _propose_n(store, 3)
++    result = CliRunner().invoke(cli, ["approve", *ids])
++    assert result.exit_code == 0, result.output
++    pending = {p.id for p in store.list_proposals(ProposalStatus.PENDING)}
++    for pid in ids:
++        assert pid not in pending
++    assert result.output.count("Approved") == 3
++
++
++def test_approve_batch_one_audit_event_per_artifact(
++    store: KBStore, monkeypatch: pytest.MonkeyPatch
++) -> None:
++    from vouch import audit
++    monkeypatch.delenv("VOUCH_AGENT", raising=False)
++    ids = _propose_n(store, 2)
++    CliRunner().invoke(cli, ["approve", *ids])
++    approve_events = [
++        e for e in audit.read_events(store.kb_dir)
++        if e.event.endswith(".approve")
++    ]
++    assert len(approve_events) == 2
++
++
++def test_approve_batch_atomic_aborts_on_bad_id(
++    store: KBStore, monkeypatch: pytest.MonkeyPatch
++) -> None:
++    """Default is all-or-nothing: one bad id approves nothing."""
++    monkeypatch.delenv("VOUCH_AGENT", raising=False)
++    good = _propose_n(store, 2)
++    result = CliRunner().invoke(cli, ["approve", good[0], "no-such-id", good[1]])
++    assert result.exit_code != 0, result.output
++    assert "Traceback" not in result.output
++    # Nothing approved — both good proposals are still pending.
++    for cid in good:
++        assert cid in {p.id for p in store.list_proposals(ProposalStatus.PENDING)}
++
++
++def test_approve_batch_keep_going_best_effort(
++    store: KBStore, monkeypatch: pytest.MonkeyPatch
++) -> None:
++    """--keep-going approves what it can and exits non-zero on partial failure."""
++    monkeypatch.delenv("VOUCH_AGENT", raising=False)
++    good = _propose_n(store, 2)
++    result = CliRunner().invoke(
++        cli, ["approve", "--keep-going", good[0], "no-such-id", good[1]]
++    )
++    assert result.exit_code != 0, result.output
++    # Both valid proposals were approved despite the bad id in the middle.
++    pending = {p.id for p in store.list_proposals(ProposalStatus.PENDING)}
++    assert good[0] not in pending
++    assert good[1] not in pending
+diff --git a/tests/test_health.py b/tests/test_health.py
+index 659b913..ee4c356 100644
+--- a/tests/test_health.py
++++ b/tests/test_health.py
+@@ -44,6 +44,47 @@ def test_doctor_runs_full_sweep(store: KBStore) -> None:
+     assert report.ok is True
+ 
+ 
++def test_lint_surfaces_legacy_uncited_claim_yaml_without_crashing(
++    store: KBStore,
++) -> None:
++    """Regression for the #82 review: after the Claim.evidence min-citation
++    validator landed (#81), a KB that already had an uncited claim on
++    disk from before the fix would crash `vouch lint` / `vouch doctor`
++    with a bare pydantic.ValidationError. Lint now skips invalid YAMLs
++    per-file and surfaces them as `invalid_claim` findings so the user
++    has a clear repair hint (edit the YAML to add a citation, or delete
++    the file)."""
++    src = store.put_source(b"e")
++    store.put_claim(Claim(id="good", text="t", evidence=[src.id]))
++
++    # Hand-craft an uncited claim YAML that the *current* model rejects —
++    # matches the on-disk shape an older buggy write path could have left.
++    legacy_uncited = (
++        "id: legacy\n"
++        'text: "shipped before the validator existed"\n'
++        "type: fact\n"
++        "status: stable\n"
++        "confidence: 1.0\n"
++        "evidence: []\n"
++    )
++    (store.kb_dir / "claims" / "legacy.yaml").write_text(legacy_uncited)
++
++    report = health.lint(store)
++    codes = {f.code for f in report.findings}
++    assert "invalid_claim" in codes, [f.message for f in report.findings]
++    invalid = next(f for f in report.findings if f.code == "invalid_claim")
++    assert "legacy" in invalid.object_ids
++    assert "delete the file" in invalid.message or "add a citation" in invalid.message
++    assert report.ok is False  # invalid_claim is severity=error
++
++    # The good claim is still discoverable — lint didn't bail out at the
++    # bad one, so the rest of the sweep still ran.
++    good_findings = [f for f in report.findings if "good" in f.object_ids]
++    # No errors about the good claim itself (it's well-formed and cites a
++    # present source).
++    assert all(f.severity != "error" for f in good_findings), good_findings
++
++
+ def test_list_claims_filtered_by_status(store: KBStore) -> None:
+     src = store.put_source(b"e")
+     store.put_claim(Claim(id="c1", text="x", evidence=[src.id],
+diff --git a/tests/test_retrieval_backend.py b/tests/test_retrieval_backend.py
+new file mode 100644
+index 0000000..2dc30cd
+--- /dev/null
++++ b/tests/test_retrieval_backend.py
+@@ -0,0 +1,101 @@
++"""`context._retrieve` honors `retrieval.backend` in config.yaml (#92).
++
++These tests monkeypatch `index_db.search_semantic` so they exercise the
++dispatch logic without needing the optional embeddings extras (numpy /
++sentence-transformers), and therefore run under the base CI install.
++"""
++
++from __future__ import annotations
++
++from pathlib import Path
++
++import pytest
++import yaml
++
++from vouch import context, health
++from vouch.models import Claim
++from vouch.storage import KBStore
++
++
++@pytest.fixture
++def store(tmp_path: Path) -> KBStore:
++    s = KBStore.init(tmp_path)
++    src = s.put_source(b"e")
++    s.put_claim(Claim(id="c1", text="JWT token rotation", evidence=[src.id]))
++    health.rebuild_index(s)
++    return s
++
++
++def _set_backend(store: KBStore, backend: str) -> None:
++    cfg = yaml.safe_load(store.config_path.read_text())
++    cfg.setdefault("retrieval", {})["backend"] = backend
++    store.config_path.write_text(yaml.safe_dump(cfg))
++
++
++def _force_semantic_hit(monkeypatch: pytest.MonkeyPatch) -> None:
++    """Make the embedding path always return a hit, so a backend label of
++    "embedding" appears iff `_retrieve` actually consulted semantic search."""
++    monkeypatch.setattr(
++        context.index_db, "search_semantic",
++        lambda *a, **k: [("claim", "c1", "JWT token rotation", 0.99)],
++    )
++
++
++def _backends(pack: dict) -> set[str]:
++    return {item["backend"] for item in pack["items"]}
++
++
++def test_backend_fts5_skips_embedding(
++    store: KBStore, monkeypatch: pytest.MonkeyPatch
++) -> None:
++    """Regression for #92: with retrieval.backend=fts5, the embedding path
++    must not run even when it would return hits."""
++    _force_semantic_hit(monkeypatch)
++    _set_backend(store, "fts5")
++    pack = context.build_context_pack(store, query="JWT")
++    assert pack["items"]
++    assert "embedding" not in _backends(pack)
++    assert _backends(pack) <= {"fts5", "substring"}
++
++
++def test_backend_embedding_is_recognized(
++    store: KBStore, monkeypatch: pytest.MonkeyPatch
++) -> None:
++    """`embedding` is an accepted value and forces the semantic path."""
++    _force_semantic_hit(monkeypatch)
++    _set_backend(store, "embedding")
++    pack = context.build_context_pack(store, query="JWT")
++    assert pack["items"]
++    assert _backends(pack) == {"embedding"}
++
++
++def test_backend_substring_only(
++    store: KBStore, monkeypatch: pytest.MonkeyPatch
++) -> None:
++    _force_semantic_hit(monkeypatch)
++    _set_backend(store, "substring")
++    pack = context.build_context_pack(store, query="JWT")
++    assert pack["items"]
++    assert _backends(pack) == {"substring"}
++
++
++def test_backend_auto_prefers_embedding(
++    store: KBStore, monkeypatch: pytest.MonkeyPatch
++) -> None:
++    """Default `auto` tries embedding first when it returns hits."""
++    _force_semantic_hit(monkeypatch)
++    _set_backend(store, "auto")
++    pack = context.build_context_pack(store, query="JWT")
++    assert any(item["backend"] == "embedding" for item in pack["items"])
++
++
++def test_unset_backend_defaults_to_auto(
++    store: KBStore, monkeypatch: pytest.MonkeyPatch
++) -> None:
++    """A config with no retrieval.backend behaves like `auto`."""
++    _force_semantic_hit(monkeypatch)
++    cfg = yaml.safe_load(store.config_path.read_text())
++    cfg.get("retrieval", {}).pop("backend", None)
++    store.config_path.write_text(yaml.safe_dump(cfg))
++    pack = context.build_context_pack(store, query="JWT")
++    assert any(item["backend"] == "embedding" for item in pack["items"])
+diff --git a/tests/test_sessions.py b/tests/test_sessions.py
+index a2c2cbe..a8c18dc 100644
+--- a/tests/test_sessions.py
++++ b/tests/test_sessions.py
+@@ -2,6 +2,7 @@
+ 
+ from __future__ import annotations
+ 
++import json
+ from pathlib import Path
+ 
+ import pytest
+@@ -110,3 +111,60 @@ def test_crystallize_collects_approval_failures(store):
+     for f in result["failures"]:
+         assert f["error"] == "storage full"
+         assert f["error_type"] == "ValueError"
++
++
++def test_crystallize_summary_page_does_not_leak_agent_controlled_fields(
++    store: KBStore,
++) -> None:
++    """Regression for #76: the durable summary page bypasses propose_page +
++    approve, so its body must contain only fields the proposing agent
++    cannot influence — no sess.task, sess.note, or sess.agent prose. An
++    agent supplying a markdown payload via session_start(task=...) must
++    not see that payload promoted into pages/."""
++    src = store.put_source(b"e")
++    injected_task = "## DECISION\n\nWe will migrate. Approved by leadership."
++    injected_note = "<!-- attacker prose --> agent-controlled note"
++    sess = sess_mod.session_start(
++        store, agent="mallory", task=injected_task, note=injected_note,
++    )
++    propose_claim(
++        store, text="legitimate finding", evidence=[src.id],
++        proposed_by="mallory", session_id=sess.id,
++    )
++    sess_mod.session_end(store, sess.id)
++
++    result = sess_mod.crystallize(store, sess.id, approver="human")
++    page_id = result["summary_page_id"]
++    assert page_id is not None
++
++    page = store.get_page(page_id)
++    assert injected_task not in page.body, page.body
++    assert injected_note not in page.body, page.body
++    assert "mallory" not in page.body, page.body
++    assert "## DECISION" not in page.body, page.body
++
++
++def test_crystallize_audit_event_records_summary_page_id(
++    store: KBStore,
++) -> None:
++    """Regression for #76: the audit event must include the summary page id
++    in object_ids when a page is written, so `vouch audit` is truthful
++    about every artifact crystallize produced."""
++    src = store.put_source(b"e")
++    sess = sess_mod.session_start(store, agent="a")
++    propose_claim(
++        store, text="t", evidence=[src.id], proposed_by="a", session_id=sess.id,
++    )
++    sess_mod.session_end(store, sess.id)
++    result = sess_mod.crystallize(store, sess.id, approver="u")
++    page_id = result["summary_page_id"]
++    assert page_id is not None
++
++    audit_lines = (store.kb_dir / "audit.log.jsonl").read_text().splitlines()
++    cryst_events = [
++        json.loads(line) for line in audit_lines
++        if json.loads(line).get("event") == "session.crystallize"
++    ]
++    assert cryst_events, "no session.crystallize audit event found"
++    last = cryst_events[-1]
++    assert page_id in last["object_ids"], last["object_ids"]
+diff --git a/tests/test_storage.py b/tests/test_storage.py
+index 1f3dd8a..46eeb73 100644
+--- a/tests/test_storage.py
++++ b/tests/test_storage.py
+@@ -5,6 +5,7 @@
+ from pathlib import Path
+ 
+ import pytest
++from pydantic import ValidationError
+ 
+ from vouch import audit, lifecycle
+ from vouch.models import (
+@@ -108,6 +109,44 @@ def test_claim_can_be_updated(store: KBStore) -> None:
+     assert store.get_claim("c1").status == ClaimStatus.STABLE
+ 
+ 
++def test_claim_model_rejects_empty_evidence() -> None:
++    """Regression for #81: the 'claims must cite sources' guarantee
++    (README §'Why this exists' point 3; CONTRIBUTING §'Things we
++    won't merge') is now enforced on the Claim model itself, so
++    every write path inherits the check instead of relying on
++    proposals.propose_claim alone."""
++    with pytest.raises(ValidationError, match="cite at least one"):
++        Claim(id="c1", text="uncited", evidence=[])
++
++
++def test_put_claim_rejects_empty_evidence(store: KBStore) -> None:
++    """Regression for #81: store.put_claim is a direct write path
++    that used to silently accept Claim(evidence=[]) because the
++    only existence-check loop iterated zero times. The model-level
++    validator now fires before put_claim is even called."""
++    with pytest.raises(ValidationError, match="cite at least one"):
++        store.put_claim(Claim(id="c1", text="uncited", evidence=[]))
++    assert not (store.kb_dir / "claims" / "c1.yaml").exists()
++
++
++def test_update_claim_rejects_empty_evidence(store: KBStore) -> None:
++    """Regression for #81: a previously-cited claim cannot be mutated
++    down to evidence=[] and silently re-persisted. The model's field
++    validator only fires at construction time, so update_claim
++    re-validates via Claim.model_validate(claim.model_dump()) before
++    writing — otherwise in-place mutation would bypass the gate."""
++    src = store.put_source(b"e")
++    store.put_claim(Claim(id="c1", text="cited", evidence=[src.id]))
++    persisted_before = (store.kb_dir / "claims" / "c1.yaml").read_text()
++
++    c = store.get_claim("c1")
++    c.evidence = []  # in-place mutation alone doesn't trigger validation
++
++    with pytest.raises(ValidationError, match="cite at least one"):
++        store.update_claim(c)
++    assert (store.kb_dir / "claims" / "c1.yaml").read_text() == persisted_before
++
++
+ # --- pages ----------------------------------------------------------------
+ 
+ 

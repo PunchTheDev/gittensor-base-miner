@@ -1,0 +1,129 @@
+diff --git a/allways/validator/event_watcher.py b/allways/validator/event_watcher.py
+index 824530a8..4f38c587 100644
+--- a/allways/validator/event_watcher.py
++++ b/allways/validator/event_watcher.py
+@@ -226,6 +226,11 @@ def __init__(
+         self.busy_events: List[BusyEvent] = []
+         self.active_events: List[ActiveEvent] = []
+         self.active_events_by_hotkey: Dict[str, List[ActiveEvent]] = {}
++        # Swap IDs whose +1 was seeded directly from the contract's active-swap
++        # list during initialize(). Replay must skip their SwapInitiated event
++        # to avoid double-counting — the busy tick is already in open_swap_count.
++        # Entries are discarded on the matching terminal event.
++        self.bootstrapped_swap_ids: Set[int] = set()
+ 
+     # ─── Public API consumed by scoring ─────────────────────────────────
+ 
+@@ -301,6 +306,9 @@ def initialize(
+                     init_block = getattr(swap, 'initiated_block', current_block)
+                     if not hk:
+                         continue
++                    swap_id = getattr(swap, 'id', None)
++                    if isinstance(swap_id, int):
++                        self.bootstrapped_swap_ids.add(swap_id)
+                     seen_hotkeys.add(hk)
+                     self.open_swap_count[hk] = self.open_swap_count.get(hk, 0) + 1
+                     self.busy_events.append(BusyEvent(hotkey=hk, delta=+1, block=init_block))
+@@ -403,8 +411,15 @@ def apply_event(self, block_num: int, name: str, values: Dict[str, Any]) -> None
+             active = bool(values.get('active'))
+             self.record_active_transition(block_num, hotkey, active)
+         elif name == 'SwapInitiated':
++            swap_id = values.get('swap_id')
+             miner = values.get('miner', '')
+             if miner:
++                # Skip if this swap's +1 was already seeded from the contract's
++                # live active-swap list at bootstrap — otherwise a restart
++                # whose replay window covers the original SwapInitiated would
++                # double-count the miner as busy.
++                if isinstance(swap_id, int) and swap_id in self.bootstrapped_swap_ids:
++                    return
+                 self.apply_busy_delta(block_num, miner, +1)
+         elif name == 'SwapCompleted':
+             swap_id = values.get('swap_id')
+@@ -417,6 +432,7 @@ def apply_event(self, block_num: int, name: str, values: Dict[str, Any]) -> None
+                     resolved_block=block_num,
+                 )
+                 self.apply_busy_delta(block_num, miner, -1)
++                self.bootstrapped_swap_ids.discard(swap_id)
+                 if self.swap_tracker is not None:
+                     self.swap_tracker.resolve(swap_id, SwapStatus.COMPLETED, block_num)
+         elif name == 'SwapTimedOut':
+@@ -430,6 +446,7 @@ def apply_event(self, block_num: int, name: str, values: Dict[str, Any]) -> None
+                     resolved_block=block_num,
+                 )
+                 self.apply_busy_delta(block_num, miner, -1)
++                self.bootstrapped_swap_ids.discard(swap_id)
+                 if self.swap_tracker is not None:
+                     self.swap_tracker.resolve(swap_id, SwapStatus.TIMED_OUT, block_num)
+         elif name == 'ReservationExtensionFinalized':
+diff --git a/tests/test_event_watcher.py b/tests/test_event_watcher.py
+index 86e42e90..8de4f4f8 100644
+--- a/tests/test_event_watcher.py
++++ b/tests/test_event_watcher.py
+@@ -225,6 +225,66 @@ def test_bootstrap_seeds_busy_from_active_swaps(self, tmp_path: Path):
+         assert busy_now == {'hk_a': 1, 'hk_b': 1}
+         w.state_store.close()
+ 
++    def test_bootstrapped_swap_initiated_replay_is_idempotent(self, tmp_path: Path):
++        """Restart scenario: a swap that was live at bootstrap is seeded with
++        +1 from the contract, then its SwapInitiated event replays during
++        sync_to. The replay must NOT add a second +1."""
++        from unittest.mock import MagicMock
++
++        w = make_watcher(tmp_path)
++        client = MagicMock()
++        client.get_miner_active_flag.return_value = False
++        client.get_active_swaps.return_value = [
++            type('S', (), {'id': 42, 'miner_hotkey': 'hk_a', 'initiated_block': 50})(),
++        ]
++        w.initialize(current_block=100, metagraph_hotkeys=['hk_a'], contract_client=client)
++        assert w.open_swap_count['hk_a'] == 1
++
++        # sync_to replays the SwapInitiated event for swap 42 — must be a no-op.
++        w.apply_event(50, 'SwapInitiated', {'swap_id': 42, 'miner': 'hk_a'})
++        assert w.open_swap_count['hk_a'] == 1, 'bootstrapped swap must not double-count on replay'
++
++        # And when the matching terminal event fires, count returns to 0.
++        w.apply_event(120, 'SwapCompleted', {'swap_id': 42, 'miner': 'hk_a'})
++        assert w.open_swap_count['hk_a'] == 0
++        assert 42 not in w.bootstrapped_swap_ids
++        w.state_store.close()
++
++    def test_non_bootstrapped_initiated_still_increments(self, tmp_path: Path):
++        """A SwapInitiated whose id wasn't in the bootstrap set (new swap
++        after startup) applies the +1 normally."""
++        from unittest.mock import MagicMock
++
++        w = make_watcher(tmp_path)
++        client = MagicMock()
++        client.get_miner_active_flag.return_value = False
++        client.get_active_swaps.return_value = [
++            type('S', (), {'id': 42, 'miner_hotkey': 'hk_a', 'initiated_block': 50})(),
++        ]
++        w.initialize(current_block=100, metagraph_hotkeys=['hk_a'], contract_client=client)
++
++        # swap_id 99 was not in the bootstrap set — treat normally.
++        w.apply_event(110, 'SwapInitiated', {'swap_id': 99, 'miner': 'hk_a'})
++        assert w.open_swap_count['hk_a'] == 2
++        w.state_store.close()
++
++    def test_bootstrapped_swap_timeout_also_clears_set(self, tmp_path: Path):
++        from unittest.mock import MagicMock
++
++        w = make_watcher(tmp_path)
++        client = MagicMock()
++        client.get_miner_active_flag.return_value = False
++        client.get_active_swaps.return_value = [
++            type('S', (), {'id': 7, 'miner_hotkey': 'hk_a', 'initiated_block': 50})(),
++        ]
++        w.initialize(current_block=100, metagraph_hotkeys=['hk_a'], contract_client=client)
++        assert 7 in w.bootstrapped_swap_ids
++
++        w.apply_event(130, 'SwapTimedOut', {'swap_id': 7, 'miner': 'hk_a'})
++        assert w.open_swap_count['hk_a'] == 0
++        assert 7 not in w.bootstrapped_swap_ids
++        w.state_store.close()
++
+ 
+ class TestSCALEDecoder:
+     """Decoder fixtures: hand-build event bytes and feed them through.

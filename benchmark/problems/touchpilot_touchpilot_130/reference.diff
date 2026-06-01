@@ -1,0 +1,790 @@
+diff --git a/app/src/main/java/dev/touchpilot/app/agent/AgentModels.kt b/app/src/main/java/dev/touchpilot/app/agent/AgentModels.kt
+index 0642f50..88f621f 100644
+--- a/app/src/main/java/dev/touchpilot/app/agent/AgentModels.kt
++++ b/app/src/main/java/dev/touchpilot/app/agent/AgentModels.kt
+@@ -14,5 +14,37 @@ data class AgentCommand(
+ data class AgentRunResult(
+     val transcript: String,
+     val finalAnswer: String?,
+-    val events: List<AgentEvent> = emptyList()
++    val events: List<AgentEvent> = emptyList(),
++    val steps: List<AgentStep> = emptyList(),
++    val stopReason: AgentStepStopReason? = null,
++    val stopMessage: String = ""
+ )
++
++data class AgentRunLimits(
++    val maxSteps: Int = DefaultMaxSteps,
++    val maxConsecutiveFailures: Int = DefaultMaxConsecutiveFailures
++) {
++    init {
++        require(maxSteps > 0) { "maxSteps must be positive" }
++        require(maxConsecutiveFailures > 0) { "maxConsecutiveFailures must be positive" }
++    }
++
++    companion object {
++        const val DefaultMaxSteps = 4
++        const val DefaultMaxConsecutiveFailures = 2
++    }
++}
++
++val AgentStepStopReason.userMessage: String
++    get() = when (this) {
++        AgentStepStopReason.COMPLETED -> "The task completed successfully."
++        AgentStepStopReason.MAX_STEPS -> "TouchPilot stopped after reaching the local step limit."
++        AgentStepStopReason.REPEATED_TOOL_FAILURE -> "TouchPilot stopped after repeated tool failures."
++        AgentStepStopReason.POLICY_BLOCKED -> "TouchPilot stopped because policy blocked the next action."
++        AgentStepStopReason.APPROVAL_DENIED -> "TouchPilot stopped because approval was denied."
++        AgentStepStopReason.USER_CANCELLED -> "TouchPilot stopped because the action was not approved."
++        AgentStepStopReason.CLARIFICATION_NEEDED -> "TouchPilot needs clarification before continuing."
++        AgentStepStopReason.PARSER_ERROR -> "TouchPilot could not parse the next local action."
++        AgentStepStopReason.EXECUTOR_ERROR -> "TouchPilot stopped because the tool executor failed."
++        AgentStepStopReason.NO_VALID_ACTION -> "TouchPilot could not find a valid next local action."
++    }
+diff --git a/app/src/main/java/dev/touchpilot/app/agent/AgentRunner.kt b/app/src/main/java/dev/touchpilot/app/agent/AgentRunner.kt
+index d743c96..0395f6d 100644
+--- a/app/src/main/java/dev/touchpilot/app/agent/AgentRunner.kt
++++ b/app/src/main/java/dev/touchpilot/app/agent/AgentRunner.kt
+@@ -3,15 +3,13 @@ package dev.touchpilot.app.agent
+ import dev.touchpilot.app.memory.Skill
+ import dev.touchpilot.app.security.ActionPolicy
+ import dev.touchpilot.app.security.DefaultActionPolicy
+-import dev.touchpilot.app.security.PolicyDecision
+-import dev.touchpilot.app.security.SensitiveTextRedactor
+-import dev.touchpilot.app.security.ToolApprovalRequest
+ import dev.touchpilot.app.security.ToolApprovalProvider
+-import dev.touchpilot.app.security.ToolPolicyRequest
+ import dev.touchpilot.app.security.ToolSource
+ import dev.touchpilot.app.tools.AndroidToolCatalog
+ import dev.touchpilot.app.tools.AndroidToolExecutor
+ import dev.touchpilot.app.tools.ToolExecutionLog
++import dev.touchpilot.app.tools.ToolResult
++import dev.touchpilot.app.tools.ToolSpec
+ 
+ class AgentRunner(
+     private val toolExecutor: AndroidToolExecutor,
+@@ -21,158 +19,42 @@ class AgentRunner(
+     private val source: ToolSource = ToolSource.LOCAL_ROUTER,
+     private val policy: ActionPolicy = DefaultActionPolicy()
+ ) {
+-    fun run(task: String, maxSteps: Int = 4): AgentRunResult {
+-        val transcript = StringBuilder()
+-        val events = mutableListOf<AgentEvent>(AgentEvent.UserMessage(task))
+-        var context = "User task: $task\n\nCurrent screen:\n${SensitiveTextRedactor.redact(toolExecutor.observeScreen())}"
+-
+-        repeat(maxSteps) { step ->
+-            transcript.appendLine("Step ${step + 1}")
+-            val raw = runCatching {
+-                commandProvider.complete(AgentPrompts.systemPrompt(skill), context)
+-            }.getOrElse { error ->
+-                transcript.appendLine("Command provider error: ${error.message}")
+-                return AgentRunResult(transcript.toString(), null, events)
+-            }
+-            transcript.appendLine("Model: $raw")
+-
+-            val command = runCatching {
+-                AgentCommandParser.parse(raw)
+-            }.getOrElse { error ->
+-                transcript.appendLine("Command parse error: ${error.message}")
+-                return AgentRunResult(transcript.toString(), null, events)
+-            }
+-            if (command.finalAnswer != null) {
+-                transcript.appendLine("Final: ${command.finalAnswer}")
+-                events += AgentEvent.FinalAnswer(command.finalAnswer)
+-                return AgentRunResult(transcript.toString(), command.finalAnswer, events)
+-            }
+-
+-            val toolName = command.tool
+-            if (toolName == null) {
+-                transcript.appendLine("No tool or final answer returned.")
+-                return AgentRunResult(transcript.toString(), null, events)
+-            }
+-            AgentEvent.toolRequested(command, source)?.let { events += it }
+-
+-            val validationError = toolExecutor.validate(toolName, command.args)
+-            val spec = AndroidToolCatalog.find(toolName)
+-            val allowlistError = validateSkillAllowlist(toolName)
+-            if (allowlistError != null) {
+-                transcript.appendLine("Skill allowlist denied tool: $allowlistError")
+-                ToolExecutionLog.record(
+-                    name = toolName,
+-                    args = "skill=${skill?.id.orEmpty()}",
+-                    ok = false,
+-                    message = "denied by skill allowlist"
+-                )
+-                events += AgentEvent.PolicyBlocked(
+-                    tool = toolName,
+-                    reason = "denied by skill allowlist",
+-                    userMessage = allowlistError
+-                )
+-                return AgentRunResult(transcript.toString(), null, events)
+-            } else if (validationError != null) {
+-                transcript.appendLine("Tool validation failed: $validationError")
+-            } else if (spec != null) {
+-                val decision = policy.evaluate(
+-                    ToolPolicyRequest(
+-                        tool = spec,
+-                        args = command.args,
+-                        source = source,
+-                        activeScreen = toolExecutor.observeScreen(),
+-                        activeSkillId = skill?.id
+-                    )
+-                )
+-                when (decision) {
+-                    is PolicyDecision.Allow -> {
+-                        transcript.appendLine("Policy allowed $toolName: ${decision.reason}")
+-                    }
+-                    is PolicyDecision.RequireApproval -> {
+-                        transcript.appendLine("Approval requested for $toolName: ${decision.reason}")
+-                        val approvalRequest = ToolApprovalRequest(spec, command.args, decision)
+-                        events += AgentEvent.approvalRequired(approvalRequest)
+-                        val approved = approvalProvider.approve(approvalRequest)
+-                        if (!approved) {
+-                            transcript.appendLine("Tool denied by user: $toolName")
+-                            ToolExecutionLog.record(
+-                                name = toolName,
+-                                args = "risk=${spec.risk}",
+-                                ok = false,
+-                                message = "denied by user: ${decision.reason}"
+-                            )
+-                            events += AgentEvent.PolicyBlocked(
+-                                tool = toolName,
+-                                reason = "denied by user: ${decision.reason}",
+-                                userMessage = "The user did not approve $toolName."
+-                            )
+-                            return AgentRunResult(transcript.toString(), null, events)
+-                        }
+-                        transcript.appendLine("Tool approved by user: $toolName")
+-                    }
+-                    is PolicyDecision.Deny -> {
+-                        transcript.appendLine("Policy denied $toolName: ${decision.reason}")
+-                        ToolExecutionLog.record(toolName, "policy=deny", false, decision.userMessage)
+-                        AgentEvent.policyBlocked(toolName, decision)?.let { events += it }
+-                        return AgentRunResult(transcript.toString(), null, events)
+-                    }
+-                    is PolicyDecision.Block -> {
+-                        transcript.appendLine("Policy blocked $toolName: ${decision.reason}")
+-                        ToolExecutionLog.record(toolName, "policy=block", false, decision.userMessage)
+-                        AgentEvent.policyBlocked(toolName, decision)?.let { events += it }
+-                        return AgentRunResult(transcript.toString(), null, events)
+-                    }
+-                }
+-            }
++    fun run(task: String, maxSteps: Int = AgentRunLimits.DefaultMaxSteps): AgentRunResult {
++        return run(task, AgentRunLimits(maxSteps = maxSteps))
++    }
+ 
+-            AgentEvent.toolRunning(command, source)?.let { events += it }
+-            val result = runCatching {
+-                toolExecutor.execute(toolName, command.args, source)
+-            }.getOrElse { error ->
+-                transcript.appendLine("Tool execution error: ${error.message}")
+-                events += AgentEvent.ToolFailed(tool = toolName, message = error.message ?: "Tool execution error")
+-                context = recoveryContext(task, transcript.toString())
+-                return@repeat
+-            }
+-            events += AgentEvent.toolResult(toolName, result)
+-            transcript.appendLine("Tool result: ${result.ok} ${SensitiveTextRedactor.redact(result.message)}")
+-            if (result.data.isNotEmpty()) {
+-                transcript.appendLine("Tool data: ${SensitiveTextRedactor.redact(result.data)}")
+-            }
++    fun run(task: String, limits: AgentRunLimits): AgentRunResult {
++        return BoundedLocalAgentLoop(
++            tools = AndroidLoopTools(toolExecutor),
++            approvalProvider = approvalProvider,
++            commandProvider = commandProvider,
++            skill = skill,
++            source = source,
++            policy = policy
++        ).run(task, limits)
++    }
+ 
+-            val verificationScreen = if (toolName == "observe_screen") {
+-                result.message
+-            } else {
+-                toolExecutor.observeScreen()
+-            }
+-            transcript.appendLine("Verification screen length: ${verificationScreen.length}")
++    private class AndroidLoopTools(
++        private val toolExecutor: AndroidToolExecutor
++    ) : LocalAgentLoopTools {
++        override fun observeScreen(): String = toolExecutor.observeScreen()
+ 
+-            context = buildString {
+-                appendLine("User task: $task")
+-                appendLine("Previous transcript:")
+-                appendLine(transcript.toString())
+-                appendLine("Verification screen:")
+-                appendLine(SensitiveTextRedactor.redact(verificationScreen))
+-            }
++        override fun validate(name: String, args: Map<String, String>): String? {
++            return toolExecutor.validate(name, args)
+         }
+ 
+-        return AgentRunResult(transcript.toString(), null, events)
+-    }
++        override fun findTool(name: String): ToolSpec? = AndroidToolCatalog.find(name)
+ 
+-    private fun recoveryContext(task: String, transcript: String): String {
+-        return buildString {
+-            appendLine("User task: $task")
+-            appendLine("Previous transcript:")
+-            appendLine(transcript)
+-            appendLine("Current screen:")
+-            appendLine(SensitiveTextRedactor.redact(toolExecutor.observeScreen()))
+-            appendLine("Recover from the last error or return a final answer if recovery is unsafe.")
++        override fun execute(
++            name: String,
++            args: Map<String, String>,
++            source: ToolSource
++        ): ToolResult {
++            return toolExecutor.execute(name, args, source)
+         }
+-    }
+ 
+-    private fun validateSkillAllowlist(toolName: String): String? {
+-        val activeSkill = skill ?: return null
+-        if (toolName in activeSkill.allowedTools) return null
+-        return "$toolName is not allowed by ${activeSkill.title}"
++        override fun recordExecution(name: String, args: String, ok: Boolean, message: String) {
++            ToolExecutionLog.record(name, args, ok, message)
++        }
+     }
+ }
+diff --git a/app/src/main/java/dev/touchpilot/app/agent/AgentStep.kt b/app/src/main/java/dev/touchpilot/app/agent/AgentStep.kt
+index 90393fc..224fe78 100644
+--- a/app/src/main/java/dev/touchpilot/app/agent/AgentStep.kt
++++ b/app/src/main/java/dev/touchpilot/app/agent/AgentStep.kt
+@@ -159,8 +159,11 @@ enum class AgentStepStatus(val wireName: String) {
+ enum class AgentStepStopReason(val wireName: String) {
+     COMPLETED("completed"),
+     MAX_STEPS("max_steps"),
++    REPEATED_TOOL_FAILURE("repeated_tool_failure"),
+     POLICY_BLOCKED("policy_blocked"),
+     APPROVAL_DENIED("approval_denied"),
++    USER_CANCELLED("user_cancelled"),
++    CLARIFICATION_NEEDED("clarification_needed"),
+     PARSER_ERROR("parser_error"),
+     EXECUTOR_ERROR("executor_error"),
+     NO_VALID_ACTION("no_valid_action");
+diff --git a/app/src/main/java/dev/touchpilot/app/agent/BoundedLocalAgentLoop.kt b/app/src/main/java/dev/touchpilot/app/agent/BoundedLocalAgentLoop.kt
+new file mode 100644
+index 0000000..cc838f1
+--- /dev/null
++++ b/app/src/main/java/dev/touchpilot/app/agent/BoundedLocalAgentLoop.kt
+@@ -0,0 +1,346 @@
++package dev.touchpilot.app.agent
++
++import dev.touchpilot.app.memory.Skill
++import dev.touchpilot.app.security.ActionPolicy
++import dev.touchpilot.app.security.DefaultActionPolicy
++import dev.touchpilot.app.security.PolicyDecision
++import dev.touchpilot.app.security.SensitiveTextRedactor
++import dev.touchpilot.app.security.ToolApprovalRequest
++import dev.touchpilot.app.security.ToolApprovalProvider
++import dev.touchpilot.app.security.ToolPolicyRequest
++import dev.touchpilot.app.security.ToolSource
++import dev.touchpilot.app.tools.ToolResult
++import dev.touchpilot.app.tools.ToolSpec
++
++class BoundedLocalAgentLoop(
++    private val tools: LocalAgentLoopTools,
++    private val approvalProvider: ToolApprovalProvider,
++    private val commandProvider: AgentCommandProvider,
++    private val skill: Skill? = null,
++    private val source: ToolSource = ToolSource.LOCAL_ROUTER,
++    private val policy: ActionPolicy = DefaultActionPolicy()
++) {
++    fun run(task: String, limits: AgentRunLimits = AgentRunLimits()): AgentRunResult {
++        val transcript = StringBuilder()
++        val events = mutableListOf<AgentEvent>(AgentEvent.UserMessage(task))
++        val steps = mutableListOf<AgentStep>()
++        var currentScreen = tools.observeScreen()
++        var context = initialContext(task, currentScreen)
++        var consecutiveFailures = 0
++
++        repeat(limits.maxSteps) { step ->
++            val stepIndex = step + 1
++            transcript.appendLine("Step $stepIndex")
++            val raw = runCatching {
++                commandProvider.complete(AgentPrompts.systemPrompt(skill), context)
++            }.getOrElse { error ->
++                transcript.appendLine("Command provider error: ${error.message}")
++                steps += invalidStep(stepIndex, currentScreen, "Command provider error: ${error.message}")
++                return stopped(transcript, events, steps, AgentStepStopReason.NO_VALID_ACTION)
++            }
++            transcript.appendLine("Model: $raw")
++
++            val command = runCatching {
++                AgentCommandParser.parse(raw)
++            }.getOrElse { error ->
++                transcript.appendLine("Command parse error: ${error.message}")
++                steps += invalidStep(stepIndex, currentScreen, "Command parse error: ${error.message}")
++                return stopped(transcript, events, steps, AgentStepStopReason.NO_VALID_ACTION)
++            }
++            if (command.finalAnswer != null) {
++                transcript.appendLine("Final: ${command.finalAnswer}")
++                events += AgentEvent.FinalAnswer(command.finalAnswer)
++                steps += AgentStepFactory.stop(
++                    sequenceNumber = stepIndex,
++                    reason = AgentStepStopReason.COMPLETED,
++                    outputSummary = command.finalAnswer,
++                    inputSummary = "final answer produced"
++                )
++                return AgentRunResult(
++                    transcript = transcript.toString(),
++                    finalAnswer = command.finalAnswer,
++                    events = events,
++                    steps = steps,
++                    stopReason = AgentStepStopReason.COMPLETED,
++                    stopMessage = AgentStepStopReason.COMPLETED.userMessage
++                )
++            }
++
++            val toolName = command.tool
++            if (toolName == null) {
++                transcript.appendLine("No tool or final answer returned.")
++                steps += invalidStep(stepIndex, currentScreen, "No tool or final answer returned.")
++                return stopped(transcript, events, steps, AgentStepStopReason.NO_VALID_ACTION)
++            }
++            val redactedArgs = SensitiveTextRedactor.redact(command.args)
++            steps += AgentStepFactory.act(
++                sequenceNumber = stepIndex,
++                tool = toolName,
++                args = redactedArgs,
++                source = source.name.lowercase(),
++                inputSummary = "observed ${currentScreen.length} character(s)",
++                outputSummary = "Tool selected.",
++                status = AgentStepStatus.PENDING
++            )
++            AgentEvent.toolRequested(command, source)?.let { events += it }
++
++            val validationError = tools.validate(toolName, command.args)
++            val spec = tools.findTool(toolName)
++            val allowlistError = validateSkillAllowlist(toolName)
++            if (allowlistError != null) {
++                transcript.appendLine("Skill allowlist denied tool: $allowlistError")
++                tools.recordExecution(
++                    name = toolName,
++                    args = "skill=${skill?.id.orEmpty()}",
++                    ok = false,
++                    message = "denied by skill allowlist"
++                )
++                events += AgentEvent.PolicyBlocked(
++                    tool = toolName,
++                    reason = "denied by skill allowlist",
++                    userMessage = allowlistError
++                )
++                steps.replaceLast(
++                    status = AgentStepStatus.BLOCKED,
++                    message = allowlistError,
++                    stopReason = AgentStepStopReason.POLICY_BLOCKED
++                )
++                return stopped(transcript, events, steps, AgentStepStopReason.POLICY_BLOCKED)
++            } else if (validationError != null) {
++                transcript.appendLine("Tool validation failed: $validationError")
++                steps.replaceLast(
++                    status = AgentStepStatus.FAILED,
++                    message = validationError,
++                    stopReason = AgentStepStopReason.NO_VALID_ACTION
++                )
++                return stopped(transcript, events, steps, AgentStepStopReason.NO_VALID_ACTION)
++            } else if (spec != null) {
++                val decision = policy.evaluate(
++                    ToolPolicyRequest(
++                        tool = spec,
++                        args = command.args,
++                        source = source,
++                        activeScreen = currentScreen,
++                        activeSkillId = skill?.id
++                    )
++                )
++                when (decision) {
++                    is PolicyDecision.Allow -> {
++                        transcript.appendLine("Policy allowed $toolName: ${decision.reason}")
++                    }
++                    is PolicyDecision.RequireApproval -> {
++                        transcript.appendLine("Approval requested for $toolName: ${decision.reason}")
++                        val approvalRequest = ToolApprovalRequest(spec, command.args, decision)
++                        events += AgentEvent.approvalRequired(approvalRequest)
++                        val approved = approvalProvider.approve(approvalRequest)
++                        if (!approved) {
++                            transcript.appendLine("Tool denied by user: $toolName")
++                            tools.recordExecution(
++                                name = toolName,
++                                args = "risk=${spec.risk}",
++                                ok = false,
++                                message = "denied by user: ${decision.reason}"
++                            )
++                            events += AgentEvent.PolicyBlocked(
++                                tool = toolName,
++                                reason = "denied by user: ${decision.reason}",
++                                userMessage = "The user did not approve $toolName."
++                            )
++                            steps.replaceLast(
++                                status = AgentStepStatus.BLOCKED,
++                                message = "The user did not approve $toolName.",
++                                stopReason = AgentStepStopReason.USER_CANCELLED
++                            )
++                            return stopped(transcript, events, steps, AgentStepStopReason.USER_CANCELLED)
++                        }
++                        transcript.appendLine("Tool approved by user: $toolName")
++                    }
++                    is PolicyDecision.Deny -> {
++                        transcript.appendLine("Policy denied $toolName: ${decision.reason}")
++                        tools.recordExecution(toolName, "policy=deny", false, decision.userMessage)
++                        AgentEvent.policyBlocked(toolName, decision)?.let { events += it }
++                        steps.replaceLast(
++                            status = AgentStepStatus.BLOCKED,
++                            message = decision.userMessage,
++                            stopReason = AgentStepStopReason.POLICY_BLOCKED
++                        )
++                        return stopped(transcript, events, steps, AgentStepStopReason.POLICY_BLOCKED)
++                    }
++                    is PolicyDecision.Block -> {
++                        transcript.appendLine("Policy blocked $toolName: ${decision.reason}")
++                        tools.recordExecution(toolName, "policy=block", false, decision.userMessage)
++                        AgentEvent.policyBlocked(toolName, decision)?.let { events += it }
++                        steps.replaceLast(
++                            status = AgentStepStatus.BLOCKED,
++                            message = decision.userMessage,
++                            stopReason = AgentStepStopReason.POLICY_BLOCKED
++                        )
++                        return stopped(transcript, events, steps, AgentStepStopReason.POLICY_BLOCKED)
++                    }
++                }
++            }
++
++            steps.replaceLast(status = AgentStepStatus.RUNNING, message = "Tool is running.")
++            AgentEvent.toolRunning(command, source)?.let { events += it }
++            val result = runCatching {
++                tools.execute(toolName, command.args, source)
++            }.getOrElse { error ->
++                val message = error.message ?: "Tool execution error"
++                transcript.appendLine("Tool execution error: $message")
++                events += AgentEvent.ToolFailed(tool = toolName, message = message)
++                consecutiveFailures += 1
++                steps.replaceLast(
++                    status = AgentStepStatus.FAILED,
++                    message = message,
++                    stopReason = if (consecutiveFailures >= limits.maxConsecutiveFailures) {
++                        AgentStepStopReason.REPEATED_TOOL_FAILURE
++                    } else {
++                        null
++                    }
++                )
++                if (consecutiveFailures >= limits.maxConsecutiveFailures) {
++                    return stopped(transcript, events, steps, AgentStepStopReason.REPEATED_TOOL_FAILURE)
++                }
++                currentScreen = tools.observeScreen()
++                context = recoveryContext(task, transcript.toString(), currentScreen)
++                return@repeat
++            }
++            events += AgentEvent.toolResult(toolName, result)
++            transcript.appendLine("Tool result: ${result.ok} ${SensitiveTextRedactor.redact(result.message)}")
++            if (result.data.isNotEmpty()) {
++                transcript.appendLine("Tool data: ${SensitiveTextRedactor.redact(result.data)}")
++            }
++
++            val verificationScreen = if (toolName == "observe_screen") {
++                result.message
++            } else {
++                tools.observeScreen()
++            }
++            transcript.appendLine("Verification screen length: ${verificationScreen.length}")
++
++            if (result.ok) {
++                consecutiveFailures = 0
++                steps.replaceLast(
++                    status = AgentStepStatus.OK,
++                    message = result.message,
++                    verificationStatus = result.data["verification_status"],
++                    result = result
++                )
++            } else {
++                consecutiveFailures += 1
++                steps.replaceLast(
++                    status = AgentStepStatus.FAILED,
++                    message = result.message,
++                    verificationStatus = result.data["verification_status"],
++                    result = result,
++                    stopReason = if (consecutiveFailures >= limits.maxConsecutiveFailures) {
++                        AgentStepStopReason.REPEATED_TOOL_FAILURE
++                    } else {
++                        null
++                    }
++                )
++                if (consecutiveFailures >= limits.maxConsecutiveFailures) {
++                    return stopped(transcript, events, steps, AgentStepStopReason.REPEATED_TOOL_FAILURE)
++                }
++            }
++
++            currentScreen = verificationScreen
++            context = nextContext(task, transcript.toString(), verificationScreen)
++        }
++
++        return stopped(transcript, events, steps, AgentStepStopReason.MAX_STEPS)
++    }
++
++    private fun stopped(
++        transcript: StringBuilder,
++        events: List<AgentEvent>,
++        steps: List<AgentStep>,
++        reason: AgentStepStopReason
++    ): AgentRunResult {
++        transcript.appendLine("Stopped: ${reason.name.lowercase()} - ${reason.userMessage}")
++        return AgentRunResult(
++            transcript = transcript.toString(),
++            finalAnswer = null,
++            events = events,
++            steps = steps,
++            stopReason = reason,
++            stopMessage = reason.userMessage
++        )
++    }
++
++    private fun initialContext(task: String, screen: String): String {
++        return "User task: $task\n\nCurrent screen:\n${SensitiveTextRedactor.redact(screen)}"
++    }
++
++    private fun nextContext(task: String, transcript: String, verificationScreen: String): String {
++        return buildString {
++            appendLine("User task: $task")
++            appendLine("Previous transcript:")
++            appendLine(transcript)
++            appendLine("Verification screen:")
++            appendLine(SensitiveTextRedactor.redact(verificationScreen))
++        }
++    }
++
++    private fun recoveryContext(task: String, transcript: String, currentScreen: String): String {
++        return buildString {
++            appendLine("User task: $task")
++            appendLine("Previous transcript:")
++            appendLine(transcript)
++            appendLine("Current screen:")
++            appendLine(SensitiveTextRedactor.redact(currentScreen))
++            appendLine("Recover from the last error or return a final answer if recovery is unsafe.")
++        }
++    }
++
++    private fun validateSkillAllowlist(toolName: String): String? {
++        val activeSkill = skill ?: return null
++        if (toolName in activeSkill.allowedTools) return null
++        return "$toolName is not allowed by ${activeSkill.title}"
++    }
++
++    private fun invalidStep(stepIndex: Int, screen: String, message: String): AgentStep {
++        return AgentStepFactory.stop(
++            sequenceNumber = stepIndex,
++            reason = AgentStepStopReason.NO_VALID_ACTION,
++            outputSummary = message,
++            inputSummary = "observed ${screen.length} character(s)"
++        )
++    }
++
++    private fun MutableList<AgentStep>.replaceLast(
++        status: AgentStepStatus,
++        message: String,
++        verificationStatus: String? = null,
++        stopReason: AgentStepStopReason? = null,
++        result: ToolResult? = null
++    ) {
++        val last = removeAt(lastIndex)
++        val redactedMessage = SensitiveTextRedactor.redact(message)
++        add(
++            last.copy(
++                status = status,
++                outputSummary = redactedMessage,
++                toolCall = last.toolCall?.copy(
++                    result = result?.let { AgentStepToolResult.of(it, redactOnConstruct = true) }
++                        ?: last.toolCall.result
++                ),
++                verification = verificationStatus?.let {
++                    AgentStepVerification(
++                        status = SensitiveTextRedactor.redact(it),
++                        reason = redactedMessage
++                    )
++                } ?: last.verification,
++                stopReason = stopReason
++            )
++        )
++    }
++}
++
++interface LocalAgentLoopTools {
++    fun observeScreen(): String
++    fun validate(name: String, args: Map<String, String>): String?
++    fun findTool(name: String): ToolSpec?
++    fun execute(name: String, args: Map<String, String>, source: ToolSource): ToolResult
++    fun recordExecution(name: String, args: String, ok: Boolean, message: String) = Unit
++}
+diff --git a/app/src/main/java/dev/touchpilot/app/agent/LocalReasoningCore.kt b/app/src/main/java/dev/touchpilot/app/agent/LocalReasoningCore.kt
+index c203868..7ac23e0 100644
+--- a/app/src/main/java/dev/touchpilot/app/agent/LocalReasoningCore.kt
++++ b/app/src/main/java/dev/touchpilot/app/agent/LocalReasoningCore.kt
+@@ -67,7 +67,9 @@ class DefaultLocalReasoningCore(
+             return AgentRunResult(
+                 transcript = "Conversational reply",
+                 finalAnswer = canned.message,
+-                events = listOf(userEvent, finalEvent)
++                events = listOf(userEvent, finalEvent),
++                stopReason = AgentStepStopReason.COMPLETED,
++                stopMessage = AgentStepStopReason.COMPLETED.userMessage
+             )
+         }
+ 
+@@ -143,7 +145,9 @@ class DefaultLocalReasoningCore(
+         return AgentRunResult(
+             transcript = "Blocked by intent gate: ${intent.reason}",
+             finalAnswer = intent.userMessage,
+-            events = listOf(userEvent, blocked, finalEvent)
++            events = listOf(userEvent, blocked, finalEvent),
++            stopReason = AgentStepStopReason.POLICY_BLOCKED,
++            stopMessage = blocked.userMessage
+         )
+     }
+ 
+@@ -162,7 +166,9 @@ class DefaultLocalReasoningCore(
+         return AgentRunResult(
+             transcript = "Clarification requested: ${intent.reason}",
+             finalAnswer = intent.clarification,
+-            events = listOf(userEvent, assistant)
++            events = listOf(userEvent, assistant),
++            stopReason = AgentStepStopReason.CLARIFICATION_NEEDED,
++            stopMessage = intent.clarification
+         )
+     }
+ 
+@@ -191,7 +197,9 @@ class DefaultLocalReasoningCore(
+         return AgentRunResult(
+             transcript = transcript,
+             finalAnswer = summary.sentence,
+-            events = listOf(userEvent, assistant, finalEvent)
++            events = listOf(userEvent, assistant, finalEvent),
++            stopReason = AgentStepStopReason.COMPLETED,
++            stopMessage = AgentStepStopReason.COMPLETED.userMessage
+         )
+     }
+ 
+diff --git a/app/src/test/java/dev/touchpilot/app/agent/BoundedLocalAgentLoopTest.kt b/app/src/test/java/dev/touchpilot/app/agent/BoundedLocalAgentLoopTest.kt
+new file mode 100644
+index 0000000..f8f83f7
+--- /dev/null
++++ b/app/src/test/java/dev/touchpilot/app/agent/BoundedLocalAgentLoopTest.kt
+@@ -0,0 +1,115 @@
++package dev.touchpilot.app.agent
++
++import dev.touchpilot.app.security.ToolApprovalProvider
++import dev.touchpilot.app.security.ToolSource
++import dev.touchpilot.app.tools.AndroidToolCatalog
++import dev.touchpilot.app.tools.ToolResult
++import dev.touchpilot.app.tools.ToolSpec
++import kotlin.test.Test
++import kotlin.test.assertEquals
++import kotlin.test.assertFalse
++
++class BoundedLocalAgentLoopTest {
++    @Test
++    fun stopsWithSuccessWhenFinalAnswerIsProduced() {
++        val result = loop(
++            commands = listOf(
++                """{"tool":"observe_screen","args":{}}""",
++                """{"final":"Done."}"""
++            ),
++            results = listOf(ToolResult(ok = true, message = "Settings screen"))
++        ).run("check settings", AgentRunLimits(maxSteps = 3))
++
++        assertEquals(AgentStepStopReason.COMPLETED, result.stopReason)
++        assertEquals("Done.", result.finalAnswer)
++        assertEquals(listOf(AgentStepStatus.OK, AgentStepStatus.STOPPED), result.steps.map { it.status })
++        assertEquals("observe_screen", result.steps.first().toolCall?.tool)
++    }
++
++    @Test
++    fun stopsWhenMaxStepsIsReached() {
++        val result = loop(
++            commands = listOf(
++                """{"tool":"observe_screen","args":{}}""",
++                """{"tool":"observe_screen","args":{}}"""
++            ),
++            results = listOf(
++                ToolResult(ok = true, message = "screen one"),
++                ToolResult(ok = true, message = "screen two")
++            )
++        ).run("keep observing", AgentRunLimits(maxSteps = 2))
++
++        assertEquals(AgentStepStopReason.MAX_STEPS, result.stopReason)
++        assertEquals(2, result.steps.size)
++        assertEquals(listOf(AgentStepStatus.OK, AgentStepStatus.OK), result.steps.map { it.status })
++    }
++
++    @Test
++    fun stopsWhenPolicyBlocksNextAction() {
++        val result = loop(
++            commands = listOf("""{"tool":"type_text","args":{"text":"password=hunter2"}}"""),
++            results = emptyList()
++        ).run("enter password", AgentRunLimits(maxSteps = 2))
++
++        assertEquals(AgentStepStopReason.POLICY_BLOCKED, result.stopReason)
++        assertEquals(AgentStepStatus.BLOCKED, result.steps.single().status)
++        assertEquals("type_text", result.steps.single().toolCall?.tool)
++        assertEquals("[REDACTED]", result.steps.single().toolCall?.args?.get("text"))
++        assertFalse("hunter2" in result.steps.single().outputSummary)
++    }
++
++    @Test
++    fun stopsAfterRepeatedToolFailures() {
++        val result = loop(
++            commands = listOf(
++                """{"tool":"observe_screen","args":{}}""",
++                """{"tool":"observe_screen","args":{}}"""
++            ),
++            results = listOf(
++                ToolResult(ok = false, message = "screen unavailable"),
++                ToolResult(ok = false, message = "screen still unavailable")
++            )
++        ).run("observe twice", AgentRunLimits(maxSteps = 4, maxConsecutiveFailures = 2))
++
++        assertEquals(AgentStepStopReason.REPEATED_TOOL_FAILURE, result.stopReason)
++        assertEquals(2, result.steps.size)
++        assertEquals(listOf(AgentStepStatus.FAILED, AgentStepStatus.FAILED), result.steps.map { it.status })
++        assertEquals(AgentStepStopReason.REPEATED_TOOL_FAILURE, result.steps.last().stopReason)
++    }
++
++    private fun loop(
++        commands: List<String>,
++        results: List<ToolResult>
++    ): BoundedLocalAgentLoop {
++        return BoundedLocalAgentLoop(
++            tools = FakeLoopTools(results),
++            approvalProvider = ToolApprovalProvider { true },
++            commandProvider = SequenceCommandProvider(commands),
++            source = ToolSource.LOCAL_ROUTER
++        )
++    }
++
++    private class SequenceCommandProvider(commands: List<String>) : AgentCommandProvider {
++        private val queue = ArrayDeque(commands)
++
++        override fun complete(systemPrompt: String, context: String): String {
++            return queue.removeFirstOrNull() ?: """{"final":"No more commands."}"""
++        }
++    }
++
++    private class FakeLoopTools(results: List<ToolResult>) : LocalAgentLoopTools {
++        private val resultQueue = ArrayDeque(results)
++
++        override fun observeScreen(): String = "Home screen"
++
++        override fun validate(name: String, args: Map<String, String>): String? {
++            return AndroidToolCatalog.validate(name, args)
++        }
++
++        override fun findTool(name: String): ToolSpec? = AndroidToolCatalog.find(name)
++
++        override fun execute(name: String, args: Map<String, String>, source: ToolSource): ToolResult {
++            return resultQueue.removeFirst()
++        }
++    }
++}

@@ -1,0 +1,1435 @@
+diff --git a/app/src/main/java/dev/touchpilot/app/MainActivity.kt b/app/src/main/java/dev/touchpilot/app/MainActivity.kt
+index 57df7a3..8032197 100644
+--- a/app/src/main/java/dev/touchpilot/app/MainActivity.kt
++++ b/app/src/main/java/dev/touchpilot/app/MainActivity.kt
+@@ -29,12 +29,20 @@ import androidx.core.content.ContextCompat
+ import com.google.android.material.button.MaterialButton
+ import com.google.android.material.card.MaterialCardView
+ import com.google.android.material.tabs.TabLayout
++import dev.touchpilot.app.agent.AgentEventListener
+ import dev.touchpilot.app.agent.AgentProviderMode
+ import dev.touchpilot.app.agent.AgentRunDetailFormatter
+ import dev.touchpilot.app.agent.AgentRunDisplayStep
+ import dev.touchpilot.app.agent.AgentRunIds
+ import dev.touchpilot.app.agent.AgentRunRecord
+ import dev.touchpilot.app.agent.AgentRunStepStatus
++import dev.touchpilot.app.agent.AgentStep
++import dev.touchpilot.app.agent.AgentStepStatus
++import dev.touchpilot.app.agent.AgentStepTimelineBuilder
++import dev.touchpilot.app.agent.timelineChipAccent
++import dev.touchpilot.app.agent.timelineChipLabel
++import dev.touchpilot.app.agent.timelineDetail
++import dev.touchpilot.app.agent.timelineLabel
+ import dev.touchpilot.app.agent.ConversationalGate
+ import dev.touchpilot.app.agent.DefaultLocalReasoningCore
+ import dev.touchpilot.app.agent.LocalReasoningContext
+@@ -460,6 +468,7 @@ class MainActivity : Activity() {
+                 actionHint = event.runId?.let { "Tap for run details" },
+                 onClick = event.runId?.let { runId -> { openRunDetail(runId) } }
+             )
++            is ChatEvent.StepTimeline -> stepTimelineCard(event)
+             is ChatEvent.ToolCall -> toolCallCard(event.card)
+             is ChatEvent.ApprovalPrompt -> approvalCard(event)
+         }
+@@ -611,13 +620,26 @@ class MainActivity : Activity() {
+         }
+ 
+         conversation += ChatEvent.Working("Working on it.", "Runtime: ${currentProviderMode().label()}")
++        val stepTimeline = ChatEvent.StepTimeline()
++        conversation += stepTimeline
+         showSection(Section.CHAT)
+ 
+         val runId = AgentRunIds.next()
+         val startedAtMillis = System.currentTimeMillis()
+ 
+         Thread {
+-            val runOutcome = runCatching { reasoningCore.run(task) }
++            val timelineBuilder = AgentStepTimelineBuilder()
++            val runOutcome = runCatching {
++                reasoningCore.run(
++                    task = task,
++                    timeline = timelineBuilder,
++                    listener = AgentEventListener {
++                        runOnUiThread {
++                            refreshStepTimeline(stepTimeline, timelineBuilder.snapshot)
++                        }
++                    }
++                )
++            }
+             val completedAtMillis = System.currentTimeMillis()
+             val record = if (runOutcome.isSuccess) {
+                 AgentRunRecord(
+@@ -639,6 +661,14 @@ class MainActivity : Activity() {
+             }
+ 
+             runOnUiThread {
++                val steps = if (runOutcome.isFailure) {
++                    timelineBuilder.snapshot + timelineBuilder.failureStop(
++                        "Agent failed: ${runOutcome.exceptionOrNull()?.message.orEmpty()}"
++                    )
++                } else {
++                    timelineBuilder.snapshot
++                }
++                refreshStepTimeline(stepTimeline, steps, complete = true)
+                 agentRunHistory += record
+                 val workingIdx = conversation.indexOfLast { it is ChatEvent.Working }
+                 if (workingIdx >= 0) conversation.removeAt(workingIdx)
+@@ -652,10 +682,14 @@ class MainActivity : Activity() {
+                     body = AgentRunDetailFormatter.compactSummary(record),
+                     runId = runId
+                 )
+-                conversation += ChatEvent.Agent(
+-                    "Done.",
+-                    "Tap the timeline card to inspect tool calls, verification, and stop reason."
+-                )
++                val finalAnswer = runOutcome.getOrNull()?.finalAnswer
++                val doneDetail = when {
++                    finalAnswer != null -> finalAnswer
++                    runOutcome.isFailure -> record.errorMessage ?: "Agent failed."
++                    steps.isEmpty() -> "No steps recorded."
++                    else -> "Tap the timeline card to inspect tool calls, verification, and stop reason."
++                }
++                conversation += ChatEvent.Agent("Done.", doneDetail)
+                 refreshExecutionLog()
+                 refreshStatus()
+                 showSection(Section.CHAT)
+@@ -663,6 +697,17 @@ class MainActivity : Activity() {
+         }.start()
+     }
+ 
++    private fun refreshStepTimeline(
++        event: ChatEvent.StepTimeline,
++        steps: List<AgentStep>,
++        complete: Boolean = false
++    ) {
++        event.steps = steps
++        event.isComplete = complete || event.isComplete
++        bindStepTimeline(event)
++        scrollChatToBottom()
++    }
++
+     private fun currentReasoningContext(): LocalReasoningContext {
+         val providerMode = currentProviderMode()
+         return LocalReasoningContext(
+@@ -1795,6 +1840,162 @@ class MainActivity : Activity() {
+         return withoutScheme.substringBefore('/').ifBlank { trimmed }
+     }
+ 
++    private fun stepTimelineCard(event: ChatEvent.StepTimeline): View {
++        val card = MaterialCardView(this).apply {
++            setCardBackgroundColor(Theme.Card)
++            strokeColor = Theme.StrokeDark
++            strokeWidth = 1
++            radius = 8f
++            cardElevation = 0f
++        }
++        val content = LinearLayout(this).apply {
++            orientation = LinearLayout.VERTICAL
++            setPadding(18, 14, 18, 14)
++        }
++        val titleView = TextView(this).apply {
++            text = "Agent steps"
++            textSize = 13f
++            typeface = Typeface.DEFAULT_BOLD
++            setTextColor(Color.WHITE)
++        }
++        val subtitleView = TextView(this).apply {
++            textSize = 11.5f
++            setTextColor(Theme.MutedText)
++            setPadding(0, 4, 0, 0)
++        }
++        val stepsContainer = LinearLayout(this).apply {
++            orientation = LinearLayout.VERTICAL
++            setPadding(0, 10, 0, 0)
++        }
++        content.addView(titleView)
++        content.addView(subtitleView)
++        content.addView(stepsContainer)
++        card.addView(content)
++        event.viewHolder = ChatEvent.StepTimeline.ViewHolder(
++            subtitleView = subtitleView,
++            stepsContainer = stepsContainer
++        )
++        bindStepTimeline(event)
++        return card.withMargins(top = 8, bottom = 8)
++    }
++
++    private fun bindStepTimeline(event: ChatEvent.StepTimeline) {
++        val holder = event.viewHolder ?: return
++        val steps = event.steps
++        holder.subtitleView.text = when {
++            steps.isEmpty() -> "Waiting for the first step..."
++            event.isComplete -> "Completed ${steps.size} step${if (steps.size == 1) "" else "s"}"
++            else -> "Running locally on device"
++        }
++        holder.stepsContainer.removeAllViews()
++        if (steps.isEmpty()) {
++            holder.stepsContainer.addView(stepTimelineEmptyState())
++            return
++        }
++        steps.forEachIndexed { index, step ->
++            holder.stepsContainer.addView(stepTimelineRow(step, isLast = index == steps.lastIndex))
++        }
++    }
++
++    private fun stepTimelineEmptyState(): View {
++        return TextView(this).apply {
++            text = "Steps will appear here as TouchPilot observes, decides, and acts."
++            textSize = 12f
++            setTextColor(Theme.MutedText)
++            setPadding(0, 4, 0, 4)
++        }
++    }
++
++    private fun stepTimelineRow(step: AgentStep, isLast: Boolean): View {
++        val row = LinearLayout(this).apply {
++            orientation = LinearLayout.HORIZONTAL
++            setPadding(0, if (isLast) 0 else 6, 0, 6)
++        }
++        val rail = LinearLayout(this).apply {
++            orientation = LinearLayout.VERTICAL
++            gravity = Gravity.CENTER_HORIZONTAL
++            setPadding(0, 2, 12, 0)
++        }
++        rail.addView(
++            View(this).apply {
++                layoutParams = LinearLayout.LayoutParams(10, 10).apply {
++                    gravity = Gravity.CENTER_HORIZONTAL
++                }
++                background = rounded(stepStatusColor(step.status), 5, stepStatusColor(step.status))
++            }
++        )
++        if (!isLast) {
++            rail.addView(
++                View(this).apply {
++                    layoutParams = LinearLayout.LayoutParams(2, 28)
++                    setBackgroundColor(Theme.StrokeDark)
++                }
++            )
++        }
++        val column = LinearLayout(this).apply {
++            orientation = LinearLayout.VERTICAL
++            layoutParams = LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f)
++        }
++        val header = LinearLayout(this).apply {
++            orientation = LinearLayout.HORIZONTAL
++        }
++        header.addView(
++            TextView(this).apply {
++                text = step.type.timelineLabel()
++                textSize = 12.5f
++                typeface = Typeface.DEFAULT_BOLD
++                setTextColor(Color.WHITE)
++                layoutParams = LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f)
++            }
++        )
++        header.addView(stepStatusChip(step.status))
++        column.addView(header)
++        column.addView(
++            TextView(this).apply {
++                text = step.timelineDetail()
++                textSize = 12f
++                setTextColor(Theme.BodyText)
++                setPadding(0, 4, 0, 0)
++            }
++        )
++        row.addView(rail)
++        row.addView(column)
++        return row
++    }
++
++    private fun stepStatusChip(status: AgentStepStatus): TextView {
++        return statusChip(status.timelineChipLabel(), accent = status.timelineChipAccent()).apply {
++            when (status) {
++                AgentStepStatus.FAILED,
++                AgentStepStatus.BLOCKED -> {
++                    background = rounded(Theme.SurfaceRaised, 8, Color.rgb(180, 70, 70))
++                    setTextColor(Color.rgb(255, 210, 210))
++                }
++                AgentStepStatus.CLARIFIED -> {
++                    background = rounded(Theme.SurfaceRaised, 8, Color.rgb(200, 150, 40))
++                    setTextColor(Color.rgb(255, 230, 170))
++                }
++                AgentStepStatus.PENDING -> {
++                    background = rounded(Theme.SurfaceRaised, 8, Theme.StrokeDark)
++                    setTextColor(Theme.MutedText)
++                }
++                else -> Unit
++            }
++        }
++    }
++
++    private fun stepStatusColor(status: AgentStepStatus): Int {
++        return when (status) {
++            AgentStepStatus.OK -> Theme.Accent
++            AgentStepStatus.RUNNING -> Color.rgb(80, 170, 255)
++            AgentStepStatus.FAILED -> Color.rgb(220, 90, 90)
++            AgentStepStatus.BLOCKED -> Color.rgb(180, 70, 70)
++            AgentStepStatus.CLARIFIED -> Color.rgb(220, 170, 60)
++            AgentStepStatus.PENDING -> Theme.StrokeDark
++            AgentStepStatus.STOPPED -> Theme.MutedText
++        }
++    }
++
+     private fun timelineCard(
+         title: String,
+         body: String,
+@@ -2222,6 +2423,19 @@ class MainActivity : Activity() {
+         data class Agent(val text: String, val detail: String) : ChatEvent()
+         data class Working(val text: String, val detail: String) : ChatEvent()
+         data class Timeline(val title: String, val body: String, val runId: String? = null) : ChatEvent()
++        class StepTimeline(
++            steps: List<AgentStep> = emptyList(),
++            isComplete: Boolean = false
++        ) : ChatEvent() {
++            var steps: List<AgentStep> = steps
++            var isComplete: Boolean = isComplete
++            var viewHolder: ViewHolder? = null
++
++            class ViewHolder(
++                val subtitleView: TextView,
++                val stepsContainer: LinearLayout
++            )
++        }
+         data class ToolCall(val card: ToolCallCardModel) : ChatEvent()
+         class ApprovalPrompt(
+             val request: ToolApprovalRequest,
+diff --git a/app/src/main/java/dev/touchpilot/app/agent/AgentRunner.kt b/app/src/main/java/dev/touchpilot/app/agent/AgentRunner.kt
+index c8d8c46..3f170ec 100644
+--- a/app/src/main/java/dev/touchpilot/app/agent/AgentRunner.kt
++++ b/app/src/main/java/dev/touchpilot/app/agent/AgentRunner.kt
+@@ -20,11 +20,30 @@ class AgentRunner(
+     private val policy: ActionPolicy = DefaultActionPolicy(),
+     private val clarificationDecider: ClarificationDecider = ClarificationDecider()
+ ) {
+-    fun run(task: String, maxSteps: Int = AgentRunLimits.DefaultMaxSteps): AgentRunResult {
+-        return run(task, AgentRunLimits(maxSteps = maxSteps))
++    fun run(
++        task: String,
++        maxSteps: Int = AgentRunLimits.DefaultMaxSteps,
++        listener: AgentEventListener = AgentEventListener {},
++        timeline: AgentStepTimelineBuilder? = null
++    ): AgentRunResult {
++        return run(
++            task = task,
++            limits = AgentRunLimits(maxSteps = maxSteps),
++            listener = listener,
++            timeline = timeline
++        )
+     }
+ 
+     fun run(task: String, limits: AgentRunLimits): AgentRunResult {
++        return run(task, limits, AgentEventListener {}, null)
++    }
++
++    fun run(
++        task: String,
++        limits: AgentRunLimits,
++        listener: AgentEventListener,
++        timeline: AgentStepTimelineBuilder?
++    ): AgentRunResult {
+         return BoundedLocalAgentLoop(
+             tools = AndroidLoopTools(toolExecutor),
+             approvalProvider = approvalProvider,
+@@ -33,7 +52,12 @@ class AgentRunner(
+             source = source,
+             policy = policy,
+             clarificationDecider = clarificationDecider
+-        ).run(task, limits)
++        ).run(
++            task = task,
++            limits = limits,
++            listener = listener,
++            onStepsUpdated = timeline?.let { builder -> { steps -> builder.replaceAll(steps) } }
++        )
+     }
+ 
+     private class AndroidLoopTools(
+diff --git a/app/src/main/java/dev/touchpilot/app/agent/AgentStepTimelineBuilder.kt b/app/src/main/java/dev/touchpilot/app/agent/AgentStepTimelineBuilder.kt
+new file mode 100644
+index 0000000..1785013
+--- /dev/null
++++ b/app/src/main/java/dev/touchpilot/app/agent/AgentStepTimelineBuilder.kt
+@@ -0,0 +1,312 @@
++package dev.touchpilot.app.agent
++
++import dev.touchpilot.app.security.SensitiveTextRedactor
++
++/**
++ * Builds a structured agent step timeline from runtime events and runner
++ * lifecycle callbacks. Produces [AgentStep] records compatible with
++ * [AgentStepFactory]; all summaries are redaction-safe.
++ */
++class AgentStepTimelineBuilder {
++    private val steps = mutableListOf<AgentStep>()
++    private var sequence = 0
++    private var activeDecideSeq: Int? = null
++    private var activeToolStepSeq: Int? = null
++    private var activeVerifySeq: Int? = null
++
++    val snapshot: List<AgentStep>
++        get() = steps.toList()
++
++    val isEmpty: Boolean
++        get() = steps.isEmpty()
++
++    /** Replaces the timeline with steps produced by [BoundedLocalAgentLoop]. */
++    fun replaceAll(runnerSteps: List<AgentStep>) {
++        steps.clear()
++        steps.addAll(runnerSteps)
++        activeDecideSeq = null
++        activeToolStepSeq = null
++        activeVerifySeq = null
++    }
++
++    fun onEvent(event: AgentEvent) {
++        when (event) {
++            is AgentEvent.UserMessage -> Unit
++            is AgentEvent.AssistantMessage -> Unit
++            is AgentEvent.ToolRequested -> onToolRequested(event)
++            is AgentEvent.ToolRunning -> onToolRunning(event)
++            is AgentEvent.ToolSucceeded -> onToolSucceeded(event)
++            is AgentEvent.ToolFailed -> onToolFailed(event)
++            is AgentEvent.ApprovalRequired -> onApprovalRequired(event)
++            is AgentEvent.PolicyBlocked -> onPolicyBlocked(event)
++            is AgentEvent.FinalAnswer -> onFinalAnswer(event)
++            is AgentEvent.Clarification -> onClarification(event)
++        }
++    }
++
++    fun startDecide(stepNumber: Int) {
++        completeActiveDecide(success = false, outputSummary = "Superseded by next step")
++        val step = AgentStepFactory.decide(
++            sequenceNumber = nextSequence(),
++            inputSummary = "Step $stepNumber: choosing next action",
++            outputSummary = "",
++            status = AgentStepStatus.RUNNING,
++            endedAtMillis = null,
++        )
++        activeDecideSeq = step.sequenceNumber
++        append(step)
++    }
++
++    fun completeDecide(outputSummary: String) {
++        val seq = activeDecideSeq ?: return
++        updateCompleted(seq, AgentStepStatus.OK, outputSummary)
++        activeDecideSeq = null
++    }
++
++    fun failDecide(outputSummary: String) {
++        val seq = activeDecideSeq
++        if (seq == null) {
++            append(
++                AgentStepFactory.decide(
++                    sequenceNumber = nextSequence(),
++                    inputSummary = "Choosing next action",
++                    outputSummary = outputSummary,
++                    status = AgentStepStatus.FAILED,
++                    endedAtMillis = System.currentTimeMillis(),
++                )
++            )
++        } else {
++            updateCompleted(seq, AgentStepStatus.FAILED, outputSummary)
++        }
++        activeDecideSeq = null
++    }
++
++    fun startVerify() {
++        val step = AgentStep(
++            sequenceNumber = nextSequence(),
++            type = AgentStepType.VERIFY,
++            status = AgentStepStatus.RUNNING,
++            inputSummary = SensitiveTextRedactor.redact("Checking screen after action"),
++            outputSummary = "",
++            startedAtMillis = System.currentTimeMillis(),
++            endedAtMillis = null,
++        )
++        activeVerifySeq = step.sequenceNumber
++        append(step)
++    }
++
++    fun completeVerify(outputSummary: String = "Screen checked") {
++        val seq = activeVerifySeq ?: return
++        updateCompleted(seq, AgentStepStatus.OK, outputSummary)
++        activeVerifySeq = null
++    }
++
++    fun skipVerify(outputSummary: String) {
++        val seq = activeVerifySeq ?: return
++        updateCompleted(seq, AgentStepStatus.FAILED, outputSummary)
++        activeVerifySeq = null
++    }
++
++    fun requestClarification(question: String) {
++        append(
++            AgentStepFactory.clarify(
++                sequenceNumber = nextSequence(),
++                clarification = AgentStepClarification(
++                    reason = AgentStepClarificationReason.AMBIGUOUS_REQUEST,
++                    question = question,
++                ),
++            )
++        )
++    }
++
++    fun failureStop(message: String): AgentStep {
++        return AgentStepFactory.stop(
++            sequenceNumber = nextSequence(),
++            reason = AgentStepStopReason.EXECUTOR_ERROR,
++            outputSummary = message,
++        ).copy(status = AgentStepStatus.FAILED)
++    }
++
++    private fun onToolRequested(event: AgentEvent.ToolRequested) {
++        completeActiveDecide(success = true, outputSummary = "Selected ${event.tool}")
++        val type = if (event.tool == OBSERVE_TOOL) AgentStepType.OBSERVE else AgentStepType.ACT
++        val summary = toolLabel(event.tool, event.args)
++        val step = when (type) {
++            AgentStepType.OBSERVE -> AgentStep(
++                sequenceNumber = nextSequence(),
++                type = AgentStepType.OBSERVE,
++                status = AgentStepStatus.PENDING,
++                inputSummary = SensitiveTextRedactor.redact(summary),
++                outputSummary = "",
++                startedAtMillis = System.currentTimeMillis(),
++            )
++            AgentStepType.ACT -> AgentStep(
++                sequenceNumber = nextSequence(),
++                type = AgentStepType.ACT,
++                status = AgentStepStatus.PENDING,
++                inputSummary = SensitiveTextRedactor.redact(summary),
++                outputSummary = "",
++                toolCall = AgentStepToolCall(
++                    tool = event.tool,
++                    args = SensitiveTextRedactor.redact(event.args),
++                    source = event.source.name.lowercase(),
++                ),
++                startedAtMillis = System.currentTimeMillis(),
++            )
++            else -> error("unexpected tool step type: $type")
++        }
++        activeToolStepSeq = step.sequenceNumber
++        append(step)
++    }
++
++    private fun onToolRunning(event: AgentEvent.ToolRunning) {
++        val seq = activeToolStepSeq ?: return
++        updateRunning(seq, toolLabel(event.tool, event.args))
++    }
++
++    private fun onToolSucceeded(event: AgentEvent.ToolSucceeded) {
++        val seq = activeToolStepSeq ?: return
++        updateCompleted(
++            seq,
++            AgentStepStatus.OK,
++            summarizeToolResult(event.tool, event.message, success = true),
++        )
++        activeToolStepSeq = null
++    }
++
++    private fun onToolFailed(event: AgentEvent.ToolFailed) {
++        val seq = activeToolStepSeq ?: return
++        updateCompleted(
++            seq,
++            AgentStepStatus.FAILED,
++            summarizeToolResult(event.tool, event.message, success = false),
++        )
++        activeToolStepSeq = null
++    }
++
++    private fun onApprovalRequired(event: AgentEvent.ApprovalRequired) {
++        val seq = activeToolStepSeq ?: return
++        updateRunning(
++            seq,
++            "${toolLabel(event.tool, event.args)} — waiting for approval",
++        )
++        updateStatus(seq, AgentStepStatus.PENDING)
++    }
++
++    private fun onPolicyBlocked(event: AgentEvent.PolicyBlocked) {
++        val toolSeq = activeToolStepSeq
++        if (toolSeq != null) {
++            updateCompleted(toolSeq, AgentStepStatus.BLOCKED, event.userMessage)
++            activeToolStepSeq = null
++        } else {
++            append(
++                AgentStepFactory.stop(
++                    sequenceNumber = nextSequence(),
++                    reason = AgentStepStopReason.POLICY_BLOCKED,
++                    outputSummary = event.userMessage,
++                ).copy(status = AgentStepStatus.BLOCKED)
++            )
++        }
++        activeDecideSeq = null
++        activeVerifySeq = null
++    }
++
++    private fun onClarification(event: AgentEvent.Clarification) {
++        append(
++            AgentStepFactory.clarify(
++                sequenceNumber = nextSequence(),
++                clarification = AgentStepClarification(
++                    reason = event.reason.toAgentStepReason(),
++                    question = event.question,
++                    detail = event.detail,
++                    candidateLabels = event.candidates.map { it.displayLabel },
++                ),
++            )
++        )
++    }
++
++    private fun onFinalAnswer(event: AgentEvent.FinalAnswer) {
++        completeActiveDecide(success = true, outputSummary = "Task complete")
++        activeVerifySeq?.let { updateCompleted(it, AgentStepStatus.OK, "Screen checked") }
++        activeVerifySeq = null
++        append(
++            AgentStepFactory.stop(
++                sequenceNumber = nextSequence(),
++                reason = AgentStepStopReason.COMPLETED,
++                outputSummary = event.text,
++            )
++        )
++    }
++
++    private fun completeActiveDecide(success: Boolean, outputSummary: String) {
++        val seq = activeDecideSeq ?: return
++        updateCompleted(
++            seq,
++            if (success) AgentStepStatus.OK else AgentStepStatus.FAILED,
++            outputSummary,
++        )
++        activeDecideSeq = null
++    }
++
++    private fun toolLabel(tool: String, args: Map<String, String>): String {
++        val redactedArgs = SensitiveTextRedactor.redact(args)
++        val argSummary = if (redactedArgs.isEmpty()) {
++            ""
++        } else {
++            redactedArgs.entries.joinToString(", ") { "${it.key}=${it.value.take(40)}" }
++        }
++        return if (argSummary.isBlank()) tool else "$tool ($argSummary)"
++    }
++
++    private fun summarizeToolResult(tool: String, message: String, success: Boolean): String {
++        val redacted = SensitiveTextRedactor.redact(message).take(120)
++        val prefix = if (success) "Completed" else "Failed"
++        return if (redacted.isBlank()) {
++            "$prefix $tool"
++        } else {
++            "$prefix $tool: $redacted"
++        }
++    }
++
++    private fun nextSequence(): Int = sequence++
++
++    private fun append(step: AgentStep): AgentStep {
++        steps += step
++        return step
++    }
++
++    private fun updateCompleted(sequenceNumber: Int, status: AgentStepStatus, outputSummary: String) {
++        val index = steps.indexOfFirst { it.sequenceNumber == sequenceNumber }
++        if (index < 0) return
++        steps[index] = steps[index].completed(status, outputSummary = outputSummary)
++    }
++
++    private fun updateRunning(sequenceNumber: Int, outputSummary: String) {
++        val index = steps.indexOfFirst { it.sequenceNumber == sequenceNumber }
++        if (index < 0) return
++        steps[index] = steps[index].copy(
++            status = AgentStepStatus.RUNNING,
++            outputSummary = SensitiveTextRedactor.redact(outputSummary),
++        )
++    }
++
++    private fun updateStatus(sequenceNumber: Int, status: AgentStepStatus) {
++        val index = steps.indexOfFirst { it.sequenceNumber == sequenceNumber }
++        if (index < 0) return
++        steps[index] = steps[index].copy(status = status)
++    }
++
++    private companion object {
++        const val OBSERVE_TOOL = "observe_screen"
++    }
++}
++
++private fun ClarificationReason.toAgentStepReason(): AgentStepClarificationReason {
++    return when (this) {
++        ClarificationReason.MULTIPLE_TARGETS -> AgentStepClarificationReason.MULTIPLE_TARGETS
++        ClarificationReason.MISSING_TARGET -> AgentStepClarificationReason.MISSING_TARGET
++        ClarificationReason.AMBIGUOUS_REQUEST -> AgentStepClarificationReason.AMBIGUOUS_REQUEST
++        ClarificationReason.LOW_CONFIDENCE -> AgentStepClarificationReason.LOW_CONFIDENCE
++        ClarificationReason.NEEDS_USER_CHOICE -> AgentStepClarificationReason.NEEDS_USER_CHOICE
++    }
++}
+diff --git a/app/src/main/java/dev/touchpilot/app/agent/AgentStepTimelineUi.kt b/app/src/main/java/dev/touchpilot/app/agent/AgentStepTimelineUi.kt
+new file mode 100644
+index 0000000..9141d02
+--- /dev/null
++++ b/app/src/main/java/dev/touchpilot/app/agent/AgentStepTimelineUi.kt
+@@ -0,0 +1,24 @@
++package dev.touchpilot.app.agent
++
++/**
++ * Chat timeline display helpers for [AgentStep] records (issue #124).
++ */
++fun AgentStep.timelineDetail(): String = outputSummary.ifBlank { inputSummary }
++
++fun AgentStepType.timelineLabel(): String =
++    name.lowercase().replaceFirstChar { char -> char.titlecase() }
++
++fun AgentStepStatus.timelineChipLabel(): String = when (this) {
++    AgentStepStatus.PENDING -> "Pending"
++    AgentStepStatus.RUNNING -> "Running"
++    AgentStepStatus.OK -> "Success"
++    AgentStepStatus.FAILED -> "Failed"
++    AgentStepStatus.BLOCKED -> "Blocked"
++    AgentStepStatus.CLARIFIED -> "Needs info"
++    AgentStepStatus.STOPPED -> "Stopped"
++}
++
++fun AgentStepStatus.timelineChipAccent(): Boolean = when (this) {
++    AgentStepStatus.OK, AgentStepStatus.RUNNING -> true
++    else -> false
++}
+diff --git a/app/src/main/java/dev/touchpilot/app/agent/BoundedLocalAgentLoop.kt b/app/src/main/java/dev/touchpilot/app/agent/BoundedLocalAgentLoop.kt
+index 9a34a32..80bf7ac 100644
+--- a/app/src/main/java/dev/touchpilot/app/agent/BoundedLocalAgentLoop.kt
++++ b/app/src/main/java/dev/touchpilot/app/agent/BoundedLocalAgentLoop.kt
+@@ -21,10 +21,28 @@ class BoundedLocalAgentLoop(
+     private val policy: ActionPolicy = DefaultActionPolicy(),
+     private val clarificationDecider: ClarificationDecider = ClarificationDecider()
+ ) {
+-    fun run(task: String, limits: AgentRunLimits = AgentRunLimits()): AgentRunResult {
++    fun run(
++        task: String,
++        limits: AgentRunLimits = AgentRunLimits(),
++        listener: AgentEventListener = AgentEventListener {},
++        onStepsUpdated: ((List<AgentStep>) -> Unit)? = null
++    ): AgentRunResult {
+         val transcript = StringBuilder()
+-        val events = mutableListOf<AgentEvent>(AgentEvent.UserMessage(task))
++        val events = mutableListOf<AgentEvent>()
+         val steps = mutableListOf<AgentStep>()
++
++        fun emit(event: AgentEvent) {
++            events += event
++            listener.onEvent(event)
++        }
++
++        fun publishSteps() {
++            onStepsUpdated?.invoke(steps.toList())
++        }
++
++        emit(AgentEvent.UserMessage(task))
++        publishSteps()
++
+         var currentScreen = tools.observeScreen()
+         var context = initialContext(task, currentScreen)
+         var nextStepContext = NextStepContext.initial(task)
+@@ -38,6 +56,7 @@ class BoundedLocalAgentLoop(
+             }.getOrElse { error ->
+                 transcript.appendLine("Command provider error: ${error.message}")
+                 steps += invalidStep(stepIndex, currentScreen, "Command provider error: ${error.message}")
++                publishSteps()
+                 return stopped(transcript, events, steps, AgentStepStopReason.NO_VALID_ACTION)
+             }
+             transcript.appendLine("Model: $raw")
+@@ -47,17 +66,19 @@ class BoundedLocalAgentLoop(
+             }.getOrElse { error ->
+                 transcript.appendLine("Command parse error: ${error.message}")
+                 steps += invalidStep(stepIndex, currentScreen, "Command parse error: ${error.message}")
++                publishSteps()
+                 return stopped(transcript, events, steps, AgentStepStopReason.NO_VALID_ACTION)
+             }
+             if (command.finalAnswer != null) {
+                 transcript.appendLine("Final: ${command.finalAnswer}")
+-                events += AgentEvent.FinalAnswer(command.finalAnswer)
++                emit(AgentEvent.FinalAnswer(command.finalAnswer))
+                 steps += AgentStepFactory.stop(
+                     sequenceNumber = stepIndex,
+                     reason = AgentStepStopReason.COMPLETED,
+                     outputSummary = command.finalAnswer,
+                     inputSummary = "final answer produced"
+                 )
++                publishSteps()
+                 return AgentRunResult(
+                     transcript = transcript.toString(),
+                     finalAnswer = command.finalAnswer,
+@@ -107,6 +128,7 @@ class BoundedLocalAgentLoop(
+             if (toolName == null) {
+                 transcript.appendLine("No tool or final answer returned.")
+                 steps += invalidStep(stepIndex, currentScreen, "No tool or final answer returned.")
++                publishSteps()
+                 return stopped(transcript, events, steps, AgentStepStopReason.NO_VALID_ACTION)
+             }
+             val redactedArgs = SensitiveTextRedactor.redact(command.args)
+@@ -119,7 +141,8 @@ class BoundedLocalAgentLoop(
+                 outputSummary = "Tool selected.",
+                 status = AgentStepStatus.PENDING
+             )
+-            AgentEvent.toolRequested(command, source)?.let { events += it }
++            AgentEvent.toolRequested(command, source)?.let(::emit)
++            publishSteps()
+ 
+             val validationError = tools.validate(toolName, command.args)
+             val spec = tools.findTool(toolName)
+@@ -132,16 +155,19 @@ class BoundedLocalAgentLoop(
+                     ok = false,
+                     message = "denied by skill allowlist"
+                 )
+-                events += AgentEvent.PolicyBlocked(
+-                    tool = toolName,
+-                    reason = "denied by skill allowlist",
+-                    userMessage = allowlistError
++                emit(
++                    AgentEvent.PolicyBlocked(
++                        tool = toolName,
++                        reason = "denied by skill allowlist",
++                        userMessage = allowlistError
++                    )
+                 )
+                 steps.replaceLast(
+                     status = AgentStepStatus.BLOCKED,
+                     message = allowlistError,
+                     stopReason = AgentStepStopReason.POLICY_BLOCKED
+                 )
++                publishSteps()
+                 return stopped(transcript, events, steps, AgentStepStopReason.POLICY_BLOCKED)
+             } else if (validationError != null) {
+                 transcript.appendLine("Tool validation failed: $validationError")
+@@ -150,6 +176,7 @@ class BoundedLocalAgentLoop(
+                     message = validationError,
+                     stopReason = AgentStepStopReason.NO_VALID_ACTION
+                 )
++                publishSteps()
+                 return stopped(transcript, events, steps, AgentStepStopReason.NO_VALID_ACTION)
+             } else if (spec != null) {
+                 val decision = policy.evaluate(
+@@ -168,7 +195,8 @@ class BoundedLocalAgentLoop(
+                     is PolicyDecision.RequireApproval -> {
+                         transcript.appendLine("Approval requested for $toolName: ${decision.reason}")
+                         val approvalRequest = ToolApprovalRequest(spec, command.args, decision)
+-                        events += AgentEvent.approvalRequired(approvalRequest)
++                        emit(AgentEvent.approvalRequired(approvalRequest))
++                        publishSteps()
+                         val approved = approvalProvider.approve(approvalRequest)
+                         if (!approved) {
+                             transcript.appendLine("Tool denied by user: $toolName")
+@@ -178,16 +206,19 @@ class BoundedLocalAgentLoop(
+                                 ok = false,
+                                 message = "denied by user: ${decision.reason}"
+                             )
+-                            events += AgentEvent.PolicyBlocked(
+-                                tool = toolName,
+-                                reason = "denied by user: ${decision.reason}",
+-                                userMessage = "The user did not approve $toolName."
++                            emit(
++                                AgentEvent.PolicyBlocked(
++                                    tool = toolName,
++                                    reason = "denied by user: ${decision.reason}",
++                                    userMessage = "The user did not approve $toolName."
++                                )
+                             )
+                             steps.replaceLast(
+                                 status = AgentStepStatus.BLOCKED,
+                                 message = "The user did not approve $toolName.",
+                                 stopReason = AgentStepStopReason.USER_CANCELLED
+                             )
++                            publishSteps()
+                             return stopped(transcript, events, steps, AgentStepStopReason.USER_CANCELLED)
+                         }
+                         transcript.appendLine("Tool approved by user: $toolName")
+@@ -195,36 +226,39 @@ class BoundedLocalAgentLoop(
+                     is PolicyDecision.Deny -> {
+                         transcript.appendLine("Policy denied $toolName: ${decision.reason}")
+                         tools.recordExecution(toolName, "policy=deny", false, decision.userMessage)
+-                        AgentEvent.policyBlocked(toolName, decision)?.let { events += it }
++                        AgentEvent.policyBlocked(toolName, decision)?.let(::emit)
+                         steps.replaceLast(
+                             status = AgentStepStatus.BLOCKED,
+                             message = decision.userMessage,
+                             stopReason = AgentStepStopReason.POLICY_BLOCKED
+                         )
++                        publishSteps()
+                         return stopped(transcript, events, steps, AgentStepStopReason.POLICY_BLOCKED)
+                     }
+                     is PolicyDecision.Block -> {
+                         transcript.appendLine("Policy blocked $toolName: ${decision.reason}")
+                         tools.recordExecution(toolName, "policy=block", false, decision.userMessage)
+-                        AgentEvent.policyBlocked(toolName, decision)?.let { events += it }
++                        AgentEvent.policyBlocked(toolName, decision)?.let(::emit)
+                         steps.replaceLast(
+                             status = AgentStepStatus.BLOCKED,
+                             message = decision.userMessage,
+                             stopReason = AgentStepStopReason.POLICY_BLOCKED
+                         )
++                        publishSteps()
+                         return stopped(transcript, events, steps, AgentStepStopReason.POLICY_BLOCKED)
+                     }
+                 }
+             }
+ 
+             steps.replaceLast(status = AgentStepStatus.RUNNING, message = "Tool is running.")
+-            AgentEvent.toolRunning(command, source)?.let { events += it }
++            publishSteps()
++            AgentEvent.toolRunning(command, source)?.let(::emit)
+             val result = runCatching {
+                 tools.execute(toolName, command.args, source)
+             }.getOrElse { error ->
+                 val message = error.message ?: "Tool execution error"
+                 transcript.appendLine("Tool execution error: $message")
+-                events += AgentEvent.ToolFailed(tool = toolName, message = message)
++                emit(AgentEvent.ToolFailed(tool = toolName, message = message))
+                 consecutiveFailures += 1
+                 steps.replaceLast(
+                     status = AgentStepStatus.FAILED,
+@@ -235,6 +269,7 @@ class BoundedLocalAgentLoop(
+                         null
+                     }
+                 )
++                publishSteps()
+                 if (consecutiveFailures >= limits.maxConsecutiveFailures) {
+                     return stopped(transcript, events, steps, AgentStepStopReason.REPEATED_TOOL_FAILURE)
+                 }
+@@ -249,7 +284,7 @@ class BoundedLocalAgentLoop(
+                 )
+                 return@repeat
+             }
+-            events += AgentEvent.toolResult(toolName, result)
++            emit(AgentEvent.toolResult(toolName, result))
+             transcript.appendLine("Tool result: ${result.ok} ${SensitiveTextRedactor.redact(result.message)}")
+             if (result.data.isNotEmpty()) {
+                 transcript.appendLine("Tool data: ${SensitiveTextRedactor.redact(result.data)}")
+@@ -284,9 +319,11 @@ class BoundedLocalAgentLoop(
+                     }
+                 )
+                 if (consecutiveFailures >= limits.maxConsecutiveFailures) {
++                    publishSteps()
+                     return stopped(transcript, events, steps, AgentStepStopReason.REPEATED_TOOL_FAILURE)
+                 }
+             }
++            publishSteps()
+ 
+             currentScreen = verificationScreen
+             context = nextContext(task, transcript.toString(), verificationScreen)
+@@ -299,6 +336,7 @@ class BoundedLocalAgentLoop(
+             )
+         }
+ 
++        publishSteps()
+         return stopped(transcript, events, steps, AgentStepStopReason.MAX_STEPS)
+     }
+ 
+diff --git a/app/src/main/java/dev/touchpilot/app/agent/LocalReasoningCore.kt b/app/src/main/java/dev/touchpilot/app/agent/LocalReasoningCore.kt
+index 7ac23e0..28bf541 100644
+--- a/app/src/main/java/dev/touchpilot/app/agent/LocalReasoningCore.kt
++++ b/app/src/main/java/dev/touchpilot/app/agent/LocalReasoningCore.kt
+@@ -19,7 +19,11 @@ import dev.touchpilot.app.tools.AndroidToolExecutor
+  * channel.
+  */
+ interface LocalReasoningCore {
+-    fun run(task: String, listener: AgentEventListener = AgentEventListener {}): AgentRunResult
++    fun run(
++        task: String,
++        timeline: AgentStepTimelineBuilder? = null,
++        listener: AgentEventListener = AgentEventListener {}
++    ): AgentRunResult
+ }
+ 
+ fun interface AgentEventListener {
+@@ -45,7 +49,12 @@ data class LocalReasoningContext(
+  * [defaultAgentRunInvocation] which builds and runs a real [AgentRunner].
+  */
+ fun interface AgentRunInvocation {
+-    fun invoke(task: String, context: LocalReasoningContext): AgentRunResult
++    fun invoke(
++        task: String,
++        context: LocalReasoningContext,
++        listener: AgentEventListener,
++        timeline: AgentStepTimelineBuilder?
++    ): AgentRunResult
+ }
+ 
+ class DefaultLocalReasoningCore(
+@@ -58,12 +67,24 @@ class DefaultLocalReasoningCore(
+     private val screenSummarizer: ScreenContextSummarizer = ScreenContextSummarizer()
+ ) : LocalReasoningCore {
+ 
+-    override fun run(task: String, listener: AgentEventListener): AgentRunResult {
++    override fun run(
++        task: String,
++        timeline: AgentStepTimelineBuilder?,
++        listener: AgentEventListener
++    ): AgentRunResult {
++        val streamed = mutableSetOf<String>()
++        fun forward(event: AgentEvent) {
++            if (streamed.add(event.id)) {
++                listener.onEvent(event)
++                timeline?.onEvent(event)
++            }
++        }
++
+         intents.respond(task)?.let { canned ->
+             val userEvent = AgentEvent.UserMessage(task)
+             val finalEvent = AgentEvent.FinalAnswer(canned.message)
+-            listener.onEvent(userEvent)
+-            listener.onEvent(finalEvent)
++            forward(userEvent)
++            forward(finalEvent)
+             return AgentRunResult(
+                 transcript = "Conversational reply",
+                 finalAnswer = canned.message,
+@@ -78,9 +99,9 @@ class DefaultLocalReasoningCore(
+         val intent = intentClassifier.classify(task, skills)
+ 
+         when (intent) {
+-            is IntentDecision.UnsafeRequest -> return blockUnsafe(task, intent, listener)
+-            is IntentDecision.ClarificationNeeded -> return askForClarification(task, intent, listener)
+-            is IntentDecision.ScreenInquiry -> return answerScreenInquiry(task, intent, listener)
++            is IntentDecision.UnsafeRequest -> return blockUnsafe(task, intent, ::forward)
++            is IntentDecision.ClarificationNeeded -> return askForClarification(task, intent, ::forward, timeline)
++            is IntentDecision.ScreenInquiry -> return answerScreenInquiry(task, intent, ::forward)
+             is IntentDecision.ExactCommand,
+             is IntentDecision.KnownSkill,
+             is IntentDecision.LocalModelNeeded -> Unit
+@@ -111,7 +132,8 @@ class DefaultLocalReasoningCore(
+                             reason = "matched skill '${intent.skillId}' is unavailable",
+                             clarification = "I couldn't load that skill. Please pick another skill or rephrase the request."
+                         ),
+-                        listener = listener
++                        forward = ::forward,
++                        timeline = timeline
+                     )
+                 }
+                 baseCtx.copy(skill = matchedSkill)
+@@ -122,15 +144,20 @@ class DefaultLocalReasoningCore(
+             is IntentDecision.ScreenInquiry -> error("handled above")
+         }
+ 
+-        val result = invocation.invoke(task, effectiveCtx)
+-        result.events.forEach(listener::onEvent)
++        val result = invocation.invoke(
++            task = task,
++            context = effectiveCtx,
++            listener = AgentEventListener(::forward),
++            timeline = timeline
++        )
++        result.events.forEach(::forward)
+         return result
+     }
+ 
+     private fun blockUnsafe(
+         task: String,
+         intent: IntentDecision.UnsafeRequest,
+-        listener: AgentEventListener
++        forward: (AgentEvent) -> Unit
+     ): AgentRunResult {
+         val userEvent = AgentEvent.UserMessage(task)
+         val blocked = AgentEvent.PolicyBlocked(
+@@ -139,9 +166,9 @@ class DefaultLocalReasoningCore(
+             userMessage = intent.userMessage
+         )
+         val finalEvent = AgentEvent.FinalAnswer(intent.userMessage)
+-        listener.onEvent(userEvent)
+-        listener.onEvent(blocked)
+-        listener.onEvent(finalEvent)
++        forward(userEvent)
++        forward(blocked)
++        forward(finalEvent)
+         return AgentRunResult(
+             transcript = "Blocked by intent gate: ${intent.reason}",
+             finalAnswer = intent.userMessage,
+@@ -154,15 +181,17 @@ class DefaultLocalReasoningCore(
+     private fun askForClarification(
+         task: String,
+         intent: IntentDecision.ClarificationNeeded,
+-        listener: AgentEventListener
++        forward: (AgentEvent) -> Unit,
++        timeline: AgentStepTimelineBuilder?
+     ): AgentRunResult {
+         val userEvent = AgentEvent.UserMessage(task)
+         val assistant = AgentEvent.AssistantMessage(
+             text = intent.clarification,
+             detail = intent.reason
+         )
+-        listener.onEvent(userEvent)
+-        listener.onEvent(assistant)
++        forward(userEvent)
++        timeline?.requestClarification(intent.clarification)
++        forward(assistant)
+         return AgentRunResult(
+             transcript = "Clarification requested: ${intent.reason}",
+             finalAnswer = intent.clarification,
+@@ -175,7 +204,7 @@ class DefaultLocalReasoningCore(
+     private fun answerScreenInquiry(
+         task: String,
+         intent: IntentDecision.ScreenInquiry,
+-        listener: AgentEventListener
++        forward: (AgentEvent) -> Unit
+     ): AgentRunResult {
+         val context = screenContextProvider()
+         val summary = screenSummarizer.summarize(context)
+@@ -186,9 +215,9 @@ class DefaultLocalReasoningCore(
+             detail = suggestionBlock
+         )
+         val finalEvent = AgentEvent.FinalAnswer(summary.sentence)
+-        listener.onEvent(userEvent)
+-        listener.onEvent(assistant)
+-        listener.onEvent(finalEvent)
++        forward(userEvent)
++        forward(assistant)
++        forward(finalEvent)
+         val transcript = if (suggestionBlock.isBlank()) {
+             summary.sentence
+         } else {
+@@ -225,7 +254,7 @@ fun defaultAgentRunInvocation(
+     approvalProvider: ToolApprovalProvider,
+     localModelRuntime: LocalCommandModelRuntime,
+     policy: ActionPolicy = DefaultActionPolicy()
+-): AgentRunInvocation = AgentRunInvocation { task, context ->
++): AgentRunInvocation = AgentRunInvocation { task, context, listener, timeline ->
+     buildDefaultAgentRunner(
+         task = task,
+         context = context,
+@@ -233,7 +262,7 @@ fun defaultAgentRunInvocation(
+         approvalProvider = approvalProvider,
+         localModelRuntime = localModelRuntime,
+         policy = policy
+-    ).run(task)
++    ).run(task, listener = listener, timeline = timeline)
+ }
+ 
+ /**
+diff --git a/app/src/test/java/dev/touchpilot/app/agent/AgentStepTimelineBuilderTest.kt b/app/src/test/java/dev/touchpilot/app/agent/AgentStepTimelineBuilderTest.kt
+new file mode 100644
+index 0000000..3f1c85e
+--- /dev/null
++++ b/app/src/test/java/dev/touchpilot/app/agent/AgentStepTimelineBuilderTest.kt
+@@ -0,0 +1,101 @@
++package dev.touchpilot.app.agent
++
++import dev.touchpilot.app.security.ToolSource
++import kotlin.test.Test
++import kotlin.test.assertEquals
++import kotlin.test.assertTrue
++
++class AgentStepTimelineBuilderTest {
++    @Test
++    fun decideActVerifyStopSequenceIsBuiltFromRunnerCallbacksAndEvents() {
++        val builder = AgentStepTimelineBuilder()
++        builder.startDecide(1)
++        builder.completeDecide("Selected tap_text")
++
++        val command = AgentCommand(tool = "tap_text", args = mapOf("text" to "Settings"), finalAnswer = null)
++        builder.onEvent(AgentEvent.UserMessage("open Settings"))
++        builder.onEvent(requireNotNull(AgentEvent.toolRequested(command, ToolSource.LOCAL_ROUTER)))
++        builder.onEvent(requireNotNull(AgentEvent.toolRunning(command, ToolSource.LOCAL_ROUTER)))
++        builder.onEvent(
++            AgentEvent.ToolSucceeded(
++                tool = "tap_text",
++                message = "Tapped Settings"
++            )
++        )
++        builder.startVerify()
++        builder.completeVerify("Screen checked")
++        builder.onEvent(AgentEvent.FinalAnswer("Opened Settings."))
++
++        val steps = builder.snapshot
++        assertEquals(
++            listOf(
++                AgentStepType.DECIDE,
++                AgentStepType.ACT,
++                AgentStepType.VERIFY,
++                AgentStepType.STOP
++            ),
++            steps.map { it.type }
++        )
++        assertEquals(AgentStepStatus.STOPPED, steps.last().status)
++        assertEquals("Opened Settings.", steps.last().outputSummary)
++    }
++
++    @Test
++    fun observeToolMapsToObserveStepType() {
++        val builder = AgentStepTimelineBuilder()
++        val command = AgentCommand(tool = "observe_screen", args = emptyMap(), finalAnswer = null)
++        builder.onEvent(requireNotNull(AgentEvent.toolRequested(command, ToolSource.LOCAL_ROUTER)))
++        builder.onEvent(requireNotNull(AgentEvent.toolRunning(command, ToolSource.LOCAL_ROUTER)))
++        builder.onEvent(
++            AgentEvent.ToolSucceeded(
++                tool = "observe_screen",
++                message = "screen snapshot"
++            )
++        )
++
++        assertEquals(AgentStepType.OBSERVE, builder.snapshot.single().type)
++        assertEquals(AgentStepStatus.OK, builder.snapshot.single().status)
++    }
++
++    @Test
++    fun clarificationRequestCreatesClarifyStep() {
++        val builder = AgentStepTimelineBuilder()
++        builder.requestClarification("Which app should I open?")
++
++        val step = builder.snapshot.single()
++        assertEquals(AgentStepType.CLARIFY, step.type)
++        assertEquals(AgentStepStatus.CLARIFIED, step.status)
++        assertEquals("Which app should I open?", step.outputSummary)
++    }
++
++    @Test
++    fun policyBlockedMarksActStepBlockedWhenToolWasActive() {
++        val builder = AgentStepTimelineBuilder()
++        val command = AgentCommand(tool = "type_text", args = mapOf("text" to "secret"), finalAnswer = null)
++        builder.onEvent(requireNotNull(AgentEvent.toolRequested(command, ToolSource.LOCAL_ROUTER)))
++        builder.onEvent(
++            AgentEvent.PolicyBlocked(
++                tool = "type_text",
++                reason = "blocked",
++                userMessage = "That action is blocked."
++            )
++        )
++
++        val act = builder.snapshot.single()
++        assertEquals(AgentStepType.ACT, act.type)
++        assertEquals(AgentStepStatus.BLOCKED, act.status)
++    }
++
++    @Test
++    fun sensitiveArgsAreRedactedInSummaries() {
++        val builder = AgentStepTimelineBuilder()
++        val command = AgentCommand(
++            tool = "type_text",
++            args = mapOf("text" to "password is hunter2"),
++            finalAnswer = null
++        )
++        builder.onEvent(requireNotNull(AgentEvent.toolRequested(command, ToolSource.LOCAL_ROUTER)))
++
++        assertTrue(builder.snapshot.single().inputSummary.contains("[REDACTED]"))
++    }
++}
+diff --git a/app/src/test/java/dev/touchpilot/app/agent/LocalReasoningCoreTest.kt b/app/src/test/java/dev/touchpilot/app/agent/LocalReasoningCoreTest.kt
+index 49478b6..9e63c4e 100644
+--- a/app/src/test/java/dev/touchpilot/app/agent/LocalReasoningCoreTest.kt
++++ b/app/src/test/java/dev/touchpilot/app/agent/LocalReasoningCoreTest.kt
+@@ -23,7 +23,7 @@ class LocalReasoningCoreTest {
+         val invocations = mutableListOf<String>()
+         val collected = mutableListOf<AgentEvent>()
+         val core = DefaultLocalReasoningCore(
+-            invocation = { task, _ ->
++            invocation = { task, _, _, _ ->
+                 invocations += task
+                 error("invocation must not run for conversational input")
+             },
+@@ -53,7 +53,7 @@ class LocalReasoningCoreTest {
+         val recordedContexts = mutableListOf<LocalReasoningContext>()
+         val collected = mutableListOf<AgentEvent>()
+         val core = DefaultLocalReasoningCore(
+-            invocation = { _, ctx ->
++            invocation = { _, ctx, _, _ ->
+                 recordedContexts += ctx
+                 sentinelResult
+             },
+@@ -72,7 +72,7 @@ class LocalReasoningCoreTest {
+     @Test
+     fun nullListenerIsTolerated() {
+         val core = DefaultLocalReasoningCore(
+-            invocation = { _, _ -> error("should not be called") },
++            invocation = { _, _, _, _ -> error("should not be called") },
+             sessionContext = { defaultContext }
+         )
+         val result = core.run("help")
+@@ -86,7 +86,7 @@ class LocalReasoningCoreTest {
+     @Test
+     fun customIntentsCanOverrideTheDefaultGate() {
+         val core = DefaultLocalReasoningCore(
+-            invocation = { _, _ -> error("should not be called") },
++            invocation = { _, _, _, _ -> error("should not be called") },
+             sessionContext = { defaultContext },
+             intents = { input ->
+                 if (input == "ping") ConversationalResponse("pong") else null
+@@ -100,7 +100,7 @@ class LocalReasoningCoreTest {
+     fun mixedHelpPhraseFallsThroughToInvocation() {
+         var sawInvocation = false
+         val core = DefaultLocalReasoningCore(
+-            invocation = { task, _ ->
++            invocation = { task, _, _, _ ->
+                 sawInvocation = true
+                 AgentRunResult(
+                     transcript = "stub",
+@@ -169,7 +169,7 @@ class LocalReasoningCoreTest {
+         var invoked = false
+         val collected = mutableListOf<AgentEvent>()
+         val core = DefaultLocalReasoningCore(
+-            invocation = { _, _ ->
++            invocation = { _, _, _, _ ->
+                 invoked = true
+                 error("unsafe intent must not invoke the runner")
+             },
+@@ -191,7 +191,7 @@ class LocalReasoningCoreTest {
+         var invoked = false
+         val collected = mutableListOf<AgentEvent>()
+         val core = DefaultLocalReasoningCore(
+-            invocation = { _, _ ->
++            invocation = { _, _, _, _ ->
+                 invoked = true
+                 error("clarification intent must not invoke the runner")
+             },
+@@ -222,7 +222,7 @@ class LocalReasoningCoreTest {
+             providerMode = AgentProviderMode.LOCAL_MODEL
+         )
+         val core = DefaultLocalReasoningCore(
+-            invocation = { _, ctx ->
++            invocation = { _, ctx, _, _ ->
+                 ctxsSeen += ctx
+                 AgentRunResult(transcript = "", finalAnswer = null, events = emptyList())
+             },
+@@ -246,7 +246,7 @@ class LocalReasoningCoreTest {
+         // independent parser would press_back. The gate's decision must win.
+         val ctxsSeen = mutableListOf<LocalReasoningContext>()
+         val core = DefaultLocalReasoningCore(
+-            invocation = { _, ctx ->
++            invocation = { _, ctx, _, _ ->
+                 ctxsSeen += ctx
+                 AgentRunResult(transcript = "", finalAnswer = null, events = emptyList())
+             },
+@@ -288,7 +288,7 @@ class LocalReasoningCoreTest {
+             providerMode = AgentProviderMode.LOCAL_MODEL
+         )
+         val core = DefaultLocalReasoningCore(
+-            invocation = { _, ctx ->
++            invocation = { _, ctx, _, _ ->
+                 ctxsSeen += ctx
+                 AgentRunResult(transcript = "", finalAnswer = null, events = emptyList())
+             },
+@@ -317,7 +317,7 @@ class LocalReasoningCoreTest {
+         )
+         val ctxsSeen = mutableListOf<LocalReasoningContext>()
+         val core = DefaultLocalReasoningCore(
+-            invocation = { _, ctx ->
++            invocation = { _, ctx, _, _ ->
+                 ctxsSeen += ctx
+                 AgentRunResult(transcript = "", finalAnswer = "ok", events = emptyList())
+             },
+@@ -344,7 +344,7 @@ class LocalReasoningCoreTest {
+         var invoked = false
+         val collected = mutableListOf<AgentEvent>()
+         val core = DefaultLocalReasoningCore(
+-            invocation = { _, _ ->
++            invocation = { _, _, _, _ ->
+                 invoked = true
+                 error("missing skill should not invoke runner")
+             },
+@@ -388,7 +388,7 @@ class LocalReasoningCoreTest {
+             )
+         )
+         val core = DefaultLocalReasoningCore(
+-            invocation = { _, _ ->
++            invocation = { _, _, _, _ ->
+                 invoked = true
+                 error("screen inquiry must not invoke the runner")
+             },
+@@ -422,7 +422,7 @@ class LocalReasoningCoreTest {
+         var invoked = false
+         val collected = mutableListOf<AgentEvent>()
+         val core = DefaultLocalReasoningCore(
+-            invocation = { _, _ ->
++            invocation = { _, _, _, _ ->
+                 invoked = true
+                 error("screen inquiry must not invoke the runner")
+             },
+diff --git a/app/src/test/java/dev/touchpilot/app/agent/OfflineMilestone2Test.kt b/app/src/test/java/dev/touchpilot/app/agent/OfflineMilestone2Test.kt
+index 25ff137..033255d 100644
+--- a/app/src/test/java/dev/touchpilot/app/agent/OfflineMilestone2Test.kt
++++ b/app/src/test/java/dev/touchpilot/app/agent/OfflineMilestone2Test.kt
+@@ -44,7 +44,7 @@ class OfflineMilestone2Test {
+     private fun core(
+         sessionContext: LocalReasoningContext = baseContext,
+         skills: List<Skill> = emptyList(),
+-        invocation: AgentRunInvocation = AgentRunInvocation { _, _ ->
++        invocation: AgentRunInvocation = AgentRunInvocation { _, _, _, _ ->
+             error("invocation should not run for this flow")
+         }
+     ): DefaultLocalReasoningCore = DefaultLocalReasoningCore(
+@@ -91,7 +91,7 @@ class OfflineMilestone2Test {
+ 
+     @Test
+     fun openSettingsRoutesThroughIntentGateAsExactCommand() {
+-        val capture = CapturingInvocation { _, ctx ->
++        val capture = CapturingInvocation { _, ctx, _, _ ->
+             val cmd = assertNotNull(ctx.exactCommand)
+             scriptedRunnerEvents(
+                 task = "Open Settings",
+@@ -134,7 +134,7 @@ class OfflineMilestone2Test {
+ 
+     @Test
+     fun goBackRoutesThroughIntentGateAsExactCommand() {
+-        val capture = CapturingInvocation { _, ctx ->
++        val capture = CapturingInvocation { _, ctx, _, _ ->
+             val cmd = assertNotNull(ctx.exactCommand)
+             scriptedRunnerEvents(
+                 task = "Go back",
+@@ -164,7 +164,7 @@ class OfflineMilestone2Test {
+     @Test
+     fun passwordTaskBlockedByIntentGateBeforeReachingRunner() {
+         val result = core(
+-            invocation = AgentRunInvocation { _, _ ->
++            invocation = AgentRunInvocation { _, _, _, _ ->
+                 error("unsafe requests must not reach the runner")
+             }
+         ).run("change my password please")
+@@ -191,7 +191,7 @@ class OfflineMilestone2Test {
+     @Test
+     fun ambiguousReferencePromptsForClarification() {
+         val result = core(
+-            invocation = AgentRunInvocation { _, _ ->
++            invocation = AgentRunInvocation { _, _, _, _ ->
+                 error("ambiguous references must not reach the runner")
+             }
+         ).run("do the thing")
+@@ -210,7 +210,7 @@ class OfflineMilestone2Test {
+ 
+     @Test
+     fun unmatchedRequestRoutesToLocalModelNeededAndPreservesSessionMode() {
+-        val capture = CapturingInvocation { task, _ ->
++        val capture = CapturingInvocation { task, _, _, _ ->
+             // The runner would normally produce events here; we only need to
+             // confirm the core hands off to invocation with the right context.
+             AgentRunResult(
+@@ -256,14 +256,19 @@ class OfflineMilestone2Test {
+ 
+     /** Captures the context the core passes to invocation so tests can assert on it. */
+     private class CapturingInvocation(
+-        private val producer: (String, LocalReasoningContext) -> AgentRunResult
++        private val producer: (String, LocalReasoningContext, AgentEventListener, AgentStepTimelineBuilder?) -> AgentRunResult
+     ) : AgentRunInvocation {
+         var context: LocalReasoningContext? = null
+             private set
+ 
+-        override fun invoke(task: String, context: LocalReasoningContext): AgentRunResult {
++        override fun invoke(
++            task: String,
++            context: LocalReasoningContext,
++            listener: AgentEventListener,
++            timeline: AgentStepTimelineBuilder?
++        ): AgentRunResult {
+             this.context = context
+-            return producer(task, context)
++            return producer(task, context, listener, timeline)
+         }
+     }
+ 
+diff --git a/app/src/test/java/dev/touchpilot/app/screen/OfflineMilestone3Test.kt b/app/src/test/java/dev/touchpilot/app/screen/OfflineMilestone3Test.kt
+index 19c1029..1cbde5e 100644
+--- a/app/src/test/java/dev/touchpilot/app/screen/OfflineMilestone3Test.kt
++++ b/app/src/test/java/dev/touchpilot/app/screen/OfflineMilestone3Test.kt
+@@ -172,7 +172,7 @@ class OfflineMilestone3Test {
+     }
+ 
+     private fun runScreenInquiry(context: ScreenContext) = DefaultLocalReasoningCore(
+-        invocation = { _, _ -> error("screen inquiry must not invoke the agent runner") },
++        invocation = { _, _, _, _ -> error("screen inquiry must not invoke the agent runner") },
+         sessionContext = {
+             LocalReasoningContext(
+                 skill = null,
