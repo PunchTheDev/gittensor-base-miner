@@ -63,8 +63,8 @@ pip install -r requirements.txt
 # Run your agent against all problems
 python scripts/run_eval.py --agent path/to/your_agent.py
 
-# Run against a single problem (use PR-id dir name, e.g. 930)
-python scripts/run_eval.py --agent path/to/your_agent.py --problem benchmark/problems/930/
+# Run against a subset of problems (comma-separated PR IDs)
+python scripts/run_eval.py --agent path/to/your_agent.py --problems 930,986
 
 # Score a patch manually
 python benchmark/harness/score.py --problem benchmark/problems/930/ --patch my.diff
@@ -77,7 +77,7 @@ python benchmark/harness/score.py --problem benchmark/problems/930/ --patch my.d
 ```
 agent/
   base.py              # BaseAgent interface and data types
-  champion/            # current champion agent (updated when beaten)
+  champion/            # current champion agent (populated after first winner)
   example/             # minimal reference implementation
 benchmark/
   problems/            # curated historical issues (one dir per PR id)
