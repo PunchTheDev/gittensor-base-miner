@@ -30,15 +30,16 @@ def load_problem_meta(problem_dir: Path) -> dict:
 
 def apply_patch(repo_dir: Path, patch_path: Path) -> bool:
     """Apply a unified diff. Returns True if apply succeeded."""
+    abs_patch = str(patch_path.resolve())
     result = subprocess.run(
-        ["git", "apply", "--check", str(patch_path)],
+        ["git", "apply", "--check", abs_patch],
         cwd=repo_dir,
         capture_output=True,
     )
     if result.returncode != 0:
         return False
     subprocess.run(
-        ["git", "apply", str(patch_path)],
+        ["git", "apply", abs_patch],
         cwd=repo_dir,
         check=True,
     )
@@ -128,7 +129,10 @@ def score_patch(problem_dir: Path, patch_path: Path) -> dict:
             }
 
         # Run tests
-        test_cmd = meta.get("test_cmd", ["python", "-m", "pytest", "--tb=short", "-q"])
+        raw_cmd = meta.get("test_cmd", ["python3", "-m", "pytest", "--tb=short", "-q"])
+        # Normalize: use python3 if python binary is absent
+        import shutil as _shutil
+        test_cmd = [("python3" if c == "python" and not _shutil.which("python") else c) for c in raw_cmd]
         tests_passed, test_output = run_tests(repo_dir, test_cmd)
         correctness_score = 1.0 if tests_passed else 0.0
 

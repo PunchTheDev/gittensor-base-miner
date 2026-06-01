@@ -79,7 +79,7 @@ def load_problem(problem_dir: Path):
     )
 
 
-def run_evaluation(agent_path: str, problem_ids: list[str] | None = None) -> dict:
+def run_evaluation(agent_path: str, problem_ids: list[str] | None = None, use_sandbox: bool = True) -> dict:
     agent = load_agent(agent_path)
 
     all_problems = sorted(PROBLEMS_DIR.glob("*/meta.json"))
@@ -107,8 +107,12 @@ def run_evaluation(agent_path: str, problem_ids: list[str] | None = None) -> dic
                 f.write(patch.diff)
                 patch_path = Path(f.name)
 
-            from benchmark.harness.score import score_patch
-            score = score_patch(problem_dir, patch_path)
+            if not use_sandbox:
+                from benchmark.harness.score import score_patch
+                score = score_patch(problem_dir, patch_path)
+            else:
+                from benchmark.harness.runner import run_in_sandbox
+                score = run_in_sandbox(problem_dir, patch_path)
             patch_path.unlink()
 
             score["elapsed_seconds"] = round(elapsed, 2)
@@ -136,12 +140,13 @@ def main() -> None:
     parser.add_argument("--agent", required=True, help="Path to agent .py file")
     parser.add_argument("--problems", help="Comma-separated list of problem IDs (default: all)")
     parser.add_argument("--output", help="Write JSON results to this file")
+    parser.add_argument("--no-sandbox", action="store_true", help="Skip Docker sandbox (local dev mode)")
     args = parser.parse_args()
 
     problem_ids = args.problems.split(",") if args.problems else None
 
     print(f"Evaluating: {args.agent}")
-    results = run_evaluation(args.agent, problem_ids)
+    results = run_evaluation(args.agent, problem_ids, use_sandbox=not args.no_sandbox)
     print(f"\nMean score: {results['mean_score']} / 1.0")
 
     if args.output:
