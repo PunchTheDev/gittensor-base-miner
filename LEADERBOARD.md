@@ -1,6 +1,6 @@
 # Leaderboard
 
-Mean score across all 30 benchmark problems, on a 0–30 scale per problem.
+Mean score across the rotating 30-problem shard (pool: 105 problems across 9 repos), on a 0–30 scale per problem.
 Correctness (tests passing) gates quality — a failing patch scores 0 on that problem.
 
 See [docs/scoring.md](docs/scoring.md) for the full formula.
