@@ -1,80 +1,182 @@
 """
-Minimal reference agent. Single LLM call, returns a unified diff.
+Reference agent: observe → plan → act → verify loop.
 
-This is the floor — it exists to show the submission structure and give
-miners a working baseline to beat. No planning, no tool use, no reflection.
+Demonstrates the scaffolding pattern — same frozen model, better wrapper.
+Miners compete to outperform this baseline.
 
-Miners can improve over this baseline by adding:
-- Multi-turn reasoning (observe → plan → act → verify)
-- Tool use (read files, run tests, apply + check patch)
-- Reflection / self-repair loops
-- Smarter context selection
+Improvements over a naive single-shot approach:
+- Explicit planning turn before generating a diff
+- Self-critique pass that catches obvious diff errors and triggers a repair
+- Structured reasoning log for transparency
+
+The loop is intentionally shallow (max 2 repair attempts) so miners have
+room to build richer loops with tool use, test feedback, and memory.
 """
 
 from __future__ import annotations
 
 import os
 import re
+import textwrap
 
 import httpx
 
-from agent.base import BaseAgent, Patch, Problem
+from agent.base import BaseAgent, FileContext, Patch, Problem
 
-# Default model — must be in the harness allowed_models list.
-# Override via BENCHMARK_MODEL env var.
 DEFAULT_MODEL = os.environ.get("BENCHMARK_MODEL", "anthropic/claude-3-5-haiku")
+OPENROUTER_URL = "https://openrouter.ai/api/v1/chat/completions"
+REFERER = "https://github.com/PunchTheDev/gittensor-base-miner"
+
+MAX_REPAIR_ATTEMPTS = 2
+
+
+# ---------------------------------------------------------------------------
+# Prompts
+# ---------------------------------------------------------------------------
 
 SYSTEM_PROMPT = """\
-You are an expert software engineer. Given a GitHub issue and relevant source files,
-produce a minimal, correct unified diff (git diff format) that resolves the issue.
+You are an expert software engineer. You receive a GitHub issue and the \
+relevant source files, and your job is to produce a correct, minimal fix.
+"""
 
-Output format rules:
+OBSERVE_PROMPT = """\
+## Issue: {title}
+
+{body}
+
+## Repository: {repo}
+
+## File tree
+```
+{tree}
+```
+
+## Context files
+{files}
+
+---
+
+Analyse the issue carefully. Answer these questions in order:
+
+1. What is the root cause?
+2. Which files and lines need to change?
+3. What is the minimal correct change — no refactors, no style fixes?
+
+Be concise and precise. Do not write any code yet.
+"""
+
+ACT_PROMPT = """\
+Based on your analysis:
+
+{plan}
+
+Now produce the unified diff that fixes the issue.
+
+Rules:
 - Output ONLY the unified diff, starting with `diff --git`.
-- No prose before or after the diff. No markdown code fences.
-- Make the smallest correct change. No refactors, no style fixes.
+- No prose, no markdown code fences.
+- Smallest correct change only — no refactors or unrelated fixes.
 - The patch must apply cleanly and all tests must pass.
 """
 
+VERIFY_PROMPT = """\
+You just produced this diff:
 
-def build_user_prompt(problem: Problem) -> str:
-    parts = [
-        f"## Issue: {problem.issue_title}\n\n{problem.issue_body}\n",
-        "## Repository file tree\n```\n" + "\n".join(problem.file_tree) + "\n```\n",
-    ]
-    for f in problem.context_files:
+```diff
+{diff}
+```
+
+The issue was:
+
+{title}
+
+{body}
+
+Review the diff carefully. Answer:
+1. Does it address the root cause identified in your plan?
+2. Are the `---` / `+++` headers and hunk offsets syntactically correct?
+3. Are there any obviously wrong or missing changes?
+
+If the diff is correct, respond with exactly: LGTM
+
+If not, respond with a corrected diff starting with `diff --git` and nothing else.
+"""
+
+
+# ---------------------------------------------------------------------------
+# Helpers
+# ---------------------------------------------------------------------------
+
+
+def _format_files(files: list[FileContext]) -> str:
+    parts = []
+    for f in files:
         lang = f.language or ""
-        parts.append(f"## {f.path}\n```{lang}\n{f.content}\n```\n")
-    parts.append("Produce the unified diff to fix this issue:")
-    return "\n".join(parts)
+        parts.append(f"### {f.path}\n```{lang}\n{f.content}\n```")
+    return "\n\n".join(parts)
 
 
-def extract_diff(text: str) -> str:
-    """Extract the unified diff from LLM output.
-
-    Handles cases where the model wraps the diff in a markdown code block
-    (```diff ... ``` or ``` ... ```) despite being told not to.
-    """
+def _extract_diff(text: str) -> str:
+    """Pull the unified diff out of LLM output, stripping markdown fences."""
     text = text.strip()
-
-    # Try to find a fenced code block containing the diff
-    fence_match = re.search(
-        r"```(?:diff)?\s*\n(diff --git.+?)```",
-        text,
-        re.DOTALL,
-    )
-    if fence_match:
-        return fence_match.group(1).strip()
-
-    # Otherwise take content from the first `diff --git` line onward
+    fence = re.search(r"```(?:diff)?\s*\n(diff --git.+?)```", text, re.DOTALL)
+    if fence:
+        return fence.group(1).strip()
     idx = text.find("diff --git")
     if idx != -1:
         return text[idx:].strip()
-
     return text
 
 
+def _looks_valid(diff: str) -> bool:
+    """Basic sanity: must start with `diff --git` and have at least one hunk."""
+    return diff.startswith("diff --git") and "@@" in diff
+
+
+# ---------------------------------------------------------------------------
+# LLM client
+# ---------------------------------------------------------------------------
+
+
+def _call(
+    messages: list[dict[str, str]],
+    model: str,
+    api_key: str,
+    max_tokens: int,
+    timeout: float,
+) -> str:
+    resp = httpx.post(
+        OPENROUTER_URL,
+        headers={
+            "Authorization": f"Bearer {api_key}",
+            "Content-Type": "application/json",
+            "HTTP-Referer": REFERER,
+        },
+        json={
+            "model": model,
+            "messages": messages,
+            "max_tokens": max_tokens,
+            "temperature": 0.2,
+        },
+        timeout=timeout,
+    )
+    resp.raise_for_status()
+    return resp.json()["choices"][0]["message"]["content"]
+
+
+# ---------------------------------------------------------------------------
+# Agent
+# ---------------------------------------------------------------------------
+
+
 class ExampleAgent(BaseAgent):
-    """Single-shot LLM agent — minimal reference implementation."""
+    """
+    Observe → plan → act → verify agent.
+
+    Turn 1: analyse the issue and identify the root cause and required changes.
+    Turn 2: produce the unified diff.
+    Turn 3+: self-critique; repair if the diff looks wrong (up to MAX_REPAIR_ATTEMPTS).
+    """
 
     def __init__(self, model: str = DEFAULT_MODEL) -> None:
         self.model = model
@@ -84,29 +186,74 @@ class ExampleAgent(BaseAgent):
         if not api_key:
             raise RuntimeError("OPENROUTER_KEY environment variable not set")
 
-        user_prompt = build_user_prompt(problem)
+        timeout = float(problem.time_limit_seconds)
+        token_budget = problem.output_token_budget
+        plan_tokens = token_budget // 3
+        act_tokens = token_budget // 2
+        verify_tokens = token_budget // 4
 
-        response = httpx.post(
-            "https://openrouter.ai/api/v1/chat/completions",
-            headers={
-                "Authorization": f"Bearer {api_key}",
-                "Content-Type": "application/json",
-                "HTTP-Referer": "https://github.com/PunchTheDev/gittensor-base-miner",
-            },
-            json={
-                "model": self.model,
-                "messages": [
-                    {"role": "system", "content": SYSTEM_PROMPT},
-                    {"role": "user", "content": user_prompt},
-                ],
-                "max_tokens": problem.output_token_budget,
-                "temperature": 0.2,
-            },
-            timeout=float(problem.time_limit_seconds),
+        log: list[str] = []
+
+        # --- Turn 1: Observe + Plan ---
+        observe_user = OBSERVE_PROMPT.format(
+            title=problem.issue_title,
+            body=problem.issue_body,
+            repo=problem.repo_name,
+            tree="\n".join(problem.file_tree),
+            files=_format_files(problem.context_files),
         )
-        response.raise_for_status()
+        history: list[dict[str, str]] = [
+            {"role": "system", "content": SYSTEM_PROMPT},
+            {"role": "user", "content": observe_user},
+        ]
+        plan = _call(history, self.model, api_key, plan_tokens, timeout)
+        log.append(f"[plan]\n{plan}")
+        history.append({"role": "assistant", "content": plan})
 
-        raw = response.json()["choices"][0]["message"]["content"]
-        diff = extract_diff(raw)
+        # --- Turn 2: Act ---
+        act_user = ACT_PROMPT.format(plan=textwrap.shorten(plan, width=2000))
+        history.append({"role": "user", "content": act_user})
+        raw_diff = _call(history, self.model, api_key, act_tokens, timeout)
+        diff = _extract_diff(raw_diff)
+        log.append(f"[diff v0]\n{diff}")
+        history.append({"role": "assistant", "content": raw_diff})
 
-        return Patch(diff=diff, reasoning=f"model={self.model}")
+        # --- Turn 3+: Verify + Repair ---
+        for attempt in range(MAX_REPAIR_ATTEMPTS):
+            if _looks_valid(diff):
+                verify_user = VERIFY_PROMPT.format(
+                    diff=diff,
+                    title=problem.issue_title,
+                    body=problem.issue_body,
+                )
+                history.append({"role": "user", "content": verify_user})
+                verdict = _call(history, self.model, api_key, verify_tokens, timeout)
+                log.append(f"[verify {attempt}]\n{verdict}")
+
+                if verdict.strip().upper().startswith("LGTM"):
+                    break
+
+                repaired = _extract_diff(verdict)
+                if _looks_valid(repaired):
+                    diff = repaired
+                    log.append(f"[diff v{attempt + 1}]\n{diff}")
+                    history.append({"role": "assistant", "content": verdict})
+                else:
+                    # Verdict was prose criticism, not a diff — accept what we have
+                    break
+            else:
+                history.append({
+                    "role": "user",
+                    "content": (
+                        "The diff you produced does not look like a valid unified diff "
+                        "(must start with `diff --git` and contain at least one `@@` hunk). "
+                        "Please output only the corrected unified diff."
+                    ),
+                })
+                raw_diff = _call(history, self.model, api_key, act_tokens, timeout)
+                diff = _extract_diff(raw_diff)
+                log.append(f"[repair {attempt}]\n{diff}")
+                history.append({"role": "assistant", "content": raw_diff})
+
+        reasoning = f"model={self.model}\n\n" + "\n\n".join(log)
+        return Patch(diff=diff, reasoning=reasoning)
