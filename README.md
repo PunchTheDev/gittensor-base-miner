@@ -1,0 +1,107 @@
+# Gittensor Base-Miner Benchmark
+
+A competitive benchmark where miners build the best autonomous agent for contributing to open-source software — scored by replaying real merged Gittensor pull requests.
+
+The winning agent becomes the canonical base miner for [Gittensor (SN74)](https://github.com/entrius/gittensor), a Bittensor subnet that incentivizes software development.
+
+---
+
+## What you're building
+
+Gittensor rewards miners who contribute quality code to whitelisted open-source repositories. This benchmark measures **agent scaffolding skill**: given a frozen, whitelisted LLM, how well can you engineer the wrapper around it to produce correct, high-quality code patches?
+
+Each submission is an agent that receives a GitHub issue and repository context, then produces a pull request. It's scored by replaying a curated set of real Gittensor issues against their accepted solutions — using Gittensor's own scoring engine as the judge.
+
+The champion agent lives in `agent/champion/` and is updated each time a miner beats the current record.
+
+---
+
+## How scoring works
+
+1. A curated set of ~30 real Gittensor issues is held in `benchmark/problems/`.
+2. Each issue has a recorded "correct" solution (the merged PR diff) used as a reference signal.
+3. Your agent checks out the repo at the pre-issue commit, reads the issue, and produces a patch.
+4. Scoring is done by Gittensor's native engine: tests passing + issue requirements covered, then code quality/density.
+5. **Correctness gates quality** — a passing test suite is required before quality metrics count.
+6. Your agent's score = mean score across all problems. Beat the current champion to win.
+
+### Anti-gaming
+
+- **Commit-reveal**: Submit a SHA-256 hash of your agent first; the harness evaluates privately; only then is your score published.
+- **Time-segmented problems**: All benchmark problems come from PRs merged *after* the agent's model knowledge cutoff, making memorization impossible.
+- **Marginal reward**: Rewards are proportional to margin over the current leader, not absolute score. Copying earns near zero.
+- **Similarity checks**: Submissions are compared against prior submissions; near-duplicates are flagged.
+
+See [docs/threat_model.md](docs/threat_model.md) for the full threat model.
+
+---
+
+## Submission interface
+
+Your agent must implement the `BaseAgent` interface in `agent/base.py`:
+
+```python
+from agent.base import BaseAgent, Problem, Patch
+
+class MyAgent(BaseAgent):
+    def solve(self, problem: Problem) -> Patch:
+        ...
+```
+
+A `Problem` contains the issue body, repository context (file tree + relevant file contents), and constraints (model whitelist, time limit, token budget). A `Patch` is a unified diff string.
+
+See `agent/example/` for a minimal reference implementation.
+
+---
+
+## Running the benchmark locally
+
+```bash
+# Install dependencies
+pip install -r requirements.txt
+
+# Run your agent against all problems
+python scripts/run_eval.py --agent path/to/your_agent.py
+
+# Run against a single problem
+python scripts/run_eval.py --agent path/to/your_agent.py --problem benchmark/problems/001/
+
+# Score a patch manually
+python benchmark/harness/score.py --problem benchmark/problems/001/ --patch my.diff
+```
+
+---
+
+## Repository structure
+
+```
+agent/
+  base.py              # BaseAgent interface and data types
+  champion/            # current champion agent (updated when beaten)
+  example/             # minimal reference implementation
+benchmark/
+  problems/            # curated historical issues (001/, 002/, ...)
+  harness/             # replay and scoring pipeline
+  evaluate.py          # main evaluation entry point
+scripts/
+  run_eval.py          # local evaluation runner
+  curate_problems.py   # tooling for curating new problems
+docs/
+  scoring.md           # scoring mechanics explained
+  hyperparameters.md   # Gittensor hyperparameter configuration for this repo
+  threat_model.md      # anti-gaming threat model
+CONTRIBUTING.md        # how to submit
+hyperparameters.json   # live Gittensor repo hyperparameter config
+```
+
+---
+
+## Hyperparameters
+
+This repo is registered on Gittensor (SN74). See [docs/hyperparameters.md](docs/hyperparameters.md) for how rewards are distributed and why each parameter was chosen.
+
+---
+
+## License
+
+MIT
