@@ -34,6 +34,7 @@ def load_problems():
         repo = meta.get("repo_name", "")
         pr = meta.get("pr_number")
         issue = meta.get("issue_number")
+        issue_body = meta.get("issue_body") or ""
         problems.append(
             {
                 "id": meta.get("id"),
@@ -41,10 +42,15 @@ def load_problems():
                 "pr": pr,
                 "issue": issue,
                 "title": (meta.get("issue_title") or "")[:120],
+                "issue_body": issue_body[:3000] + ("…" if len(issue_body) > 3000 else ""),
                 "merged_at": meta.get("merged_at", ""),
                 "das_score": das_f,
                 "das_base_score": float(meta.get("das_base_score") or 0),
                 "das_token_score": float(meta.get("das_token_score") or 0),
+                "das_structural_score": float(meta.get("das_structural_score") or 0),
+                "das_total_nodes": meta.get("das_total_nodes"),
+                "test_cmd": meta.get("test_cmd") or [],
+                "base_commit": meta.get("base_commit", ""),
                 "pr_url": f"https://github.com/{repo}/pull/{pr}",
                 "issue_url": f"https://github.com/{repo}/issues/{issue}" if issue else None,
             }
