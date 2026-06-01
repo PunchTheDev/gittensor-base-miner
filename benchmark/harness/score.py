@@ -16,8 +16,10 @@ Final score is the base_score (0–30 scale, same as Gittensor native).
 
 Full precision scoring uses Gittensor's tree-sitter pipeline in Docker CI.
 This local implementation approximates src_tok via a token-counting heuristic
-on the unified diff. The approximation is accurate enough for development
-iteration; the authoritative score comes from CI.
+on the unified diff. Local scores typically run 3–5× higher than DAS reference
+scores because tree-sitter parses AST nodes with language-specific weights, while
+this heuristic counts tokens on raw diff lines. Use local scores for relative
+comparison only; the authoritative score comes from Docker CI.
 
 Usage:
     python benchmark/harness/score.py --problem benchmark/problems/930/ --patch my.diff
@@ -115,7 +117,9 @@ def approximate_src_token_score(diff_text: str, saturation_scale: float = SRC_TO
     higher weight (≈2–3x leaf identifiers), matching tree-sitter's structural
     node bonus weights.
 
-    Accuracy: within ~15% of native tree-sitter scoring on typical Python diffs.
+    Accuracy: rough estimate only. Local scores typically run 3–5× higher than
+    DAS reference scores due to the token-counting heuristic vs tree-sitter AST
+    parsing. Use for relative iteration only; CI gives authoritative scores.
     """
     lines = diff_text.splitlines()
     src_score = 0.0
@@ -238,7 +242,7 @@ def score_patch(problem_dir: Path, patch_path: Path) -> dict:
         src_tok, total_tok = approximate_src_token_score(diff_text, saturation_scale)
         base_score = compute_base_score(src_tok, total_tok, saturation_scale)
 
-        scoring_note = "local approximation — CI uses Gittensor tree-sitter pipeline for authoritative score"
+        scoring_note = "local approximation (typically 3–5× above DAS) — CI uses Gittensor tree-sitter pipeline for authoritative score"
         if all_skipped:
             scoring_note = (
                 "tests skipped locally (missing heavy deps e.g. bittensor) — "

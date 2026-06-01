@@ -6,7 +6,7 @@ Subcommands:
     eval     Score an agent against the current shard (or all problems)
     hash     Compute the commit-reveal SHA-256 hash for a patch file
     shard    Print the current week's 30-problem shard IDs
-    submit   Validate an agent, generate its commit-reveal hash, and print PR instructions
+    submit   Validate an agent, generate its commit-reveal hash, and print (or open) a PR
 
 Usage:
     python gitminer.py eval agent/submissions/myhandle/agent.py
@@ -16,6 +16,7 @@ Usage:
     python gitminer.py hash my_patch.diff
     python gitminer.py shard
     python gitminer.py submit agent/submissions/myhandle/agent.py
+    python gitminer.py submit agent/submissions/myhandle/agent.py --model claude-3-5-haiku-20241022 --open-pr
 """
 
 from __future__ import annotations
@@ -91,13 +92,94 @@ def cmd_shard(args: argparse.Namespace) -> None:
         print(f"  {meta['id']:<32}  {meta['repo_name']}  —  {meta['issue_title'][:55]}")
 
 
+def _derive_handle(agent_path: Path) -> str:
+    parts = agent_path.parts
+    if "submissions" in parts:
+        idx = parts.index("submissions")
+        if idx + 1 < len(parts):
+            return parts[idx + 1]
+    return agent_path.parent.name
+
+
+def _build_pr_body(handle: str, sha: str, model: str) -> str:
+    return f"""## Agent submission
+
+**Handle:** {handle}
+**SHA-256 (commit-reveal):** `{sha}`
+**Model:** {model}
+
+## Approach
+<!-- Describe your agent's scaffolding: observe→plan→act loop, memory, tools, retries, reflection. -->
+
+## Results (local eval)
+<!-- Paste output from: gitminer eval agent/submissions/{handle}/agent.py --no-sandbox -->
+
+## Checklist
+- [ ] Agent inherits `BaseAgent` and implements `solve(problem) -> str`
+- [ ] Model is listed in `benchmark/harness/allowed_models.txt`
+- [ ] SHA-256 above matches: `sha256sum agent/submissions/{handle}/agent.py`
+- [ ] Ran `gitminer eval` locally with no errors
+"""
+
+
+def cmd_parity(args: argparse.Namespace) -> None:
+    """Compare local scorer output against embedded DAS reference scores."""
+    import json as _json
+    import math as _math
+    from benchmark.evaluate import POOL_DIR
+    from benchmark.harness.score import approximate_src_token_score, compute_base_score
+
+    problems = sorted(POOL_DIR.glob("*/meta.json"))
+    rows = []
+    skipped = 0
+
+    for meta_path in problems:
+        meta = _json.loads(meta_path.read_text())
+        if "das_base_score" not in meta:
+            skipped += 1
+            continue
+        ref_diff = meta_path.parent / "reference.diff"
+        if not ref_diff.exists():
+            skipped += 1
+            continue
+
+        das_base = float(meta["das_base_score"])
+        diff_text = ref_diff.read_text()
+        src_tok, total_tok = approximate_src_token_score(diff_text)
+        local_base = compute_base_score(src_tok, total_tok)
+        ratio = local_base / max(das_base, 0.001)
+        rows.append((meta["id"], das_base, local_base, ratio))
+
+    if not rows:
+        print("No problems with DAS reference scores found.")
+        return
+
+    rows.sort(key=lambda r: abs(r[3] - 1), reverse=True)
+    limit = args.top if hasattr(args, "top") else 20
+
+    print(f"Local vs DAS score calibration ({len(rows)} problems, {skipped} skipped)\n")
+    print(f"{'Problem ID':<42} {'DAS Base':>9} {'Local':>8} {'Ratio':>7}")
+    print("─" * 72)
+    for pid, das, local, ratio in rows[:limit]:
+        flag = " ← outlier" if ratio > 10 or ratio < 0.5 else ""
+        print(f"{pid:<42} {das:>9.2f} {local:>8.2f} {ratio:>6.1f}×{flag}")
+
+    ratios = [r[3] for r in rows]
+    median_ratio = sorted(ratios)[len(ratios) // 2]
+    print("─" * 72)
+    print(f"Median local/DAS ratio: {median_ratio:.1f}×  "
+          f"(local scores typically read {median_ratio:.0f}× higher than DAS reference)")
+
+
 def cmd_submit(args: argparse.Namespace) -> None:
+    import subprocess as _sp
+
     agent_path = Path(args.agent)
     if not agent_path.exists():
         print(f"Error: agent file not found: {agent_path}", file=sys.stderr)
         sys.exit(1)
 
-    # Validate agent can be loaded
+    # Validate agent loads correctly
     try:
         from benchmark.evaluate import load_agent
         load_agent(str(agent_path))
@@ -106,27 +188,51 @@ def cmd_submit(args: argparse.Namespace) -> None:
         print(f"Agent failed to load: {exc}", file=sys.stderr)
         sys.exit(1)
 
-    # Compute hash of the agent file
     content = agent_path.read_bytes()
     sha = hashlib.sha256(content).hexdigest()
-
-    # Derive handle from path: agent/submissions/<handle>/agent.py
-    parts = agent_path.parts
-    handle = "unknown"
-    if "submissions" in parts:
-        idx = parts.index("submissions")
-        if idx + 1 < len(parts):
-            handle = parts[idx + 1]
+    handle = _derive_handle(agent_path)
+    model = args.model or "claude-3-5-haiku-20241022"
+    pr_body = _build_pr_body(handle, sha, model)
+    branch = f"submission/{handle}"
 
     print(f"\nAgent SHA-256: {sha}")
+
+    if args.open_pr:
+        # Stage, commit, push, and open PR automatically
+        try:
+            _sp.run(["git", "checkout", "-b", branch], check=True)
+        except _sp.CalledProcessError:
+            # Branch may already exist
+            _sp.run(["git", "checkout", branch], check=True)
+
+        _sp.run(["git", "add", str(agent_path)], check=True)
+        _sp.run(
+            ["git", "commit", "-m", f"Submit {handle} agent\n\nagent-sha256: {sha}"],
+            check=True,
+        )
+        _sp.run(["git", "push", "-u", "origin", branch], check=True)
+        _sp.run(
+            [
+                "gh", "pr", "create",
+                "--title", f"[Submission] {handle}",
+                "--body", pr_body,
+            ],
+            check=True,
+        )
+        return
+
+    # Default: print everything the miner needs to run manually
     print(f"\n{'─'*60}")
-    print("Next steps to submit:")
-    print(f"  1. Commit your agent to: agent/submissions/{handle}/agent.py")
-    print(f"  2. Include this hash in your PR description:")
-    print(f"       agent-sha256: {sha}")
-    print(f"  3. Open a PR to main — CI will run the benchmark and post your score.")
-    print(f"  4. If you beat the leader, your entry appears in LEADERBOARD.md.")
-    print(f"{'─'*60}")
+    print("Run these commands to open your submission PR:\n")
+    print(f"  git checkout -b {branch}")
+    print(f"  git add {agent_path}")
+    print(f'  git commit -m "Submit {handle} agent\n\nagent-sha256: {sha}"')
+    print(f"  git push -u origin {branch}")
+    print()
+    print("Then open a PR with this body (or run with --open-pr to automate):\n")
+    print("─" * 60)
+    print(pr_body)
+    print("─" * 60)
 
 
 def main() -> None:
@@ -158,9 +264,36 @@ def main() -> None:
     p_shard = sub.add_parser("shard", help="Print current week's 30-problem shard")
     p_shard.set_defaults(func=cmd_shard)
 
+    # parity
+    p_parity = sub.add_parser(
+        "parity",
+        help="Compare local scorer output against DAS reference scores",
+    )
+    p_parity.add_argument(
+        "--top",
+        type=int,
+        default=20,
+        metavar="N",
+        help="Show top N most divergent problems (default: 20)",
+    )
+    p_parity.set_defaults(func=cmd_parity)
+
     # submit
-    p_submit = sub.add_parser("submit", help="Validate agent and print PR submission instructions")
+    p_submit = sub.add_parser(
+        "submit",
+        help="Validate agent and print (or open) a PR submission",
+    )
     p_submit.add_argument("agent", help="Path to the agent Python file")
+    p_submit.add_argument(
+        "--model",
+        metavar="MODEL_ID",
+        help="Model ID to embed in the PR body (default: claude-3-5-haiku-20241022)",
+    )
+    p_submit.add_argument(
+        "--open-pr",
+        action="store_true",
+        help="Create branch, commit, push, and open the PR via gh (requires gh CLI)",
+    )
     p_submit.set_defaults(func=cmd_submit)
 
     args = parser.parse_args()
