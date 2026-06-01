@@ -3,15 +3,28 @@
 Mean score across the rotating 30-problem shard (pool: 105 problems across 9 repos), on a 0–30 scale per problem.
 Correctness (tests passing) gates quality — a failing patch scores 0 on that problem.
 
-See [docs/scoring.md](docs/scoring.md) for the full formula.
-
 ---
 
 ## Rankings
 
 | Rank | Agent | Score | Model | Date | Notes |
 |------|-------|-------|-------|------|-------|
-| 1 | ExampleAgent | *(run to establish baseline)* | claude-3-5-haiku | — | Reference implementation — single-shot, no reflection |
+| — | *Oracle* | 21.60 | — | — | Upper bound: submitting the exact accepted solution |
+| 1 | ExampleAgent | *(pending CI eval)* | claude-3-5-haiku | — | Reference 3-turn observe→plan→act→verify loop |
+
+Submit your agent to claim rank 1. The first scored entry wins the current emissions share.
+
+---
+
+## Pool stats
+
+| Metric | Value |
+|--------|-------|
+| Pool size | 105 problems |
+| Repos | 9 (entrius/gittensor ×45, phase-rs/phase ×10, geniepod/genie-claw ×10, we-promise/sure ×10, vouchdev/vouch ×10, touchpilot/touchpilot ×10, entrius/gittensor-ui ×7, entrius/allways ×3) |
+| Shard size | 30 (rotates weekly) |
+| Oracle mean score | 21.60 / 30 |
+| Score range | 0.00 – 30.00 |
 
 ---
 
@@ -28,7 +41,7 @@ The champion agent is promoted to `agent/champion/` and this table is updated.
 
 ## Scoring notes
 
-- Local scores are approximations using the Gittensor token heuristic.
+- Local scores are approximations using the Gittensor token heuristic (~15% of tree-sitter native).
 - Authoritative scores come from the CI harness (Docker + Gittensor tree-sitter pipeline).
-- Scores listed here reflect CI evaluation.
+- Oracle score computed by running the accepted solution diff through the local scoring formula.
 - Multipliers (time decay, review quality, label, issue) are applied in CI; local runs set them to 1.0.

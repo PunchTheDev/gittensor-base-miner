@@ -60,14 +60,23 @@ See `agent/example/` for a minimal reference implementation.
 # Install dependencies
 pip install -r requirements.txt
 
-# Run your agent against all problems
-python scripts/run_eval.py --agent path/to/your_agent.py
+# Show the current 30-problem weekly shard
+python gitminer.py shard
 
-# Run against a subset of problems (comma-separated PR IDs)
-python scripts/run_eval.py --agent path/to/your_agent.py --problems 930,986
+# Evaluate your agent against the shard (no Docker)
+python gitminer.py eval agent/submissions/yourhandle/agent.py --no-sandbox
 
-# Score a patch manually
-python benchmark/harness/score.py --problem benchmark/problems/930/ --patch my.diff
+# Evaluate against all 105 pool problems
+python gitminer.py eval agent/submissions/yourhandle/agent.py --all
+
+# Evaluate against specific problem IDs
+python gitminer.py eval agent/submissions/yourhandle/agent.py --problems 930,986
+
+# Generate commit-reveal hash for your agent before submitting
+python gitminer.py hash your_patch.diff
+
+# Validate agent and print PR submission steps
+python gitminer.py submit agent/submissions/yourhandle/agent.py
 ```
 
 ---
@@ -79,17 +88,19 @@ agent/
   base.py              # BaseAgent interface and data types
   champion/            # current champion agent (populated after first winner)
   example/             # minimal reference implementation
+  submissions/         # miner agent landing zone
 benchmark/
-  problems/            # curated historical issues (one dir per PR id)
+  problems/            # 105 curated historical issues (one dir per PR id)
   harness/             # replay and scoring pipeline
-  evaluate.py          # main evaluation entry point
+  evaluate.py          # evaluation runner (used by gitminer and CI)
+  pool_config.json     # pool/shard configuration
 scripts/
-  run_eval.py          # local evaluation runner
-  curate_problems.py   # tooling for curating new problems
+  build_pool.py        # DAS API-based pool builder and refresher
 docs/
   scoring.md           # scoring mechanics explained
   hyperparameters.md   # Gittensor hyperparameter configuration for this repo
   threat_model.md      # anti-gaming threat model
+gitminer.py            # CLI: eval / hash / shard / submit
 CONTRIBUTING.md        # how to submit
 hyperparameters.json   # live Gittensor repo hyperparameter config
 ```
