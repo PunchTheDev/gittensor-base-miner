@@ -31,3 +31,20 @@ What was built:
 - Gittensor scoring engine: using an approximation for local dev. Need location of the validator's native scoring engine to wire it in for CI. Going with approximation until then.
 
 ---
+
+## 2026-06-01 — Phase 5: GitHub Actions CI
+
+**Milestone: `.github/workflows/eval.yml` live (commit `3f3dc5e`).**
+
+What was built:
+- `detect` job: diffs PR against base, finds `agent/submissions/*/agent.py` changes, extracts handle
+- `evaluate` job: sets up Python 3.12, installs deps, runs `scripts/run_eval.py` in Docker sandbox, posts formatted score table as a PR comment (upserts to avoid spam)
+- Results uploaded as workflow artifact (30-day retention)
+- `agent/submissions/` directory created — the expected landing zone for miner submissions
+- Workflow skips gracefully for non-agent PRs (docs, harness changes, etc.)
+
+Comment format: mean score + per-problem pass/fail table + collapsed run details block.
+
+**Remaining:** Phase 6 (Gittensor registration) is on the operator side. Flywheel is ready to receive submissions.
+
+---
