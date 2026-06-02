@@ -81,6 +81,9 @@ Improvements over a naive single-shot approach:
 - Sibling import budget raised to 12 KB (from 6 KB): Go same-package files average
   2-4 KB each; the old limit cut off after 1-2 files, leaving the agent without
   factory or interface definitions it needs.
+- Rust sibling import expansion: `_expand_sibling_imports` now handles `use super::module`
+  patterns in `.rs` files, resolving to `module.rs` or `module/mod.rs` in the same
+  directory. Previously Rust problems got no sibling expansion — 57 pool problems affected.
 - Assertion injection in verify: `_extract_assertions()` pulls the assert/expect/assertEquals
   lines (up to 30) from test files and injects them directly into the verify prompt. The
   model no longer relies on conversation context to recall what assertions must pass —
@@ -126,6 +129,11 @@ Improvements over a naive single-shot approach:
   file path and `N |` start line before writing the diff, pre-computing `@@ -N` offsets
   so the ACT step can use them directly rather than re-deriving under time pressure. ACT
   prompt references the hunk map to focus attention on using the pre-computed line numbers.
+- Line numbers for small (non-windowed) files: `_window_file` now adds `N | ` prefixes
+  even for files under the 300-line windowing threshold. Previously only windowed files
+  showed line numbers — small files required the model to count manually to determine
+  `@@ -N` offsets, causing off-by-one errors. All implementation source files now show
+  consistent `N | content` formatting regardless of size.
 - Missing `--- a/` / `+++ b/` header auto-insert: `_fix_diff_headers()` detects file blocks
   that jump straight from `diff --git` to a `@@` hunk without the required path headers and
   inserts them. `git apply` requires these headers; models in repair mode often omit them.
@@ -337,10 +345,10 @@ Requirements:
 - Start with `diff --git a/<path> b/<path>`
 - Include `--- a/<path>` and `+++ b/<path>` headers
 - Each hunk starts with `@@ -<start>,<count> +<start>,<count> @@`
-- **Line numbers**: windowed **source** files show lines as `  N | content`. Use \
+- **Line numbers**: all source files show lines as `  N | content`. Use \
   these numbers directly for `@@ -N` offsets. The numbers are display-only — do \
   NOT include ` N | ` in your diff; write the actual file content only. Test files \
-  are windowed without line numbers since you do not write diffs against them.
+  do not have line numbers since you do not write diffs against them.
 - **Context lines**: include exactly 3 unchanged lines before and after each \
   change — copy them verbatim from the source file display (same characters, \
   same whitespace) — even a space/tab difference causes `git apply` to fail
@@ -877,6 +885,17 @@ def _expand_sibling_imports(
                 ):
                     siblings.append(path)
 
+        elif ext == "rs":
+            # Rust: `use super::module_name;` references a sibling in the same dir.
+            # `use super::module_name::Symbol;` — same, just one level deeper.
+            for m in re.finditer(r"^use\s+super::([a-z_][a-z0-9_]*)", content, re.MULTILINE):
+                mod_name = m.group(1)
+                for suffix in (f"{mod_name}.rs", f"{mod_name}/mod.rs"):
+                    candidate = (file_dir + "/" if file_dir else "") + suffix
+                    if candidate in tree_set and candidate not in already:
+                        siblings.append(candidate)
+                        break
+
         for sib_path in siblings:
             sib = all_by_path.get(sib_path)
             if sib is None:
@@ -1138,6 +1157,15 @@ def _compute_header_end(lines: list[str], ext: str) -> int:
                 last_import = i
         return min(n, last_import + 1 + POST_IMPORT_BUFFER)
 
+    if ext == "rb":
+        # Ruby: last `require` or `require_relative` line.
+        last_require = 0
+        for i, raw in enumerate(lines):
+            stripped = raw.strip()
+            if stripped.startswith("require ") or stripped.startswith("require_relative "):
+                last_require = i
+        return min(n, last_require + 1 + POST_IMPORT_BUFFER)
+
     # Unknown extension — fall back to fixed constant
     return min(n, HEADER_LINES)
 
@@ -1168,6 +1196,15 @@ def _window_file(
     """
     lines = content.splitlines(keepends=True)
     if len(lines) <= threshold:
+        if show_line_numbers:
+            # Even for small (non-windowed) files, add line numbers so the model
+            # can read @@ -N offsets directly without counting from the top.
+            # Format matches windowed output: "  42 | line content"
+            width = len(str(len(lines)))
+            numbered = []
+            for i, line in enumerate(lines, start=1):
+                numbered.append(f"{i:{width}d} | {line}" if line.endswith("\n") else f"{i:{width}d} | {line}\n")
+            return "".join(numbered), False
         return content, False
 
     # Mark which lines contain a keyword hit
