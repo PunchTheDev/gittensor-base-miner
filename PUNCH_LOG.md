@@ -4,6 +4,23 @@ Milestone trail for the base-miner benchmark. Discord is the primary channel; th
 
 ---
 
+## 2026-06-02 — Pool refresh 347→349, score-aware prompts (commits 342d874, 72b622a)
+
+### Pool expansion (+2 phase-rs/phase problems)
+- Added `phase-rs_phase_1857` (Terra, Herald of Hope card bug) and `phase-rs_phase_1851` (Exhibition Tidecaller targeting bug).
+- Both are Rust game-engine card-mechanic fixes with integration tests — deterministic, high-quality problems.
+- Pool: 347 → 349 problems. Oracle mean: 22.85 → 22.81 (recomputed across all 349).
+- entrius/gittensor: still saturated. ragflow: 0 new qualifying PRs (no linked issues on newer PRs).
+
+### Example agent: score-aware prompting
+- Added scoring explanation to SYSTEM_PROMPT: agents learn that (1) tests gate everything, (2) source-token quality drives the score — complete implementations beat minimal stubs.
+- OBSERVE_PROMPT: added "Implementation plan" step (helper functions, error handling, edge cases) and "Completeness check" step (secondary files) to push toward thorough fixes.
+- ACT_PROMPT: explicitly guides agent to implement the full fix, not a minimal stub.
+- VERIFY_PROMPT: added criterion 5 — "Is the implementation complete?" — can expand a bare fix into a more complete one.
+- Net effect: agents tuned to write complete, well-structured code that passes tests AND scores high.
+
+---
+
 ## 2026-06-02 — Pool refresh 343→347, score breakdown (commit cdb7b4c)
 
 ### Pool expansion (+4 ragflow problems)
