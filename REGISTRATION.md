@@ -6,25 +6,25 @@ Everything the operator needs to do to register this repo on Gittensor and go li
 
 ## 1. GitHub Secrets (benchmark repo)
 
-Go to: `https://github.com/PunchTheDev/gittensor-base-miner/settings/secrets/actions`
+**Status:** `SHARD_SECRET` and `DASHBOARD_DEPLOY_TOKEN` are already set as repository secrets (set by Punch). `OPENROUTER_KEY` is set in the "Github Actions Environment" — the CI workflows now reference that environment, so it will be available automatically.
 
-Add three repository secrets:
+Only remaining secret: confirm `OPENROUTER_KEY` in the "Github Actions Environment" is the correct production key.
 
-| Secret | Value | Purpose |
-|--------|-------|---------|
-| `OPENROUTER_KEY` | OpenRouter API key | CI eval runs the example agent via OpenRouter |
-| `DASHBOARD_DEPLOY_TOKEN` | PAT with `repo` scope on `gittensor-miner-dashboard` | CI pushes updated `data.json` to dashboard repo after each merged submission |
-| `SHARD_SECRET` | Any random string (e.g. `openssl rand -hex 32`) | XORed into the weekly shard seed so miners cannot predict the evaluated shard from public parameters |
+Go to: `https://github.com/PunchTheDev/gittensor-base-miner/settings/environments/16104198406/edit`
 
-**Creating the PAT**: GitHub → Settings → Developer settings → Personal access tokens → Fine-grained → `gittensor-miner-dashboard` → Contents: read+write.
+| Secret | Status | Notes |
+|--------|--------|-------|
+| `OPENROUTER_KEY` | Set (environment) | Verify this is your production OpenRouter key |
+| `DASHBOARD_DEPLOY_TOKEN` | Set (repo) | Uses current gh auth token — rotate if needed |
+| `SHARD_SECRET` | Set (repo) | Random 32-byte hex, set by Punch |
 
 ---
 
-## 2. Confirm frozen model
+## 2. Frozen model
 
-Default: `anthropic/claude-3-5-haiku` via OpenRouter.
+**Updated per operator preference:** default model is now `deepseek/deepseek-chat` via OpenRouter (much cheaper than claude-haiku; good at code tasks).
 
-This is set in `benchmark/harness/allowed_models.txt`. If you want a different model (or multiple), update the file and tell Punch. The model choice affects the benchmark — it should be cheap enough for miners to run many eval rounds, capable enough to get non-trivial scores.
+Full allowed list is in `benchmark/harness/allowed_models.txt`. Miners can use any whitelisted model — the point is that scaffolding wins, not raw model power.
 
 ---
 
@@ -64,12 +64,12 @@ Once registered and CI is live:
 
 | Step | Who | Status |
 |------|-----|--------|
-| Add `OPENROUTER_KEY` secret | Operator | Pending |
-| Add `DASHBOARD_DEPLOY_TOKEN` secret | Operator | Pending |
-| Add `SHARD_SECRET` secret | Operator | Pending |
-| Confirm frozen model | Operator | Pending |
+| `OPENROUTER_KEY` (environment) | Operator | Verify existing key is correct |
+| `DASHBOARD_DEPLOY_TOKEN` (repo) | Punch | Done |
+| `SHARD_SECRET` (repo) | Punch | Done |
+| Frozen model set to deepseek/deepseek-chat | Punch | Done |
 | Gittensor registration + approval | Operator | Pending |
-| Trigger test workflow run after secrets | Operator | Pending |
+| Trigger test workflow run | Operator | After verifying OPENROUTER_KEY |
 | Announce | Operator | After approval |
 
-All code, docs, and CI are complete. The benchmark has 325 problems across 20 repos, a live dashboard, and a fully audited CI pipeline. It is ready to go live.
+All code, docs, and CI are complete. The benchmark has 325 problems across 13 repos, a live dashboard, and a fully audited CI pipeline.

@@ -24,7 +24,7 @@ import httpx
 
 from agent.base import BaseAgent, FileContext, Patch, Problem
 
-DEFAULT_MODEL = os.environ.get("BENCHMARK_MODEL", "anthropic/claude-3-5-haiku")
+DEFAULT_MODEL = os.environ.get("BENCHMARK_MODEL", "deepseek/deepseek-chat")
 OPENROUTER_URL = "https://openrouter.ai/api/v1/chat/completions"
 REFERER = "https://github.com/PunchTheDev/gittensor-base-miner"
 
