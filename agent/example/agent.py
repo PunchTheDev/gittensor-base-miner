@@ -700,6 +700,66 @@ def _expand_sibling_imports(
     return added
 
 
+def _prune_file_tree(
+    file_tree: list[str],
+    context_files: list[FileContext],
+    char_cap: int = 3_000,
+) -> list[str]:
+    """Return a compact, relevant subset of the repository file tree.
+
+    Large repos (ragflow, phase) have 500+ entries in file_tree.  At ~32 chars
+    per path that's 16+ KB of prompt budget showing paths the agent will never
+    touch.  This function keeps only paths that share a directory with a context
+    file (or an ancestor of that directory), so the agent sees the local package
+    structure without the full repo listing.
+
+    Falls back to a character-capped prefix of the full tree if no useful
+    context can be derived.
+    """
+    def _cap(paths: list[str], cap: int, total_count: int) -> list[str]:
+        result: list[str] = []
+        used = 0
+        for p in paths:
+            ln = len(p) + 1
+            if used + ln > cap:
+                omitted = total_count - len(result)
+                if omitted > 0:
+                    result.append(f"... ({omitted} more files)")
+                break
+            result.append(p)
+            used += ln
+        return result
+
+    if not context_files or not file_tree:
+        return _cap(file_tree, char_cap, len(file_tree))
+
+    # Build set of relevant directory prefixes from context files:
+    # for each context file, its directory and all ancestor directories.
+    # Root-level context files mark "" as relevant.
+    relevant_dirs: set[str] = set()
+    for f in context_files:
+        parts = f.path.split("/")
+        # Root-level file: add empty string so root-level siblings are visible
+        if len(parts) == 1:
+            relevant_dirs.add("")
+        for depth in range(1, len(parts)):
+            relevant_dirs.add("/".join(parts[:depth]))
+
+    # Keep tree entries whose immediate parent directory is in relevant_dirs
+    kept = [
+        p for p in file_tree
+        if (p.rsplit("/", 1)[0] if "/" in p else "") in relevant_dirs
+    ]
+
+    # If pruning reduced the list meaningfully, cap and return the relevant subset
+    if 0 < len(kept) < len(file_tree) * 0.7:
+        return _cap(kept, char_cap, len(kept))
+
+    # Pruning had little effect, or kept is empty (all context is in a test dir
+    # with no siblings in the tree) — fall back to capped full list
+    return _cap(file_tree, char_cap, len(file_tree))
+
+
 def _index_hint(top_files: list[FileContext], file_tree: list[str]) -> str:
     """Return a prompt hint listing __init__.py / index.ts|js files in the same
     directories as the top implementation files.
@@ -1153,13 +1213,27 @@ class ExampleAgent(BaseAgent):
         if lang_note:
             log.append(f"[context] language detected: {lang}")
 
+        # Prune file tree to only paths in directories of context files.
+        # Large repos (ragflow, phase) have 500 paths (16-22 KB) in the raw tree.
+        # Showing the full tree wastes context budget; the pruned view covers
+        # all directories the agent needs to reason about import paths.
+        all_context = test_files + selected_impl
+        pruned_tree = _prune_file_tree(problem.file_tree, all_context)
+        raw_tree_len = sum(len(p) for p in problem.file_tree)
+        pruned_tree_len = sum(len(p) for p in pruned_tree if not p.startswith("..."))
+        if raw_tree_len > pruned_tree_len + 200:
+            log.append(
+                f"[context] file tree pruned: {len(pruned_tree)} paths "
+                f"({pruned_tree_len} chars, saved {raw_tree_len - pruned_tree_len} chars)"
+            )
+
         observe_user = OBSERVE_PROMPT.format(
             title=problem.issue_title,
             body=problem.issue_body,
             repo=problem.repo_name,
             test_cmd=test_cmd_str,
             test_cmd_short=test_cmd_short,
-            tree="\n".join(problem.file_tree),
+            tree="\n".join(pruned_tree),
             init_hint=init_hint,
             test_section=test_section,
             new_test_section=new_test_section + new_impl_section,
