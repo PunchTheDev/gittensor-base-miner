@@ -406,8 +406,12 @@ def _rank_files(
     mentioned_paths = set(re.findall(r"[\w/.-]+\.(?:py|ts|js|rs|go|java|kt|rb|cpp|c|h)", issue_text))
 
     # Identifier tokens from the issue (snake_case, camelCase, UPPER_CASE)
-    raw_tokens = re.findall(r"\b([a-z_][a-z0-9_]{3,}|[A-Z][A-Za-z0-9]{3,})\b", issue_title + " " + issue_body)
-    keywords = {t.lower() for t in raw_tokens}
+    # Title tokens weighted 3×: issue titles are precise ("fix RepoScanner.scan") vs
+    # body prose that often describes the symptom rather than the cause.
+    title_raw = re.findall(r"\b([a-z_][a-z0-9_]{3,}|[A-Z][A-Za-z0-9]{3,})\b", issue_title)
+    body_raw = re.findall(r"\b([a-z_][a-z0-9_]{3,}|[A-Z][A-Za-z0-9]{3,})\b", issue_body)
+    title_kws = {t.lower() for t in title_raw}
+    body_kws = {t.lower() for t in body_raw}
 
     # Additional keywords from test files — tested symbols are in the impl files
     test_kws = _test_keywords(test_files) if test_files else set()
@@ -425,12 +429,12 @@ def _rank_files(
         # High bonus if the file is explicitly mentioned in the issue text
         path_score = 20.0 * sum(1 for mp in mentioned_paths if mp in path_lower)
         content_lower = f.content.lower()
-        # Keyword density in file content (identifiers > 4 chars to reduce noise)
-        keyword_hits = sum(1 for kw in keywords if len(kw) > 4 and kw in content_lower)
-        # Test-derived symbols: paths/names from test imports/calls — weighted higher
-        # because they pinpoint exactly which module is under test
+        # Title hits weighted 3× — titles name the exact function/module being fixed
+        title_hits = sum(1 for kw in title_kws if len(kw) > 4 and kw in content_lower)
+        body_hits = sum(1 for kw in body_kws if len(kw) > 4 and kw in content_lower)
+        # Test-derived symbols: paths/names from test imports/calls — weighted 2×
         test_hits = sum(1 for kw in test_kws if len(kw) > 4 and kw in content_lower)
-        return import_bonus + path_score + keyword_hits + 2.0 * test_hits
+        return import_bonus + path_score + 3.0 * title_hits + body_hits + 2.0 * test_hits
 
     return sorted(files, key=score, reverse=True)
 
