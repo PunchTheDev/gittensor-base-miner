@@ -865,24 +865,100 @@ def cmd_run(args: argparse.Namespace) -> None:
             if baselines_path.exists():
                 baselines = json.loads(baselines_path.read_text())
                 ref_score = next(
-                    (b["score"] for b in baselines if b["problem_id"] == args.problem),
+                    (b.get("base_score") for b in baselines if b.get("id") == args.problem),
                     None,
                 )
                 if ref_score is not None:
                     delta = score - ref_score
                     sign = "+" if delta >= 0 else ""
                     color = GREEN if delta >= 0 else RED
-                    print(f"Oracle   : {ref_score:.2f}  (delta {color}{sign}{delta:.2f}{RESET})")
+                    print(f"Oracle   : {ref_score:.2f}  (local, delta {color}{sign}{delta:.2f}{RESET})")
+
+            # Show DAS validator score for the reference PR if available
+            meta_path = problem_dir / "meta.json"
+            if meta_path.exists():
+                prob_meta = json.loads(meta_path.read_text())
+                das_base = prob_meta.get("das_base_score")
+                if das_base is not None:
+                    try:
+                        das_base_f = float(das_base)
+                        if das_base_f > 0:
+                            print(f"DAS ref  : {CYAN}{das_base_f:.2f}{RESET}  "
+                                  f"(Gittensor validator score for the reference PR)")
+                    except (ValueError, TypeError):
+                        pass
 
             oracle_mean = _oracle_mean()
             delta_vs_oracle = score - oracle_mean
             sign = "+" if delta_vs_oracle >= 0 else ""
             color = GREEN if delta_vs_oracle >= 0 else CYAN
-            print(f"Avg oracle: {oracle_mean:.2f}  (vs mean: {color}{sign}{delta_vs_oracle:.2f}{RESET})")
+            print(f"Pool mean: {oracle_mean:.2f}  (vs mean: {color}{sign}{delta_vs_oracle:.2f}{RESET})")
 
             if args.no_sandbox:
-                print(f"\n{CYAN}Note:{RESET} --no-sandbox scores ~2× above Docker CI.  "
-                      "Use CI score as the authoritative benchmark.")
+                print(f"\n{CYAN}Note:{RESET} --no-sandbox scores ~3-5× above Docker CI.  "
+                      "DAS ref above shows what the reference PR actually earned on the validator.")
+
+            # --- Repair loop (--repair N, local only) ---
+            if args.repair and args.no_sandbox and not tests_ok:
+                test_out_for_repair = result.get("test_output", "")
+                for repair_attempt in range(1, args.repair + 1):
+                    print()
+                    print(f"─" * 72)
+                    print(f"Repair attempt {repair_attempt}/{args.repair}  (feeding test failure to agent)")
+                    current_patch = patch
+                    try:
+                        repaired_patch = agent.repair(problem, current_patch, test_out_for_repair)
+                    except Exception as exc:
+                        print(f"  Repair error: {exc}", file=sys.stderr)
+                        break
+
+                    repaired_diff = repaired_patch.diff or ""
+                    if not repaired_diff:
+                        print("  Agent produced empty patch — stopping.")
+                        break
+
+                    print()
+                    print("Repaired patch:")
+                    _print_diff(repaired_diff)
+                    print()
+
+                    with tempfile.NamedTemporaryFile(suffix=".diff", mode="w", delete=False) as tmp2:
+                        tmp2.write(repaired_diff)
+                        repair_path = Path(tmp2.name)
+                    try:
+                        from benchmark.harness.score import score_patch as _score_patch
+                        repair_result = _score_patch(problem_dir, repair_path)
+                    finally:
+                        repair_path.unlink(missing_ok=True)
+
+                    tests_ok = repair_result.get("tests_passed", False)
+                    repair_score = repair_result.get("final_score", 0.0)
+                    test_out_for_repair = repair_result.get("test_output", "")
+                    status2 = f"{GREEN}PASS{RESET}" if tests_ok else f"{RED}FAIL{RESET}"
+                    print(f"Tests    : {status2}")
+                    if tests_ok:
+                        src_tok2 = repair_result.get("source_token_score", 0.0)
+                        src_bar2 = "█" * int(round(src_tok2 / 25 * 20)) + "░" * (20 - int(round(src_tok2 / 25 * 20)))
+                        print(f"Src tok  : {GREEN}{src_tok2:5.2f}{RESET} / 25.00  [{src_bar2}]")
+                        print(f"Score    : {GREEN}{repair_score:.2f}{RESET} / 30.00")
+                        patch = repaired_patch
+                        diff = repaired_diff
+                        if args.output:
+                            Path(args.output).write_text(diff)
+                            print(f"Saved    : {args.output}  (repaired)")
+                        break
+                    else:
+                        lines2 = test_out_for_repair.strip().splitlines()
+                        shown2 = lines2[-15:]
+                        if len(lines2) > 15:
+                            print(f"  [{len(lines2) - 15} lines omitted]")
+                        for line in shown2:
+                            print(f"  {line}")
+                        print(f"Score    : {RED}0.00{RESET} / 30.00  (still failing)")
+                        if repair_attempt == args.repair:
+                            print(f"\nRepair limit reached — consider adjusting your agent or context.")
+            elif args.repair and not args.no_sandbox:
+                print(f"\n{CYAN}Note:{RESET} --repair requires --no-sandbox (Docker sandbox doesn't support in-loop repair)")
         finally:
             tmp_path.unlink(missing_ok=True)
     elif args.score:
@@ -1067,6 +1143,9 @@ def main() -> None:
                        help="Save the generated patch to FILE")
     p_run.add_argument("--verbose", action="store_true",
                        help="Print the agent's internal reasoning log")
+    p_run.add_argument("--repair", type=int, default=0, metavar="N",
+                       help="After test failure, call agent.repair() up to N times "
+                            "(requires --score --no-sandbox; not used in CI scoring)")
     p_run.set_defaults(func=cmd_run)
 
     # validate

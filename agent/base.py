@@ -80,3 +80,31 @@ class BaseAgent(abc.ABC):
         whitelisted model API.
         """
         raise NotImplementedError
+
+    def repair(self, problem: Problem, failed_patch: Patch, test_output: str) -> Patch:
+        """
+        Repair a patch that failed the test suite.
+
+        Called by the local dev harness (gitminer run --repair) when a patch
+        fails tests — gives the agent a second shot with real failure context.
+
+        The default implementation retries solve() with a modified problem
+        that includes the failure context in issue_body. Agents should override
+        this for a more targeted repair that extends the existing conversation.
+
+        Not called in CI — the benchmark scores the first solve() result only.
+        This is a local iteration aid.
+        """
+        import dataclasses
+        failure_context = (
+            f"\n\n---\n## Previous attempt failed\n\n"
+            f"This patch was produced but the test suite failed:\n\n"
+            f"```diff\n{failed_patch.diff}\n```\n\n"
+            f"Test output:\n```\n{test_output[-2000:]}\n```\n\n"
+            f"Analyse what went wrong and produce a corrected patch."
+        )
+        augmented = dataclasses.replace(
+            problem,
+            issue_body=(problem.issue_body or "") + failure_context,
+        )
+        return self.solve(augmented)

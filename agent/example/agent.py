@@ -148,6 +148,33 @@ If it needs fixing, respond with the corrected diff only (no prose, starts with 
 If the implementation is a bare minimum that should be more thorough, expand it and respond with the improved diff.
 """
 
+TEST_REPAIR_PROMPT = """\
+Your patch was applied but the test suite failed.
+
+Issue: {title}
+
+Test command: `{test_cmd}`
+
+Your diff:
+```diff
+{diff}
+```
+
+Test output (last 60 lines):
+```
+{test_output}
+```
+
+Diagnose the failure — look at the assertion error, traceback, or missing import. \
+Then produce a corrected unified diff that fixes the root cause and makes the tests pass.
+
+Requirements:
+- Start with `diff --git a/<path> b/<path>`
+- Include correct `--- a/<path>` and `+++ b/<path>` headers
+- Each hunk starts with `@@ -<start>,<count> +<start>,<count> @@`
+- Output ONLY the diff — no markdown fences, no prose
+"""
+
 REPAIR_FORMAT_PROMPT = """\
 The diff you produced is not a valid unified diff.
 
@@ -483,4 +510,49 @@ class ExampleAgent(BaseAgent):
                 break
 
         reasoning = f"model={self.model}\n\n" + "\n\n".join(log)
+        return Patch(diff=diff, reasoning=reasoning)
+
+    def repair(self, problem: Problem, failed_patch: Patch, test_output: str) -> Patch:
+        """
+        Targeted repair: extend the conversation with the test failure output and
+        ask the model to produce a corrected diff.
+
+        Called by `gitminer run --repair N` after a local test run fails.
+        Not used in CI scoring — the benchmark scores the first solve() result.
+        """
+        api_key = os.environ.get("OPENROUTER_KEY", "")
+        if not api_key:
+            raise RuntimeError("OPENROUTER_KEY environment variable not set")
+
+        test_cmd_str = " ".join(problem.test_cmd) if problem.test_cmd else "pytest"
+        timeout = float(problem.time_limit_seconds) / MAX_CALLS
+        act_tokens = problem.output_token_budget // 2
+
+        log: list[str] = [f"[repair] test failure detected, starting targeted repair"]
+
+        # Build a fresh conversation focused on the failure — cheaper than a full re-solve
+        repair_user = TEST_REPAIR_PROMPT.format(
+            title=problem.issue_title,
+            test_cmd=test_cmd_str,
+            diff=failed_patch.diff,
+            test_output=test_output[-3000:],
+        )
+        history: list[dict[str, str]] = [
+            {"role": "system", "content": SYSTEM_PROMPT},
+            {"role": "user", "content": repair_user},
+        ]
+        raw_diff = _call(history, self.model, api_key, act_tokens, timeout, temperature=0)
+        diff = _extract_diff(raw_diff)
+        log.append(f"[repair diff]\n{diff}")
+
+        # One structural validation pass
+        if not _looks_valid(diff):
+            problem_desc = _diagnose_diff(diff)
+            history.append({"role": "assistant", "content": raw_diff})
+            history.append({"role": "user", "content": REPAIR_FORMAT_PROMPT.format(problem=problem_desc)})
+            raw_diff = _call(history, self.model, api_key, act_tokens, timeout, temperature=0)
+            diff = _extract_diff(raw_diff)
+            log.append(f"[repair format fix]\n{diff}")
+
+        reasoning = (failed_patch.reasoning or "") + "\n\n" + f"model={self.model}\n\n" + "\n\n".join(log)
         return Patch(diff=diff, reasoning=reasoning)

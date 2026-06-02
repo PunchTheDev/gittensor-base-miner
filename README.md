@@ -79,12 +79,13 @@ python gitminer.py shard
 # Run your agent on one problem and inspect the patch it produces (fast dev loop)
 python gitminer.py run --problem 0463 --agent agent/submissions/yourhandle/agent.py
 python gitminer.py run --problem 0463 --show-ref --score --no-sandbox   # compare to reference + score inline
+python gitminer.py run --problem 0463 --score --no-sandbox --repair 3   # if tests fail, agent repairs with test output (up to 3 attempts)
 
 # Evaluate your agent against the shard (no Docker)
 python gitminer.py eval agent/submissions/yourhandle/agent.py --no-sandbox
 
 # Calibration check: score reference diffs to verify the full pipeline (no agent or API key needed)
-python gitminer.py eval --oracle --no-sandbox   # expected mean: ~22.77 / 30.00
+python gitminer.py eval --oracle --no-sandbox   # expected mean: ~22.81 / 30.00
 
 # Evaluate against all 349 pool problems
 python gitminer.py eval agent/submissions/yourhandle/agent.py --all
