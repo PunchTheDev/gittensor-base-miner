@@ -1316,7 +1316,7 @@ def _extract_diff(text: str) -> str:
        `re.search` would only capture the first block — we join all of them.
     Also matches ` ```patch ` fences (less common but valid).
     """
-    text = text.strip()
+    text = text.strip().replace("\r\n", "\n").replace("\r", "\n")
     fences = list(re.finditer(r"```(?:diff|patch)?\s*\n(diff --git.+?)```", text, re.DOTALL))
     if fences:
         return "\n".join(m.group(1).strip() for m in fences)
@@ -1540,13 +1540,19 @@ class ExampleAgent(BaseAgent):
                 assertions_section=assertions_section,
             )
             history.append({"role": "user", "content": verify_user})
-            verdict = _call(history, self.model, api_key, verify_tokens, verify_timeout)
+            verdict = _call(history, self.model, api_key, verify_tokens, verify_timeout, temperature=0)
             log.append(f"[verify {attempt}]\n{verdict}")
 
+            repaired = _post_process(_extract_diff(verdict))
+            # LGTM: model approved the diff (no valid diff extracted) or explicitly said LGTM.
+            # Check for LGTM before checking for a repaired diff — if the model both says
+            # "LGTM" and includes a diff, we treat it as approval (not a replacement).
             if verdict.strip().upper().startswith("LGTM"):
                 break
+            if not _looks_valid(repaired) and "lgtm" in verdict.lower():
+                log.append(f"[verify {attempt}] LGTM detected (non-leading position)")
+                break
 
-            repaired = _post_process(_extract_diff(verdict))
             if _looks_valid(repaired):
                 # Only replace if repaired diff covers at least as many files as the
                 # current diff.  If it covers fewer, the model returned a partial
@@ -1555,7 +1561,10 @@ class ExampleAgent(BaseAgent):
                 if _count_diff_files(repaired) >= _count_diff_files(diff):
                     diff = repaired
                     log.append(f"[diff v{attempt + 1}]\n{diff}")
-                    history.append({"role": "assistant", "content": verdict})
+                    # Store the cleaned diff in history — not the raw verdict which may
+                    # contain prose mixed with the diff.  Subsequent verify/repair calls
+                    # see the same artifact-free version they would produce via _post_process.
+                    history.append({"role": "assistant", "content": repaired})
                 else:
                     log.append(
                         f"[verify {attempt}] partial repair ({_count_diff_files(repaired)} < "
