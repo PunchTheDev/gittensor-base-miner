@@ -131,6 +131,13 @@ MAX_CALLS = 3 + MAX_REPAIR_ATTEMPTS
 MAX_CONTEXT_FILES = 20
 MAX_CONTEXT_CHARS = 40_000
 
+# Per-file size cap used in budget accounting: files over the windowing threshold
+# (300 lines ≈ 12 KB typical) get windowed down to ~6-10 KB in the prompt.
+# Counting raw size for budget dramatically underestimates how many files can fit
+# (270/400 pool problems exceed 40 KB raw but compress to ~20 KB windowed).
+# Using this cap lets the ranker pass more files through to the windowing step.
+MAX_FILE_BUDGET_CHARS = 10_000
+
 
 # ---------------------------------------------------------------------------
 # Prompts
@@ -925,13 +932,22 @@ def _rank_files(
 
 def _truncate_context(files: list[FileContext]) -> list[FileContext]:
     """Limit files sent to the LLM: at most MAX_CONTEXT_FILES files,
-    or until cumulative character count hits MAX_CONTEXT_CHARS."""
+    or until estimated context budget hits MAX_CONTEXT_CHARS.
+
+    Budget is counted using capped sizes (MAX_FILE_BUDGET_CHARS per file)
+    rather than raw sizes.  Large files are windowed before being sent to the
+    model, so a 50 KB file typically only occupies 6-10 KB in the prompt.
+    Using raw sizes as the budget would drop files 2-N for any problem where
+    file 1 alone exceeds 40 KB, even though the windowed prompt would be fine.
+    """
     selected: list[FileContext] = []
     total_chars = 0
     for f in files:
         if len(selected) >= MAX_CONTEXT_FILES:
             break
-        file_chars = len(f.path) + len(f.content)
+        # Use the smaller of raw size or per-file cap for budget accounting:
+        # large files will be windowed, so they occupy far less prompt space.
+        file_chars = min(len(f.path) + len(f.content), MAX_FILE_BUDGET_CHARS)
         if total_chars + file_chars > MAX_CONTEXT_CHARS and selected:
             break
         selected.append(f)
