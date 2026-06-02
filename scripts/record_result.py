@@ -64,15 +64,18 @@ def contribution_weight(score: float, sota: float, champion_mult: float = 3.0, p
 
 
 def update_leaderboard(leaderboard: list[dict], entry: dict) -> list[dict]:
-    """Upsert by agent handle, re-rank by score descending."""
+    """Upsert by agent handle, re-rank by weighted_score descending (falls back to score)."""
     handle = entry["agent"]
     # Remove existing entry for this handle
     rows = [r for r in leaderboard if r.get("rank") is None or r.get("agent") != handle]
     rows.append(entry)
-    # Sort real entries by score descending
+    # Sort real entries by weighted_score (primary) then score (secondary)
     oracle = [r for r in rows if r.get("rank") is None]
-    real = sorted([r for r in rows if r.get("rank") is not None],
-                  key=lambda r: r.get("score") or 0, reverse=True)
+    real = sorted(
+        [r for r in rows if r.get("rank") is not None],
+        key=lambda r: (r.get("weighted_score") or r.get("score") or 0, r.get("score") or 0),
+        reverse=True,
+    )
     for i, r in enumerate(real, 1):
         r["rank"] = i
     return oracle + real
@@ -94,6 +97,7 @@ def main():
     mean_score = results.get("mean_score")
     if mean_score is None:
         raise SystemExit("results.json missing mean_score field")
+    weighted_mean = results.get("weighted_mean_score", mean_score)
 
     RESULTS_DIR.mkdir(parents=True, exist_ok=True)
     lb_file = RESULTS_DIR / "leaderboard.json"
@@ -111,6 +115,7 @@ def main():
         "rank": 1,  # placeholder — update_leaderboard will re-rank
         "agent": args.handle,
         "score": round(float(mean_score), 4),
+        "weighted_score": round(float(weighted_mean), 4),
         "model": args.model,
         "date": today,
         "note": args.note,

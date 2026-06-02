@@ -42,6 +42,30 @@ REPO_ROOT = Path(__file__).parent.parent
 POOL_DIR = Path(__file__).parent / "problems"
 POOL_CONFIG_PATH = Path(__file__).parent / "pool_config.json"
 
+# Difficulty tiers based on reference diff patch size (added lines, ignoring test files).
+# Weights increase the contribution of hard problems to the weighted mean.
+DIFFICULTY_TIERS = [
+    ("easy",   30,  1.0),   # < 30 added lines → weight 1.0×
+    ("medium", 150, 1.5),   # 30–149 → weight 1.5×
+    ("hard",   None, 2.0),  # 150+ → weight 2.0×
+]
+
+
+def problem_difficulty(problem_dir: Path) -> tuple[str, float]:
+    """Return (tier_name, weight) for a problem based on reference diff size."""
+    ref = problem_dir / "reference.diff"
+    if not ref.exists():
+        return "medium", 1.5
+
+    added = sum(
+        1 for line in ref.read_text(errors="replace").splitlines()
+        if line.startswith("+") and not line.startswith("+++")
+    )
+    for name, threshold, weight in DIFFICULTY_TIERS:
+        if threshold is None or added < threshold:
+            return name, weight
+    return "hard", 2.0
+
 
 def _diff_hash(diff_text: str) -> str:
     """Return a stable SHA-256 of the normalized diff.
@@ -211,8 +235,19 @@ def run_evaluation(
 
         total = sum(r["final_score"] for r in results)
         mean = total / len(results) if results else 0.0
+
+        weighted_total = weighted_count = 0.0
+        for r, d in zip(results, selected):
+            _, w = problem_difficulty(d)
+            r["difficulty"] = problem_difficulty(d)[0]
+            r["difficulty_weight"] = w
+            weighted_total += r["final_score"] * w
+            weighted_count += w
+        weighted_mean = weighted_total / weighted_count if weighted_count else 0.0
+
         return {
             "mean_score": round(mean, 4),
+            "weighted_mean_score": round(weighted_mean, 4),
             "problems_evaluated": len(results),
             "pool_size": len(all_problem_dirs),
             "shard_size": len(selected),
@@ -270,8 +305,19 @@ def run_evaluation(
 
     total = sum(r["final_score"] for r in results)
     mean = total / len(results) if results else 0.0
+
+    weighted_total = weighted_count = 0.0
+    for r, d in zip(results, selected):
+        tier, w = problem_difficulty(d)
+        r["difficulty"] = tier
+        r["difficulty_weight"] = w
+        weighted_total += r["final_score"] * w
+        weighted_count += w
+    weighted_mean = weighted_total / weighted_count if weighted_count else 0.0
+
     return {
         "mean_score": round(mean, 4),
+        "weighted_mean_score": round(weighted_mean, 4),
         "problems_evaluated": len(results),
         "pool_size": len(all_problem_dirs),
         "shard_size": len(selected),
@@ -323,7 +369,8 @@ def main() -> None:
     )
 
     pool_info = f"{results['shard_size']}/{results['pool_size']} problems"
-    print(f"\nMean score: {results['mean_score']} ({pool_info})")
+    print(f"\nMean score:          {results['mean_score']} ({pool_info})")
+    print(f"Weighted mean score: {results['weighted_mean_score']} (easy×1 / medium×1.5 / hard×2)")
 
     if args.output:
         Path(args.output).write_text(json.dumps(results, indent=2))

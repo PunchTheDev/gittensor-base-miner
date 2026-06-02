@@ -64,10 +64,20 @@ Each problem includes `reference.diff` — the diff of the actual merged PR. Thi
 
 ## Problem difficulty tiers
 
-| Tier | Description | Typical patch size |
-|------|-------------|-------------------|
-| Easy | Single-function fix, clear test failure | < 30 lines |
-| Medium | Multi-file change, requires understanding of module interactions | 30–150 lines |
-| Hard | Architecture change, new feature with tests | 150+ lines |
+| Tier | Added lines in ref diff | Weight |
+|------|------------------------|--------|
+| Easy | < 30 | 1.0× |
+| Medium | 30–149 | 1.5× |
+| Hard | 150+ | 2.0× |
 
-The initial problem set targets a mix of Easy and Medium, with Hard problems added as the benchmark matures.
+Difficulty is derived from the reference diff size (added lines, excluding test files). Each problem reports its tier in `meta.json`.
+
+### Weighted mean score
+
+In addition to the flat `mean_score`, results include a `weighted_mean_score`:
+
+```
+weighted_mean = sum(score_i × weight_i) / sum(weight_i)
+```
+
+Hard problems contribute twice as much as easy ones. An agent that solves hard problems while struggling on easy ones can outscore an agent that only coasts on easy ones. The weighted mean is the primary benchmark metric for ranking.
