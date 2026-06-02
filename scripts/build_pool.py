@@ -199,6 +199,12 @@ def curate_pr(
         print(f"  Skip {repo}#{pr_number}: issue #{issue_number} fetch failed")
         return False
 
+    # Reject issues with no meaningful body — agent has nothing to work from
+    issue_body = issue_data.get("body") or ""
+    if len(issue_body.strip()) < 50:
+        print(f"  Skip {repo}#{pr_number}: issue body too short ({len(issue_body)} chars)")
+        return False
+
     # Fetch PR from GitHub for base_commit
     try:
         pr_data = gh_api(f"repos/{repo}/pulls/{pr_number}")
@@ -238,7 +244,7 @@ def curate_pr(
         "pr_number": pr_number,
         "issue_number": issue_number,
         "issue_title": issue_data["title"],
-        "issue_body": issue_data.get("body") or "",
+        "issue_body": issue_body,
         "merged_at": merged_at,
         "test_cmd": test_cmd,
         "time_limit_seconds": 120,

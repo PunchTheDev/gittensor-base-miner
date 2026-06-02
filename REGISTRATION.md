@@ -72,4 +72,4 @@ Once registered and CI is live:
 | Trigger test workflow run | Operator | After verifying OPENROUTER_KEY |
 | Announce | Operator | After approval |
 
-All code, docs, and CI are complete. The benchmark has 325 problems across 13 repos, a live dashboard, and a fully audited CI pipeline.
+All code, docs, and CI are complete. The benchmark has 324 problems across 13 repos, a live dashboard, and a fully audited CI pipeline.
