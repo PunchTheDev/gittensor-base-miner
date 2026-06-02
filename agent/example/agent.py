@@ -81,6 +81,10 @@ Improvements over a naive single-shot approach:
 - Sibling import budget raised to 12 KB (from 6 KB): Go same-package files average
   2-4 KB each; the old limit cut off after 1-2 files, leaving the agent without
   factory or interface definitions it needs.
+- Assertion injection in verify: `_extract_assertions()` pulls the assert/expect/assertEquals
+  lines (up to 30) from test files and injects them directly into the verify prompt. The
+  model no longer relies on conversation context to recall what assertions must pass —
+  they're explicitly listed so the model can check each one against the diff.
 """
 
 from __future__ import annotations
@@ -251,7 +255,7 @@ Issue: {title}
 {body}
 
 Test command that must pass: `{test_cmd}`
-
+{assertions_section}
 You produced this diff:
 
 ```diff
@@ -259,7 +263,7 @@ You produced this diff:
 ```
 
 Check it against these criteria:
-1. Does the diff address every assertion in the test file, not just the surface symptom?
+1. Does the diff satisfy every test assertion listed above? Map each one to a concrete line.
 2. Are `@@ -N` line numbers accurate? Cross-check with `N |` line markers in the context.
 3. Are there missing changes or accidental deletions that would break unrelated tests?
 4. Are all new symbols, functions, or classes properly imported in every file that uses them?
@@ -270,6 +274,14 @@ If the diff is correct and complete, respond with exactly: LGTM
 
 If it needs fixing, respond with the corrected diff only (no prose, starts with `diff --git`).
 If the implementation is a bare minimum that should be more thorough, expand it and respond with the improved diff.
+"""
+
+ASSERTIONS_SECTION_TEMPLATE = """\
+Key test assertions (from context — each must pass after your diff):
+```
+{assertions}
+```
+
 """
 
 TEST_REPAIR_PROMPT = """\
@@ -1026,6 +1038,54 @@ def _format_files(
 # ---------------------------------------------------------------------------
 
 
+def _extract_assertions(test_files: list[FileContext], limit: int = 30) -> str:
+    """Extract assertion lines from test files for the verify prompt.
+
+    Assertions are the ground truth the diff must satisfy.  Injecting them
+    directly into the verify prompt lets the model check each one explicitly
+    rather than relying on the conversation context from the observe step.
+
+    Caps at `limit` lines to keep the verify prompt compact.  Recognises
+    assert styles for Python, Rust, Go, TypeScript, Kotlin, and Java.
+    """
+    _ASSERT_PREFIXES = (
+        "assert ",          # Python / general
+        "assert_eq!",       # Rust
+        "assert_ne!",       # Rust
+        "assert!(",         # Rust
+        "expect(",          # JS/TS
+        "toEqual",          # Jest/Vitest
+        "toBe(",            # Jest/Vitest
+        "toHaveBeenCalled",
+        "assertEquals(",    # JUnit / Kotlin
+        "assertTrue(",
+        "assertFalse(",
+        "assertThat(",
+        "assertNotNull(",
+        "assertNull(",
+        "verify(",          # Kotlin mockk / Go mock
+        "if got",           # Go-style: if got != want { t.Errorf... }
+        "t.Errorf(",
+        "t.Fatalf(",
+        "assert.Equal(",    # testify (Go)
+        "assert.NoError(",
+        "assert.Error(",
+        "require.Equal(",
+        "require.NoError(",
+    )
+    lines: list[str] = []
+    for f in test_files:
+        for raw in f.content.splitlines():
+            stripped = raw.strip()
+            if any(stripped.startswith(p) for p in _ASSERT_PREFIXES):
+                lines.append(stripped)
+            if len(lines) >= limit:
+                break
+        if len(lines) >= limit:
+            break
+    return "\n".join(lines)
+
+
 def _trim_test_output(output: str, head: int = 30, tail: int = 50) -> str:
     """Return the first `head` + last `tail` lines of test output with a gap marker.
 
@@ -1379,13 +1439,21 @@ class ExampleAgent(BaseAgent):
                 history.append({"role": "assistant", "content": raw_diff})
                 continue
 
-            # Diff looks structurally valid — ask for semantic verification
+            # Diff looks structurally valid — ask for semantic verification.
+            # Inject extracted assertions so the model can cross-check each one
+            # rather than relying solely on the earlier conversation context.
             body_snippet = (problem.issue_body or "")[:1500]
+            assertions_text = _extract_assertions(test_files)
+            assertions_section = (
+                ASSERTIONS_SECTION_TEMPLATE.format(assertions=assertions_text)
+                if assertions_text else ""
+            )
             verify_user = VERIFY_PROMPT.format(
                 diff=diff,
                 title=problem.issue_title,
                 body=body_snippet,
                 test_cmd=test_cmd_str,
+                assertions_section=assertions_section,
             )
             history.append({"role": "user", "content": verify_user})
             verdict = _call(history, self.model, api_key, verify_tokens, timeout)
