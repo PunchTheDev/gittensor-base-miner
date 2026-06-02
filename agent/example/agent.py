@@ -169,6 +169,16 @@ Improvements over a naive single-shot approach:
   corrected diff, previously the loop broke immediately — accepting the unverified diff. Now the
   critique is stored in history and the loop continues, letting the model self-correct by
   producing a diff on the next iteration (still within the budgeted MAX_REPAIR_ATTEMPTS calls).
+- Conditional history compaction: the observe message (source files, 20-30k chars) is now
+  only compacted to a 150-char summary if the act step produced a valid diff. When the act step
+  times out or returns empty, the source files are kept in context so repair iterations can
+  produce a correct diff from scratch. Without this, API-timeout cascades left all repair
+  attempts with only the issue title and file names — insufficient to write code.
+- Empty-act retry: when the repair loop detects "empty output — no diff produced" (act step
+  returned nothing), instead of sending the useless REPAIR_FORMAT_PROMPT with an empty diff
+  to fix, it resends ACT_PROMPT directly — giving the model another full act-step attempt
+  with the complete source-file context still available. Triggers a history compaction on
+  success so subsequent verify steps don't re-process the full source context.
 """
 
 from __future__ import annotations
@@ -1973,26 +1983,49 @@ class ExampleAgent(BaseAgent):
         # reduces the context sent on every verify/repair call, freeing token budget
         # for the model to reason about the diff itself rather than re-processing
         # source files it has already analysed.
+        #
+        # IMPORTANT: only compact if the act step produced a valid diff.  If the
+        # act step returned empty (API timeout/error), the repair iterations need
+        # the full source-file context to have any chance of producing a correct
+        # diff — compacting here would leave them with only the issue title and
+        # file names, which is insufficient to write accurate code.
         compact_observe = (
             f"[Earlier context: {problem.repo_name} — issue: {problem.issue_title} — "
             f"files in scope: {', '.join(f.path for f in all_context[:10])}"
             + (f" (+{len(all_context) - 10} more)" if len(all_context) > 10 else "")
             + f" — test: {test_cmd_str}]"
         )
-        history[1] = {"role": "user", "content": compact_observe}
+        if _looks_valid(diff):
+            history[1] = {"role": "user", "content": compact_observe}
+            log.append("[context] history compacted (act produced valid diff)")
+        else:
+            log.append("[context] history NOT compacted (act returned empty/invalid — keeping source context)")
 
         # --- Turn 3+: Verify + Repair ---
         for attempt in range(MAX_REPAIR_ATTEMPTS):
             problem_desc = _diagnose_diff(diff)
 
             if problem_desc:
-                # Structural problem — give targeted feedback before asking for repair
-                repair_msg = REPAIR_FORMAT_PROMPT.format(problem=problem_desc, diff=diff)
-                history.append({"role": "user", "content": repair_msg})
+                # Structural problem — give targeted feedback before asking for repair.
+                # Special case: if the diff is empty (act step timed out / API error),
+                # resend ACT_PROMPT instead of REPAIR_FORMAT_PROMPT — the model has
+                # nothing to fix and needs to produce the diff from scratch using the
+                # source files still in context.
+                if "empty output" in problem_desc:
+                    history.append({"role": "user", "content": ACT_PROMPT})
+                    log.append(f"[repair {attempt} (empty-retry act)]")
+                else:
+                    repair_msg = REPAIR_FORMAT_PROMPT.format(problem=problem_desc, diff=diff)
+                    history.append({"role": "user", "content": repair_msg})
                 raw_diff = _call(history, self.model, api_key, act_tokens, act_timeout, temperature=0)
                 diff = pp(_extract_diff(raw_diff))
                 log.append(f"[repair {attempt} (format)]\n{diff}")
                 history.append({"role": "assistant", "content": diff})
+                # Compact history after a successful empty-retry: the repair produced
+                # a real diff, so subsequent verify calls no longer need source files.
+                if "empty output" in problem_desc and _looks_valid(diff):
+                    history[1] = {"role": "user", "content": compact_observe}
+                    log.append("[context] history compacted after empty-retry success")
                 continue
 
             # Diff looks structurally valid — ask for semantic verification.
