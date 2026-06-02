@@ -116,6 +116,9 @@ Improvements over a naive single-shot approach:
   no-keyword-hit peek (was always 80 lines; now max(language_header, 80)).
 - Sibling import scan expanded from top 3 to top 5 ranked files: larger multi-file problems
   where the most relevant file is ranked 4th or 5th now benefit from sibling expansion too.
+- JavaScript / JSX support: LANG_NOTES["js"] and ["jsx"] added — covers export/module
+  patterns, null-safety, and async style reminders for JS problems (gittensor-ui,
+  product-data-extractor, ragflow JS issues); previously these got no language guidance.
 - Scala support: LANG_NOTES["scala"] with trait/sealed/case-class reminders;
   `_is_test_file` recognises `*Spec.scala`; `_compute_header_end` handles `.scala` imports;
   `_resolve_test_imports` resolves Scala JVM-style imports to `.scala` source files.
@@ -456,6 +459,19 @@ LANG_NOTES: dict[str, str] = {
     "tsx": (
         "This is a TypeScript/React codebase. Key reminders: update prop types; "
         "add exports for new components; handle null/undefined in JSX expressions."
+    ),
+    "js": (
+        "This is a JavaScript codebase. Key reminders: add named exports for new "
+        "symbols (`export function foo` or `export const foo`); check `index.js` "
+        "files for re-exports; handle undefined/null at every call site; do not "
+        "use TypeScript syntax (no type annotations, no `interface`); use `const`/"
+        "`let` — never `var`; use `async/await` or `.then()` consistently with the "
+        "surrounding code style."
+    ),
+    "jsx": (
+        "This is a JavaScript/React codebase. Key reminders: add exports for new "
+        "components; handle undefined/null in JSX expressions; use prop-types if "
+        "the existing codebase does; no TypeScript syntax."
     ),
     "rb": (
         "This is a Ruby codebase. Key reminders: follow snake_case naming; "
@@ -1424,7 +1440,7 @@ def _fix_hunk_offsets(diff: str, file_lookup: dict[str, str]) -> str:
 
     Algorithm per hunk:
       1. Extract the first two consecutive context lines (` `-prefixed).
-      2. Search the file for those two consecutive lines within ±30 lines of N.
+      2. Search the file for those two consecutive lines within ±25 lines of N.
       3. If found at a different offset, rewrite @@ -N accordingly.
 
     Only files present in `file_lookup` are checked.  New-file hunks
