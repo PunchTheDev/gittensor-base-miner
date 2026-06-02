@@ -1,0 +1,433 @@
+diff --git a/crates/engine/src/game/coverage.rs b/crates/engine/src/game/coverage.rs
+index 2c9f166eb..e828662bd 100644
+--- a/crates/engine/src/game/coverage.rs
++++ b/crates/engine/src/game/coverage.rs
+@@ -2268,6 +2268,7 @@ fn effect_details(effect: &Effect) -> Vec<(String, String)> {
+             phase,
+             after,
+             followed_by,
++            count,
+         } => {
+             d.push(("player".into(), fmt_target(target)));
+             d.push(("phase".into(), format!("{phase:?}")));
+@@ -2275,6 +2276,9 @@ fn effect_details(effect: &Effect) -> Vec<(String, String)> {
+             if !followed_by.is_empty() {
+                 d.push(("followed by".into(), format!("{followed_by:?}")));
+             }
++            if !matches!(count, QuantityExpr::Fixed { value: 1 }) {
++                d.push(("count".into(), format!("{count:?}")));
++            }
+         }
+         Effect::Double {
+             target_kind,
+diff --git a/crates/engine/src/game/effects/additional_phase.rs b/crates/engine/src/game/effects/additional_phase.rs
+index ded48b3e2..e465857f8 100644
+--- a/crates/engine/src/game/effects/additional_phase.rs
++++ b/crates/engine/src/game/effects/additional_phase.rs
+@@ -1,3 +1,4 @@
++use crate::game::quantity::resolve_quantity;
+ use crate::types::ability::{
+     Effect, EffectError, EffectKind, ResolvedAbility, TargetFilter, TargetRef,
+ };
+@@ -11,13 +12,14 @@ pub fn resolve(
+     ability: &ResolvedAbility,
+     events: &mut Vec<GameEvent>,
+ ) -> Result<(), EffectError> {
+-    let (target, phase, after, followed_by) = match &ability.effect {
++    let (target, phase, after, followed_by, count_expr) = match &ability.effect {
+         Effect::AdditionalPhase {
+             target,
+             phase,
+             after,
+             followed_by,
+-        } => (target, *phase, *after, followed_by),
++            count,
++        } => (target, *phase, *after, followed_by, count),
+         _ => return Err(EffectError::MissingParam("expected AdditionalPhase".into())),
+     };
+ 
+@@ -49,18 +51,36 @@ pub fn resolve(
+         return Ok(());
+     }
+ 
++    // CR 500.8 + CR 510.2: Resolve the count against the triggering combat
++    // damage event so Obeka, Splitter of Seconds (and any future "for that
++    // many additional <step>" wording) pushes N copies of the extra phase
++    // bundle instead of one. Fixed quantities preserve legacy single-push.
++    let count =
++        resolve_quantity(state, count_expr, ability.controller, ability.source_id).max(0) as usize;
++    if count == 0 {
++        events.push(GameEvent::EffectResolved {
++            kind: EffectKind::AdditionalPhase,
++            source_id: ability.source_id,
++        });
++        return Ok(());
++    }
++
+     // CR 500.8: Push follow-up phases before the primary phase so the
+-    // `advance_phase` LIFO scan consumes the primary phase first.
+-    for &follow_up in followed_by.iter().rev() {
++    // `advance_phase` LIFO scan consumes the primary phase first. Repeat
++    // the bundle `count` times so each scheduled occurrence still fires
++    // its own anchor → primary → follow_up sequence.
++    for _ in 0..count {
++        for &follow_up in followed_by.iter().rev() {
++            state.extra_phases.push(ExtraPhase {
++                anchor: after,
++                phase: follow_up,
++            });
++        }
+         state.extra_phases.push(ExtraPhase {
+             anchor: after,
+-            phase: follow_up,
++            phase,
+         });
+     }
+-    state.extra_phases.push(ExtraPhase {
+-        anchor: after,
+-        phase,
+-    });
+ 
+     events.push(GameEvent::EffectResolved {
+         kind: EffectKind::AdditionalPhase,
+@@ -73,7 +93,7 @@ pub fn resolve(
+ #[cfg(test)]
+ mod tests {
+     use super::*;
+-    use crate::types::ability::{AbilityKind, SpellContext, TargetFilter};
++    use crate::types::ability::{AbilityKind, QuantityExpr, SpellContext, TargetFilter};
+     use crate::types::identifiers::ObjectId;
+     use crate::types::phase::Phase;
+     use crate::types::player::PlayerId;
+@@ -84,6 +104,24 @@ mod tests {
+         after: Phase,
+         followed_by: Vec<Phase>,
+         controller: PlayerId,
++    ) -> ResolvedAbility {
++        make_ability_with_count(
++            target,
++            phase,
++            after,
++            followed_by,
++            controller,
++            QuantityExpr::Fixed { value: 1 },
++        )
++    }
++
++    fn make_ability_with_count(
++        target: TargetFilter,
++        phase: Phase,
++        after: Phase,
++        followed_by: Vec<Phase>,
++        controller: PlayerId,
++        count: QuantityExpr,
+     ) -> ResolvedAbility {
+         ResolvedAbility {
+             effect: Effect::AdditionalPhase {
+@@ -91,6 +129,7 @@ mod tests {
+                 phase,
+                 after,
+                 followed_by,
++                count,
+             },
+             controller,
+             original_controller: None,
+@@ -285,4 +324,48 @@ mod tests {
+             }]
+         );
+     }
++
++    /// CR 500.8 + CR 510.2: Obeka, Splitter of Seconds — "you get that many
++    /// additional upkeep steps after this phase" must push one ExtraPhase per
++    /// point of combat damage, not a single phase.
++    #[test]
++    fn additional_phase_count_from_event_context_amount_pushes_n_phases() {
++        use crate::types::ability::QuantityRef;
++        use crate::types::identifiers::ObjectId as Oid;
++
++        let mut state = GameState {
++            active_player: PlayerId(0),
++            current_trigger_event: Some(GameEvent::DamageDealt {
++                source_id: Oid(1),
++                target: TargetRef::Player(PlayerId(1)),
++                amount: 5,
++                is_combat: true,
++                excess: 0,
++            }),
++            ..Default::default()
++        };
++        let mut events = Vec::new();
++        let ability = make_ability_with_count(
++            TargetFilter::Controller,
++            Phase::Upkeep,
++            Phase::Upkeep,
++            vec![],
++            PlayerId(0),
++            crate::types::ability::QuantityExpr::Ref {
++                qty: QuantityRef::EventContextAmount,
++            },
++        );
++
++        resolve(&mut state, &ability, &mut events).unwrap();
++
++        let expected = ExtraPhase {
++            anchor: Phase::Upkeep,
++            phase: Phase::Upkeep,
++        };
++        assert_eq!(
++            state.extra_phases,
++            vec![expected, expected, expected, expected, expected],
++            "5 combat damage should schedule 5 additional upkeep steps"
++        );
++    }
+ }
+diff --git a/crates/engine/src/parser/oracle_effect/imperative.rs b/crates/engine/src/parser/oracle_effect/imperative.rs
+index de6ff4ec9..733e4da34 100644
+--- a/crates/engine/src/parser/oracle_effect/imperative.rs
++++ b/crates/engine/src/parser/oracle_effect/imperative.rs
+@@ -4978,6 +4978,47 @@ pub(super) fn lower_cost_resource_ast(ast: CostResourceImperativeAst) -> Effect
+     }
+ }
+ 
++/// CR 500.8 + CR 510.2: Quantity for "<N> additional <step/phase>s". The
++/// scanner advances along word boundaries and tries a single composed
++/// combinator at each position:
++///   `quantifier ~ " additional"` where `quantifier` =
++///     `tag("that many")` → event-bound (`QuantityRef::EventContextAmount`)
++///   | `parse_number`        → literal N (e.g. "two additional combat phases")
++///
++/// Anything else — including the article forms "an"/"a"/"the" already parsed
++/// elsewhere as 1 — falls through to the singular default
++/// `QuantityExpr::Fixed { value: 1 }`. Anchoring on `" additional"` keeps the
++/// helper agnostic to surrounding sentence shapes ("you get that many
++/// additional upkeep steps after this phase", "after this phase, there is an
++/// additional combat phase").
++fn parse_additional_phase_count(lower: &str) -> QuantityExpr {
++    fn count_combinator(input: &str) -> OracleResult<'_, QuantityExpr> {
++        let event_bound = value(
++            QuantityExpr::Ref {
++                qty: QuantityRef::EventContextAmount,
++            },
++            tag("that many"),
++        );
++        let literal = map(nom_primitives::parse_number, |n| QuantityExpr::Fixed {
++            value: n as i32,
++        });
++        terminated(alt((event_bound, literal)), tag(" additional")).parse(input)
++    }
++
++    let mut remaining = lower;
++    while !remaining.is_empty() {
++        if let Ok((_rest, qty)) = count_combinator(remaining) {
++            return qty;
++        }
++        // Advance to the next word boundary so the combinator stays anchored
++        // to candidate quantifier positions.
++        remaining = remaining
++            .find(' ')
++            .map_or("", |i| remaining[i + 1..].trim_start());
++    }
++    QuantityExpr::Fixed { value: 1 }
++}
++
+ pub(super) fn parse_imperative_family_ast(
+     text: &str,
+     lower: &str,
+@@ -5000,6 +5041,7 @@ pub(super) fn parse_imperative_family_ast(
+             } else {
+                 vec![]
+             },
++            count: parse_additional_phase_count(lower),
+         }));
+     }
+     if nom_primitives::scan_contains(lower, "additional upkeep step") {
+@@ -5008,6 +5050,7 @@ pub(super) fn parse_imperative_family_ast(
+             phase: Phase::Upkeep,
+             after: Phase::Upkeep,
+             followed_by: vec![],
++            count: parse_additional_phase_count(lower),
+         }));
+     }
+ 
+@@ -8942,6 +8985,71 @@ mod tests {
+         assert!(result.is_some(), "Should parse 'after this phase' variant");
+     }
+ 
++    /// CR 500.8 + CR 510.2: Obeka, Splitter of Seconds — "you get that many
++    /// additional upkeep steps after this phase" must thread the triggering
++    /// combat damage amount through `EventContextAmount`, not collapse it to
++    /// the singular default.
++    #[test]
++    fn parse_obeka_that_many_additional_upkeep_steps_binds_event_amount() {
++        let text = "you get that many additional upkeep steps after this phase";
++        let lower = text.to_lowercase();
++        let result = parse_imperative_family_ast(text, &lower, &mut ParseContext::default());
++        let effect = lower_imperative_family_effect(
++            result.expect("Obeka consequent should parse as AdditionalPhase"),
++        );
++        match effect {
++            Effect::AdditionalPhase {
++                phase: Phase::Upkeep,
++                after: Phase::Upkeep,
++                count:
++                    QuantityExpr::Ref {
++                        qty: QuantityRef::EventContextAmount,
++                    },
++                ..
++            } => {}
++            other => {
++                panic!("expected AdditionalPhase with EventContextAmount count, got {other:?}")
++            }
++        }
++    }
++
++    #[test]
++    fn parse_fixed_count_additional_upkeep_steps_binds_literal_count() {
++        let text = "you get two additional upkeep steps after this phase";
++        let lower = text.to_lowercase();
++        let effect = lower_imperative_family_effect(
++            parse_imperative_family_ast(text, &lower, &mut ParseContext::default())
++                .expect("fixed-count additional upkeep should parse"),
++        );
++        match effect {
++            Effect::AdditionalPhase {
++                count: QuantityExpr::Fixed { value: 2 },
++                ..
++            } => {}
++            other => panic!("expected count=Fixed(2) for fixed-count form, got {other:?}"),
++        }
++    }
++
++    /// Singular "an additional upkeep step" must keep the legacy Fixed(1)
++    /// semantics so Paradox Haze and similar cards still push exactly one
++    /// extra step.
++    #[test]
++    fn parse_additional_upkeep_step_defaults_to_count_one() {
++        let text = "get an additional upkeep step after this step";
++        let lower = text.to_lowercase();
++        let effect = lower_imperative_family_effect(
++            parse_imperative_family_ast(text, &lower, &mut ParseContext::default())
++                .expect("should parse singular additional upkeep"),
++        );
++        match effect {
++            Effect::AdditionalPhase {
++                count: QuantityExpr::Fixed { value: 1 },
++                ..
++            } => {}
++            other => panic!("expected count=Fixed(1) for singular form, got {other:?}"),
++        }
++    }
++
+     #[test]
+     fn parse_discard_your_hand() {
+         let text = "discard your hand";
+diff --git a/crates/engine/src/parser/oracle_trigger.rs b/crates/engine/src/parser/oracle_trigger.rs
+index fbc62e12a..f672d9be9 100644
+--- a/crates/engine/src/parser/oracle_trigger.rs
++++ b/crates/engine/src/parser/oracle_trigger.rs
+@@ -18054,6 +18054,7 @@ mod tests {
+                 phase: Phase::Upkeep,
+                 after: Phase::Upkeep,
+                 followed_by,
++                ..
+             }) if followed_by.is_empty()
+         ));
+     }
+diff --git a/crates/engine/src/types/ability.rs b/crates/engine/src/types/ability.rs
+index a23084b33..aa5fda0d2 100644
+--- a/crates/engine/src/types/ability.rs
++++ b/crates/engine/src/types/ability.rs
+@@ -6830,6 +6830,10 @@ pub enum Effect {
+     /// before `phase`, so "additional combat followed by an additional main phase"
+     /// resolves in printed order while preserving CR 500.8 LIFO ordering.
+     /// CR 500.10a: Only adds steps/phases to the affected player's own turn.
++    /// `count` resolves at resolution time so dynamic quantities such as Obeka,
++    /// Splitter of Seconds' "that many additional upkeep steps" thread the
++    /// triggering event amount through `QuantityRef::EventContextAmount`. Legacy
++    /// callers and explicit "an additional" wording deserialize to a Fixed 1.
+     AdditionalPhase {
+         #[serde(default = "default_target_filter_controller")]
+         target: TargetFilter,
+@@ -6837,6 +6841,8 @@ pub enum Effect {
+         after: Phase,
+         #[serde(default)]
+         followed_by: Vec<Phase>,
++        #[serde(default = "default_quantity_one")]
++        count: QuantityExpr,
+     },
+     /// CR 701.10d-f: Double counters on a permanent, a player's life total, or mana pool.
+     /// Uses `DoubleTarget` enum per D-05 to distinguish the three variants.
+diff --git a/crates/engine/tests/integration/main.rs b/crates/engine/tests/integration/main.rs
+index e166338f3..15899689f 100644
+--- a/crates/engine/tests/integration/main.rs
++++ b/crates/engine/tests/integration/main.rs
+@@ -88,6 +88,7 @@ mod militant_angel_attacked_opponents;
+ mod morophon_chosen_type_1653;
+ mod mycoloth_upkeep_trigger;
+ mod mystic_forge_regression;
++mod obeka_splitter_additional_phases;
+ mod obliterate_regression;
+ mod old_growth_troll_return_as_aura;
+ mod omo_queen_of_vesuva;
+diff --git a/crates/engine/tests/integration/obeka_splitter_additional_phases.rs b/crates/engine/tests/integration/obeka_splitter_additional_phases.rs
+new file mode 100644
+index 000000000..7fe3c8d1b
+--- /dev/null
++++ b/crates/engine/tests/integration/obeka_splitter_additional_phases.rs
+@@ -0,0 +1,56 @@
++//! Issues #1486 / #1533 — Obeka, Splitter of Seconds drops "that many".
++//!
++//! Oracle (Obeka, Splitter of Seconds):
++//! > Menace
++//! > Whenever Obeka deals combat damage to a player, you get that many
++//! > additional upkeep steps after this phase.
++//!
++//! Before the fix, the parser produced `Effect::AdditionalPhase` with no count
++//! field, so the resolver pushed exactly one extra upkeep step regardless of
++//! the combat damage delivered. After the fix, the parser threads
++//! `QuantityRef::EventContextAmount` into `Effect::AdditionalPhase { count, .. }`
++//! and the resolver pushes one bundle per point of damage.
++//!
++//! CR 500.8 (extra phases), CR 510.2 (combat damage dealt), CR 503.1
++//! (upkeep step).
++//!
++//! This test drives an unblocked 5/2 Obeka into P1, then asserts that the
++//! resolved trigger queued 5 additional upkeep steps — discriminating against
++//! the broken behaviour (1 step).
++
++use engine::game::scenario::{GameScenario, P0};
++use engine::types::game_state::ExtraPhase;
++use engine::types::phase::Phase;
++
++use super::rules::run_combat;
++
++const OBEKA_ORACLE: &str = "Menace\nWhenever Obeka deals combat damage to a player, \
++you get that many additional upkeep steps after this phase.";
++
++/// CR 500.8 + CR 510.2: Five combat damage from Obeka schedules five additional
++/// upkeep steps (one ExtraPhase per damage point), not a single step.
++#[test]
++fn obeka_combat_damage_pushes_one_extra_upkeep_per_damage_point() {
++    let mut scenario = GameScenario::new();
++    scenario.at_phase(Phase::PreCombatMain);
++    // 5 power so a single unblocked swing delivers 5 combat damage to P1.
++    let obeka = scenario
++        .add_creature_from_oracle(P0, "Obeka, Splitter of Seconds", 5, 2, OBEKA_ORACLE)
++        .id();
++    let mut runner = scenario.build();
++
++    // Unblocked attack → 5 combat damage to P1 → trigger fires.
++    run_combat(&mut runner, vec![obeka], vec![]);
++    runner.advance_until_stack_empty();
++
++    // CR 500.8: each "additional upkeep step" entry uses (anchor=Upkeep, phase=Upkeep).
++    let expected = ExtraPhase {
++        anchor: Phase::Upkeep,
++        phase: Phase::Upkeep,
++    };
++    assert_eq!(
++        runner.state().extra_phases,
++        vec![expected, expected, expected, expected, expected],
++        "Obeka dealing 5 combat damage should schedule exactly 5 additional upkeep steps",
++    );
++}
