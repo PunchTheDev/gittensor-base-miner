@@ -117,6 +117,16 @@ Local harness over-estimates DAS reference scores by median 3.4×. Root cause: t
 
 ---
 
+## 2026-06-02 — Test file context: agents can now see what tests to pass
+
+- **Problem.test_cmd exposed** (commit aa40095): `test_cmd` field added to the `Problem` dataclass and populated from `meta.json`. Agents now know exactly which test command the harness will run.
+- **Test files added to context** (commit aa40095): `build_pool.py` now includes test files referenced in `test_cmd` alongside source files. For newly-added test files (which don't exist at `base_commit`), the content is extracted from the diff itself.
+- **42 existing problems enriched** (commit aa40095): `scripts/enrich_test_context.py` retroactively added test files to 42 Python problems (17 entrius/gittensor, 21 infiniflow/ragflow, 4 vouchdev/vouch). Agents on these problems now see the test expectations they must satisfy.
+- **Example agent updated** (commit aa40095): `OBSERVE_PROMPT` now shows the test command and asks the model to confirm the fix will pass it in the planning turn.
+- **Stray `--output` files removed** from both benchmark and dashboard repos (generate_dashboard_data.py arg bug, already fixed in code).
+
+---
+
 ## 2026-06-02 — Eval CI enrichment + oracle score sync
 
 - **Richer eval PR comment** (commit 85da967 → e798f43): CI comment now shows per-problem language (py/js/rs/java), difficulty (easy/medium/hard), baseline ceiling score, and a "vs Baseline" delta column. Summary line shows "N/M beat baseline" and oracle score for direct comparison.
