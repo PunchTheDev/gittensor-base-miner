@@ -115,7 +115,7 @@ def _build_pr_body(handle: str, sha: str, model: str) -> str:
 <!-- Paste output from: gitminer eval agent/submissions/{handle}/agent.py --no-sandbox -->
 
 ## Checklist
-- [ ] Agent inherits `BaseAgent` and implements `solve(problem) -> str`
+- [ ] Agent inherits `BaseAgent` and implements `solve(problem: Problem) -> Patch`
 - [ ] Model is listed in `benchmark/harness/allowed_models.txt`
 - [ ] SHA-256 above matches: `sha256sum agent/submissions/{handle}/agent.py`
 - [ ] Ran `gitminer eval` locally with no errors
