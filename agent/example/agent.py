@@ -106,6 +106,15 @@ Improvements over a naive single-shot approach:
   fewer files than the current diff, the replacement is rejected and the current diff is kept.
   Without this guard, a partial correction (e.g. the model fixes only fileA out of a
   fileA+fileB diff) would silently drop fileB's changes, producing a worse patch than before.
+- Language-aware header in windowed files: `_compute_header_end()` scans the file for the
+  end of its import block (Go `import (...)`, Python `from … import`, TypeScript `import`,
+  Rust `use`, Kotlin/Java `import`) and always includes that block plus a post-import buffer
+  of 8 lines. The old fixed HEADER_LINES=20 cut off mid-import-block in Go files (which
+  routinely have 25-40-line import sections), so the model never saw struct/type definitions
+  that immediately follow. Now the header extends as far as needed to cover the full import
+  section and the first top-level type declarations.
+- Sibling import scan expanded from top 3 to top 5 ranked files: larger multi-file problems
+  where the most relevant file is ranked 4th or 5th now benefit from sibling expansion too.
 """
 
 from __future__ import annotations
@@ -711,7 +720,7 @@ def _expand_sibling_imports(
     added: list[FileContext] = []
     chars_used = 0
 
-    for f in selected[:3]:  # only follow imports from top 3 ranked files
+    for f in selected[:5]:  # follow imports from top 5 ranked files
         ext = f.path.rsplit(".", 1)[-1].lower() if "." in f.path else ""
         file_dir = f.path.rsplit("/", 1)[0] if "/" in f.path else ""
         content = f.content
@@ -955,7 +964,81 @@ def _truncate_context(files: list[FileContext]) -> list[FileContext]:
     return selected
 
 
-HEADER_LINES = 20  # always shown at top of a windowed file (imports, class defs, etc.)
+HEADER_LINES = 20  # fallback header size for unknown languages
+
+
+def _compute_header_end(lines: list[str], ext: str) -> int:
+    """Return how many lines from the top to always include in a windowed file.
+
+    The header must cover the entire import section so the model can see:
+    (a) what symbols are already imported (avoids duplicate imports), and
+    (b) the type/struct/class definitions that follow imports.
+
+    Go import blocks (`import (...)`) can span 25-40 lines.  With the old
+    fixed HEADER_LINES=20 the model never saw the struct definitions that
+    immediately follow the import block, causing wrong type assumptions.
+
+    Strategy: scan for the last import-related line and add a post-import
+    buffer so at least the first few top-level declarations are visible too.
+    Falls back to HEADER_LINES when the language is unknown or the file is
+    shorter than the computed end.
+    """
+    n = len(lines)
+    POST_IMPORT_BUFFER = 8  # show a few lines after imports end
+
+    if ext == "go":
+        # Go: find the closing `)` of the import block, or the last bare import line.
+        # Also include the `package` declaration and any top-level `var`/`const` blocks.
+        last_import = 0
+        in_import_block = False
+        for i, raw in enumerate(lines):
+            stripped = raw.strip()
+            if stripped.startswith("import ("):
+                in_import_block = True
+                last_import = i
+            elif in_import_block and stripped == ")":
+                last_import = i
+                in_import_block = False
+            elif stripped.startswith("import ") and not in_import_block:
+                last_import = i
+        return min(n, last_import + 1 + POST_IMPORT_BUFFER)
+
+    if ext in ("ts", "tsx", "js", "jsx"):
+        # TypeScript/JS: last `import` statement line.
+        last_import = 0
+        for i, raw in enumerate(lines):
+            stripped = raw.strip()
+            if stripped.startswith("import ") or stripped.startswith("import{") or stripped.startswith("import *"):
+                last_import = i
+        return min(n, last_import + 1 + POST_IMPORT_BUFFER)
+
+    if ext in ("kt", "java"):
+        # Kotlin/Java: last `import` line.
+        last_import = 0
+        for i, raw in enumerate(lines):
+            if raw.strip().startswith("import "):
+                last_import = i
+        return min(n, last_import + 1 + POST_IMPORT_BUFFER)
+
+    if ext == "rs":
+        # Rust: last `use ` statement.
+        last_use = 0
+        for i, raw in enumerate(lines):
+            if raw.strip().startswith("use "):
+                last_use = i
+        return min(n, last_use + 1 + POST_IMPORT_BUFFER)
+
+    if ext == "py":
+        # Python: last `import` or `from ... import` line.
+        last_import = 0
+        for i, raw in enumerate(lines):
+            stripped = raw.strip()
+            if stripped.startswith("import ") or stripped.startswith("from "):
+                last_import = i
+        return min(n, last_import + 1 + POST_IMPORT_BUFFER)
+
+    # Unknown extension — fall back to fixed constant
+    return min(n, HEADER_LINES)
 
 
 def _window_file(
@@ -964,6 +1047,7 @@ def _window_file(
     context_lines: int = 40,
     threshold: int = 300,
     show_line_numbers: bool = True,
+    ext: str = "",
 ) -> tuple[str, bool]:
     """Return the relevant sections of a file and whether windowing was applied.
 
@@ -998,8 +1082,10 @@ def _window_file(
         suffix = f"\n... [lines {peek + 1}-{len(lines)} omitted — no keyword hits in this file]"
         return "".join(lines[:peek]) + suffix, True
 
-    # Force the header section into the window set so imports/class defs are visible
-    header_end = min(HEADER_LINES, len(lines))
+    # Force the header section into the window set so imports/class defs are visible.
+    # Use language-aware detection so Go/TS/Kotlin files include the full import
+    # block — their imports can run 25-40 lines, exceeding the old fixed cap.
+    header_end = _compute_header_end(lines, ext)
 
     # Expand each hit into a window and merge overlapping windows
     windows: list[tuple[int, int]] = []
@@ -1056,12 +1142,15 @@ def _format_files(
     parts = []
     for f in files:
         lang = f.language or ""
+        # Derive file extension for language-aware header computation
+        ext = f.path.rsplit(".", 1)[-1].lower() if "." in f.path else ""
         if keywords:
             content, windowed = _window_file(
                 f.content, keywords,
                 context_lines=context_lines,
                 threshold=threshold,
                 show_line_numbers=show_line_numbers,
+                ext=ext,
             )
             total_lines = f.content.count("\n") + 1
             header = (
