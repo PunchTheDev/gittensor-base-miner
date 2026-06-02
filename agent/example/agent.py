@@ -137,10 +137,10 @@ Requirements:
 - Start with `diff --git a/<path> b/<path>`
 - Include `--- a/<path>` and `+++ b/<path>` headers
 - Each hunk starts with `@@ -<start>,<count> +<start>,<count> @@`
-- **Line numbers**: if a file was windowed, the omission markers show the exact \
-  line range (e.g. `... [lines 21-260 omitted — next visible line is 261]`). Use \
-  these markers to compute accurate `@@ -N` offsets — wrong line numbers prevent \
-  the patch from applying
+- **Line numbers**: windowed files show lines as `  N | content`. Use these \
+  numbers directly for `@@ -N` offsets. The numbers are display-only — do NOT \
+  include ` N | ` in your diff's context or change lines; they must match the \
+  actual file content
 - Every test assertion from your plan must be satisfied by your diff
 - Include helper functions, proper error handling, and secondary file changes
 - Do NOT change unrelated logic, but do implement the full fix as described
@@ -508,6 +508,7 @@ def _window_file(content: str, keywords: set[str], context_lines: int = 40) -> t
 
     parts = []
     prev_end = 0
+    width = len(str(len(lines)))  # digit width for consistent alignment
     for start, end in windows:
         if start > prev_end:
             # Show exact line range so model can calculate accurate hunk offsets
@@ -515,7 +516,11 @@ def _window_file(content: str, keywords: set[str], context_lines: int = 40) -> t
                 f"... [lines {prev_end + 1}-{start} omitted"
                 f" — next visible line is {start + 1}]\n"
             )
-        parts.append("".join(lines[start:end]))
+        # Prefix each visible line with its 1-based number so the model can
+        # write accurate @@ -N hunk offsets without counting from the top.
+        # Format: "  42 | actual line content"  (numbers are display-only)
+        for i, line in enumerate(lines[start:end], start=start + 1):
+            parts.append(f"{i:{width}d} | {line}" if line.endswith("\n") else f"{i:{width}d} | {line}\n")
         prev_end = end
     if prev_end < len(lines):
         parts.append(
