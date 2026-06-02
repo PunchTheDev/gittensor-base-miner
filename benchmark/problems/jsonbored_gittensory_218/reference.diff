@@ -1,0 +1,1545 @@
+diff --git a/apps/gittensory-ui/public/openapi.json b/apps/gittensory-ui/public/openapi.json
+index c965971..867e3ce 100644
+--- a/apps/gittensory-ui/public/openapi.json
++++ b/apps/gittensory-ui/public/openapi.json
+@@ -2217,6 +2217,12 @@
+               }
+             }
+           },
++          "evidenceGraph": {
++            "type": "object",
++            "additionalProperties": {
++              "nullable": true
++            }
++          },
+           "dataQuality": {
+             "type": "object",
+             "additionalProperties": {
+diff --git a/src/db/repositories.ts b/src/db/repositories.ts
+index 585fa41..239f4c5 100644
+--- a/src/db/repositories.ts
++++ b/src/db/repositories.ts
+@@ -131,6 +131,7 @@ const MAX_SIGNAL_FRESHNESS_TARGETS = 200;
+ const MAX_SIGNAL_FRESHNESS_TARGET_KEY_CHARS = 256;
+ const FRESHNESS_SIGNAL_TYPES = [
+   "contributor-decision-pack",
++  "contributor-evidence-graph",
+   "contributor-intake-health",
+   "contributor-outcome-history",
+   "contributor-strategy",
+diff --git a/src/openapi/schemas.ts b/src/openapi/schemas.ts
+index a6d2e87..4a1d520 100644
+--- a/src/openapi/schemas.ts
++++ b/src/openapi/schemas.ts
+@@ -1384,6 +1384,7 @@ export const ContributorDecisionPackSchema = z
+     avoidRepos: z.array(z.record(z.unknown())),
+     maintainerLaneRepos: z.array(z.record(z.unknown())),
+     scoreBlockers: z.array(z.record(z.unknown())),
++    evidenceGraph: z.record(z.unknown()).optional(),
+     dataQuality: z.record(z.unknown()),
+     summary: z.string(),
+     nextActions: z.array(z.string()),
+diff --git a/src/queue/processors.ts b/src/queue/processors.ts
+index f97ea6a..6c8ab64 100644
+--- a/src/queue/processors.ts
++++ b/src/queue/processors.ts
+@@ -23,6 +23,7 @@ import {
+   listPullRequests,
+   listRecentMergedPullRequests,
+   listRepoLabels,
++  listRepoPullRequestFiles,
+   listRepoSyncStates,
+   listRepoSyncSegments,
+   listRepositories,
+@@ -73,6 +74,11 @@ import { refreshRegistry } from "../registry/sync";
+ import { buildIssueAdvisory, buildPullRequestAdvisory } from "../rules/advisory";
+ import { getOrCreateScoringModelSnapshot, refreshScoringModelSnapshot } from "../scoring/model";
+ import { buildAndPersistContributorDecisionPack, loadDecisionPackSharedInputs } from "../services/decision-pack";
++import {
++  buildContributorEvidenceGraph,
++  CONTRIBUTOR_EVIDENCE_GRAPH_SIGNAL,
++  evidenceGraphTouchedRepoFullNames,
++} from "../services/contributor-evidence-graph";
+ import { executeAgentRun, explainBlockersWithAgent, planNextWork, preflightBranchWithAgent, preparePrPacketWithAgent } from "../services/agent-orchestrator";
+ import { isAuthorizedGitHubSessionLogin } from "../auth/security";
+ import { loadIssueQualityReportMap } from "../services/issue-quality";
+@@ -108,6 +114,7 @@ import {
+   buildPublicCommentSignalBundle,
+   buildPublicPrIntelligenceComment,
+   buildQueueHealth,
++  buildRoleContext,
+   detectGittensorContributor,
+ } from "../signals/engine";
+ import { rewritePublicPrIntelligenceComment } from "../services/ai-summaries";
+@@ -348,10 +355,47 @@ async function buildContributorEvidence(env: Env, login?: string): Promise<void>
+     ]);
+     const repoStats = authoritativeContributorRepoStats(gittensorSnapshot, cachedRepoStats);
+     const profile = buildContributorProfile(contributorLogin, github, contributorPullRequests, contributorIssues, repoStats, gittensorSnapshot);
++    const pullRequestFiles = (
++      await Promise.all(
++        evidenceGraphTouchedRepoFullNames({
++          login: contributorLogin,
++          profile,
++          pullRequests: contributorPullRequests,
++          issues: contributorIssues,
++          repoStats,
++          repositories,
++        }).map((repoFullName) => listRepoPullRequestFiles(env, repoFullName)),
++      )
++    ).flat();
+     const fit = buildContributorFit(profile, repositories, allIssues, allPullRequests, syncStates, repoStats, allBounties, issueQualityByRepo);
+     const scoringProfile = buildContributorScoringProfile({ login: contributorLogin, fit, scoringSnapshot: snapshot });
+     const outcomeHistory = buildContributorOutcomeHistory({ login: contributorLogin, profile, repositories, pullRequests: allPullRequests, issues: allIssues, repoStats, cachedRepoStats });
+     const strategy = buildContributorStrategy({ login: contributorLogin, fit, scoringProfile, scoringSnapshot: snapshot, outcomeHistory });
++    const roleContexts = repositories
++      .filter((repo) => repo.isRegistered)
++      .map((repo) =>
++        buildRoleContext({
++          login: contributorLogin,
++          repo,
++          repoFullName: repo.fullName,
++          pullRequests: contributorPullRequests,
++          issues: contributorIssues,
++          profile,
++        }),
++      );
++    const evidenceGraph = buildContributorEvidenceGraph({
++      login: contributorLogin,
++      profile,
++      outcomeHistory,
++      roleContexts,
++      repositories,
++      pullRequests: contributorPullRequests,
++      issues: contributorIssues,
++      repoStats,
++      syncStates,
++      pullRequestFiles,
++      gittensorSnapshot,
++    });
+     const evidence: ContributorEvidenceRecord = {
+       login: contributorLogin,
+       generatedAt: scoringProfile.generatedAt,
+@@ -364,6 +408,7 @@ async function buildContributorEvidence(env: Env, login?: string): Promise<void>
+         issueDiscoveryReports: scoringProfile.evidence.issueDiscoveryReports,
+         languageMatches: scoringProfile.evidence.languageMatches,
+         credibilityAssumption: scoringProfile.evidence.credibilityAssumption,
++        evidenceGraph: evidenceGraph as unknown as JsonValue,
+       },
+     };
+     await upsertContributorEvidence(env, evidence);
+@@ -387,6 +432,13 @@ async function buildContributorEvidence(env: Env, login?: string): Promise<void>
+       payload: strategy as unknown as Record<string, JsonValue>,
+       generatedAt: strategy.generatedAt,
+     });
++    await persistSignalSnapshot(env, {
++      id: crypto.randomUUID(),
++      signalType: CONTRIBUTOR_EVIDENCE_GRAPH_SIGNAL,
++      targetKey: contributorLogin,
++      payload: evidenceGraph as unknown as Record<string, JsonValue>,
++      generatedAt: evidenceGraph.generatedAt,
++    });
+   }
+ }
+ 
+diff --git a/src/services/agent-orchestrator.ts b/src/services/agent-orchestrator.ts
+index 39e4273..20a0cc0 100644
+--- a/src/services/agent-orchestrator.ts
++++ b/src/services/agent-orchestrator.ts
+@@ -847,6 +847,15 @@ function contextSnapshotFromPack(runId: string, pack: ContributorDecisionPack, d
+       login: pack.login,
+       source: pack.source,
+       selectedRepos: decisions.map((decision) => decision.repoFullName),
++      evidenceGraph: (pack.evidenceGraph
++        ? {
++            version: pack.evidenceGraph.version,
++            generatedAt: pack.evidenceGraph.generatedAt,
++            totals: pack.evidenceGraph.totals,
++            sources: pack.evidenceGraph.sources,
++            selectedRepos: pack.evidenceGraph.repos.filter((repo) => decisions.some((decision) => decision.repoFullName.toLowerCase() === repo.repoFullName.toLowerCase())),
++          }
++        : null) as unknown as JsonValue,
+       dataQuality: pack.dataQuality as unknown as JsonValue,
+       openPrMonitor: (pack.openPrMonitor ?? null) as unknown as JsonValue,
+     },
+diff --git a/src/services/contributor-evidence-graph.ts b/src/services/contributor-evidence-graph.ts
+new file mode 100644
+index 0000000..21c0021
+--- /dev/null
++++ b/src/services/contributor-evidence-graph.ts
+@@ -0,0 +1,724 @@
++import type { GittensorContributorSnapshot } from "../gittensor/api";
++import type { ContributorOutcomeHistory, ContributorProfile, RoleContext } from "../signals/engine";
++import type {
++  ContributorRepoStatRecord,
++  IssueRecord,
++  PullRequestFileRecord,
++  PullRequestRecord,
++  RepositoryRecord,
++  RepoSyncStateRecord,
++} from "../types";
++import { nowIso } from "../utils/json";
++
++export const CONTRIBUTOR_EVIDENCE_GRAPH_SIGNAL = "contributor-evidence-graph";
++export const CONTRIBUTOR_EVIDENCE_GRAPH_VERSION = 1;
++export const CONTRIBUTOR_EVIDENCE_GRAPH_MAX_REPOS = 50;
++export const CONTRIBUTOR_EVIDENCE_GRAPH_MAX_LABELS = 80;
++export const CONTRIBUTOR_EVIDENCE_GRAPH_MAX_PATHS = 80;
++export const CONTRIBUTOR_EVIDENCE_GRAPH_MAX_OUTCOMES = 50;
++
++const OFFICIAL_STALE_AFTER_MS = 7 * 24 * 60 * 60 * 1000;
++const MIRROR_STALE_AFTER_MS = 7 * 24 * 60 * 60 * 1000;
++const GITHUB_CACHE_STALE_AFTER_MS = 14 * 24 * 60 * 60 * 1000;
++
++const SOURCE_PRIORITY: Record<ContributorEvidenceGraphSourceKind, number> = {
++  official_gittensor: 0,
++  mirror: 1,
++  github_cache: 2,
++  computed: 3,
++};
++
++export type ContributorEvidenceGraphSourceKind = "official_gittensor" | "mirror" | "github_cache" | "computed";
++export type ContributorEvidenceGraphFreshness = "fresh" | "stale" | "partial" | "missing";
++
++export type ContributorEvidenceGraphProvenance = {
++  source: ContributorEvidenceGraphSourceKind;
++  freshness: ContributorEvidenceGraphFreshness;
++  observedAt?: string | undefined;
++  generatedAt: string;
++  detail: string;
++};
++
++export type ContributorEvidenceGraphSource = ContributorEvidenceGraphProvenance & {
++  relationshipCount: number;
++};
++
++export type ContributorEvidenceGraphRepo = {
++  repoFullName: string;
++  role: RoleContext["role"];
++  lane: ContributorOutcomeHistory["repoOutcomes"][number]["lane"] | "unknown";
++  maintainerLane: boolean;
++  normalContributorEvidenceAllowed: boolean;
++  source: ContributorEvidenceGraphSourceKind;
++  freshness: ContributorEvidenceGraphFreshness;
++  provenance: ContributorEvidenceGraphProvenance[];
++  pullRequests: number;
++  mergedPullRequests: number;
++  openPullRequests: number;
++  closedPullRequests: number;
++  issues: number;
++  solvedIssues: number;
++  validSolvedIssues: number;
++};
++
++export type ContributorEvidenceGraphLabel = {
++  repoFullName: string;
++  label: string;
++  pullRequests: number;
++  issues: number;
++  source: ContributorEvidenceGraphSourceKind;
++  freshness: ContributorEvidenceGraphFreshness;
++  provenance: ContributorEvidenceGraphProvenance;
++};
++
++export type ContributorEvidenceGraphPath = {
++  repoFullName: string;
++  path: string;
++  pullRequests: number;
++  mergedPullRequests: number;
++  source: Extract<ContributorEvidenceGraphSourceKind, "github_cache">;
++  freshness: ContributorEvidenceGraphFreshness;
++  provenance: ContributorEvidenceGraphProvenance;
++};
++
++export type ContributorEvidenceGraphOutcome = {
++  repoFullName: string;
++  role: ContributorOutcomeHistory["repoOutcomes"][number]["role"];
++  lane: ContributorOutcomeHistory["repoOutcomes"][number]["lane"];
++  maintainerLane: boolean;
++  source: ContributorEvidenceGraphSourceKind;
++  freshness: ContributorEvidenceGraphFreshness;
++  provenance: ContributorEvidenceGraphProvenance;
++  pullRequests: number;
++  mergedPullRequests: number;
++  openPullRequests: number;
++  closedPullRequests: number;
++  issues: number;
++  solvedIssues: number;
++  validSolvedIssues: number;
++  successLevel: ContributorOutcomeHistory["repoOutcomes"][number]["successLevel"];
++};
++
++export type ContributorEvidenceGraphTotals = {
++  repositories: number;
++  outsideContributorRepositories: number;
++  maintainerLaneRepositories: number;
++  pullRequests: number;
++  outsideContributorPullRequests: number;
++  maintainerLanePullRequests: number;
++  mergedPullRequests: number;
++  outsideContributorMergedPullRequests: number;
++  maintainerLaneMergedPullRequests: number;
++  issues: number;
++  outsideContributorIssues: number;
++  maintainerLaneIssues: number;
++  validSolvedIssues: number;
++  outsideContributorValidSolvedIssues: number;
++  maintainerLaneValidSolvedIssues: number;
++  labels: number;
++  paths: number;
++  outcomes: number;
++  staleRelationships: number;
++};
++
++export type ContributorEvidenceGraph = {
++  version: typeof CONTRIBUTOR_EVIDENCE_GRAPH_VERSION;
++  login: string;
++  generatedAt: string;
++  sourcePreference: ["official_gittensor", "mirror", "github_cache"];
++  bounds: {
++    maxRepos: number;
++    maxLabels: number;
++    maxPaths: number;
++    maxOutcomes: number;
++  };
++  sources: ContributorEvidenceGraphSource[];
++  totals: ContributorEvidenceGraphTotals;
++  repos: ContributorEvidenceGraphRepo[];
++  labels: ContributorEvidenceGraphLabel[];
++  paths: ContributorEvidenceGraphPath[];
++  outcomes: ContributorEvidenceGraphOutcome[];
++  warnings: string[];
++  summary: string;
++};
++
++export type ContributorEvidenceGraphInput = {
++  login: string;
++  generatedAt?: string | undefined;
++  profile: ContributorProfile;
++  outcomeHistory: ContributorOutcomeHistory;
++  roleContexts: RoleContext[];
++  repositories: RepositoryRecord[];
++  pullRequests?: PullRequestRecord[] | undefined;
++  issues?: IssueRecord[] | undefined;
++  repoStats?: ContributorRepoStatRecord[] | undefined;
++  syncStates?: RepoSyncStateRecord[] | undefined;
++  pullRequestFiles?: PullRequestFileRecord[] | undefined;
++  gittensorSnapshot?: GittensorContributorSnapshot | null | undefined;
++};
++
++type EvidenceCounts = {
++  pullRequests: number;
++  mergedPullRequests: number;
++  openPullRequests: number;
++  closedPullRequests: number;
++  issues: number;
++  solvedIssues: number;
++  validSolvedIssues: number;
++};
++
++type LabelBucket = {
++  repoFullName: string;
++  label: string;
++  pullRequests: number;
++  issues: number;
++  source: ContributorEvidenceGraphSourceKind;
++  observedAt?: string | undefined;
++};
++
++type PathBucket = {
++  repoFullName: string;
++  path: string;
++  pullRequests: number;
++  mergedPullRequests: number;
++  observedAt?: string | undefined;
++};
++
++export function buildContributorEvidenceGraph(args: ContributorEvidenceGraphInput): ContributorEvidenceGraph {
++  const generatedAt = args.generatedAt ?? nowIso();
++  const repositoriesByKey = new Map(args.repositories.map((repo) => [repo.fullName.toLowerCase(), repo]));
++  const roleByRepo = new Map(args.roleContexts.map((role) => [role.repoFullName.toLowerCase(), role]));
++  const outcomeByRepo = new Map(args.outcomeHistory.repoOutcomes.map((outcome) => [outcome.repoFullName.toLowerCase(), outcome]));
++  const officialByRepo = new Map((args.profile.gittensor?.repositories ?? []).map((repo) => [repo.repoFullName.toLowerCase(), repo]));
++  const repoStatsByRepo = new Map((args.repoStats ?? []).filter((stat) => sameLogin(stat.login, args.login)).map((stat) => [stat.repoFullName.toLowerCase(), stat]));
++  const syncByRepo = new Map((args.syncStates ?? []).map((state) => [state.repoFullName.toLowerCase(), state]));
++  const contributorPullRequests = (args.pullRequests ?? []).filter((pr) => sameLogin(pr.authorLogin, args.login));
++  const contributorIssues = (args.issues ?? []).filter((issue) => sameLogin(issue.authorLogin, args.login));
++  const mirrorIssues = args.gittensorSnapshot?.issues ?? [];
++  const mirrorIssuesByRepo = new Map<string, NonNullable<GittensorContributorSnapshot["issues"]>>();
++  for (const issue of mirrorIssues) {
++    const key = issue.repoFullName.toLowerCase();
++    const bucket = mirrorIssuesByRepo.get(key) ?? [];
++    bucket.push(issue);
++    mirrorIssuesByRepo.set(key, bucket);
++  }
++
++  const repoNamesByKey = new Map<string, string>();
++  const addRepo = (repoFullName: string | null | undefined) => {
++    if (!repoFullName) return;
++    const key = repoFullName.toLowerCase();
++    if (!repoNamesByKey.has(key)) repoNamesByKey.set(key, repoFullName);
++  };
++  for (const repoFullName of args.profile.registeredRepoActivity.reposTouched) addRepo(repoFullName);
++  for (const stat of repoStatsByRepo.values()) addRepo(stat.repoFullName);
++  for (const pr of contributorPullRequests) addRepo(pr.repoFullName);
++  for (const issue of contributorIssues) addRepo(issue.repoFullName);
++  for (const repo of args.profile.gittensor?.repositories ?? []) addRepo(repo.repoFullName);
++  for (const pr of args.gittensorSnapshot?.pullRequests ?? []) addRepo(pr.repoFullName);
++  for (const issue of mirrorIssues) addRepo(issue.repoFullName);
++  for (const role of args.roleContexts) {
++    if (role.maintainerLane || role.source !== "unknown") addRepo(role.repoFullName);
++  }
++
++  const allRepoNames = [...repoNamesByKey.values()].sort((left, right) => left.localeCompare(right));
++  const repoNames = allRepoNames.slice(0, CONTRIBUTOR_EVIDENCE_GRAPH_MAX_REPOS);
++  const reposCapped = allRepoNames.length > repoNames.length;
++
++  const repoNodes = repoNames.map((repoFullName) => {
++    const key = repoFullName.toLowerCase();
++    const official = officialByRepo.get(key);
++    const outcome = outcomeByRepo.get(key);
++    const stat = repoStatsByRepo.get(key);
++    const cachedPullRequests = contributorPullRequests.filter((pr) => sameRepo(pr.repoFullName, repoFullName));
++    const cachedIssues = contributorIssues.filter((issue) => sameRepo(issue.repoFullName, repoFullName));
++    const role =
++      roleByRepo.get(key) ??
++      fallbackRoleContext(args.login, repoFullName, outcome, repositoriesByKey.get(key), cachedPullRequests, cachedIssues, args.profile);
++    const source = repoSource(official, mirrorIssuesByRepo.get(key), stat, cachedPullRequests, cachedIssues);
++    const observedAt = observedAtForRepo(source, generatedAt, args.profile, args.gittensorSnapshot, stat, cachedPullRequests, cachedIssues, syncByRepo.get(key));
++    const freshness = freshnessFor(source, observedAt, generatedAt);
++    const counts = countsForRepo(outcome, official, mirrorIssuesByRepo.get(key), stat, cachedPullRequests, cachedIssues);
++    return {
++      repoFullName,
++      role: role.role,
++      lane: outcome?.lane ?? "unknown",
++      maintainerLane: role.maintainerLane,
++      normalContributorEvidenceAllowed: role.normalContributorEvidenceAllowed,
++      source,
++      freshness,
++      provenance: [
++        provenance(source, freshness, generatedAt, observedAt, provenanceDetailForSource(source)),
++        ...(role.maintainerLane
++          ? [provenance("computed", "fresh", generatedAt, generatedAt, "maintainer-lane relationship derived from repo ownership or cached author association")]
++          : []),
++      ],
++      ...counts,
++    } satisfies ContributorEvidenceGraphRepo;
++  });
++
++  const includedRepoKeys = new Set(repoNodes.map((repo) => repo.repoFullName.toLowerCase()));
++  const allLabels = preferredLabelEdges(buildLabelBuckets(args, contributorPullRequests, contributorIssues), generatedAt).filter((label) => includedRepoKeys.has(label.repoFullName.toLowerCase()));
++  const labels = allLabels.slice(0, CONTRIBUTOR_EVIDENCE_GRAPH_MAX_LABELS);
++  const allPaths = buildPathEdges(args.login, contributorPullRequests, args.pullRequestFiles ?? [], generatedAt).filter((path) => includedRepoKeys.has(path.repoFullName.toLowerCase()));
++  const paths = allPaths.slice(0, CONTRIBUTOR_EVIDENCE_GRAPH_MAX_PATHS);
++  const allOutcomes = buildOutcomeEdges(args.outcomeHistory, repoNodes, generatedAt, args.profile, args.gittensorSnapshot, repoStatsByRepo, contributorPullRequests, contributorIssues);
++  const outcomes = allOutcomes.slice(0, CONTRIBUTOR_EVIDENCE_GRAPH_MAX_OUTCOMES);
++
++  const warnings = [
++    ...(!args.profile.gittensor ? ["Official Gittensor contributor snapshot is unavailable; GitHub cache evidence is used where present."] : []),
++    ...(args.profile.gittensor && args.gittensorSnapshot?.issueMirrorAvailable === false ? ["Gittensor issue mirror is unavailable; issue-label evidence falls back to GitHub cache."] : []),
++    ...(reposCapped ? [`Evidence graph repo relationships capped at ${CONTRIBUTOR_EVIDENCE_GRAPH_MAX_REPOS}.`] : []),
++    ...(labels.length < allLabels.length ? [`Evidence graph label relationships capped at ${CONTRIBUTOR_EVIDENCE_GRAPH_MAX_LABELS}.`] : []),
++    ...(paths.length < allPaths.length ? [`Evidence graph path relationships capped at ${CONTRIBUTOR_EVIDENCE_GRAPH_MAX_PATHS}.`] : []),
++  ];
++
++  const sources = buildSources(generatedAt, args.profile, args.gittensorSnapshot, repoNodes, labels, paths, outcomes);
++  const totals = buildTotals(repoNodes, labels, paths, outcomes);
++  return {
++    version: CONTRIBUTOR_EVIDENCE_GRAPH_VERSION,
++    login: args.login,
++    generatedAt,
++    sourcePreference: ["official_gittensor", "mirror", "github_cache"],
++    bounds: {
++      maxRepos: CONTRIBUTOR_EVIDENCE_GRAPH_MAX_REPOS,
++      maxLabels: CONTRIBUTOR_EVIDENCE_GRAPH_MAX_LABELS,
++      maxPaths: CONTRIBUTOR_EVIDENCE_GRAPH_MAX_PATHS,
++      maxOutcomes: CONTRIBUTOR_EVIDENCE_GRAPH_MAX_OUTCOMES,
++    },
++    sources,
++    totals,
++    repos: repoNodes,
++    labels,
++    paths,
++    outcomes,
++    warnings,
++    summary: `${args.login} evidence graph has ${repoNodes.length} repo, ${paths.length} path, ${labels.length} label, and ${outcomes.length} outcome relationship(s).`,
++  };
++}
++
++export function evidenceGraphTouchedRepoFullNames(args: {
++  login: string;
++  profile?: ContributorProfile | null | undefined;
++  pullRequests?: PullRequestRecord[] | undefined;
++  issues?: IssueRecord[] | undefined;
++  repoStats?: ContributorRepoStatRecord[] | undefined;
++  repositories?: RepositoryRecord[] | undefined;
++}): string[] {
++  const namesByKey = new Map<string, string>();
++  const add = (repoFullName: string | null | undefined) => {
++    if (!repoFullName) return;
++    const key = repoFullName.toLowerCase();
++    if (!namesByKey.has(key)) namesByKey.set(key, repoFullName);
++  };
++  for (const repoFullName of args.profile?.registeredRepoActivity.reposTouched ?? []) add(repoFullName);
++  for (const repo of args.profile?.gittensor?.repositories ?? []) add(repo.repoFullName);
++  for (const stat of args.repoStats ?? []) if (sameLogin(stat.login, args.login)) add(stat.repoFullName);
++  for (const pr of args.pullRequests ?? []) if (sameLogin(pr.authorLogin, args.login)) add(pr.repoFullName);
++  for (const issue of args.issues ?? []) if (sameLogin(issue.authorLogin, args.login)) add(issue.repoFullName);
++  const registeredKeys = new Set((args.repositories ?? []).filter((repo) => repo.isRegistered).map((repo) => repo.fullName.toLowerCase()));
++  return [...namesByKey.values()]
++    .filter((repoFullName) => registeredKeys.size === 0 || registeredKeys.has(repoFullName.toLowerCase()))
++    .sort((left, right) => left.localeCompare(right))
++    .slice(0, CONTRIBUTOR_EVIDENCE_GRAPH_MAX_REPOS);
++}
++
++function buildLabelBuckets(args: ContributorEvidenceGraphInput, contributorPullRequests: PullRequestRecord[], contributorIssues: IssueRecord[]): LabelBucket[] {
++  const buckets = new Map<string, LabelBucket>();
++  const add = (repoFullName: string, label: string | null | undefined, source: ContributorEvidenceGraphSourceKind, kind: "pull_request" | "issue", observedAt?: string | undefined) => {
++    const normalized = label?.trim();
++    if (!normalized) return;
++    const key = `${repoFullName.toLowerCase()}\0${normalized.toLowerCase()}\0${source}`;
++    const current = buckets.get(key) ?? { repoFullName, label: normalized, pullRequests: 0, issues: 0, source, observedAt };
++    if (kind === "pull_request") current.pullRequests += 1;
++    else current.issues += 1;
++    current.observedAt = newestIso(current.observedAt, observedAt);
++    buckets.set(key, current);
++  };
++
++  for (const pr of args.gittensorSnapshot?.pullRequests ?? []) add(pr.repoFullName, pr.label, "official_gittensor", "pull_request", args.gittensorSnapshot?.updatedAt ?? args.gittensorSnapshot?.evaluatedAt);
++  for (const issue of args.gittensorSnapshot?.issues ?? []) for (const label of issue.labels) add(issue.repoFullName, label, "mirror", "issue", args.gittensorSnapshot?.updatedAt ?? args.gittensorSnapshot?.evaluatedAt);
++  for (const pr of contributorPullRequests) for (const label of pr.labels ?? []) add(pr.repoFullName, label, "github_cache", "pull_request", pr.updatedAt ?? pr.createdAt ?? undefined);
++  for (const issue of contributorIssues) for (const label of issue.labels ?? []) add(issue.repoFullName, label, "github_cache", "issue", issue.updatedAt ?? issue.createdAt ?? undefined);
++  for (const stat of args.repoStats ?? []) {
++    if (!sameLogin(stat.login, args.login)) continue;
++    for (const label of stat.dominantLabels) add(stat.repoFullName, label, "github_cache", "pull_request", stat.lastActivityAt ?? undefined);
++  }
++  return [...buckets.values()];
++}
++
++function preferredLabelEdges(buckets: LabelBucket[], generatedAt: string): ContributorEvidenceGraphLabel[] {
++  const byLabel = new Map<string, LabelBucket>();
++  for (const bucket of buckets) {
++    const key = `${bucket.repoFullName.toLowerCase()}\0${bucket.label.toLowerCase()}`;
++    const current = byLabel.get(key);
++    if (!current || SOURCE_PRIORITY[bucket.source] < SOURCE_PRIORITY[current.source]) byLabel.set(key, bucket);
++  }
++  return [...byLabel.values()]
++    .map((bucket) => {
++      const freshness = freshnessFor(bucket.source, bucket.observedAt, generatedAt);
++      return {
++        repoFullName: bucket.repoFullName,
++        label: bucket.label,
++        pullRequests: bucket.pullRequests,
++        issues: bucket.issues,
++        source: bucket.source,
++        freshness,
++        provenance: provenance(bucket.source, freshness, generatedAt, bucket.observedAt, `label relationship observed from ${sourceLabel(bucket.source)}`),
++      };
++    })
++    .sort(
++      (left, right) =>
++        right.pullRequests + right.issues - (left.pullRequests + left.issues) ||
++        left.repoFullName.localeCompare(right.repoFullName) ||
++        left.label.localeCompare(right.label) ||
++        SOURCE_PRIORITY[left.source] - SOURCE_PRIORITY[right.source],
++    );
++}
++
++function buildPathEdges(login: string, contributorPullRequests: PullRequestRecord[], files: PullRequestFileRecord[], generatedAt: string): ContributorEvidenceGraphPath[] {
++  const prByKey = new Map(contributorPullRequests.filter((pr) => sameLogin(pr.authorLogin, login)).map((pr) => [`${pr.repoFullName.toLowerCase()}#${pr.number}`, pr]));
++  const buckets = new Map<string, PathBucket>();
++  for (const file of files) {
++    const pr = prByKey.get(`${file.repoFullName.toLowerCase()}#${file.pullNumber}`);
++    if (!pr) continue;
++    const path = file.path.trim();
++    if (!path) continue;
++    const key = `${file.repoFullName.toLowerCase()}\0${path}`;
++    const current = buckets.get(key) ?? { repoFullName: file.repoFullName, path, pullRequests: 0, mergedPullRequests: 0, observedAt: undefined };
++    current.pullRequests += 1;
++    if (pr.mergedAt || pr.state.toLowerCase() === "merged") current.mergedPullRequests += 1;
++    current.observedAt = newestIso(current.observedAt, pr.updatedAt ?? pr.createdAt ?? pr.mergedAt ?? undefined);
++    buckets.set(key, current);
++  }
++  return [...buckets.values()]
++    .map((bucket) => {
++      const freshness = freshnessFor("github_cache", bucket.observedAt, generatedAt);
++      return {
++        repoFullName: bucket.repoFullName,
++        path: bucket.path,
++        pullRequests: bucket.pullRequests,
++        mergedPullRequests: bucket.mergedPullRequests,
++        source: "github_cache" as const,
++        freshness,
++        provenance: provenance("github_cache", freshness, generatedAt, bucket.observedAt, "path relationship observed from cached pull-request file metadata"),
++      };
++    })
++    .sort((left, right) => right.pullRequests - left.pullRequests || left.repoFullName.localeCompare(right.repoFullName) || left.path.localeCompare(right.path));
++}
++
++function buildOutcomeEdges(
++  outcomeHistory: ContributorOutcomeHistory,
++  repoNodes: ContributorEvidenceGraphRepo[],
++  generatedAt: string,
++  profile: ContributorProfile,
++  gittensorSnapshot: GittensorContributorSnapshot | null | undefined,
++  repoStatsByRepo: Map<string, ContributorRepoStatRecord>,
++  contributorPullRequests: PullRequestRecord[],
++  contributorIssues: IssueRecord[],
++): ContributorEvidenceGraphOutcome[] {
++  const repoByKey = new Map(repoNodes.map((repo) => [repo.repoFullName.toLowerCase(), repo]));
++  return outcomeHistory.repoOutcomes
++    .filter((outcome) => repoByKey.has(outcome.repoFullName.toLowerCase()))
++    .map((outcome) => {
++      const key = outcome.repoFullName.toLowerCase();
++      const source = repoByKey.get(key)!.source;
++      const observedAt = observedAtForRepo(
++        source,
++        generatedAt,
++        profile,
++        gittensorSnapshot,
++        repoStatsByRepo.get(key),
++        contributorPullRequests.filter((pr) => sameRepo(pr.repoFullName, outcome.repoFullName)),
++        contributorIssues.filter((issue) => sameRepo(issue.repoFullName, outcome.repoFullName)),
++      );
++      const freshness = freshnessFor(source, observedAt, generatedAt);
++      return {
++        repoFullName: outcome.repoFullName,
++        role: outcome.role,
++        lane: outcome.lane,
++        maintainerLane: outcome.maintainerLane,
++        source,
++        freshness,
++        provenance: provenance(source, freshness, generatedAt, observedAt, `outcome relationship computed from ${sourceLabel(source)} evidence`),
++        pullRequests: outcome.pullRequests,
++        mergedPullRequests: outcome.mergedPullRequests,
++        openPullRequests: outcome.openPullRequests,
++        closedPullRequests: outcome.closedPullRequests,
++        issues: outcome.issues,
++        solvedIssues: outcome.solvedIssues,
++        validSolvedIssues: outcome.validSolvedIssues,
++        successLevel: outcome.successLevel,
++      };
++    })
++    .sort((left, right) => left.repoFullName.localeCompare(right.repoFullName));
++}
++
++function fallbackRoleContext(
++  login: string,
++  repoFullName: string,
++  outcome: ContributorOutcomeHistory["repoOutcomes"][number] | undefined,
++  repo: RepositoryRecord | undefined,
++  pullRequests: PullRequestRecord[],
++  issues: IssueRecord[],
++  profile: ContributorProfile,
++): RoleContext {
++  const maintainerLane = Boolean(outcome?.maintainerLane) || sameLogin(repo?.owner, login) || maintainerAssociationVisible(pullRequests, issues);
++  const role = outcome?.role ?? (maintainerLane ? "repo_maintainer" : "outside_contributor");
++  return {
++    login,
++    repoFullName,
++    generatedAt: nowIso(),
++    role,
++    maintainerLane,
++    normalContributorEvidenceAllowed: !maintainerLane,
++    source: profile.source === "gittensor_api" ? "gittensor_api" : "cache",
++    reasons: maintainerLane ? ["Maintainer-lane relationship inferred from available outcome evidence."] : ["Contributor relationship inferred from available repo evidence."],
++    guidance: maintainerLane
++      ? "Use maintainer-lane guidance; do not count this repo as normal contributor evidence."
++      : "Use contributor-lane guidance.",
++  };
++}
++
++function maintainerAssociationVisible(pullRequests: PullRequestRecord[], issues: IssueRecord[]): boolean {
++  return [...pullRequests.map((pr) => pr.authorAssociation), ...issues.map((issue) => issue.authorAssociation)].some((association) =>
++    ["OWNER", "MEMBER", "COLLABORATOR"].includes((association ?? "").toUpperCase()),
++  );
++}
++
++function repoSource(
++  official: NonNullable<ContributorProfile["gittensor"]>["repositories"][number] | undefined,
++  mirrorIssues: NonNullable<GittensorContributorSnapshot["issues"]> | undefined,
++  stat: ContributorRepoStatRecord | undefined,
++  pullRequests: PullRequestRecord[],
++  issues: IssueRecord[],
++): ContributorEvidenceGraphSourceKind {
++  if (official) return "official_gittensor";
++  if ((mirrorIssues?.length ?? 0) > 0) return "mirror";
++  if (stat || pullRequests.length > 0 || issues.length > 0) return "github_cache";
++  return "computed";
++}
++
++function countsForRepo(
++  outcome: ContributorOutcomeHistory["repoOutcomes"][number] | undefined,
++  official: NonNullable<ContributorProfile["gittensor"]>["repositories"][number] | undefined,
++  mirrorIssues: NonNullable<GittensorContributorSnapshot["issues"]> | undefined,
++  stat: ContributorRepoStatRecord | undefined,
++  pullRequests: PullRequestRecord[],
++  issues: IssueRecord[],
++): EvidenceCounts {
++  if (outcome) {
++    return {
++      pullRequests: outcome.pullRequests,
++      mergedPullRequests: outcome.mergedPullRequests,
++      openPullRequests: outcome.openPullRequests,
++      closedPullRequests: outcome.closedPullRequests,
++      issues: outcome.issues,
++      solvedIssues: outcome.solvedIssues,
++      validSolvedIssues: outcome.validSolvedIssues,
++    };
++  }
++  if (official) {
++    return {
++      pullRequests: official.pullRequests,
++      mergedPullRequests: official.mergedPullRequests,
++      openPullRequests: official.openPullRequests,
++      closedPullRequests: official.closedPullRequests,
++      issues: official.openIssues + official.closedIssues,
++      solvedIssues: official.solvedIssues,
++      validSolvedIssues: official.validSolvedIssues,
++    };
++  }
++  if (mirrorIssues && mirrorIssues.length > 0) {
++    const solvedIssues = mirrorIssues.filter((issue) => issue.solvedByPullRequest).length;
++    return {
++      pullRequests: 0,
++      mergedPullRequests: 0,
++      openPullRequests: 0,
++      closedPullRequests: 0,
++      issues: mirrorIssues.length,
++      solvedIssues,
++      validSolvedIssues: 0,
++    };
++  }
++  const mergedPullRequests = stat?.mergedPullRequests ?? pullRequests.filter((pr) => pr.mergedAt || pr.state.toLowerCase() === "merged").length;
++  const openPullRequests = stat?.openPullRequests ?? pullRequests.filter((pr) => pr.state.toLowerCase() === "open").length;
++  const pullRequestCount = stat?.pullRequests ?? pullRequests.length;
++  return {
++    pullRequests: pullRequestCount,
++    mergedPullRequests,
++    openPullRequests,
++    closedPullRequests: Math.max(pullRequestCount - mergedPullRequests - openPullRequests, 0),
++    issues: stat?.issues ?? issues.length,
++    solvedIssues: 0,
++    validSolvedIssues: 0,
++  };
++}
++
++function observedAtForRepo(
++  source: ContributorEvidenceGraphSourceKind,
++  generatedAt: string,
++  profile: ContributorProfile,
++  gittensorSnapshot: GittensorContributorSnapshot | null | undefined,
++  stat?: ContributorRepoStatRecord | undefined,
++  pullRequests: PullRequestRecord[] = [],
++  issues: IssueRecord[] = [],
++  syncState?: RepoSyncStateRecord | undefined,
++): string | undefined {
++  if (source === "official_gittensor" || source === "mirror") return gittensorSnapshot?.updatedAt ?? gittensorSnapshot?.evaluatedAt ?? profile.gittensor?.updatedAt ?? profile.gittensor?.evaluatedAt;
++  if (source === "computed") return generatedAt;
++  return newestIso(
++    stat?.lastActivityAt ?? undefined,
++    newestIso(
++      newestIso(syncState?.pullRequestsSyncedAt ?? syncState?.lastCompletedAt ?? syncState?.updatedAt ?? undefined, syncState?.issuesSyncedAt ?? undefined),
++      newestIso(
++        pullRequests.map((pr) => pr.updatedAt ?? pr.createdAt ?? pr.mergedAt ?? undefined).reduce((latest, date) => newestIso(latest, date), undefined as string | undefined),
++        issues.map((issue) => issue.updatedAt ?? issue.createdAt ?? undefined).reduce((latest, date) => newestIso(latest, date), undefined as string | undefined),
++      ),
++    ),
++  );
++}
++
++function provenance(
++  source: ContributorEvidenceGraphSourceKind,
++  freshness: ContributorEvidenceGraphFreshness,
++  generatedAt: string,
++  observedAt: string | undefined,
++  detail: string,
++): ContributorEvidenceGraphProvenance {
++  return {
++    source,
++    freshness,
++    generatedAt,
++    ...(observedAt ? { observedAt } : {}),
++    detail,
++  };
++}
++
++function provenanceDetailForSource(source: ContributorEvidenceGraphSourceKind): string {
++  if (source === "official_gittensor") return "repo relationship observed from official Gittensor contributor data";
++  if (source === "mirror") return "repo relationship observed from Gittensor issue mirror data";
++  if (source === "github_cache") return "repo relationship observed from cached GitHub contributor data";
++  return "repo relationship derived from computed role or outcome context";
++}
++
++function buildSources(
++  generatedAt: string,
++  profile: ContributorProfile,
++  gittensorSnapshot: GittensorContributorSnapshot | null | undefined,
++  repos: ContributorEvidenceGraphRepo[],
++  labels: ContributorEvidenceGraphLabel[],
++  paths: ContributorEvidenceGraphPath[],
++  outcomes: ContributorEvidenceGraphOutcome[],
++): ContributorEvidenceGraphSource[] {
++  const relationshipCounts = new Map<ContributorEvidenceGraphSourceKind, number>();
++  for (const source of ["official_gittensor", "mirror", "github_cache", "computed"] as const) relationshipCounts.set(source, 0);
++  for (const relation of [...repos, ...labels, ...paths, ...outcomes]) relationshipCounts.set(relation.source, relationshipCounts.get(relation.source)! + 1);
++  const officialObservedAt = gittensorSnapshot?.updatedAt ?? gittensorSnapshot?.evaluatedAt ?? profile.gittensor?.updatedAt ?? profile.gittensor?.evaluatedAt;
++  const githubRelations = [...repos, ...labels, ...paths, ...outcomes].filter((relation) => relation.source === "github_cache");
++  const githubObservedAt = githubRelations.map((relation) => relationObservedAt(relation)).reduce((latest, date) => newestIso(latest, date), undefined as string | undefined);
++  return [
++    {
++      ...provenance("official_gittensor", profile.gittensor ? freshnessFor("official_gittensor", officialObservedAt, generatedAt) : "missing", generatedAt, officialObservedAt, "official Gittensor contributor source"),
++      relationshipCount: relationshipCounts.get("official_gittensor")!,
++    },
++    {
++      ...provenance(
++        "mirror",
++        gittensorSnapshot?.issueMirrorAvailable ? freshnessFor("mirror", officialObservedAt, generatedAt) : "missing",
++        generatedAt,
++        officialObservedAt,
++        "Gittensor issue mirror source",
++      ),
++      relationshipCount: relationshipCounts.get("mirror")!,
++    },
++    {
++      ...provenance(
++        "github_cache",
++        githubRelations.length > 0 ? freshnessFor("github_cache", githubObservedAt, generatedAt) : "missing",
++        generatedAt,
++        githubObservedAt,
++        "cached GitHub source",
++      ),
++      relationshipCount: relationshipCounts.get("github_cache")!,
++    },
++  ];
++}
++
++function relationObservedAt(
++  relation: ContributorEvidenceGraphRepo | ContributorEvidenceGraphLabel | ContributorEvidenceGraphPath | ContributorEvidenceGraphOutcome,
++): string | undefined {
++  if (Array.isArray(relation.provenance)) return relation.provenance.map((entry) => entry.observedAt).reduce((latest, date) => newestIso(latest, date), undefined as string | undefined);
++  return relation.provenance.observedAt;
++}
++
++function buildTotals(
++  repos: ContributorEvidenceGraphRepo[],
++  labels: ContributorEvidenceGraphLabel[],
++  paths: ContributorEvidenceGraphPath[],
++  outcomes: ContributorEvidenceGraphOutcome[],
++): ContributorEvidenceGraphTotals {
++  const outside = repos.filter((repo) => repo.normalContributorEvidenceAllowed);
++  const maintainer = repos.filter((repo) => repo.maintainerLane);
++  const staleRelationships = [...repos, ...labels, ...paths, ...outcomes].filter((relation) => relation.freshness === "stale").length;
++  return {
++    repositories: repos.length,
++    outsideContributorRepositories: outside.length,
++    maintainerLaneRepositories: maintainer.length,
++    pullRequests: sum(repos, (repo) => repo.pullRequests),
++    outsideContributorPullRequests: sum(outside, (repo) => repo.pullRequests),
++    maintainerLanePullRequests: sum(maintainer, (repo) => repo.pullRequests),
++    mergedPullRequests: sum(repos, (repo) => repo.mergedPullRequests),
++    outsideContributorMergedPullRequests: sum(outside, (repo) => repo.mergedPullRequests),
++    maintainerLaneMergedPullRequests: sum(maintainer, (repo) => repo.mergedPullRequests),
++    issues: sum(repos, (repo) => repo.issues),
++    outsideContributorIssues: sum(outside, (repo) => repo.issues),
++    maintainerLaneIssues: sum(maintainer, (repo) => repo.issues),
++    validSolvedIssues: sum(repos, (repo) => repo.validSolvedIssues),
++    outsideContributorValidSolvedIssues: sum(outside, (repo) => repo.validSolvedIssues),
++    maintainerLaneValidSolvedIssues: sum(maintainer, (repo) => repo.validSolvedIssues),
++    labels: labels.length,
++    paths: paths.length,
++    outcomes: outcomes.length,
++    staleRelationships,
++  };
++}
++
++function freshnessFor(source: ContributorEvidenceGraphSourceKind, observedAt: string | undefined, generatedAt: string): ContributorEvidenceGraphFreshness {
++  if (!observedAt) return "partial";
++  const observedMs = Date.parse(observedAt);
++  const generatedMs = Date.parse(generatedAt);
++  if (!Number.isFinite(observedMs) || !Number.isFinite(generatedMs)) return "partial";
++  const ageMs = Math.max(0, generatedMs - observedMs);
++  const staleAfterMs = source === "official_gittensor" ? OFFICIAL_STALE_AFTER_MS : source === "mirror" ? MIRROR_STALE_AFTER_MS : GITHUB_CACHE_STALE_AFTER_MS;
++  return ageMs > staleAfterMs ? "stale" : "fresh";
++}
++
++function sourceLabel(source: ContributorEvidenceGraphSourceKind): string {
++  if (source === "official_gittensor") return "official Gittensor";
++  if (source === "mirror") return "Gittensor mirror";
++  if (source === "github_cache") return "GitHub cache";
++  /* v8 ignore next -- Labels are emitted only from official, mirror, or GitHub cache sources. */
++  return "computed";
++}
++
++function sameLogin(value: string | null | undefined, login: string): boolean {
++  return value?.toLowerCase() === login.toLowerCase();
++}
++
++function sameRepo(left: string | null | undefined, right: string | null | undefined): boolean {
++  return left?.toLowerCase() === right?.toLowerCase();
++}
++
++function newestIso(left: string | undefined, right: string | undefined): string | undefined {
++  if (!left) return right;
++  if (!right) return left;
++  const leftMs = Date.parse(left);
++  const rightMs = Date.parse(right);
++  if (!Number.isFinite(leftMs)) return right;
++  if (!Number.isFinite(rightMs)) return left;
++  return rightMs > leftMs ? right : left;
++}
++
++function sum<T>(items: T[], mapper: (item: T) => number): number {
++  return items.reduce((total, item) => total + mapper(item), 0);
++}
+diff --git a/src/services/decision-pack.ts b/src/services/decision-pack.ts
+index fb458a0..a1e2680 100644
+--- a/src/services/decision-pack.ts
++++ b/src/services/decision-pack.ts
+@@ -10,6 +10,7 @@ import {
+   listContributorPullRequests,
+   listContributorRepoStats,
+   listLatestRepoGithubTotalsSnapshots,
++  listRepoPullRequestFiles,
+   listRepositories,
+   listRepoSyncSegments,
+   listRepoSyncStates,
+@@ -39,6 +40,12 @@ import {
+ } from "../signals/engine";
+ import { buildSignalFidelity } from "../signals/data-quality";
+ import { buildContributorOpenPrMonitor, type ContributorOpenPrMonitor } from "../signals/contributor-open-pr-monitor";
++import {
++  buildContributorEvidenceGraph,
++  CONTRIBUTOR_EVIDENCE_GRAPH_SIGNAL,
++  evidenceGraphTouchedRepoFullNames,
++  type ContributorEvidenceGraph,
++} from "./contributor-evidence-graph";
+ import { loadIssueQualityReportMap } from "./issue-quality";
+ import { loadRepoOutcomePatternsMap } from "./repo-outcome-patterns";
+ import type {
+@@ -46,6 +53,7 @@ import type {
+   ContributorRepoStatRecord,
+   IssueRecord,
+   JsonValue,
++  PullRequestFileRecord,
+   PullRequestRecord,
+   RepositoryRecord,
+   RepoGithubTotalsSnapshotRecord,
+@@ -93,6 +101,7 @@ export type ContributorDecisionPack = {
+   avoidRepos: RepoDecision[];
+   maintainerLaneRepos: RepoDecision[];
+   scoreBlockers: ScoreBlocker[];
++  evidenceGraph?: ContributorEvidenceGraph | undefined;
+   dataQuality: {
+     signalFidelity: ReturnType<typeof buildSignalFidelity>;
+   };
+@@ -324,6 +333,18 @@ export async function buildAndPersistContributorDecisionPack(env: Env, login: st
+     repositories.filter((repo) => repo.isRegistered).map((repo) => repo.fullName),
+   );
+   const profile = buildContributorProfile(login, github, contributorPullRequests, contributorIssues, repoStats, gittensorSnapshot);
++  const pullRequestFiles = (
++    await Promise.all(
++      evidenceGraphTouchedRepoFullNames({
++        login,
++        profile,
++        pullRequests: contributorPullRequests,
++        issues: contributorIssues,
++        repoStats,
++        repositories,
++      }).map((repoFullName) => listRepoPullRequestFiles(env, repoFullName)),
++    )
++  ).flat();
+   const outcomeHistory = buildContributorOutcomeHistory({
+     login,
+     profile,
+@@ -348,6 +369,9 @@ export async function buildAndPersistContributorDecisionPack(env: Env, login: st
+     scoringModelSnapshotId: scoringSnapshot.id,
+     contributorPullRequests,
+     contributorIssues,
++    repoStats,
++    pullRequestFiles,
++    gittensorSnapshot,
+     issueQualityByRepo,
+     openPrMonitor,
+     focusManifests,
+@@ -366,6 +390,7 @@ export async function buildAndPersistContributorDecisionPack(env: Env, login: st
+       issueDiscoveryReports: scoringProfile.evidence.issueDiscoveryReports,
+       languageMatches: scoringProfile.evidence.languageMatches,
+       credibilityAssumption: scoringProfile.evidence.credibilityAssumption,
++      evidenceGraph: pack.evidenceGraph as unknown as JsonValue,
+     },
+   });
+   await upsertContributorScoringProfile(env, {
+@@ -381,6 +406,15 @@ export async function buildAndPersistContributorDecisionPack(env: Env, login: st
+     payload: pack as unknown as Record<string, JsonValue>,
+     generatedAt: pack.generatedAt,
+   });
++  if (pack.evidenceGraph) {
++    await persistSignalSnapshot(env, {
++      id: crypto.randomUUID(),
++      signalType: CONTRIBUTOR_EVIDENCE_GRAPH_SIGNAL,
++      targetKey: login,
++      payload: pack.evidenceGraph as unknown as Record<string, JsonValue>,
++      generatedAt: pack.evidenceGraph.generatedAt,
++    });
++  }
+   return pack;
+ }
+ 
+@@ -401,6 +435,9 @@ function buildContributorDecisionPack(args: {
+   scoringModelSnapshotId: string;
+   contributorPullRequests: Parameters<typeof buildRoleContext>[0]["pullRequests"];
+   contributorIssues: Parameters<typeof buildRoleContext>[0]["issues"];
++  repoStats?: ContributorRepoStatRecord[] | undefined;
++  pullRequestFiles?: PullRequestFileRecord[] | undefined;
++  gittensorSnapshot?: Awaited<ReturnType<typeof fetchGittensorContributorSnapshot>> | undefined;
+   issueQualityByRepo?: Map<string, IssueQualityReport> | undefined;
+   openPrMonitor: ContributorOpenPrMonitor;
+   focusManifests?: Map<string, FocusManifest> | undefined;
+@@ -448,6 +485,19 @@ function buildContributorDecisionPack(args: {
+   const dataQuality = {
+     signalFidelity: buildSignalFidelity(registeredRepositories.length, args.syncStates, args.syncSegments),
+   };
++  const evidenceGraph = buildContributorEvidenceGraph({
++    login: args.login,
++    profile: args.profile,
++    outcomeHistory: args.outcomeHistory,
++    roleContexts,
++    repositories: args.repositories,
++    pullRequests: args.contributorPullRequests,
++    issues: args.contributorIssues,
++    repoStats: args.repoStats,
++    syncStates: args.syncStates,
++    pullRequestFiles: args.pullRequestFiles,
++    gittensorSnapshot: args.gittensorSnapshot,
++  });
+   const monitor = args.openPrMonitor;
+   const monitorNextSteps = monitor.guidance.slice(0, 6);
+   const packNextActions = [...new Set([...monitorNextSteps, ...topActions.flatMap((action) => action.nextActions)])].slice(0, 12);
+@@ -479,6 +529,7 @@ function buildContributorDecisionPack(args: {
+     avoidRepos: repoDecisions.filter((decision) => decision.recommendation === "avoid_for_now").slice(0, 8),
+     maintainerLaneRepos: repoDecisions.filter((decision) => decision.recommendation === "maintainer_lane").slice(0, 8),
+     scoreBlockers,
++    evidenceGraph,
+     dataQuality,
+     summary: `${args.login} has ${topActions.length} ranked action(s), ${scoreBlockers.length} scoreability blocker(s), and ${repoDecisions.length} registered repo decision(s).${monitorSummary}`,
+     nextActions: packNextActions,
+diff --git a/test/unit/agent-orchestrator.test.ts b/test/unit/agent-orchestrator.test.ts
+index 51f394a..46f4be8 100644
+--- a/test/unit/agent-orchestrator.test.ts
++++ b/test/unit/agent-orchestrator.test.ts
+@@ -582,6 +582,13 @@ describe("agent orchestrator", () => {
+           rateLimitedRepos: ["owner/rate"],
+         },
+       },
++      evidenceGraph: {
++        version: 1,
++        generatedAt,
++        totals: { repositories: 1 },
++        sources: [],
++        repos: [{ repoFullName: readyDecision.repoFullName, source: "github_cache", freshness: "fresh" }],
++      } as any,
+     }), [readyDecision]);
+     expect(snapshot.freshnessWarnings).toEqual(
+       expect.arrayContaining([
+@@ -592,6 +599,7 @@ describe("agent orchestrator", () => {
+         "owner/rate: rate limited signal coverage",
+       ]),
+     );
++    expect(snapshot.payload.evidenceGraph).toMatchObject({ selectedRepos: [expect.objectContaining({ repoFullName: readyDecision.repoFullName })] });
+     expect(snapshot.payload.openPrMonitor).toBeNull();
+ 
+     const staleSnapshot = __agentOrchestratorInternals.contextSnapshotFromPack("run-2", decisionPackFixture({
+diff --git a/test/unit/contributor-evidence-graph.test.ts b/test/unit/contributor-evidence-graph.test.ts
+new file mode 100644
+index 0000000..44b801a
+--- /dev/null
++++ b/test/unit/contributor-evidence-graph.test.ts
+@@ -0,0 +1,453 @@
++import { describe, expect, it } from "vitest";
++import {
++  buildContributorEvidenceGraph,
++  CONTRIBUTOR_EVIDENCE_GRAPH_MAX_LABELS,
++  CONTRIBUTOR_EVIDENCE_GRAPH_MAX_PATHS,
++  CONTRIBUTOR_EVIDENCE_GRAPH_MAX_REPOS,
++  evidenceGraphTouchedRepoFullNames,
++} from "../../src/services/contributor-evidence-graph";
++import type { PullRequestFileRecord, PullRequestRecord, RepositoryRecord } from "../../src/types";
++
++const GENERATED_AT = "2026-05-28T00:00:00.000Z";
++const FRESH_AT = "2026-05-27T00:00:00.000Z";
++const STALE_AT = "2026-04-01T00:00:00.000Z";
++const FORBIDDEN_PUBLIC_TERMS = /wallet|hotkey|raw trust score|payout|reward estimate|farming|private reviewability|public score estimate/i;
++
++function repo(fullName: string): RepositoryRecord {
++  const [owner, name] = fullName.split("/") as [string, string];
++  return {
++    fullName,
++    owner,
++    name,
++    isInstalled: true,
++    isRegistered: true,
++    isPrivate: false,
++    defaultBranch: "main",
++    registryConfig: {
++      repo: fullName,
++      emissionShare: 0.02,
++      issueDiscoveryShare: 0,
++      labelMultipliers: {},
++      trustedLabelPipeline: false,
++      maintainerCut: 0,
++      raw: {},
++    },
++  };
++}
++
++function pr(repoFullName: string, number: number, overrides: Partial<PullRequestRecord> = {}): PullRequestRecord {
++  return {
++    repoFullName,
++    number,
++    title: `PR ${number}`,
++    state: "open",
++    authorLogin: "dev",
++    authorAssociation: "CONTRIBUTOR",
++    labels: [],
++    linkedIssues: [],
++    createdAt: FRESH_AT,
++    updatedAt: FRESH_AT,
++    ...overrides,
++  };
++}
++
++function file(repoFullName: string, pullNumber: number, path: string): PullRequestFileRecord {
++  return { repoFullName, pullNumber, path, additions: 5, deletions: 1, changes: 6, payload: {} };
++}
++
++function profile(overrides: Record<string, unknown> = {}) {
++  return {
++    login: "dev",
++    generatedAt: GENERATED_AT,
++    github: { login: "dev", topLanguages: ["TypeScript"], source: "github" },
++    source: "github_cache",
++    registeredRepoActivity: { pullRequests: 0, mergedPullRequests: 0, issues: 0, reposTouched: [], dominantLabels: [] },
++    trustSignals: { evidenceScore: 0, level: "new", unlinkedOpenPullRequests: 0, maintainerAssociatedPullRequests: 0 },
++    ...overrides,
++  } as any;
++}
++
++function outcome(repoFullName: string, overrides: Record<string, unknown> = {}) {
++  return {
++    repoFullName,
++    role: "outside_contributor",
++    lane: "direct_pr",
++    maintainerLane: false,
++    pullRequests: 1,
++    mergedPullRequests: 0,
++    openPullRequests: 1,
++    closedPullRequests: 0,
++    closedPullRequestRate: 0,
++    issues: 0,
++    openIssues: 0,
++    closedIssues: 0,
++    solvedIssues: 0,
++    validSolvedIssues: 0,
++    credibility: 1,
++    issueCredibility: 1,
++    isEligible: false,
++    successLevel: "emerging",
++    strengths: [],
++    risks: [],
++    ...overrides,
++  } as any;
++}
++
++function history(repoOutcomes: any[]) {
++  return {
++    login: "dev",
++    generatedAt: GENERATED_AT,
++    source: "github_cache",
++    totals: {},
++    repoOutcomes,
++    successPatterns: [],
++    failurePatterns: [],
++    summary: "fixture",
++  } as any;
++}
++
++function role(repoFullName: string, overrides: Record<string, unknown> = {}) {
++  return {
++    login: "dev",
++    repoFullName,
++    generatedAt: GENERATED_AT,
++    role: "outside_contributor",
++    maintainerLane: false,
++    normalContributorEvidenceAllowed: true,
++    source: "cache",
++    reasons: [],
++    guidance: "Use contributor-lane guidance.",
++    ...overrides,
++  } as any;
++}
++
++describe("contributor evidence graph", () => {
++  it("prefers official Gittensor evidence, then mirror labels, then cached paths", () => {
++    const repoFullName = "owner/direct";
++    const gittensorSnapshot = {
++      updatedAt: FRESH_AT,
++      evaluatedAt: FRESH_AT,
++      hotkey: "secret-key-material",
++      issueMirrorAvailable: true,
++      repositories: [
++        {
++          repoFullName,
++          pullRequests: 10,
++          mergedPullRequests: 8,
++          openPullRequests: 1,
++          closedPullRequests: 1,
++          openIssues: 1,
++          closedIssues: 2,
++          solvedIssues: 2,
++          validSolvedIssues: 1,
++        },
++      ],
++      pullRequests: [{ repoFullName, number: 7, title: "Official", state: "MERGED", mergedAt: FRESH_AT, label: "feature", score: 1, baseScore: 1, tokenScore: 1 }],
++      issues: [{ repoFullName, number: 9, state: "closed", solvedByPullRequest: 7, labels: ["bug"] }],
++      issueLabels: ["bug"],
++      totals: {},
++    } as any;
++    const graph = buildContributorEvidenceGraph({
++      login: "dev",
++      generatedAt: GENERATED_AT,
++      profile: profile({
++        source: "gittensor_api",
++        gittensor: {
++          updatedAt: FRESH_AT,
++          evaluatedAt: FRESH_AT,
++          hotkey: "secret-key-material",
++          repositories: gittensorSnapshot.repositories,
++          totals: {},
++        },
++        registeredRepoActivity: { pullRequests: 10, mergedPullRequests: 8, issues: 3, reposTouched: [repoFullName], dominantLabels: ["feature"] },
++      }),
++      outcomeHistory: history([outcome(repoFullName, { pullRequests: 10, mergedPullRequests: 8, openPullRequests: 1, closedPullRequests: 1, issues: 3, solvedIssues: 2, validSolvedIssues: 1 })]),
++      roleContexts: [role(repoFullName, { source: "gittensor_api" })],
++      repositories: [repo(repoFullName)],
++      pullRequests: [pr(repoFullName, 7, { state: "merged", mergedAt: FRESH_AT, labels: ["cached-only"] })],
++      issues: [],
++      repoStats: [{ login: "dev", repoFullName, pullRequests: 2, mergedPullRequests: 1, openPullRequests: 1, issues: 0, stalePullRequests: 0, unlinkedPullRequests: 0, dominantLabels: ["cached-only"], lastActivityAt: FRESH_AT }],
++      pullRequestFiles: [file(repoFullName, 7, "src/direct.ts")],
++      gittensorSnapshot,
++    });
++
++    expect(graph.sourcePreference).toEqual(["official_gittensor", "mirror", "github_cache"]);
++    expect(graph.repos[0]).toMatchObject({ repoFullName, source: "official_gittensor", freshness: "fresh", pullRequests: 10, validSolvedIssues: 1 });
++    expect(graph.labels).toEqual(
++      expect.arrayContaining([
++        expect.objectContaining({ repoFullName, label: "feature", source: "official_gittensor" }),
++        expect.objectContaining({ repoFullName, label: "bug", source: "mirror" }),
++      ]),
++    );
++    expect(graph.paths).toEqual([expect.objectContaining({ repoFullName, path: "src/direct.ts", source: "github_cache", mergedPullRequests: 1 })]);
++    expect(graph.outcomes[0]).toMatchObject({ repoFullName, source: "official_gittensor", pullRequests: 10, mergedPullRequests: 8 });
++    expect(JSON.stringify(graph)).not.toMatch(FORBIDDEN_PUBLIC_TERMS);
++  });
++
++  it("keeps maintainer-lane relationships out of outside-contributor totals", () => {
++    const outsideRepo = "owner/direct";
++    const maintainerRepo = "dev/owned";
++    const graph = buildContributorEvidenceGraph({
++      login: "dev",
++      generatedAt: GENERATED_AT,
++      profile: profile({ registeredRepoActivity: { pullRequests: 11, mergedPullRequests: 7, issues: 0, reposTouched: [outsideRepo, maintainerRepo], dominantLabels: [] } }),
++      outcomeHistory: history([
++        outcome(outsideRepo, { pullRequests: 3, mergedPullRequests: 2, issues: 2, validSolvedIssues: 1 }),
++        outcome(maintainerRepo, { role: "owner", maintainerLane: true, pullRequests: 8, mergedPullRequests: 5, issues: 7, validSolvedIssues: 4, successLevel: "maintainer_context" }),
++      ]),
++      roleContexts: [role(outsideRepo), role(maintainerRepo, { role: "owner", maintainerLane: true, normalContributorEvidenceAllowed: false, source: "repo_owner_match" })],
++      repositories: [repo(outsideRepo), repo(maintainerRepo)],
++      pullRequests: [
++        pr(outsideRepo, 1, { state: "merged", mergedAt: FRESH_AT }),
++        pr(maintainerRepo, 2, { authorAssociation: "OWNER", state: "merged", mergedAt: FRESH_AT }),
++      ],
++    });
++
++    expect(graph.totals).toMatchObject({
++      repositories: 2,
++      outsideContributorRepositories: 1,
++      maintainerLaneRepositories: 1,
++      outsideContributorPullRequests: 3,
++      maintainerLanePullRequests: 8,
++      outsideContributorMergedPullRequests: 2,
++      maintainerLaneMergedPullRequests: 5,
++      issues: 9,
++      outsideContributorIssues: 2,
++      maintainerLaneIssues: 7,
++      validSolvedIssues: 5,
++      outsideContributorValidSolvedIssues: 1,
++      maintainerLaneValidSolvedIssues: 4,
++    });
++    expect(graph.repos.find((entry) => entry.repoFullName === maintainerRepo)).toMatchObject({
++      maintainerLane: true,
++      normalContributorEvidenceAllowed: false,
++    });
++  });
++
++  it("falls back to stale GitHub cache evidence when official sources are missing", () => {
++    const repoFullName = "owner/stale";
++    const graph = buildContributorEvidenceGraph({
++      login: "dev",
++      generatedAt: GENERATED_AT,
++      profile: profile({ registeredRepoActivity: { pullRequests: 1, mergedPullRequests: 0, issues: 1, reposTouched: [repoFullName], dominantLabels: ["bug"] } }),
++      outcomeHistory: history([outcome(repoFullName, { pullRequests: 1, openPullRequests: 1, issues: 1 })]),
++      roleContexts: [role(repoFullName)],
++      repositories: [repo(repoFullName)],
++      pullRequests: [pr(repoFullName, 1, { labels: ["bug"], updatedAt: STALE_AT, createdAt: STALE_AT })],
++      issues: [{ repoFullName, number: 2, title: "Old report", state: "open", authorLogin: "dev", authorAssociation: "CONTRIBUTOR", labels: ["triage"], linkedPrs: [], createdAt: STALE_AT, updatedAt: STALE_AT }],
++      repoStats: [{ login: "dev", repoFullName, pullRequests: 1, mergedPullRequests: 0, openPullRequests: 1, issues: 1, stalePullRequests: 1, unlinkedPullRequests: 0, dominantLabels: ["bug"], lastActivityAt: STALE_AT }],
++    });
++
++    expect(graph.sources).toEqual(
++      expect.arrayContaining([
++        expect.objectContaining({ source: "official_gittensor", freshness: "missing", relationshipCount: 0 }),
++        expect.objectContaining({ source: "github_cache", freshness: "stale" }),
++      ]),
++    );
++    expect(graph.repos[0]).toMatchObject({ source: "github_cache", freshness: "stale" });
++    expect(graph.labels.map((label) => label.freshness)).toContain("stale");
++    expect(graph.totals.staleRelationships).toBeGreaterThan(0);
++    expect(graph.warnings.join("\n")).toContain("Official Gittensor contributor snapshot is unavailable");
++  });
++
++  it("infers fallback roles and direct official counts when role snapshots are sparse", () => {
++    const officialRepo = "dev/official";
++    const outsideRepo = "owner/outside";
++    const computedRepo = "dev/empty";
++    const graph = buildContributorEvidenceGraph({
++      login: "dev",
++      generatedAt: GENERATED_AT,
++      profile: profile({
++        source: "gittensor_api",
++        gittensor: {
++          updatedAt: FRESH_AT,
++          evaluatedAt: FRESH_AT,
++          repositories: [
++            {
++              repoFullName: officialRepo,
++              pullRequests: 4,
++              mergedPullRequests: 3,
++              openPullRequests: 1,
++              closedPullRequests: 0,
++              openIssues: 2,
++              closedIssues: 1,
++              solvedIssues: 1,
++              validSolvedIssues: 1,
++            },
++          ],
++          totals: {},
++        },
++        registeredRepoActivity: { pullRequests: 5, mergedPullRequests: 3, issues: 3, reposTouched: [officialRepo, outsideRepo], dominantLabels: [] },
++      }),
++      outcomeHistory: history([]),
++      roleContexts: [role(computedRepo, { role: "owner", maintainerLane: true, normalContributorEvidenceAllowed: false, source: "repo_owner_match" })],
++      repositories: [repo(officialRepo), repo(outsideRepo), repo(computedRepo)],
++      pullRequests: [pr(outsideRepo, 1, { state: "closed", authorAssociation: "NONE", labels: [] })],
++      issues: [{ repoFullName: outsideRepo, number: 2, title: "Member-authored report", state: "open", authorLogin: "dev", authorAssociation: "MEMBER", labels: [], linkedPrs: [], createdAt: FRESH_AT, updatedAt: FRESH_AT }],
++      gittensorSnapshot: {
++        updatedAt: FRESH_AT,
++        evaluatedAt: FRESH_AT,
++        issueMirrorAvailable: false,
++        repositories: [],
++        pullRequests: [],
++        issues: [],
++        issueLabels: [],
++        totals: {},
++      } as any,
++    });
++
++    expect(graph.repos.find((entry) => entry.repoFullName === officialRepo)).toMatchObject({
++      source: "official_gittensor",
++      role: "repo_maintainer",
++      maintainerLane: true,
++      pullRequests: 4,
++      issues: 3,
++      validSolvedIssues: 1,
++    });
++    expect(graph.repos.find((entry) => entry.repoFullName === outsideRepo)).toMatchObject({
++      source: "github_cache",
++      role: "repo_maintainer",
++      maintainerLane: true,
++      pullRequests: 1,
++      closedPullRequests: 1,
++    });
++    expect(graph.repos.find((entry) => entry.repoFullName === computedRepo)).toMatchObject({
++      source: "computed",
++      freshness: "fresh",
++      maintainerLane: true,
++      pullRequests: 0,
++    });
++    expect(graph.warnings).toContain("Gittensor issue mirror is unavailable; issue-label evidence falls back to GitHub cache.");
++  });
++
++  it("marks malformed cached timestamps as partial while keeping valid cache dates authoritative", () => {
++    const leftBadRepo = "owner/left-bad";
++    const rightBadRepo = "owner/right-bad";
++    const partialRepo = "owner/partial-date";
++    const graph = buildContributorEvidenceGraph({
++      login: "dev",
++      generatedAt: GENERATED_AT,
++      profile: profile({
++        registeredRepoActivity: { pullRequests: 3, mergedPullRequests: 0, issues: 0, reposTouched: [leftBadRepo, rightBadRepo, partialRepo], dominantLabels: [] },
++      }),
++      outcomeHistory: history([]),
++      roleContexts: [],
++      repositories: [repo(leftBadRepo), repo(rightBadRepo), repo(partialRepo)],
++      pullRequests: [
++        pr(leftBadRepo, 1, { updatedAt: FRESH_AT }),
++        pr(rightBadRepo, 2, { updatedAt: "not-a-date", createdAt: undefined }),
++      ],
++      repoStats: [
++        { login: "dev", repoFullName: leftBadRepo, pullRequests: 1, mergedPullRequests: 0, openPullRequests: 1, issues: 0, stalePullRequests: 0, unlinkedPullRequests: 0, dominantLabels: [], lastActivityAt: "not-a-date" },
++        { login: "dev", repoFullName: rightBadRepo, pullRequests: 1, mergedPullRequests: 0, openPullRequests: 1, issues: 0, stalePullRequests: 0, unlinkedPullRequests: 0, dominantLabels: [], lastActivityAt: FRESH_AT },
++        { login: "dev", repoFullName: partialRepo, pullRequests: 1, mergedPullRequests: 0, openPullRequests: 1, issues: 0, stalePullRequests: 0, unlinkedPullRequests: 0, dominantLabels: [], lastActivityAt: "not-a-date" },
++      ],
++    });
++
++    expect(graph.repos.find((entry) => entry.repoFullName === leftBadRepo)).toMatchObject({ freshness: "fresh", source: "github_cache" });
++    expect(graph.repos.find((entry) => entry.repoFullName === rightBadRepo)).toMatchObject({ freshness: "fresh", source: "github_cache" });
++    expect(graph.repos.find((entry) => entry.repoFullName === partialRepo)).toMatchObject({ freshness: "partial", source: "github_cache" });
++  });
++
++  it("uses mirror-only repo evidence and issue-only GitHub timestamps", () => {
++    const mirrorRepo = "owner/mirror-only";
++    const issueOnlyRepo = "owner/issue-only";
++    const graph = buildContributorEvidenceGraph({
++      login: "dev",
++      generatedAt: GENERATED_AT,
++      profile: profile({
++        registeredRepoActivity: { pullRequests: 0, mergedPullRequests: 0, issues: 2, reposTouched: [issueOnlyRepo, ""], dominantLabels: [] },
++      }),
++      outcomeHistory: history([]),
++      roleContexts: [],
++      repositories: [repo(mirrorRepo), repo(issueOnlyRepo)],
++      pullRequests: [pr(issueOnlyRepo, 3, { state: "merged", mergedAt: FRESH_AT, createdAt: undefined, updatedAt: undefined, labels: [""] })],
++      issues: [{ repoFullName: issueOnlyRepo, number: 2, title: "Fresh issue", state: "open", authorLogin: "dev", authorAssociation: "CONTRIBUTOR", labels: ["help wanted", ""], linkedPrs: [], createdAt: FRESH_AT, updatedAt: undefined }],
++      repoStats: [{ login: "someone-else", repoFullName: issueOnlyRepo, pullRequests: 9, mergedPullRequests: 9, openPullRequests: 0, issues: 0, stalePullRequests: 0, unlinkedPullRequests: 0, dominantLabels: ["ignored"] }],
++      pullRequestFiles: [file(issueOnlyRepo, 999, "src/ignored.ts"), file(issueOnlyRepo, 3, "   "), file(issueOnlyRepo, 3, "src/from-merge.ts")],
++      gittensorSnapshot: {
++        issueMirrorAvailable: true,
++        repositories: [],
++        pullRequests: [],
++        issues: [{ repoFullName: mirrorRepo, number: 1, state: "open", solvedByPullRequest: 7, labels: ["mirror-label"] }],
++        issueLabels: ["mirror-label"],
++        totals: {},
++      } as any,
++    });
++
++    expect(graph.repos.find((entry) => entry.repoFullName === mirrorRepo)).toMatchObject({ source: "mirror", freshness: "partial", issues: 1, solvedIssues: 1, validSolvedIssues: 0 });
++    expect(graph.labels.find((entry) => entry.repoFullName === mirrorRepo)).toMatchObject({ source: "mirror", freshness: "partial" });
++    expect(graph.sources).toEqual(expect.arrayContaining([expect.objectContaining({ source: "mirror", freshness: "partial" })]));
++    expect(graph.repos.find((entry) => entry.repoFullName === issueOnlyRepo)).toMatchObject({ source: "github_cache", freshness: "fresh", issues: 1 });
++    expect(graph.paths).toEqual([expect.objectContaining({ repoFullName: issueOnlyRepo, path: "src/from-merge.ts", mergedPullRequests: 1 })]);
++  });
++
++  it("orders graph relationships deterministically and applies worker-safe bounds", () => {
++    const repoNames = Array.from({ length: CONTRIBUTOR_EVIDENCE_GRAPH_MAX_REPOS + 5 }, (_, index) => `owner/repo-${String(index).padStart(2, "0")}`);
++    const omittedRepo = repoNames[CONTRIBUTOR_EVIDENCE_GRAPH_MAX_REPOS + 1]!;
++    const pullRequests = [
++      ...repoNames.map((repoFullName, index) =>
++        pr(repoFullName, index + 1, {
++          labels: [`repo-label-${String(index).padStart(2, "0")}`],
++          updatedAt: FRESH_AT,
++        }),
++      ),
++      ...Array.from({ length: CONTRIBUTOR_EVIDENCE_GRAPH_MAX_LABELS + 5 }, (_, index) =>
++        pr(repoNames[0]!, index + 100, {
++          labels: [`label-${String(index).padStart(3, "0")}`],
++          updatedAt: FRESH_AT,
++        }),
++      ),
++      pr(omittedRepo, 10_000, { labels: ["aaa-omitted"], updatedAt: FRESH_AT }),
++      pr(omittedRepo, 10_001, { labels: ["aaa-omitted"], updatedAt: FRESH_AT }),
++    ];
++    const files = [
++      ...Array.from({ length: CONTRIBUTOR_EVIDENCE_GRAPH_MAX_PATHS + 5 }, (_, index) => file(repoNames[0]!, 1, `src/path-${String(index).padStart(3, "0")}.ts`)),
++      file(omittedRepo, 10_000, "src/aaa-omitted.ts"),
++      file(omittedRepo, 10_001, "src/aaa-omitted.ts"),
++    ];
++    const args = {
++      login: "dev",
++      generatedAt: GENERATED_AT,
++      profile: profile({
++        registeredRepoActivity: { pullRequests: repoNames.length, mergedPullRequests: 0, issues: 0, reposTouched: [...repoNames].reverse(), dominantLabels: [] },
++      }),
++      outcomeHistory: history(repoNames.map((repoFullName) => outcome(repoFullName))),
++      roleContexts: [...repoNames].reverse().map((repoFullName) => role(repoFullName)),
++      repositories: [...repoNames].reverse().map((repoFullName) => repo(repoFullName)),
++      pullRequests: [...pullRequests].reverse(),
++      pullRequestFiles: [...files].reverse(),
++    };
++
++    const graphA = buildContributorEvidenceGraph(args);
++    const graphB = buildContributorEvidenceGraph({ ...args, repositories: repoNames.map((repoFullName) => repo(repoFullName)), pullRequests, pullRequestFiles: files });
++
++    expect(graphA.repos).toHaveLength(CONTRIBUTOR_EVIDENCE_GRAPH_MAX_REPOS);
++    expect(graphA.labels).toHaveLength(CONTRIBUTOR_EVIDENCE_GRAPH_MAX_LABELS);
++    expect(graphA.paths).toHaveLength(CONTRIBUTOR_EVIDENCE_GRAPH_MAX_PATHS);
++    expect(graphA.repos.map((entry) => entry.repoFullName)).toEqual(graphB.repos.map((entry) => entry.repoFullName));
++    expect(graphA.labels.map((entry) => `${entry.repoFullName}:${entry.label}`)).toEqual(graphB.labels.map((entry) => `${entry.repoFullName}:${entry.label}`));
++    expect(graphA.paths.map((entry) => `${entry.repoFullName}:${entry.path}`)).toEqual(graphB.paths.map((entry) => `${entry.repoFullName}:${entry.path}`));
++    const includedRepos = new Set(graphA.repos.map((entry) => entry.repoFullName));
++    expect(graphA.labels.every((entry) => includedRepos.has(entry.repoFullName))).toBe(true);
++    expect(graphA.paths.every((entry) => includedRepos.has(entry.repoFullName))).toBe(true);
++    expect(graphA.labels.map((entry) => entry.label)).not.toContain("aaa-omitted");
++    expect(graphA.paths.map((entry) => entry.path)).not.toContain("src/aaa-omitted.ts");
++    expect(graphA.warnings).toEqual(
++      expect.arrayContaining([expect.stringContaining("repo relationships capped"), expect.stringContaining("label relationships capped"), expect.stringContaining("path relationships capped")]),
++    );
++  });
++
++  it("selects only registered touched repos for bounded path-cache loading", () => {
++    expect(
++      evidenceGraphTouchedRepoFullNames({
++        login: "dev",
++        profile: profile({ registeredRepoActivity: { pullRequests: 2, mergedPullRequests: 1, issues: 0, reposTouched: ["owner/registered", "owner/unregistered", ""], dominantLabels: [] } }),
++        pullRequests: [pr("owner/registered", 1), pr("other/repo", 2, { authorLogin: "someone-else" })],
++        repoStats: [{ login: "dev", repoFullName: "owner/stats", pullRequests: 1, mergedPullRequests: 1, openPullRequests: 0, issues: 0, stalePullRequests: 0, unlinkedPullRequests: 0, dominantLabels: [] }],
++        repositories: [repo("owner/registered"), repo("owner/stats"), { ...repo("owner/unregistered"), isRegistered: false }],
++      }),
++    ).toEqual(["owner/registered", "owner/stats"]);
++    expect(evidenceGraphTouchedRepoFullNames({ login: "dev" })).toEqual([]);
++  });
++});
+diff --git a/test/unit/decision-pack.test.ts b/test/unit/decision-pack.test.ts
+index c4be747..f9d3825 100644
+--- a/test/unit/decision-pack.test.ts
++++ b/test/unit/decision-pack.test.ts
+@@ -619,6 +619,7 @@ describe("decision-pack service", () => {
+     expect(pack.roleContexts.map((role) => role.repoFullName)).not.toContain("owner/unconfigured");
+     expect(pack.opportunities).toEqual([expect.objectContaining({ repoFullName: "owner/pursue", issueNumber: 7, fit: "good" })]);
+     expect(pack.nextActions.length).toBeGreaterThan(0);
++    expect(pack.evidenceGraph).toMatchObject({ login: "jsonbored", totals: expect.objectContaining({ repositories: expect.any(Number) }) });
+   });
+ 
+   it("merges open PR monitor guidance into pack summary and next actions", () => {
+@@ -1087,6 +1088,7 @@ describe("decision-pack service", () => {
+     expect(packA.repoDecisions.map((d) => d.priorityScore)).toEqual(packB.repoDecisions.map((d) => d.priorityScore));
+     expect(packA.repoDecisions.map((d) => d.nextActions)).toEqual(packB.repoDecisions.map((d) => d.nextActions));
+     expect(packA.topActions.map((a) => `${a.actionKind}:${a.repoFullName}`)).toEqual(packB.topActions.map((a) => `${a.actionKind}:${a.repoFullName}`));
++    expect(packA.evidenceGraph?.repos.map((repo) => repo.repoFullName)).toEqual(packB.evidenceGraph?.repos.map((repo) => repo.repoFullName));
+   });
+ 
+   it("threads a maintainer focus manifest into RepoDecision without leaking maintainer-private notes", async () => {
+diff --git a/test/unit/queue.test.ts b/test/unit/queue.test.ts
+index 4df3c92..ff02414 100644
+--- a/test/unit/queue.test.ts
++++ b/test/unit/queue.test.ts
+@@ -145,7 +145,9 @@ describe("queue processors", () => {
+       evidenceCompleteness: expect.objectContaining({ status: expect.any(String) }),
+     });
+     expect(await listSignalSnapshots(env, "contributor-decision-pack", "oktofeesh1")).not.toHaveLength(0);
+-    expect(await getContributorEvidence(env, "oktofeesh1")).toMatchObject({ login: "oktofeesh1" });
++    const contributorEvidence = await getContributorEvidence(env, "oktofeesh1");
++    expect(contributorEvidence).toMatchObject({ login: "oktofeesh1", payload: { evidenceGraph: expect.objectContaining({ login: "oktofeesh1" }) } });
++    expect(await listSignalSnapshots(env, "contributor-evidence-graph", "oktofeesh1")).not.toHaveLength(0);
+     expect(await getContributorScoringProfile(env, "oktofeesh1")).toMatchObject({ login: "oktofeesh1" });
+     const persistedBurden = await getBurdenForecast(env, "JSONbored/gittensory");
+     expect(persistedBurden).toMatchObject({ repoFullName: "JSONbored/gittensory" });
