@@ -11,7 +11,8 @@ complete, well-structured implementations — not minimal one-liners — because
 a thorough fix that passes tests scores significantly higher than a bare stub.
 
 Improvements over a naive single-shot approach:
-- Context files ranked by keyword relevance to the issue — most relevant first,
+- Context files ranked by keyword relevance: issue tokens + test-file symbols
+  (names the tests import/call are 2× weighted — they pinpoint the module under test)
   over-long context truncated rather than blindly dumped into the prompt
 - Large files windowed to relevant sections only (±40 lines around keyword hits)
   so more files fit in the context budget without blowing the token limit
@@ -202,10 +203,28 @@ def _is_test_file(f: FileContext) -> bool:
     )
 
 
-def _rank_files(files: list[FileContext], issue_title: str, issue_body: str) -> list[FileContext]:
+def _test_keywords(test_files: list[FileContext]) -> set[str]:
+    """Extract identifier tokens from test files to guide implementation file ranking.
+
+    The names the tests import, instantiate, or call are the exact symbols the
+    implementation files must contain — treating them as high-signal keywords
+    lets the ranker surface the right files faster than issue text alone.
+    """
+    combined = " ".join(f.content for f in test_files)
+    raw = re.findall(r"\b([a-z_][a-z0-9_]{3,}|[A-Z][A-Za-z0-9]{3,})\b", combined)
+    return {t.lower() for t in raw}
+
+
+def _rank_files(
+    files: list[FileContext],
+    issue_title: str,
+    issue_body: str,
+    test_files: list[FileContext] | None = None,
+) -> list[FileContext]:
     """Return files sorted by keyword relevance to the issue, most relevant first.
 
     Test files are excluded here — they're shown in a separate section.
+    Identifiers extracted from test_files are included as weighted keywords.
     """
     issue_text = (issue_title + " " + issue_body).lower()
 
@@ -216,14 +235,20 @@ def _rank_files(files: list[FileContext], issue_title: str, issue_body: str) -> 
     raw_tokens = re.findall(r"\b([a-z_][a-z0-9_]{3,}|[A-Z][A-Za-z0-9]{3,})\b", issue_title + " " + issue_body)
     keywords = {t.lower() for t in raw_tokens}
 
+    # Additional keywords from test files — tested symbols are in the impl files
+    test_kws = _test_keywords(test_files) if test_files else set()
+
     def score(f: FileContext) -> float:
         path_lower = f.path.lower()
         # High bonus if the file is explicitly mentioned
         path_score = 20.0 * sum(1 for mp in mentioned_paths if mp in path_lower)
-        # Keyword density in file content (identifiers > 4 chars to reduce noise)
         content_lower = f.content.lower()
+        # Keyword density in file content (identifiers > 4 chars to reduce noise)
         keyword_hits = sum(1 for kw in keywords if len(kw) > 4 and kw in content_lower)
-        return path_score + keyword_hits
+        # Test-derived symbols: paths/names from test imports/calls — weighted higher
+        # because they pinpoint exactly which module is under test
+        test_hits = sum(1 for kw in test_kws if len(kw) > 4 and kw in content_lower)
+        return path_score + keyword_hits + 2.0 * test_hits
 
     return sorted(files, key=score, reverse=True)
 
@@ -424,7 +449,7 @@ class ExampleAgent(BaseAgent):
         # --- Split and rank context files ---
         test_files = [f for f in problem.context_files if _is_test_file(f)]
         impl_files = [f for f in problem.context_files if not _is_test_file(f)]
-        ranked_impl = _rank_files(impl_files, problem.issue_title, problem.issue_body)
+        ranked_impl = _rank_files(impl_files, problem.issue_title, problem.issue_body, test_files)
         selected_impl = _truncate_context(ranked_impl)
         dropped = len(impl_files) - len(selected_impl)
         if dropped > 0:
@@ -432,9 +457,9 @@ class ExampleAgent(BaseAgent):
         if test_files:
             log.append(f"[context] {len(test_files)} test file(s) shown separately")
 
-        # Build keyword set for windowing large files
+        # Build keyword set for windowing large files — union of issue tokens + test symbols
         raw_tokens = re.findall(r"\b([a-z_][a-z0-9_]{3,}|[A-Z][A-Za-z0-9]{3,})\b", problem.issue_title + " " + problem.issue_body)
-        keywords = {t.lower() for t in raw_tokens}
+        keywords = {t.lower() for t in raw_tokens} | _test_keywords(test_files)
 
         # Build test section — always shown in full (usually small)
         test_section = (
