@@ -4,6 +4,21 @@ Milestone trail for the base-miner benchmark. Discord is the primary channel; th
 
 ---
 
+## 2026-06-02 — Pool 352→353, test-symbol ranking (commits 755bd6f, 2ef869b)
+
+### Pool expansion (+1 problem)
+- Added `0335` (entrius/gittensor#335): "Looser credibility requirements for tier unlocks" — CLI test
+- Oracle mean: 22.80 → 22.76 (recomputed across 353 problems)
+- Updated across: leaderboard.json, baselines.json, pool_config.json, evaluate.py, gitminer.py, record_result.py, generate_dashboard_data.py, docs/rewards.md, docs/api.md, README badge
+
+### Agent: test-symbol ranking improvement (commit 2ef869b)
+- New `_test_keywords()` extracts identifier tokens from test files — names the tests import/call are the exact symbols the implementation files must contain
+- `_rank_files()` now accepts `test_files` param; test-derived symbols weighted 2× in the relevance score (vs 1× for issue tokens)
+- Windowing keyword set also includes test symbols — large implementation files now window around tested identifiers, not just issue text
+- Net effect: on problems where test imports are specific (e.g. `from gittensor.validator.repo_scan import RepoScanner`), the exact module gets ranked #1 instead of being buried
+
+---
+
 ## 2026-06-02 — Pool 349→352, test-repair loop, DAS calibration (commits 2c0e46c, 737cc57)
 
 ### Pool expansion (+3 problems)
