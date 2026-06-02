@@ -4,6 +4,26 @@ Milestone trail for the base-miner benchmark. Discord is the primary channel; th
 
 ---
 
+## 2026-06-02 — Removal-line whitespace fix, verify hunk-map check, fence regex (commit a07d86f)
+
+### `_fix_context_lines` extended to removal lines
+
+`git apply` requires removal lines (`-` prefixed) to match the source file exactly — the same constraint that applies to context lines (` ` prefixed). Previously `_fix_context_lines` only repaired whitespace differences on context lines; if the model wrote `-    return None` where the source had `-\treturn None` (tab indent), the hunk would be rejected.
+
+Fix: the same stripped-content safety check now applies to `-` lines. When `diff_content.strip() == source_line.strip()` but the full lines differ, the `-` line is replaced with `- {source_line}`. The same safety guard applies: only replaces on exact stripped-content match, never on partial matches that could misplace the removal.
+
+### Verify criterion 7: hunk-map completeness
+
+Added criterion 7 to `VERIFY_PROMPT`: "Look back at your step 6 hunk map from earlier in this conversation. Does this diff include a change for every file path listed there? If any planned file is missing from the diff, add the necessary changes now."
+
+Previously the verify step had no explicit prompt to cross-check the hunk map against the diff. The model could LGTM a diff that omitted a planned file if its criteria checks 1–6 all passed. Criterion 7 closes that gap by explicitly referencing the plan-step output.
+
+### `_extract_diff` fence regex generalised
+
+Changed `\`\`\`(?:diff|patch)?` to `\`\`\`\w*` — now accepts any fence language tag. Handles `\`\`\`udiff`, `\`\`\`unidiff`, `\`\`\`text`, etc. Diffs wrapped in non-standard fence tags are extracted rather than silently falling through to the bare `diff --git` search.
+
+---
+
 ## 2026-06-02 — API resilience, cascade-timeout hardening, JS support (commits d039717–2716186)
 
 ### API error resilience in `_call` (commit d039717)
