@@ -104,53 +104,90 @@ def _prepare_staging(staging: Path, meta: dict, patch_path: Path) -> None:
     """))
     (staging / "setup_and_test.sh").chmod(0o755)
 
-    # Python scorer: reads results from staging, prints JSON, exits 0 always
+    # Python scorer: reads results from staging, prints JSON, exits 0 always.
+    # Self-contained stdlib-only script — runs inside bare python:3.12-slim container.
+    # Mirrors score.py's Gittensor formula; keep in sync when score.py changes.
+    #
+    # Escaping note: this string is written via write_text(), so each \\ in this
+    # source becomes a single \ in the file. Regex patterns use single-char classes
+    # and avoid quote chars to sidestep double-escaping.
     (staging / "score_result.py").write_text(textwrap.dedent("""\
-        import json, math, pathlib, sys
+        import json, math, pathlib, re, sys
+
+        MERGED_PR_BASE_SCORE = 25
+        SRC_TOK_SATURATION_SCALE = 58.0
+        MAX_CONTRIBUTION_BONUS = 5
+        CONTRIBUTION_SCORE_FOR_FULL_BONUS = 1500
 
         staging = pathlib.Path("/staging")
 
         patch_status = (staging / "patch_status").read_text().strip() if (staging / "patch_status").exists() else "failed"
+        meta_raw = (staging / "meta.json").read_text() if (staging / "meta.json").exists() else "{}"
+        meta = json.loads(meta_raw)
+        problem_id = meta.get("id", "unknown")
+
         if patch_status != "applied":
-            print(json.dumps({
-                "patch_applied": False,
-                "tests_passed": False,
-                "correctness_score": 0.0,
-                "quality_score": 0.0,
-                "final_score": 0.0,
-            }))
+            print(json.dumps({"problem_id": problem_id, "patch_applied": False,
+                               "tests_passed": False, "base_score": 0.0, "final_score": 0.0}))
             sys.exit(0)
 
         test_rc = int((staging / "test_rc").read_text().strip()) if (staging / "test_rc").exists() else 1
         tests_passed = test_rc == 0
         test_out = (staging / "test_out.txt").read_text(errors="replace") if (staging / "test_out.txt").exists() else ""
 
+        if not tests_passed:
+            print(json.dumps({"problem_id": problem_id, "patch_applied": True, "tests_passed": False,
+                               "test_output": test_out[-2000:], "base_score": 0.0, "final_score": 0.0}))
+            sys.exit(0)
+
+        saturation_scale = float(meta.get("src_tok_saturation_scale", SRC_TOK_SATURATION_SCALE))
+
+        # Token scoring — approximates score.py's Gittensor formula
+        # Structural keywords get a 1.5x bonus; comments and blanks are skipped.
+        STRUCT_WORDS = ("def ", "class ", "async def ", "fn ", "impl ", "struct ",
+                        "func ", "interface ", "enum ", "trait ", "type ")
+        SKIP_STARTS = ("#", "//", "/*", "*", "<!--", "pass", "...")
+        DELIM = re.compile(r"[\\s()\\[\\]{},;:=<>!&|.@#$%^~]+")
+
         patch_text = (staging / "candidate.diff").read_text()
-        added_lines = [l[1:] for l in patch_text.splitlines() if l.startswith("+") and not l.startswith("+++")]
-        structural = {"def ": 2.0, "class ": 2.5, "async def ": 1.5, "fn ": 2.0, "impl ": 1.75, "func ": 2.0}
-        tok = 0.0
-        for line in added_lines:
-            s = line.strip()
-            if not s or s.startswith("#") or s.startswith("//"):
+        src_score = 0.0
+        total_score = 0.0
+        in_test = False
+
+        for line in patch_text.splitlines():
+            if line.startswith("diff --git"):
+                m = re.search("b/(.+)$", line)
+                if m:
+                    p = m.group(1)
+                    in_test = ("/test" in p or p.startswith("test") or
+                               "_test." in p or p.split("/")[-1].startswith("test_") or "spec." in p)
                 continue
-            w = 0.07
-            for kw, kw_w in structural.items():
-                if kw in s:
-                    w = max(w, kw_w)
-            tok += w
+            if not line.startswith("+") or line.startswith("+++"):
+                continue
+            content = line[1:].strip()
+            if not content or any(content.startswith(s) for s in SKIP_STARTS):
+                continue
+            tokens = [t for t in DELIM.split(content) if len(t) > 1 and not t.isdigit()]
+            if not tokens:
+                continue
+            is_structural = any(kw in content for kw in STRUCT_WORDS)
+            line_score = len(tokens) * (2.5 if is_structural else 1.0)
+            total_score += line_score
+            if not in_test:
+                src_score += line_score
 
-        quality = round(1.0 - math.exp(-tok / 58.0), 4)
-        cs = 1.0 if tests_passed else 0.0
+        initial = MERGED_PR_BASE_SCORE * (1.0 - math.exp(-src_score / saturation_scale))
+        bonus_pct = min(1.0, total_score / CONTRIBUTION_SCORE_FOR_FULL_BONUS)
+        base_score = round(initial + bonus_pct * MAX_CONTRIBUTION_BONUS, 2)
 
-        meta = json.loads((staging / "meta.json").read_text())
         print(json.dumps({
-            "problem_id": meta["id"],
+            "problem_id": problem_id,
             "patch_applied": True,
-            "tests_passed": tests_passed,
-            "test_output": test_out[-2000:] if not tests_passed else "",
-            "correctness_score": cs,
-            "quality_score": quality if tests_passed else 0.0,
-            "final_score": round(cs * (0.5 + 0.5 * quality), 4),
+            "tests_passed": True,
+            "source_token_score": round(src_score, 2),
+            "total_token_score": round(total_score, 2),
+            "base_score": base_score,
+            "final_score": base_score,
         }))
     """))
 
