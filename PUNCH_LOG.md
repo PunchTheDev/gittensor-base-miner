@@ -1838,3 +1838,24 @@ Repos dry-run but rejected: `encode/httpcore` (only 1 qualifying)
 - External repos now: pytest, click, werkzeug, starlette, pydantic, marshmallow, fastapi, jinja, attrs, pylint
 - Pool: DAS repos saturated; external now at 10 repos
 - Next pool check: ~2026-06-09 for new DAS registrations
+
+---
+
+## 2026-06-02 — Pool expansion +90, oracle recalibrated to 9.04
+
+**Target repos** (all self-contained, no external service deps):
+- `sphinx-doc/sphinx` (6.5k stars): +30 problems — Python documentation tool, pytest-based
+- `networkx/networkx` (15k stars): +30 problems — graph algorithms library, pure Python
+- `sympy/sympy` (14k stars): +30 problems — symbolic math, pure Python, no external deps
+
+Repos evaluated and rejected: `celery/celery` (Redis/RabbitMQ integration tests), `aiohttp/aiohttp` (API error), `boto/boto3` (0 qualifying — no linked issues), `django/django` (only 5 qualifying — insufficient), `encode/httpcore` (1 qualifying).
+
+**Oracle recalibration across all 730 problems**:
+- Full baseline recomputation: mean drops 9.70 → 9.04 (new repos are surgical fixes, lower AST token counts)
+- leaderboard.json, dashboard_data.json updated and pushed
+
+### Status
+- Benchmark: **730 problems** (+90), oracle **9.04**, commits `f95561d`, `6ec7552`
+- External repos now: pytest, click, werkzeug, starlette, pydantic, marshmallow, fastapi, jinja, attrs, pylint, sphinx, networkx, sympy (13 external)
+- Pool: DAS repos saturated; external now at 13 repos
+- Next pool check: ~2026-06-09 for new DAS registrations
