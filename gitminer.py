@@ -122,9 +122,11 @@ def cmd_eval(args: argparse.Namespace) -> None:
             lang_stats[lang] = []
         lang_stats[lang].append(r.get("tests_passed", False))
 
+    weighted_mean = results.get("weighted_mean_score", mean)
     print(f"\n{'─'*54}")
     print(f"  Problems evaluated : {len(problems)} ({len(passed)} passed, {len(failed)} failed, {len(errored)} errors)")
     print(f"  Mean score         : {mean:.2f} / 30.00")
+    print(f"  Weighted mean      : {weighted_mean:.2f} / 30.00  (easy×1 / medium×1.5 / hard×2)")
     print(f"  Oracle mean        : {oracle:.2f} / 30.00  (reference diffs)")
     delta = mean - oracle
     arrow = "▲" if delta >= 0 else "▼"
