@@ -1920,3 +1920,26 @@ Repos evaluated and rejected: `celery/celery` (Redis/RabbitMQ integration tests)
 - Pool: 18 DAS repos total; 13 have qualifying problems (linked issue + test files)
 - Remaining 5 DAS repos have 0 qualifying PRs (no linked issues or no test files)
 - Next DAS check: ~2026-06-09 for new repo registrations
+
+---
+
+## 2026-06-02 — Category-balanced shard selection
+
+**Root cause**: `select_shard()` was doing a random shuffle and taking 30 — ignoring the per-category budget. Every shard could be dominated by Python (198/430 problems = 46%) at the expense of smaller categories.
+
+**Fix**:
+- Added `REPO_CATEGORY` map and `DEFAULT_SHARD_BUDGET` to `evaluate.py`
+- New `_problem_category()` helper reads repo from `meta.json` and maps to category
+- `select_shard()` now groups by category, shuffles each bucket independently, samples per budget, redistributes shortfalls
+- Verified: `python:12  typescript:8  rust:5  jvm:3  ruby:2` — matches budget exactly
+
+**`pool_config.json`**: added `shard_budget` key so the budget is explicit and overridable
+
+**Result records**: both oracle and agent modes now include `category` per problem (visible in submission breakdowns)
+
+**`--list-shard` output**: now shows `[cat:n  ...]` summary and per-problem category column
+
+### Status
+- Benchmark: **430 problems**, oracle **11.83**, commit `111abff`
+- Shard: category-balanced (python:12/ts:8/rust:5/jvm:3/ruby:2) — well-roundedness guaranteed
+- Next DAS check: ~2026-06-09 for new repo registrations
