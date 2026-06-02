@@ -1728,3 +1728,36 @@ The `keywords` argument is now passed from the verify loop call site, where it's
 - Benchmark: 430 problems, oracle 13.34, 20 repos (commit `bc1240d`)
 - Agent: keyword-prioritized assertion extraction for 31 gittensory + 21 awesome-claude problems
 - Pool: fully saturated; check ~2026-06-09 for new DAS registrations
+
+---
+
+## 2026-06-02 — Scoring guidance sharpened in all three runtime prompts (commit 63e5cf6)
+
+### Summary
+Aligned SYSTEM_PROMPT, ACT_PROMPT, and VERIFY_PROMPT with the actual AST token scoring formula so the model produces higher-scoring implementations from the first attempt.
+
+### Root cause
+The SYSTEM_PROMPT said "source-token quality — the number of meaningful code tokens" but was vague about what that means in practice. The model had no clear guidance that docstrings/comments don't count and that type annotations, guard clauses, and named helpers do. This left scoring potential on the table on every problem.
+
+### Changes (commit `63e5cf6`)
+
+**SYSTEM_PROMPT** — replaced the vague "source-token quality" note with a specific breakdown:
+- Named what scores higher: function bodies with error handling, input validation/guard clauses, type annotations (Python/TypeScript/Kotlin), named helpers, constants, enum exhaustiveness
+- Added the key negative: "Docstrings, comments, and blank lines do NOT count toward the score — only executable code nodes matter"
+- Added the scoring ratio analogy: "A 40-line fix that handles every edge case scores much higher than a 5-line stub"
+
+**ACT_PROMPT** — added a **Quality matters** bullet:
+- "Guard against invalid/nil/empty inputs, add type annotations where the language supports them, split complex logic into named helpers"
+- Repeats the "only executable code nodes" clarification at the point where the model writes the diff
+
+**VERIFY_PROMPT criterion 5** — replaced the passive "Is the implementation complete?" check with an active directive:
+- Was: "Is the implementation complete — does it handle edge cases, or is it a bare stub that only handles the happy path?"
+- Now: specific checklist (edge cases covered? type annotations present? could logic be a named helper?) + explicit instruction to expand minimal stubs and return the improved diff
+
+**OBSERVE_PROMPT** — appended quality-scoring awareness to the closing instruction:
+- "the diff is scored by AST token count in non-test source files. More complete code (edge case handling, type annotations, named helpers) scores higher — but only after tests pass. Plan for both correctness and completeness."
+
+### Status
+- Benchmark: 430 problems, oracle 13.34, 20 repos (commit `63e5cf6`)
+- Agent: quality scoring guidance sharpened in system, act, observe, verify prompts
+- Pool: checked entrius/gittensor — no new qualifying PRs; next DAS check ~2026-06-09
