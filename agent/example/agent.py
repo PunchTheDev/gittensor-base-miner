@@ -296,6 +296,14 @@ Improvements over a naive single-shot approach:
   without `N | ` line-number prefixes — inconsistent with every other windowing path. Fixed: the
   same `{i:{width}d} | line` format is now applied to the no-hit header section too, so the
   model sees consistent line numbers regardless of whether keyword hits were found.
+- `_extract_assertions` Python unittest.TestCase patterns: added `self.assertEqual(`,
+  `self.assertNotEqual(`, `self.assertTrue(`, `self.assertFalse(`, `self.assertIsNone(`,
+  `self.assertIsNotNone(`, `self.assertIn(`, `self.assertNotIn(`, `self.assertRaises(`,
+  `self.assertAlmostEqual(`, `self.assertGreater(`, `self.assertGreaterEqual(`,
+  `self.assertLess(`, `self.assertLessEqual(`, plus `pytest.raises(`.
+  Root cause: `self.assert*` does not start with `assert ` (has `self.` prefix), so every
+  Python test that uses `unittest.TestCase` subclass methods was silently skipped, leaving
+  the verify step blind to the actual test requirements.
 """
 
 from __future__ import annotations
@@ -1454,7 +1462,8 @@ def _extract_assertions(test_files: list[FileContext], limit: int = 50) -> str:
     rather than relying on the conversation context from the observe step.
 
     Caps at `limit` lines to keep the verify prompt compact.  Recognises
-    assert styles for Python, Rust, Go, TypeScript, Kotlin, and Java.
+    assert styles for Python (pytest + unittest.TestCase self.assert*), Rust,
+    Go (testify), TypeScript/Jest, Kotlin, Java, and Ruby Minitest.
     Limit raised from 30 to 50: large test suites put the most specific
     edge-case assertions near the end, which the old cap would drop.
     """
@@ -1503,6 +1512,25 @@ def _extract_assertions(test_files: list[FileContext], limit: int = 50) -> str:
         "require.NotNil(",
         "require.Contains(",
         "require.Len(",
+        # Python unittest.TestCase self.assert* — not matched by bare "assert " (has "self." prefix)
+        "self.assertEqual(",
+        "self.assertNotEqual(",
+        "self.assertTrue(",
+        "self.assertFalse(",
+        "self.assertIsNone(",
+        "self.assertIsNotNone(",
+        "self.assertIn(",
+        "self.assertNotIn(",
+        "self.assertRaises(",
+        "with self.assertRaises(",
+        "self.assertAlmostEqual(",
+        "self.assertGreater(",
+        "self.assertGreaterEqual(",
+        "self.assertLess(",
+        "self.assertLessEqual(",
+        # pytest exception assertion — both direct call and `with` context manager forms
+        "pytest.raises(",
+        "with pytest.raises(",
         # Ruby Minitest assert_* (assert_ prefix — NOT matched by bare "assert ")
         "assert_equal ",    "assert_equal(",
         "assert_nil ",      "assert_nil(",
