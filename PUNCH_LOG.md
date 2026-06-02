@@ -724,3 +724,36 @@ Fixes added: `name.endswith("_test.go")`, `p.startswith("tests/")`, `name == "co
 - Benchmark: 400 problems, oracle 23.08 (unchanged)
 - Agent improvements: new impl file detection, is_test_file fixes, no-newline fix
 - Pending: Gittensor registration, nginx hookup
+
+---
+
+## 2026-06-02 — Agent: post-processing pipeline hardening (commits 27c63e8, d255803)
+
+### Three new post-processing steps in solve() and repair()
+
+**`_strip_line_number_prefixes`** (commit 27c63e8)
+
+LLMs commonly include `N | ` display prefixes from windowed source files in diff context lines, despite the ACT_PROMPT explicitly telling them not to. Example:
+```
+ 42 | def old_function():
+```
+This fails `git apply` because ` 42 | def old_function():` doesn't exist in any real file. The new function strips these prefixes from context/add/remove lines (not from `diff --git`, `---`, `+++`, `@@`, `\\` lines). Applied before hunk count recomputation.
+
+**`_trim_trailing_prose`** (commit 27c63e8)
+
+After `_extract_diff` finds `diff --git` and grabs everything to end-of-string, models sometimes append prose like "This patch fixes the issue." after the last hunk. `git apply` fails on trailing non-diff text. Walk backwards to the last valid diff line and truncate.
+
+**Sibling import budget raised to 12 KB** (commit 27c63e8)
+
+Go same-package files average 2-4 KB each; the old 6 KB budget cut off after 1-2 siblings, leaving the agent without factory/interface definitions in large Go packages.
+
+### Assertion injection in verify prompt (commit d255803)
+
+`_extract_assertions()` extracts assert/expect/assertEquals lines (up to 30) from all test files and injects them directly into VERIFY_PROMPT. The model now cross-checks each assertion against the diff explicitly, rather than relying on recall from earlier conversation turns.
+
+Recognises assert styles for: Python, Rust (assert_eq!, assert!), Go (assert.Equal, t.Errorf), TypeScript (expect(), toBe, toHaveBeenCalled), Kotlin/Java (assertEquals, assertThat, verify).
+
+### Status
+- Benchmark: 400 problems, oracle 23.08 (unchanged)
+- Pool: all repos saturated — next check 2026-06-09
+- Pending: Gittensor registration, nginx hookup
