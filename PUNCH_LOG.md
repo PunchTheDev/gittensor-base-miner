@@ -4,6 +4,25 @@ Milestone trail for the base-miner benchmark. Discord is the primary channel; th
 
 ---
 
+## 2026-06-02 — Agent: verify/repair hardening (commits 013ab2c–991f281)
+
+### Four targeted fixes to the verify + repair loop
+
+**Partial-repair guard** (commit 013ab2c): `_count_diff_files()` counts `diff --git` headers. Replacement only accepted if repaired file count >= original. Prevents multi-file diff being silently reduced to a one-file partial fix from verify.
+
+**Clean act history** (commit 013ab2c): act step now stores post-processed `diff` in history (not `raw_diff`). Model's "memory" of its own output matches the verify prompt. Same fix in format-repair branches.
+
+**Empty diff diagnostic** (commit de62dd0): `_diagnose_diff` now catches diffs where all hunk content is context-only (no `+`/`-` lines). Triggers format-repair instead of letting the harness run with a no-op patch.
+
+**Format-repair with explicit diff** (commit 991f281): `REPAIR_FORMAT_PROMPT` now includes the current diff in a code block. Model no longer needs to recall the diff from history context — it sees exactly what it produced and what's wrong with it.
+
+### Status
+- Benchmark: 400 problems, oracle 23.08 (unchanged)
+- Pool: all repos saturated — next check 2026-06-09
+- Pending: Gittensor registration, nginx hookup
+
+---
+
 ## 2026-06-02 — Agent: partial-repair guard + clean history in act step (commit 013ab2c)
 
 ### Partial-repair guard in verify loop
