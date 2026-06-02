@@ -1,0 +1,601 @@
+diff --git a/CHANGELOG.md b/CHANGELOG.md
+index 9074269..47bb225 100644
+--- a/CHANGELOG.md
++++ b/CHANGELOG.md
+@@ -9,6 +9,11 @@ All notable changes to vouch are documented here. Format follows
+ ### Fixed
+ - `discover_root()` now honours `VOUCH_KB_PATH=/abs/path/.vouch` and returns the parent root, instead of always walking up from cwd. The env var was already documented in `adapters/generic-mcp/README.md` but wasn't wired into the code — closing the doc-vs-code drift removes the `"cwd": "..."` ceremony hosts like Claude Desktop need today to point at a specific KB.
+ ### Added
++- `vouch fsck` performs deep consistency checks beyond `vouch doctor`:
++  orphaned embeddings, dangling supersede/contradict chains, decided
++  proposals whose artifact is missing, and FTS5 index-vs-file drift
++  (orphan rows, missing rows, status drift). Read-only; reports findings
++  with object ids. `--fix` is intentionally out of scope (#96).
+ - `vouch expire` garbage-collects stale pending proposals: dry-run by default,
+   `--apply` moves them to `decided/` with `decision_reason: expired`, emits
+   `proposal.expire` audit events, and honors `review.expire_pending_after_days`
+diff --git a/README.md b/README.md
+index 596e85d..74879fb 100644
+--- a/README.md
++++ b/README.md
+@@ -145,6 +145,7 @@ vouch capabilities                          # emit the JSON capabilities descrip
+ vouch status [--json]                       # KB counts + pending proposals
+ vouch lint [--stale-days N]                 # user-actionable problems
+ vouch doctor                                # full sweep incl. source verification
++vouch fsck                                  # deep consistency: indexes, lifecycle, decided
+ 
+ vouch pending                               # list pending proposals
+ vouch review [--limit N] [--type KIND]      # guided proposal review queue
+@@ -260,7 +261,7 @@ vouch import-apply kb.tar.gz --on-conflict skip  # apply (default skip; never de
+ | Area | Current support |
+ |------|-----------------|
+ | Knowledge base | `.vouch/` folder, YAML claims/entities/relations/evidence/sessions, markdown pages with frontmatter, JSONL audit log, content-addressed sources |
+-| CLI | `init`, `discover`, `capabilities`, `status`, `lint`, `doctor`, `pending`, `show`, `approve`, `reject`, `propose-{claim,page,entity,relation}`, `source add`, `source verify`, `supersede`, `contradict`, `archive`, `confirm`, `cite`, `session {start,end}`, `crystallize`, `search`, `context`, `index`, `audit`, `export`, `export-check`, `import-check`, `import-apply`, `serve` |
++| CLI | `init`, `discover`, `capabilities`, `status`, `lint`, `doctor`, `fsck`, `pending`, `show`, `approve`, `reject`, `propose-{claim,page,entity,relation}`, `source add`, `source verify`, `supersede`, `contradict`, `archive`, `confirm`, `cite`, `session {start,end}`, `crystallize`, `search`, `context`, `index`, `audit`, `export`, `export-check`, `import-check`, `import-apply`, `serve` |
+ | Tool servers | MCP over stdio + JSONL over stdin/stdout, same `kb.*` surface across both transports, capabilities + knowledge-capability descriptor |
+ | Schemas | 13 JSON Schemas (Draft 2020-12) generated from pydantic in [schemas/](schemas/), plus hand-maintained `bundle.manifest` and `jsonl-envelope` schemas |
+ | Write safety | review-gated writes via [proposed/](spec/review-gate.md), `dry_run:true` previews, host trust required for `approve`/`reject`, atomic exclusive-create storage, path-traversal blocked on source intake and bundle import |
+diff --git a/src/vouch/cli.py b/src/vouch/cli.py
+index b846c38..7391c64 100644
+--- a/src/vouch/cli.py
++++ b/src/vouch/cli.py
+@@ -288,6 +288,24 @@ def doctor(as_json: bool) -> None:
+     sys.exit(0 if report.ok else 1)
+ 
+ 
++@cli.command()
++def fsck() -> None:
++    """Deep consistency check: orphan embeddings, dangling supersede/contradict
++    chains, decided-proposal ↔ artifact mismatches, index-vs-file drift.
++    """
++    store = _load_store()
++    report = health.fsck(store)
++    for f in report.findings:
++        marker = {"error": "✗", "warning": "!", "info": "·"}.get(f.severity, "?")
++        line = f"{marker} [{f.code}] {f.message}"
++        if f.object_ids:
++            line += f" (objects: {', '.join(f.object_ids)})"
++        click.echo(line)
++    if not report.findings:
++        click.echo("clean")
++    sys.exit(0 if report.ok else 1)
++
++
+ # --- proposals ------------------------------------------------------------
+ 
+ 
+diff --git a/src/vouch/health.py b/src/vouch/health.py
+index 1123913..fb6ee53 100644
+--- a/src/vouch/health.py
++++ b/src/vouch/health.py
+@@ -17,7 +17,7 @@
+ 
+ from . import index_db
+ from .audit import count_events
+-from .models import Claim, ClaimStatus, ProposalStatus
++from .models import Claim, ClaimStatus, Entity, Page, ProposalKind, ProposalStatus
+ from .storage import KBStore, _yaml_load, sha256_hex
+ from .verify import verify_all
+ 
+@@ -59,6 +59,28 @@ def status(store: KBStore) -> dict[str, Any]:
+     }
+ 
+ 
++def _safe_counts(store: KBStore, claim_count: int) -> dict:
++    """status()-shaped counts without strictly re-loading claims.
++
++    status() calls store.list_claims(), which re-raises on the invalid
++    YAMLs that lint/fsck deliberately surface as findings. Pass the
++    already-safely-loaded claim count so the report stays self-consistent.
++    """
++    return {
++        "kb_dir": str(store.kb_dir),
++        "claims": claim_count,
++        "pages": len(store.list_pages()),
++        "sources": len(store.list_sources()),
++        "entities": len(store.list_entities()),
++        "relations": len(store.list_relations()),
++        "evidence": len(store.list_evidence()),
++        "sessions": len(store.list_sessions()),
++        "pending_proposals": len(store.list_proposals(ProposalStatus.PENDING)),
++        "audit_events": count_events(store.kb_dir),
++        "index_present": (store.kb_dir / index_db.DB_FILENAME).exists(),
++    }
++
++
+ def _load_claims_for_lint(store: KBStore) -> tuple[list[Claim], list[Finding]]:
+     """Iterate `claims/*.yaml` one file at a time so a single invalid
+     YAML can't crash the whole lint sweep — surface it as a finding
+@@ -147,24 +169,7 @@ def lint(store: KBStore, *, stale_after_days: int = 180) -> HealthReport:
+                 ))
+ 
+     ok = not any(f.severity == "error" for f in findings)
+-    # Build counts inline rather than calling status(), because status()
+-    # calls store.list_claims() which is strict and would re-raise on the
+-    # same invalid YAMLs we just surfaced as findings. Use the safely-
+-    # loaded `claims` list so the report is self-consistent.
+-    counts = {
+-        "kb_dir": str(store.kb_dir),
+-        "claims": len(claims),
+-        "pages": len(store.list_pages()),
+-        "sources": len(sources_present),
+-        "entities": len(store.list_entities()),
+-        "relations": len(store.list_relations()),
+-        "evidence": len(evidence_present),
+-        "sessions": len(store.list_sessions()),
+-        "pending_proposals": len(store.list_proposals(ProposalStatus.PENDING)),
+-        "audit_events": count_events(store.kb_dir),
+-        "index_present": (store.kb_dir / index_db.DB_FILENAME).exists(),
+-    }
+-    return HealthReport(ok=ok, findings=findings, counts=counts)
++    return HealthReport(ok=ok, findings=findings, counts=_safe_counts(store, len(claims)))
+ 
+ 
+ def doctor(
+@@ -211,6 +216,214 @@ def doctor(
+     return report
+ 
+ 
++def fsck(store: KBStore) -> HealthReport:
++    """Deep consistency check — orphaned embeddings, dangling lifecycle
++    chains, decided-proposal ↔ artifact mismatches, index-vs-file drift.
++
++    Read-only; report findings only. `--fix` is intentionally out of scope.
++    """
++    # Load claims one file at a time (like lint) so a single invalid YAML —
++    # e.g. a legacy uncited claim from before #81 — becomes an `invalid_claim`
++    # finding instead of aborting the whole check with a traceback. That bad
++    # YAML is exactly the kind of inconsistency a deep checker should surface.
++    claim_list, findings = _load_claims_for_lint(store)
++    claims: dict[str, Claim] = {c.id: c for c in claim_list}
++    pages: dict[str, Page] = {p.id: p for p in store.list_pages()}
++    entities: dict[str, Entity] = {e.id: e for e in store.list_entities()}
++
++    _check_lifecycle_chains(claims, findings)
++    _check_decided_proposals(store, claims, pages, entities, findings)
++
++    db_present = (store.kb_dir / index_db.DB_FILENAME).exists()
++    if not db_present:
++        findings.append(Finding(
++            "info", "index_missing",
++            "state.db not present — run `vouch index` to build it",
++        ))
++    else:
++        _check_index_drift(store, claims, pages, entities, findings)
++        _check_orphan_embeddings(store, claims, pages, entities, findings)
++
++    ok = not any(f.severity == "error" for f in findings)
++    return HealthReport(ok=ok, findings=findings, counts=_safe_counts(store, len(claims)))
++
++
++def _check_lifecycle_chains(
++    claims: dict[str, Claim], findings: list[Finding],
++) -> None:
++    """Detect supersede / contradict pointers into the void or out-of-sync.
++
++    Each claim records its lifecycle links inline (`supersedes`,
++    `superseded_by`, `contradicts`). Those lists can drift if a referenced
++    claim was deleted or if a `contradict` was only written from one side.
++    """
++    for cid, c in claims.items():
++        for target in c.supersedes:
++            if target not in claims:
++                findings.append(Finding(
++                    "error", "dangling_supersedes",
++                    f"claim {cid} supersedes missing claim {target}",
++                    [cid, target],
++                ))
++        if c.superseded_by is not None and c.superseded_by not in claims:
++            findings.append(Finding(
++                "error", "dangling_superseded_by",
++                f"claim {cid} superseded_by missing claim {c.superseded_by}",
++                [cid, c.superseded_by],
++            ))
++        for other in c.contradicts:
++            if other not in claims:
++                findings.append(Finding(
++                    "error", "dangling_contradicts",
++                    f"claim {cid} contradicts missing claim {other}",
++                    [cid, other],
++                ))
++                continue
++            if cid not in claims[other].contradicts:
++                findings.append(Finding(
++                    "warning", "asymmetric_contradicts",
++                    f"claim {cid} contradicts {other} but {other} does not "
++                    f"contradict {cid} back",
++                    [cid, other],
++                ))
++
++
++def _check_decided_proposals(
++    store: KBStore,
++    claims: dict[str, Claim],
++    pages: dict[str, Page],
++    entities: dict[str, Entity],
++    findings: list[Finding],
++) -> None:
++    """Every approved proposal should have its artifact on disk.
++
++    A crash between `put_<kind>()` and `move_proposal_to_decided()` would
++    leave a `decided/` entry without a matching artifact (or vice versa);
++    surface the artifact-missing case so an operator can investigate.
++    """
++    relations = {r.id for r in store.list_relations()}
++    presence: dict[ProposalKind, set[str]] = {
++        ProposalKind.CLAIM: set(claims),
++        ProposalKind.PAGE: set(pages),
++        ProposalKind.ENTITY: set(entities),
++        ProposalKind.RELATION: relations,
++    }
++    for pr in store.list_proposals(ProposalStatus.APPROVED):
++        artifact_id = pr.payload.get("id") if isinstance(pr.payload, dict) else None
++        if not artifact_id:
++            findings.append(Finding(
++                "error", "decided_no_artifact_id",
++                f"approved proposal {pr.id} has no payload id",
++                [pr.id],
++            ))
++            continue
++        if artifact_id not in presence[pr.kind]:
++            findings.append(Finding(
++                "error", "decided_missing_artifact",
++                f"approved proposal {pr.id} promised "
++                f"{pr.kind.value} {artifact_id} but artifact is missing",
++                [pr.id, artifact_id],
++            ))
++
++
++def _check_index_drift(
++    store: KBStore,
++    claims: dict[str, Claim],
++    pages: dict[str, Page],
++    entities: dict[str, Entity],
++    findings: list[Finding],
++) -> None:
++    """FTS5 must match disk for every searchable artifact.
++
++    Three drift shapes matter: an indexed row whose artifact is gone, an
++    artifact missing from the index entirely (write-hook failure), and a
++    `claims_fts.status` value that disagrees with the on-disk
++    `claim.status` (the #78 failure mode that leaks archived claims).
++    """
++    with index_db.open_db(store.kb_dir) as conn:
++        indexed_claims = {
++            (row[0], row[1]) for row in
++            conn.execute("SELECT id, status FROM claims_fts").fetchall()
++        }
++        indexed_pages = {row[0] for row in
++                         conn.execute("SELECT id FROM pages_fts").fetchall()}
++        indexed_entities = {row[0] for row in
++                            conn.execute("SELECT id FROM entities_fts").fetchall()}
++
++    indexed_claim_ids = {cid for cid, _ in indexed_claims}
++    _drift_findings("claim", indexed_claim_ids, set(claims), findings)
++    _drift_findings("page", indexed_pages, set(pages), findings)
++    _drift_findings("entity", indexed_entities, set(entities), findings)
++
++    # Status drift is claim-specific: claims_fts carries a status column that
++    # must agree with the on-disk claim (orphans are already reported above).
++    for cid, status_in_index in indexed_claims:
++        if cid not in claims:
++            continue
++        on_disk = claims[cid].status.value
++        if status_in_index != on_disk:
++            findings.append(Finding(
++                "error", "index_status_drift",
++                f"claim {cid} status on disk is {on_disk!r} but "
++                f"claims_fts has {status_in_index!r}",
++                [cid],
++            ))
++
++
++def _drift_findings(
++    kind: str, indexed_ids: set[str], on_disk_ids: set[str],
++    findings: list[Finding],
++) -> None:
++    """Emit the orphan + missing-row findings for one indexed kind.
++
++    `index_orphan_<kind>` = an FTS5 row whose artifact is gone from disk;
++    `index_missing_row` = a durable artifact with no FTS5 row. The shape is
++    identical for claims, pages, and entities, so a new kind is a one-liner.
++    The FTS5 table is `{kind}s_fts` for every kind.
++    """
++    for oid in indexed_ids - on_disk_ids:
++        findings.append(Finding(
++            "error", f"index_orphan_{kind}",
++            f"{kind}s_fts row {oid} has no {kind} on disk", [oid],
++        ))
++    for oid in on_disk_ids - indexed_ids:
++        findings.append(Finding(
++            "error", "index_missing_row",
++            f"{kind} {oid} on disk but missing from {kind}s_fts", [oid],
++        ))
++
++
++def _check_orphan_embeddings(
++    store: KBStore,
++    claims: dict[str, Claim],
++    pages: dict[str, Page],
++    entities: dict[str, Entity],
++    findings: list[Finding],
++) -> None:
++    """Flag embedding rows whose artifact has been deleted.
++
++    Stale vectors are silent: semantic search still returns them, snippets
++    just fall back to the bare id. Both the legacy `embeddings` table and
++    the newer `embedding_index` table are checked.
++    """
++    presence = {"claim": set(claims), "page": set(pages), "entity": set(entities)}
++    with index_db.open_db(store.kb_dir) as conn:
++        # Two tables exist: `embeddings` (legacy) and `embedding_index`
++        # (current). Check both — either one drifting silently breaks
++        # semantic retrieval.
++        for table in ("embeddings", "embedding_index"):
++            rows = conn.execute(f"SELECT kind, id FROM {table}").fetchall()
++            for kind, eid in rows:
++                live = presence.get(kind)
++                if live is None or eid in live:
++                    continue
++                findings.append(Finding(
++                    "warning", "orphan_embedding",
++                    f"{table} row for {kind} {eid} has no artifact on disk",
++                    [eid],
++                ))
++
++
+ def rebuild_index(
+     store: KBStore, *, on_progress: Callable[[str], None] | None = None
+ ) -> dict:
+diff --git a/tests/test_cli.py b/tests/test_cli.py
+index 4a2f7af..0ba3b70 100644
+--- a/tests/test_cli.py
++++ b/tests/test_cli.py
+@@ -84,6 +84,31 @@ def test_show_missing_proposal_shows_clean_error(store: KBStore) -> None:
+     _assert_clean_error(result, "proposal no-such-proposal")
+ 
+ 
++def test_fsck_clean_kb_prints_clean_and_exits_zero(store: KBStore) -> None:
++    """`vouch fsck` on a fresh KB exits 0 and only emits info-level findings."""
++    from vouch.models import Claim
++    src = store.put_source(b"e")
++    store.put_claim(Claim(id="c1", text="t", evidence=[src.id]))
++    result = CliRunner().invoke(cli, ["fsck"])
++    # No state.db yet → info finding, but report.ok stays True.
++    assert result.exit_code == 0, result.output
++    assert "[index_missing]" in result.output
++
++
++def test_fsck_reports_dangling_chain_and_exits_nonzero(store: KBStore) -> None:
++    """`vouch fsck` exits 1 on error findings and prints affected object ids."""
++    from vouch.models import Claim
++    src = store.put_source(b"e")
++    store.put_claim(Claim(
++        id="c1", text="t", evidence=[src.id], supersedes=["ghost"],
++    ))
++    result = CliRunner().invoke(cli, ["fsck"])
++    assert result.exit_code == 1, result.output
++    assert "dangling_supersedes" in result.output
++    # The affected object ids are surfaced inline so users can grep / pipe.
++    assert "(objects: c1, ghost)" in result.output
++
++
+ def test_pending_json_empty_queue(store: KBStore) -> None:
+     result = CliRunner().invoke(cli, ["pending", "--json"])
+ 
+diff --git a/tests/test_health.py b/tests/test_health.py
+index ee4c356..2ab9b30 100644
+--- a/tests/test_health.py
++++ b/tests/test_health.py
+@@ -6,8 +6,8 @@
+ 
+ import pytest
+ 
+-from vouch import health
+-from vouch.models import Claim, ClaimStatus, Relation
++from vouch import health, index_db
++from vouch.models import Claim, ClaimStatus, Proposal, ProposalKind, ProposalStatus, Relation
+ from vouch.storage import KBStore
+ 
+ 
+@@ -93,3 +93,200 @@ def test_list_claims_filtered_by_status(store: KBStore) -> None:
+                           status=ClaimStatus.ARCHIVED))
+     stable = [c for c in store.list_claims() if c.status == ClaimStatus.STABLE]
+     assert [c.id for c in stable] == ["c1"]
++
++
++# --- fsck ----------------------------------------------------------------
++
++
++def _index_claim(store: KBStore, claim: Claim) -> None:
++    """Write the FTS5 row for `claim` so fsck sees a healthy index baseline."""
++    with index_db.open_db(store.kb_dir) as conn:
++        index_db.index_claim(
++            conn, id=claim.id, text=claim.text,
++            type=claim.type.value, status=claim.status.value, tags=claim.tags,
++        )
++
++
++def test_fsck_clean_kb_passes(store: KBStore) -> None:
++    """A KB with one consistently-indexed claim is fsck-clean."""
++    src = store.put_source(b"e")
++    c = Claim(id="c1", text="t", evidence=[src.id])
++    store.put_claim(c)
++    _index_claim(store, c)
++    report = health.fsck(store)
++    assert report.ok is True
++    assert all(f.severity != "error" for f in report.findings)
++
++
++def test_fsck_flags_dangling_supersedes(store: KBStore) -> None:
++    """`claim.supersedes` pointing at a missing claim is an error."""
++    src = store.put_source(b"e")
++    store.put_claim(Claim(id="c1", text="t", evidence=[src.id],
++                          supersedes=["ghost"]))
++    report = health.fsck(store)
++    codes = {f.code for f in report.findings}
++    assert "dangling_supersedes" in codes
++    assert report.ok is False
++
++
++def test_fsck_flags_dangling_superseded_by(store: KBStore) -> None:
++    """`claim.superseded_by` pointing at a missing claim is an error."""
++    src = store.put_source(b"e")
++    store.put_claim(Claim(id="c1", text="t", evidence=[src.id],
++                          superseded_by="ghost"))
++    report = health.fsck(store)
++    codes = {f.code for f in report.findings}
++    assert "dangling_superseded_by" in codes
++    assert report.ok is False
++
++
++def test_fsck_flags_dangling_contradicts(store: KBStore) -> None:
++    """`claim.contradicts` pointing at a missing claim is an error."""
++    src = store.put_source(b"e")
++    store.put_claim(Claim(id="c1", text="t", evidence=[src.id],
++                          contradicts=["ghost"]))
++    report = health.fsck(store)
++    codes = {f.code for f in report.findings}
++    assert "dangling_contradicts" in codes
++    assert report.ok is False
++
++
++def test_fsck_flags_asymmetric_contradicts(store: KBStore) -> None:
++    """A → B contradiction not mirrored by B → A is a warning, not silent."""
++    src = store.put_source(b"e")
++    store.put_claim(Claim(id="c1", text="a", evidence=[src.id],
++                          contradicts=["c2"]))
++    store.put_claim(Claim(id="c2", text="b", evidence=[src.id]))
++    report = health.fsck(store)
++    codes = {f.code for f in report.findings}
++    assert "asymmetric_contradicts" in codes
++
++
++def test_fsck_decided_missing_artifact(store: KBStore) -> None:
++    """An approved decided proposal whose artifact is gone is reported."""
++    store.put_proposal(Proposal(
++        id="prop-1",
++        kind=ProposalKind.CLAIM,
++        proposed_by="agent",
++        payload={"id": "vanished", "text": "t", "evidence": ["e1"]},
++        status=ProposalStatus.APPROVED,
++    ))
++    # Move it to decided/ so list_proposals finds it as approved.
++    src_path = store.kb_dir / "proposed" / "prop-1.yaml"
++    dst_path = store.kb_dir / "decided" / "prop-1.yaml"
++    dst_path.write_text(src_path.read_text())
++    src_path.unlink()
++
++    report = health.fsck(store)
++    codes = {f.code for f in report.findings}
++    assert "decided_missing_artifact" in codes
++
++
++def test_fsck_index_orphan_row(store: KBStore) -> None:
++    """An FTS5 row with no on-disk claim is reported as an index orphan."""
++    src = store.put_source(b"e")
++    c = Claim(id="real", text="t", evidence=[src.id])
++    store.put_claim(c)
++    _index_claim(store, c)
++    # Inject a row for a claim that doesn't exist on disk.
++    with index_db.open_db(store.kb_dir) as conn:
++        index_db.index_claim(
++            conn, id="ghost", text="x",
++            type="fact", status="working", tags=[],
++        )
++    report = health.fsck(store)
++    codes = {f.code for f in report.findings}
++    assert "index_orphan_claim" in codes
++
++
++def test_fsck_index_missing_row(store: KBStore) -> None:
++    """A claim on disk that never made it into FTS5 is reported."""
++    src = store.put_source(b"e")
++    c = Claim(id="unindexed", text="t", evidence=[src.id])
++    store.put_claim(c)
++    # State.db exists but the row was never written.
++    with index_db.open_db(store.kb_dir) as _conn:
++        pass
++    report = health.fsck(store)
++    codes = {f.code for f in report.findings}
++    assert "index_missing_row" in codes
++
++
++def test_fsck_index_status_drift(store: KBStore) -> None:
++    """Regression cover for #78: status on disk vs FTS5 must agree."""
++    src = store.put_source(b"e")
++    c = Claim(id="drifty", text="t", evidence=[src.id],
++              status=ClaimStatus.STABLE)
++    store.put_claim(c)
++    # Index says working, disk says stable — the #78 failure shape.
++    with index_db.open_db(store.kb_dir) as conn:
++        index_db.index_claim(
++            conn, id=c.id, text=c.text, type=c.type.value,
++            status="working", tags=c.tags,
++        )
++    report = health.fsck(store)
++    codes = {f.code for f in report.findings}
++    assert "index_status_drift" in codes
++
++
++def test_fsck_orphan_embedding(store: KBStore) -> None:
++    """An embedding row for a kind/id with no artifact on disk is flagged."""
++    src = store.put_source(b"e")
++    c = Claim(id="real", text="t", evidence=[src.id])
++    store.put_claim(c)
++    _index_claim(store, c)
++    with index_db.open_db(store.kb_dir) as conn:
++        index_db.index_embedding(conn, kind="claim", id="ghost", vec=[0.1, 0.2])
++    report = health.fsck(store)
++    codes = {f.code for f in report.findings}
++    assert "orphan_embedding" in codes
++
++
++def test_fsck_surfaces_invalid_claim_yaml_without_crashing(
++    store: KBStore,
++) -> None:
++    """fsck opens by loading every claim; a single invalid YAML (e.g. a
++    legacy uncited claim from before #81) must become an `invalid_claim`
++    finding rather than aborting the deep check with a traceback — that
++    bad YAML is exactly the inconsistency fsck should surface. Reuses the
++    same per-file loader as lint."""
++    src = store.put_source(b"e")
++    good = Claim(id="good", text="t", evidence=[src.id])
++    store.put_claim(good)
++    _index_claim(store, good)
++
++    legacy_uncited = (
++        "id: legacy\n"
++        'text: "shipped before the validator existed"\n'
++        "type: fact\n"
++        "status: stable\n"
++        "confidence: 1.0\n"
++        "evidence: []\n"
++    )
++    (store.kb_dir / "claims" / "legacy.yaml").write_text(legacy_uncited)
++
++    report = health.fsck(store)  # must not raise
++    codes = {f.code for f in report.findings}
++    assert "invalid_claim" in codes, [f.message for f in report.findings]
++    invalid = next(f for f in report.findings if f.code == "invalid_claim")
++    assert "legacy" in invalid.object_ids
++    assert report.ok is False  # invalid_claim is severity=error
++    # counts reflect only the safely-loaded claim — building them didn't
++    # re-trip the strict loader on the bad YAML.
++    assert report.counts["claims"] == 1
++
++
++def test_fsck_without_state_db_reports_info(store: KBStore) -> None:
++    """No state.db → info-level `index_missing`, report stays ok."""
++    src = store.put_source(b"e")
++    store.put_claim(Claim(id="c1", text="t", evidence=[src.id]))
++    # The embedding write-hook may auto-create state.db on put_claim; this
++    # test verifies the explicit "no index yet" path.
++    db_path = store.kb_dir / index_db.DB_FILENAME
++    if db_path.exists():
++        db_path.unlink()
++    report = health.fsck(store)
++    codes = {f.code for f in report.findings}
++    assert "index_missing" in codes
++    # info finding alone shouldn't fail the report.
++    assert report.ok is True

@@ -25,7 +25,7 @@ Liveness check.
 ```json
 {
   "status": "ok",
-  "pool_size": 342,
+  "pool_size": 360,
   "version": "1.0"
 }
 ```
@@ -38,10 +38,10 @@ Pool-level statistics: language and difficulty distribution, repo count, mean ba
 
 ```json
 {
-  "pool_size": 342,
+  "pool_size": 360,
   "shard_size": 30,
   "repos": 13,
-  "mean_baseline": 22.77,
+  "mean_baseline": 22.83,
   "by_language": { "py": 200, "js": 68, "rs": 40, "java": 34 },
   "by_difficulty": { "easy": 80, "medium": 140, "hard": 122 },
   "rotation_policy": "weekly"
@@ -165,7 +165,7 @@ Current ranked submissions.
     {
       "rank": null,
       "agent": "Oracle (accepted solution)",
-      "score": 22.77,
+      "score": 22.83,
       "model": "—",
       "date": "—",
       "note": "Upper bound (accepted solutions mean)"

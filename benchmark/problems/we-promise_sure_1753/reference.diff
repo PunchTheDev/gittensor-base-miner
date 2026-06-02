@@ -1,0 +1,4584 @@
+diff --git a/.devcontainer/Dockerfile b/.devcontainer/Dockerfile
+index e024ef870d..119f883aa5 100644
+--- a/.devcontainer/Dockerfile
++++ b/.devcontainer/Dockerfile
+@@ -3,6 +3,9 @@ FROM ruby:${RUBY_VERSION}-slim-bookworm
+ 
+ ENV DEBIAN_FRONTEND=noninteractive
+ 
++# libvips42 supports ActiveStorage image variants through image_processing/ruby-vips
++# for existing profile/avatar images. AccountStatement.original_file only stores
++# PDF/CSV/XLSX originals, but the devcontainer needs this broader image stack.
+ RUN apt-get update -qq \
+   && apt-get -y install --no-install-recommends \
+     apt-utils \
+diff --git a/.devcontainer/docker-compose.yml b/.devcontainer/docker-compose.yml
+index d1825c041a..12b8371687 100644
+--- a/.devcontainer/docker-compose.yml
++++ b/.devcontainer/docker-compose.yml
+@@ -70,6 +70,9 @@ services:
+       - "7900:7900"
+     shm_size: 2gb
+     restart: unless-stopped
++    environment:
++      SE_NODE_MAX_SESSIONS: 4
++      SE_NODE_OVERRIDE_MAX_SESSIONS: "true"
+ 
+ volumes:
+   postgres-data:
+diff --git a/app/components/UI/account_page.html.erb b/app/components/UI/account_page.html.erb
+index b9befa6849..820d3a5214 100644
+--- a/app/components/UI/account_page.html.erb
++++ b/app/components/UI/account_page.html.erb
+@@ -20,7 +20,7 @@
+         <%= render DS::Tabs.new(active_tab: active_tab, url_param_key: "tab") do |tabs_container| %>
+           <% tabs_container.with_nav(classes: "max-w-fit") do |nav| %>
+             <% tabs.each do |tab| %>
+-              <% nav.with_btn(id: tab, label: tab.to_s.humanize, classes: "px-6") %>
++              <% nav.with_btn(id: tab, label: t("accounts.show.tabs.#{tab}", default: tab.to_s.humanize), classes: "px-6") %>
+             <% end %>
+           <% end %>
+ 
+diff --git a/app/components/UI/account_page.rb b/app/components/UI/account_page.rb
+index 0fc5f0e53f..36be3c2b24 100644
+--- a/app/components/UI/account_page.rb
++++ b/app/components/UI/account_page.rb
+@@ -1,13 +1,19 @@
+ class UI::AccountPage < ApplicationComponent
+-  attr_reader :account, :chart_view, :chart_period
++  attr_reader :account, :chart_view, :chart_period, :statement_coverage, :statements, :reconciliation_statuses,
++              :can_manage_statements
+ 
+   renders_one :activity_feed, ->(feed_data:, pagy:, search:) { UI::Account::ActivityFeed.new(feed_data: feed_data, pagy: pagy, search: search) }
+ 
+-  def initialize(account:, chart_view: nil, chart_period: nil, active_tab: nil)
++  def initialize(account:, chart_view: nil, chart_period: nil, active_tab: nil, statement_coverage: nil, statements: [],
++                 reconciliation_statuses: {}, can_manage_statements: false)
+     @account = account
+     @chart_view = chart_view
+     @chart_period = chart_period
+     @active_tab = active_tab
++    @statement_coverage = statement_coverage
++    @statements = statements
++    @reconciliation_statuses = reconciliation_statuses
++    @can_manage_statements = can_manage_statements
+   end
+ 
+   def id
+@@ -37,7 +43,7 @@ def active_tab
+   end
+ 
+   def tabs
+-    case account.accountable_type
++    base_tabs = case account.accountable_type
+     when "Investment", "Crypto"
+       [ :activity, :holdings ]
+     when "Property", "Vehicle", "Loan"
+@@ -45,6 +51,8 @@ def tabs
+     else
+       [ :activity ]
+     end
++
++    base_tabs + [ :statements ]
+   end
+ 
+   def fx_coverage_start_date
+@@ -71,6 +79,32 @@ def tab_content_for(tab)
+     when :holdings, :overview
+       # Accountable is responsible for implementing the partial in the correct folder
+       render "#{account.accountable_type.downcase.pluralize}/tabs/#{tab}", account: account
++    when :statements
++      render_statement_tab
+     end
+   end
++
++  def render_statement_tab
++    return render "accounts/show/statements_frame", **statement_tab_locals if statement_tab_loaded?
++
++    turbo_frame_tag statement_tab_frame_id, src: helpers.account_path(account, tab: "statements"), loading: :lazy
++  end
++
++  def statement_tab_loaded?
++    statement_coverage.present?
++  end
++
++  def statement_tab_frame_id
++    dom_id(account, :statements_tab)
++  end
++
++  def statement_tab_locals
++    {
++      account: account,
++      coverage: statement_coverage,
++      statements: statements,
++      reconciliation_statuses: reconciliation_statuses,
++      can_manage_statements: can_manage_statements
++    }
++  end
+ end
+diff --git a/app/controllers/account_statements_controller.rb b/app/controllers/account_statements_controller.rb
+new file mode 100644
+index 0000000000..27793c4b6e
+--- /dev/null
++++ b/app/controllers/account_statements_controller.rb
+@@ -0,0 +1,211 @@
++# frozen_string_literal: true
++
++class AccountStatementsController < ApplicationController
++  before_action :set_statement, only: %i[show update destroy link unlink reject]
++  before_action :ensure_statement_manager!, only: %i[index create update destroy link unlink reject]
++
++  def index
++    accessible_account_ids = Current.user.accessible_accounts.select(:id)
++    account_statements = Current.family.account_statements
++      .with_attached_original_file
++      .includes(:account, :suggested_account)
++      .ordered
++    visible_storage_scope = Current.family.account_statements
++      .where(account_id: nil)
++      .or(Current.family.account_statements.where(account_id: accessible_account_ids))
++    linked_statement_scope = account_statements.with_account.where(account_id: accessible_account_ids)
++
++    @unmatched_pagy, @unmatched_statements = pagy(account_statements.unmatched, limit: safe_per_page, page_param: :unmatched_page)
++    @linked_pagy, @linked_statements = pagy(linked_statement_scope, limit: safe_per_page, page_param: :linked_page)
++    @total_storage_bytes = visible_storage_scope.sum(:byte_size)
++    @accounts = Current.user.accessible_accounts.visible.alphabetically
++    @breadcrumbs = [
++      [ t("breadcrumbs.home"), root_path ],
++      [ t("account_statements.index.title"), account_statements_path ]
++    ]
++    render layout: "settings"
++  end
++
++  def show
++    @accounts = Current.user.accessible_accounts.visible.alphabetically
++    @can_manage_statement = @statement.manageable_by?(Current.user)
++    @reconciliation_checks = @statement.reconciliation_checks
++    @breadcrumbs = [
++      [ t("breadcrumbs.home"), root_path ],
++      [ t("account_statements.index.title"), account_statements_path ],
++      [ @statement.filename, nil ]
++    ]
++    render layout: "settings"
++  end
++
++  def create
++    files = Array(statement_upload_params[:files]).reject(&:blank?).select { |file| file.respond_to?(:read) }
++    account = target_account
++
++    if files.empty?
++      redirect_back_or_to account_statements_path, alert: t("account_statements.create.no_files")
++      return
++    end
++
++    return if account && !require_account_permission!(account)
++
++    created = []
++    duplicates = []
++    validation_errors = []
++
++    files.each do |file|
++      prepared_upload = AccountStatement.prepare_upload!(file)
++      created << AccountStatement.create_from_prepared_upload!(family: Current.family, account: account, prepared_upload: prepared_upload)
++    rescue AccountStatement::InvalidUploadError
++      validation_errors << t("account_statements.create.invalid_file_type")
++    rescue AccountStatement::DuplicateUploadError => e
++      duplicates << e.statement
++    rescue ActiveRecord::RecordInvalid => e
++      validation_errors << e.record.errors.full_messages.to_sentence
++    end
++
++    redirect_to redirect_after_create(account, created.first || duplicates.first),
++                flash_for_upload(created:, duplicates:, validation_errors:)
++  end
++
++  def update
++    return if @statement.account && !require_account_permission!(@statement.account)
++
++    target = statement_account_id.present? ? Current.user.accessible_accounts.find(statement_account_id) : nil
++    return if target && !require_account_permission!(target)
++
++    attrs = statement_params.to_h
++    attrs[:account] = target if statement_account_id_provided?
++
++    @statement.assign_attributes(attrs)
++    @statement.assign_account_match if @statement.account.nil? && !@statement.rejected?
++
++    if @statement.save
++      redirect_to account_statement_path(@statement), notice: t("account_statements.update.success")
++    else
++      @accounts = Current.user.accessible_accounts.visible.alphabetically
++      @can_manage_statement = @statement.manageable_by?(Current.user)
++      @reconciliation_checks = @statement.reconciliation_checks
++      flash.now[:alert] = @statement.errors.full_messages.to_sentence
++      render :show, status: :unprocessable_entity, layout: "settings"
++    end
++  end
++
++  def link
++    return if @statement.account && !require_account_permission!(@statement.account)
++
++    account_id = params[:account_id].presence || @statement.suggested_account_id
++    if account_id.blank?
++      redirect_to account_statement_path(@statement), alert: t("account_statements.link.no_account")
++      return
++    end
++
++    account = Current.user.accessible_accounts.find(account_id)
++    return unless require_account_permission!(account)
++
++    @statement.link_to_account!(account)
++    redirect_to post_link_path(@statement), notice: t("account_statements.link.success", account: account.name)
++  end
++
++  def unlink
++    return if @statement.account && !require_account_permission!(@statement.account)
++
++    @statement.unlink!
++    redirect_to account_statement_path(@statement), notice: t("account_statements.unlink.success")
++  end
++
++  def reject
++    return if @statement.account && !require_account_permission!(@statement.account)
++
++    @statement.reject_match!
++    redirect_to account_statements_path, notice: t("account_statements.reject.success")
++  end
++
++  def destroy
++    return if @statement.account && !require_account_permission!(@statement.account)
++
++    redirect_path = @statement.account ? account_path(@statement.account, tab: "statements") : account_statements_path
++    if @statement.destroy
++      redirect_to redirect_path, notice: t("account_statements.destroy.success")
++    else
++      redirect_back_or_to redirect_path, alert: t("account_statements.destroy.failure")
++    end
++  end
++
++  private
++
++    def set_statement
++      @statement = Current.family.account_statements
++        .with_attached_original_file
++        .includes(:account, :suggested_account)
++        .find(params[:id])
++
++      raise ActiveRecord::RecordNotFound unless @statement.viewable_by?(Current.user)
++    end
++
++    def ensure_statement_manager!
++      return if AccountStatement.statement_manager?(Current.user)
++
++      redirect_to accounts_path, alert: t("accounts.not_authorized")
++    end
++
++    def statement_upload_params
++      params.fetch(:account_statement, ActionController::Parameters.new).permit(files: [])
++    end
++
++    def statement_params
++      params.require(:account_statement).permit(
++        :institution_name_hint,
++        :account_name_hint,
++        :account_last4_hint,
++        :period_start_on,
++        :period_end_on,
++        :opening_balance,
++        :closing_balance,
++        :currency
++      )
++    end
++
++    def target_account
++      account_id = statement_account_id.presence
++      return nil if account_id.blank?
++
++      Current.user.accessible_accounts.find(account_id)
++    end
++
++    def statement_account_id
++      params.fetch(:account_statement, ActionController::Parameters.new)[:account_id]
++    end
++
++    def statement_account_id_provided?
++      params.fetch(:account_statement, ActionController::Parameters.new).key?(:account_id)
++    end
++
++    def redirect_after_create(account, statement = nil)
++      if account
++        account_path(account, tab: "statements")
++      elsif statement
++        account_statement_path(statement)
++      else
++        account_statements_path
++      end
++    end
++
++    def post_link_path(statement)
++      statement.account ? account_path(statement.account, tab: "statements") : account_statement_path(statement)
++    end
++
++    def flash_for_upload(created:, duplicates:, validation_errors: [])
++      alerts = []
++      alerts << t("account_statements.create.duplicates", count: duplicates.size) if duplicates.any?
++      alerts.concat(validation_errors.compact_blank)
++
++      if created.any?
++        flash = { notice: t("account_statements.create.success", count: created.size) }
++        flash[:alert] = alerts.to_sentence if alerts.any?
++        flash
++      else
++        { alert: alerts.to_sentence }
++      end
++    end
++end
+diff --git a/app/controllers/accounts_controller.rb b/app/controllers/accounts_controller.rb
+index 084a37217e..2becdd3b36 100644
+--- a/app/controllers/accounts_controller.rb
++++ b/app/controllers/accounts_controller.rb
+@@ -50,6 +50,10 @@ def show
+     @tab = params[:tab]
+     @q = params.fetch(:q, {}).permit(:search, status: [])
+     entries = @account.entries.where(excluded: false).search(@q).reverse_chronological.includes(:entryable)
++    if statement_tab_active?
++      build_statement_tab_data
++      return render_statement_tab_frame if statement_tab_frame_request?
++    end
+ 
+     @pagy, @entries = pagy(
+       entries,
+@@ -237,6 +241,39 @@ def visible_provider_items(items)
+       end
+     end
+ 
++    def build_statement_tab_data
++      return unless statement_tab_active?
++
++      @statement_coverage = AccountStatement::Coverage.for_year(@account, params[:statement_year])
++      @account_statements = @account.account_statements.with_attached_original_file.ordered.to_a
++      @statement_reconciliation_statuses = AccountStatement.reconciliation_statuses_for(@account_statements, account: @account)
++      permission = @account.permission_for(Current.user)
++      @can_manage_statements = AccountStatement.statement_manager?(Current.user) &&
++        permission.in?([ :owner, :full_control ])
++    end
++
++    def statement_tab_frame_request?
++      turbo_frame_request? && request.headers["Turbo-Frame"] == helpers.dom_id(@account, :statements_tab)
++    end
++
++    def render_statement_tab_frame
++      render partial: "accounts/show/statements_frame", locals: statement_tab_locals, layout: false
++    end
++
++    def statement_tab_locals
++      {
++        account: @account,
++        coverage: @statement_coverage,
++        statements: @account_statements,
++        reconciliation_statuses: @statement_reconciliation_statuses,
++        can_manage_statements: @can_manage_statements
++      }
++    end
++
++    def statement_tab_active?
++      @tab == "statements"
++    end
++
+     # Builds sync stats maps for all provider types to avoid N+1 queries in views
+     def build_sync_stats_maps
+       # SimpleFIN sync stats
+diff --git a/app/helpers/account_statements_helper.rb b/app/helpers/account_statements_helper.rb
+new file mode 100644
+index 0000000000..fa736b5aec
+--- /dev/null
++++ b/app/helpers/account_statements_helper.rb
+@@ -0,0 +1,91 @@
++# frozen_string_literal: true
++
++module AccountStatementsHelper
++  ACCOUNT_STATEMENT_BALANCE_FIELDS = %w[opening_balance closing_balance].freeze
++
++  def account_statement_status_badge(statement)
++    case statement.review_status
++    when "linked"
++      render("shared/badge", color: "success") { t("account_statements.status.linked") }
++    when "rejected"
++      render("shared/badge", color: "warning") { t("account_statements.status.rejected") }
++    else
++      render("shared/badge") { t("account_statements.status.unmatched") }
++    end
++  end
++
++  def account_statement_coverage_classes(status)
++    case status.to_s
++    when "not_expected"
++      "bg-container-inset text-subdued ring-alpha-black-25"
++    when "covered"
++      "bg-success/10 text-success ring-success/20"
++    when "duplicate", "ambiguous"
++      "bg-warning/10 text-warning ring-warning/20"
++    when "mismatched"
++      "bg-destructive/10 text-destructive ring-destructive/20"
++    else
++      "bg-gray-tint-5 text-secondary ring-alpha-black-50"
++    end
++  end
++
++  def account_statement_period(statement)
++    if statement.period_start_on.present? && statement.period_end_on.present?
++      "#{format_date(statement.period_start_on)} - #{format_date(statement.period_end_on)}"
++    else
++      t("account_statements.period.unknown")
++    end
++  end
++
++  def account_statement_coverage_label(month)
++    account_statement_month_label(month.date)
++  end
++
++  def account_statement_month_label(date)
++    l(date, format: "%b %Y")
++  end
++
++  def account_statement_coverage_range(coverage)
++    t(
++      "account_statements.account_tab.coverage_range",
++      start: account_statement_month_label(coverage.expected_start_month),
++      end: account_statement_month_label(coverage.expected_end_month)
++    )
++  end
++
++  def account_statement_reconciliation_label(check)
++    key = check[:key] if check.respond_to?(:key?) && check.key?(:key)
++    key ||= check["key"] if check.respond_to?(:key?) && check.key?("key")
++    fallback = t("account_statements.reconciliation.checks.unknown_check")
++    return fallback if key.blank?
++
++    t(
++      "account_statements.reconciliation.checks.#{key}",
++      default: fallback
++    )
++  end
++
++  def account_statement_balance_label(statement, field)
++    return t("account_statements.balance.unknown") unless field.to_s.in?(ACCOUNT_STATEMENT_BALANCE_FIELDS)
++
++    money = statement.public_send("#{field}_money")
++    money ? money.format : t("account_statements.balance.unknown")
++  end
++
++  def account_statement_currency_options(statement)
++    currency_picker_options_for_family(Current.family, extra: [ statement.currency ]).map do |code|
++      currency = Money::Currency.new(code)
++      [ "#{currency.name} (#{currency.iso_code})", currency.iso_code ]
++    end
++  end
++
++  def account_statement_file_icon(statement)
++    if statement.pdf?
++      "file-text"
++    elsif statement.xlsx?
++      "sheet"
++    else
++      "file-spreadsheet"
++    end
++  end
++end
+diff --git a/app/helpers/settings_helper.rb b/app/helpers/settings_helper.rb
+index 1cc3f32e23..e3cdfb3d95 100644
+--- a/app/helpers/settings_helper.rb
++++ b/app/helpers/settings_helper.rb
+@@ -1,30 +1,31 @@
+ module SettingsHelper
+   SETTINGS_ORDER = [
+     # General section
+-    { name: "Accounts", path: :accounts_path },
+-    { name: "Bank Sync", path: :settings_providers_path, condition: :admin_user? },
+-    { name: "Preferences", path: :settings_preferences_path },
+-    { name: "Appearance", path: :settings_appearance_path },
+-    { name: "Profile Info", path: :settings_profile_path },
+-    { name: "Security", path: :settings_security_path },
+-    { name: "Payment", path: :settings_payment_path, condition: :not_self_hosted? },
++    { name: -> { t("settings.settings_nav.accounts_label") }, path: :accounts_path },
++    { name: -> { t("settings.settings_nav.bank_sync_label") }, path: :settings_providers_path, condition: :admin_user? },
++    { name: -> { t("settings.settings_nav.preferences_label") }, path: :settings_preferences_path },
++    { name: -> { t("settings.settings_nav.appearance_label") }, path: :settings_appearance_path },
++    { name: -> { t("settings.settings_nav.profile_label") }, path: :settings_profile_path },
++    { name: -> { t("settings.settings_nav.security_label") }, path: :settings_security_path },
++    { name: -> { t("settings.settings_nav.payment_label") }, path: :settings_payment_path, condition: :not_self_hosted? },
+     # Transactions section
+-    { name: "Categories", path: :categories_path },
+-    { name: "Tags", path: :tags_path },
+-    { name: "Rules", path: :rules_path },
+-    { name: "Merchants", path: :family_merchants_path },
+-    { name: "Recurring", path: :recurring_transactions_path },
++    { name: -> { t("settings.settings_nav.categories_label") }, path: :categories_path },
++    { name: -> { t("settings.settings_nav.tags_label") }, path: :tags_path },
++    { name: -> { t("settings.settings_nav.rules_label") }, path: :rules_path },
++    { name: -> { t("settings.settings_nav.merchants_label") }, path: :family_merchants_path },
++    { name: -> { t("settings.settings_nav.recurring_transactions_label") }, path: :recurring_transactions_path },
++    { name: -> { t("settings.settings_nav.statement_vault_label") }, path: :account_statements_path, condition: :admin_user? },
+     # Advanced section
+-    { name: "AI Prompts", path: :settings_ai_prompts_path, condition: :admin_user? },
+-    { name: "LLM Usage", path: :settings_llm_usage_path, condition: :admin_user? },
+-    { name: "API Key", path: :settings_api_key_path, condition: :admin_user? },
+-    { name: "Self-Hosting", path: :settings_hosting_path, condition: :self_hosted_and_admin? },
+-    { name: "Imports", path: :imports_path, condition: :admin_user? },
+-    { name: "Exports", path: :family_exports_path, condition: :admin_user? },
++    { name: -> { t("settings.settings_nav.ai_prompts_label") }, path: :settings_ai_prompts_path, condition: :admin_user? },
++    { name: -> { t("settings.settings_nav.llm_usage_label") }, path: :settings_llm_usage_path, condition: :admin_user? },
++    { name: -> { t("settings.settings_nav.api_key_label") }, path: :settings_api_key_path, condition: :admin_user? },
++    { name: -> { t("settings.settings_nav.self_hosting_label") }, path: :settings_hosting_path, condition: :self_hosted_and_admin? },
++    { name: -> { t("settings.settings_nav.imports_label") }, path: :imports_path, condition: :admin_user? },
++    { name: -> { t("settings.settings_nav.exports_label") }, path: :family_exports_path, condition: :admin_user? },
+     # More section
+-    { name: "Guides", path: :settings_guides_path },
+-    { name: "What's new", path: :changelog_path },
+-    { name: "Feedback", path: :feedback_path }
++    { name: -> { t("settings.settings_nav.guides_label") }, path: :settings_guides_path },
++    { name: -> { t("settings.settings_nav.whats_new_label") }, path: :changelog_path },
++    { name: -> { t("settings.settings_nav.feedback_label") }, path: :feedback_path }
+   ]
+ 
+   def adjacent_setting(current_path, offset)
+@@ -40,7 +41,7 @@ def adjacent_setting(current_path, offset)
+     render partial: "settings/settings_nav_link_large", locals: {
+       path: send(adjacent[:path]),
+       direction: offset > 0 ? "next" : "previous",
+-      title: adjacent[:name]
++      title: setting_name(adjacent)
+     }
+   end
+ 
+@@ -222,6 +223,11 @@ def not_self_hosted?
+       !self_hosted?
+     end
+ 
++    def setting_name(setting)
++      name = setting[:name]
++      name.respond_to?(:call) ? instance_exec(&name) : name
++    end
++
+     # Helper used by SETTINGS_ORDER conditions
+     def admin_user?
+       Current.user&.admin?
+diff --git a/app/models/account.rb b/app/models/account.rb
+index 13c06c58e6..b0595d308a 100644
+--- a/app/models/account.rb
++++ b/app/models/account.rb
+@@ -2,6 +2,8 @@ class Account < ApplicationRecord
+   include AASM, Syncable, Monetizable, Chartable, Linkable, Enrichable, Anchorable, Reconcileable, TaxTreatable
+ 
+   before_validation :assign_default_owner, if: -> { owner_id.blank? }
++  before_destroy :capture_account_statement_ids_to_move
++  after_destroy_commit :move_account_statements_to_inbox
+ 
+   validates :name, :balance, :currency, presence: true
+   validate :owner_belongs_to_family, if: -> { owner_id.present? && family_id.present? }
+@@ -77,6 +79,8 @@ class Account < ApplicationRecord
+   }
+ 
+   has_one_attached :logo, dependent: :purge_later
++  # No dependent: option; before_destroy captures IDs, after_destroy_commit moves statements back to inbox.
++  has_many :account_statements
+ 
+   delegated_type :accountable, types: Accountable::TYPES, dependent: :destroy
+   delegate :subtype, to: :accountable, allow_nil: true
+@@ -256,22 +260,7 @@ def create_from_coinbase_account(coinbase_account)
+     end
+ 
+     def create_from_binance_account(binance_account)
+-      family = binance_account.binance_item.family
+-
+-      attributes = {
+-        family: family,
+-        name: binance_account.name,
+-        balance: (binance_account.current_balance || 0).to_d,
+-        cash_balance: 0,
+-        currency: binance_account.currency.presence || family.currency,
+-        accountable_type: "Crypto",
+-        accountable_attributes: {
+-          subtype: "exchange",
+-          tax_treatment: "taxable"
+-        }
+-      }
+-
+-      create_and_sync(attributes, skip_initial_sync: true)
++      create_from_crypto_exchange_account(binance_account, family: binance_account.binance_item.family)
+     end
+ 
+     def create_from_ibkr_account(ibkr_account)
+@@ -298,26 +287,28 @@ def create_from_ibkr_account(ibkr_account)
+     end
+ 
+     def create_from_kraken_account(kraken_account)
+-      family = kraken_account.kraken_item.family
+-
+-      attributes = {
+-        family: family,
+-        name: kraken_account.name,
+-        balance: (kraken_account.current_balance || 0).to_d,
+-        cash_balance: 0,
+-        currency: kraken_account.currency.presence || family.currency,
+-        accountable_type: "Crypto",
+-        accountable_attributes: {
+-          subtype: "exchange",
+-          tax_treatment: "taxable"
+-        }
+-      }
+-
+-      create_and_sync(attributes, skip_initial_sync: true)
++      create_from_crypto_exchange_account(kraken_account, family: kraken_account.kraken_item.family)
+     end
+ 
+     private
+ 
++      def create_from_crypto_exchange_account(provider_account, family:)
++        attributes = {
++          family: family,
++          name: provider_account.name,
++          balance: (provider_account.current_balance || 0).to_d,
++          cash_balance: 0,
++          currency: provider_account.currency.presence || family.currency,
++          accountable_type: "Crypto",
++          accountable_attributes: {
++            subtype: "exchange",
++            tax_treatment: "taxable"
++          }
++        }
++
++        create_and_sync(attributes, skip_initial_sync: true)
++      end
++
+       def build_simplefin_accountable_attributes(simplefin_account, account_type, subtype)
+         attributes = {}
+         attributes[:subtype] = subtype if subtype.present?
+@@ -535,4 +526,21 @@ def owner_belongs_to_family
+       return if User.where(id: owner_id, family_id: family_id).exists?
+       errors.add(:owner, :invalid, message: "must belong to the same family as the account")
+     end
++
++    def capture_account_statement_ids_to_move
++      @statement_ids_to_move = account_statements.ids
++    end
++
++    def move_account_statements_to_inbox
++      statement_ids = Array(@statement_ids_to_move).compact
++      return if statement_ids.empty?
++
++      # Bypass callbacks deliberately: the account was destroyed, so linked statements need a direct inbox move.
++      AccountStatement.where(id: statement_ids).update_all(
++        account_id: nil,
++        review_status: "unmatched",
++        match_confidence: nil,
++        updated_at: Time.current
++      )
++    end
+ end
+diff --git a/app/models/account_statement.rb b/app/models/account_statement.rb
+new file mode 100644
+index 0000000000..07cc80c86f
+--- /dev/null
++++ b/app/models/account_statement.rb
+@@ -0,0 +1,462 @@
++# frozen_string_literal: true
++
++require "digest/md5"
++require "digest/sha2"
++require "stringio"
++
++class AccountStatement < ApplicationRecord
++  include Monetizable
++
++  DuplicateUploadError = Class.new(StandardError) do
++    attr_reader :statement
++
++    def initialize(statement)
++      @statement = statement
++      super("Statement file has already been uploaded")
++    end
++  end
++  InvalidUploadError = Class.new(StandardError)
++
++  PreparedUpload = Data.define(:content, :filename, :content_type, :byte_size, :checksum, :content_sha256)
++
++  MAX_FILE_SIZE = 25.megabytes
++  READ_CHUNK_SIZE = 1.megabyte
++  ALLOWED_EXTENSION_CONTENT_TYPES = {
++    ".pdf" => %w[application/pdf],
++    ".csv" => %w[text/csv text/plain application/csv application/vnd.ms-excel],
++    ".xlsx" => %w[application/vnd.openxmlformats-officedocument.spreadsheetml.sheet]
++  }.freeze
++  ALLOWED_CONTENT_TYPES = ALLOWED_EXTENSION_CONTENT_TYPES.values.flatten.uniq.freeze
++  ACCEPTED_FILE_EXTENSIONS = ALLOWED_EXTENSION_CONTENT_TYPES.keys.freeze
++
++  belongs_to :family
++  belongs_to :account, optional: true
++  belongs_to :suggested_account, class_name: "Account", optional: true
++
++  has_one_attached :original_file, dependent: :purge_later
++
++  enum :source, { manual_upload: "manual_upload" }, validate: true, default: "manual_upload"
++  enum :upload_status, { stored: "stored", failed: "failed" }, validate: true, default: "stored"
++  enum :review_status, { unmatched: "unmatched", linked: "linked", rejected: "rejected" }, validate: true, default: "unmatched", scopes: false
++
++  monetize :opening_balance, :closing_balance
++
++  before_validation :sync_file_metadata, if: -> { original_file.attached? }
++  before_validation :normalize_currency
++  before_validation :sync_review_status
++
++  validates :filename, :content_type, :checksum, presence: true
++  validates :byte_size, presence: true, numericality: { greater_than: 0, less_than_or_equal_to: MAX_FILE_SIZE }
++  validates :content_type, inclusion: { in: ALLOWED_CONTENT_TYPES }
++  validates :content_sha256,
++            format: { with: /\A[0-9a-f]{64}\z/ },
++            uniqueness: { scope: :family_id, allow_nil: true, message: :duplicate_statement_file },
++            allow_nil: true
++  validates :parser_confidence, :match_confidence, numericality: { greater_than_or_equal_to: 0, less_than_or_equal_to: 1 }, allow_nil: true
++  validate :account_belongs_to_family
++  validate :suggested_account_belongs_to_family
++  validate :period_order
++  validate :currency_is_valid
++  validate :filename_extension_matches_content_type
++  validate :original_file_attached
++  validate :original_file_constraints, if: -> { original_file.attached? }
++
++  scope :ordered, -> { order(created_at: :desc) }
++  scope :with_account, -> { where.not(account_id: nil) }
++  scope :unmatched, -> { where(account_id: nil).where(review_status: "unmatched") }
++  scope :for_month, ->(month) {
++    month_start = month.to_date.beginning_of_month
++    month_end = month_start.end_of_month
++    where("period_start_on <= ? AND period_end_on >= ?", month_end, month_start)
++  }
++
++  class << self
++    def statement_manager?(user)
++      user&.admin? || user&.member?
++    end
++
++    def create_from_upload!(family:, account:, file:)
++      prepared_upload = prepare_upload!(file)
++      create_from_prepared_upload!(family: family, account: account, prepared_upload: prepared_upload)
++    end
++
++    def create_from_prepared_upload!(family:, account:, prepared_upload:)
++      statement = nil
++      duplicate = duplicate_for(family, prepared_upload)
++      raise DuplicateUploadError, duplicate if duplicate
++
++      statement = family.account_statements.build(
++        account: account,
++        filename: prepared_upload.filename,
++        content_type: prepared_upload.content_type,
++        byte_size: prepared_upload.byte_size,
++        checksum: prepared_upload.checksum,
++        content_sha256: prepared_upload.content_sha256,
++        source: :manual_upload,
++        upload_status: :stored,
++        review_status: account.present? ? :linked : :unmatched,
++        currency: account&.currency || family.currency
++      )
++
++      statement.original_file.attach(
++        io: StringIO.new(prepared_upload.content),
++        filename: prepared_upload.filename,
++        content_type: prepared_upload.content_type
++      )
++
++      MetadataDetector.new(statement, content: prepared_upload.content).apply
++      statement.assign_account_match unless account.present?
++      statement.save!
++      statement
++    rescue ActiveRecord::RecordNotUnique
++      duplicate = duplicate_for(family, prepared_upload)
++      purge_original_file(statement)
++
++      if duplicate
++        raise DuplicateUploadError, duplicate
++      end
++
++      raise
++    rescue StandardError
++      purge_original_file(statement)
++      raise
++    end
++
++    def reconciliation_statuses_for(statements, account:)
++      statement_list = statements.to_a
++      balance_lookup = balance_lookup_for(account, statement_list)
++
++      statement_list.to_h do |statement|
++        [ statement.id, statement.reconciliation_status(balance_lookup: balance_lookup) ]
++      end
++    end
++
++    def prepare_upload!(file)
++      filename = file.original_filename.to_s
++      content = read_upload_content!(file)
++      byte_size = content.bytesize
++      raise InvalidUploadError if byte_size.zero?
++
++      content_type = detected_content_type(content:, filename:, declared_content_type: file.content_type)
++      raise InvalidUploadError unless allowed_upload?(filename:, content_type:)
++      raise InvalidUploadError if content_type == "application/pdf" && !valid_pdf_content?(content)
++
++      PreparedUpload.new(
++        content: content,
++        filename: filename,
++        content_type: content_type,
++        byte_size: byte_size,
++        checksum: Digest::MD5.base64digest(content),
++        content_sha256: Digest::SHA256.hexdigest(content)
++      )
++    end
++
++    def detected_content_type(content:, filename:, declared_content_type:)
++      Marcel::MimeType.for(
++        StringIO.new(content),
++        name: filename,
++        declared_type: declared_content_type.presence
++      )
++    end
++
++    def allowed_upload?(filename:, content_type:)
++      allowed_content_types_for_filename(filename).include?(content_type)
++    end
++
++    def allowed_content_types_for_filename(filename)
++      ALLOWED_EXTENSION_CONTENT_TYPES.fetch(File.extname(filename.to_s).downcase, [])
++    end
++
++    def valid_pdf_content?(content)
++      content.start_with?("%PDF-")
++    end
++
++    def purge_original_file(statement)
++      return unless statement&.original_file&.attached?
++
++      statement.original_file.purge
++    rescue StandardError => e
++      Rails.logger.warn("AccountStatement staged blob cleanup failed: #{e.class}: #{e.message}")
++    end
++
++    def balance_lookup_for(account, statements)
++      currencies = statements.map(&:statement_currency).compact.uniq
++      dates = statements.flat_map { |statement| [ statement.period_start_on, statement.period_end_on ] }.compact.uniq
++      balances = if currencies.any? && dates.any?
++        account.balances.where(currency: currencies, date: dates).to_a
++      else
++        []
++      end
++      balances_by_key = balances.index_by { |balance| [ balance.date, balance.currency ] }
++
++      ->(date, currency) { balances_by_key[[ date, currency ]] }
++    end
++
++    def read_upload_content!(file)
++      declared_size = declared_upload_size(file)
++      raise InvalidUploadError if declared_size.present? && declared_size > MAX_FILE_SIZE
++
++      content = +"".b
++      loop do
++        chunk = file.read(READ_CHUNK_SIZE)
++        break if chunk.nil? || chunk.empty?
++
++        content << chunk
++        raise InvalidUploadError if content.bytesize > MAX_FILE_SIZE
++      end
++
++      file.rewind if file.respond_to?(:rewind)
++      content
++    end
++
++    def declared_upload_size(file)
++      if file.respond_to?(:size)
++        file.size
++      elsif file.respond_to?(:length)
++        file.length
++      end
++    end
++
++    def duplicate_for(family, prepared_upload)
++      scope = family.account_statements
++      sha_duplicate = scope.find_by(content_sha256: prepared_upload.content_sha256) if prepared_upload.content_sha256.present?
++      return sha_duplicate if sha_duplicate
++
++      # Active Storage's MD5 checksum is retained only to catch legacy rows that predate content_sha256.
++      legacy_scope = prepared_upload.content_sha256.present? ? scope.where(content_sha256: nil) : scope
++      legacy_scope.find_by(checksum: prepared_upload.checksum)
++    end
++  end
++
++  def viewable_by?(user)
++    return false unless user&.family_id == family_id
++
++    account.present? ? account.shared_with?(user) : self.class.statement_manager?(user)
++  end
++
++  def manageable_by?(user)
++    return false unless user&.family_id == family_id
++
++    return self.class.statement_manager?(user) if account.blank?
++
++    account.permission_for(user).in?([ :owner, :full_control ]) && self.class.statement_manager?(user)
++  end
++
++  def link_to_account!(target_account, confidence: 1.0)
++    update!(
++      account: target_account,
++      suggested_account: nil,
++      match_confidence: confidence,
++      review_status: :linked,
++      currency: currency.presence || target_account.currency
++    )
++  end
++
++  def unlink!
++    transaction do
++      update!(
++        account: nil,
++        review_status: :unmatched,
++        match_confidence: nil
++      )
++      assign_account_match
++      save!
++    end
++  end
++
++  def reject_match!
++    update!(
++      suggested_account: nil,
++      match_confidence: nil,
++      review_status: :rejected
++    )
++  end
++
++  def assign_account_match
++    match = AccountMatcher.new(self).best_match
++
++    self.suggested_account = match&.account
++    self.match_confidence = match&.confidence
++    clear_invalid_suggested_account
++  end
++
++  def covered_months
++    return [] unless period_start_on.present? && period_end_on.present?
++
++    current = period_start_on.beginning_of_month
++    last = period_end_on.beginning_of_month
++    months = []
++
++    while current <= last
++      months << current
++      current = current.next_month
++    end
++
++    months
++  end
++
++  def covers_month?(month)
++    covered_months.include?(month.to_date.beginning_of_month)
++  end
++
++  def reconciliation_status(balance_lookup: nil)
++    checks = reconciliation_checks(balance_lookup: balance_lookup)
++    return "unavailable" if checks.empty?
++
++    checks.any? { |check| check[:status] == "mismatched" } ? "mismatched" : "matched"
++  end
++
++  def reconciliation_mismatched?(balance_lookup: nil)
++    reconciliation_status(balance_lookup: balance_lookup) == "mismatched"
++  end
++
++  def reconciliation_checks(balance_lookup: nil)
++    return [] unless account.present? && period_start_on.present? && period_end_on.present?
++
++    checks = []
++    opening_balance_record = balance_record_for(period_start_on, statement_currency, balance_lookup)
++    closing_balance_record = balance_record_for(period_end_on, statement_currency, balance_lookup)
++
++    if opening_balance.present? && opening_balance_record.present?
++      checks << reconciliation_check(
++        key: "opening_balance",
++        statement_amount: opening_balance,
++        ledger_amount: opening_balance_record.start_balance
++      )
++    end
++
++    if closing_balance.present? && closing_balance_record.present?
++      checks << reconciliation_check(
++        key: "closing_balance",
++        statement_amount: closing_balance,
++        ledger_amount: closing_balance_record.end_balance
++      )
++    end
++
++    if opening_balance.present? && closing_balance.present? && opening_balance_record.present? && closing_balance_record.present?
++      checks << reconciliation_check(
++        key: "period_movement",
++        statement_amount: closing_balance - opening_balance,
++        ledger_amount: closing_balance_record.end_balance - opening_balance_record.start_balance
++      )
++    end
++
++    checks
++  end
++
++  def statement_currency
++    currency.presence || account&.currency || family.currency
++  end
++
++  def pdf?
++    content_type.in?(ALLOWED_EXTENSION_CONTENT_TYPES[".pdf"])
++  end
++
++  def csv?
++    content_type.in?(ALLOWED_EXTENSION_CONTENT_TYPES[".csv"])
++  end
++
++  def xlsx?
++    content_type.in?(ALLOWED_EXTENSION_CONTENT_TYPES[".xlsx"])
++  end
++
++  private
++
++    def reconciliation_check(key:, statement_amount:, ledger_amount:)
++      difference = statement_amount.to_d - ledger_amount.to_d
++      {
++        key: key,
++        statement_amount: statement_amount.to_d,
++        ledger_amount: ledger_amount.to_d,
++        difference: difference,
++        status: difference.abs <= 0.01.to_d ? "matched" : "mismatched"
++      }
++    end
++
++    def balance_record_for(date, currency, balance_lookup)
++      return balance_lookup.call(date, currency) if balance_lookup
++
++      account.balances.find_by(date: date, currency: currency)
++    end
++
++    def sync_file_metadata
++      blob = original_file.blob
++      self.filename ||= blob.filename.to_s
++      self.content_type ||= blob.content_type
++      self.byte_size ||= blob.byte_size
++      self.checksum ||= blob.checksum
++    end
++
++    def normalize_currency
++      self.currency = currency.to_s.upcase.presence if currency.present?
++    end
++
++    def sync_review_status
++      return if rejected?
++
++      self.review_status = "linked" if account.present? && !linked?
++      self.review_status = "unmatched" if account.blank? && linked?
++    end
++
++    def account_belongs_to_family
++      return if account.nil?
++      return if account.family_id == family_id
++
++      errors.add(:account, :invalid)
++    end
++
++    def suggested_account_belongs_to_family
++      return if suggested_account_valid_for_family?
++
++      errors.add(:suggested_account, :invalid)
++    end
++
++    def clear_invalid_suggested_account
++      return if suggested_account_valid_for_family?
++
++      self.suggested_account = nil
++      self.match_confidence = nil
++    end
++
++    def suggested_account_valid_for_family?
++      suggested_account.nil? || suggested_account.family_id == family_id
++    end
++
++    def period_order
++      return if period_start_on.blank? || period_end_on.blank?
++      return if period_start_on <= period_end_on
++
++      errors.add(:period_end_on, :on_or_after_start)
++    end
++
++    def currency_is_valid
++      return if currency.blank?
++
++      Money::Currency.new(currency)
++    rescue Money::Currency::UnknownCurrencyError, ArgumentError
++      errors.add(:currency, :invalid)
++    end
++
++    def filename_extension_matches_content_type
++      return if filename.blank? || content_type.blank?
++      return if self.class.allowed_upload?(filename: filename, content_type: content_type)
++
++      errors.add(:content_type, :invalid)
++    end
++
++    def original_file_constraints
++      if original_file.byte_size.zero?
++        errors.add(:original_file, :blank)
++      elsif original_file.byte_size > MAX_FILE_SIZE
++        errors.add(:original_file, :too_large, max_mb: MAX_FILE_SIZE / 1.megabyte)
++      end
++
++      unless self.class.allowed_upload?(filename: original_file.filename.to_s, content_type: original_file.content_type)
++        errors.add(:original_file, :invalid_format, file_format: original_file.content_type)
++      end
++    end
++
++    def original_file_attached
++      errors.add(:original_file, :blank) unless original_file.attached?
++    end
++end
+diff --git a/app/models/account_statement/account_matcher.rb b/app/models/account_statement/account_matcher.rb
+new file mode 100644
+index 0000000000..6e8c5c1c2d
+--- /dev/null
++++ b/app/models/account_statement/account_matcher.rb
+@@ -0,0 +1,73 @@
++# frozen_string_literal: true
++
++class AccountStatement::AccountMatcher
++  Match = Struct.new(:account, :confidence, keyword_init: true)
++
++  attr_reader :statement
++
++  def initialize(statement)
++    @statement = statement
++  end
++
++  def best_match
++    candidates = statement.family.accounts.visible.to_a.filter_map do |account|
++      confidence = confidence_for(account)
++      next if confidence < 0.35
++
++      Match.new(account: account, confidence: confidence.round(4))
++    end
++
++    candidates.max_by(&:confidence)
++  end
++
++  private
++
++    def confidence_for(account)
++      score = 0.to_d
++
++      if institution_hint.present?
++        score += 0.45.to_d if account_text(account).include?(institution_hint)
++      end
++
++      if account_name_hint.present?
++        score += 0.25.to_d if account.name.to_s.downcase.include?(account_name_hint)
++      end
++
++      if account_last4_hint.present?
++        score += 0.25.to_d if account_sensitive_match_text(account).include?(account_last4_hint)
++      end
++
++      score += 0.05.to_d if statement.statement_currency == account.currency
++      [ score, 1.to_d ].min
++    end
++
++    def institution_hint
++      @institution_hint ||= statement.institution_name_hint.to_s.downcase.squish.presence
++    end
++
++    def account_name_hint
++      @account_name_hint ||= statement.account_name_hint.to_s.downcase.squish.presence
++    end
++
++    def account_last4_hint
++      @account_last4_hint ||= statement.account_last4_hint.to_s.downcase.squish.presence
++    end
++
++    def account_text(account)
++      [
++        account.name,
++        account.institution_name,
++        account.institution_domain
++      ].compact.join(" ").downcase
++    end
++
++    def account_sensitive_match_text(account)
++      # Exclude user-controlled account notes from matching hints. Statement
++      # matching should use conservative account metadata, not free-form prose
++      # that can accidentally manufacture a last-four match.
++      [
++        account.name,
++        account.institution_name
++      ].compact.join(" ").downcase
++    end
++end
+diff --git a/app/models/account_statement/coverage.rb b/app/models/account_statement/coverage.rb
+new file mode 100644
+index 0000000000..225df183cd
+--- /dev/null
++++ b/app/models/account_statement/coverage.rb
+@@ -0,0 +1,194 @@
++# frozen_string_literal: true
++
++class AccountStatement::Coverage
++  Month = Struct.new(:date, :status, :statements, :ambiguous_statements, keyword_init: true) do
++    def expected?
++      status != "not_expected"
++    end
++
++    def covered?
++      status == "covered"
++    end
++
++    def missing?
++      status == "missing"
++    end
++
++    def duplicate?
++      status == "duplicate"
++    end
++
++    def ambiguous?
++      status == "ambiguous"
++    end
++
++    def mismatched?
++      status == "mismatched"
++    end
++
++    def not_expected?
++      status == "not_expected"
++    end
++  end
++
++  attr_reader :account, :start_month, :end_month, :expected_start_month, :expected_end_month, :selected_year, :available_years
++
++  class << self
++    def for_year(account, year)
++      expected_end_month = default_expected_end_month
++      expected_start_month = default_expected_start_month(account, fallback_end_month: expected_end_month)
++      available_years = years_between(expected_start_month, expected_end_month)
++      selected_year = resolve_year_value(year, available_years)
++
++      new(
++        account,
++        start_month: Date.new(selected_year, 1, 1),
++        end_month: Date.new(selected_year, 12, 1),
++        expected_start_month: expected_start_month,
++        expected_end_month: expected_end_month,
++        selected_year: selected_year,
++        available_years: available_years
++      )
++    end
++
++    def years_for(account)
++      expected_end_month = default_expected_end_month
++      expected_start_month = default_expected_start_month(account, fallback_end_month: expected_end_month)
++
++      years_between(expected_start_month, expected_end_month)
++    end
++
++    def resolve_year(account, year)
++      resolve_year_value(year, years_for(account))
++    end
++
++    def default_expected_end_month
++      Date.current.prev_month.beginning_of_month
++    end
++
++    def default_expected_start_month(account, fallback_end_month: default_expected_end_month)
++      candidates = [
++        account.entries.minimum(:date),
++        account.balances.minimum(:date),
++        account.account_statements.where.not(period_start_on: nil).minimum(:period_start_on),
++        account.family.account_statements.unmatched.where(suggested_account: account).where.not(period_start_on: nil).minimum(:period_start_on)
++      ].compact
++
++      start_month = (candidates.min || fallback_end_month.advance(months: -11)).to_date.beginning_of_month
++      start_month > fallback_end_month ? fallback_end_month : start_month
++    end
++
++    private
++
++      def years_between(start_month, end_month)
++        (start_month.year..end_month.year).to_a.reverse
++      end
++
++      def resolve_year_value(year, available_years)
++        requested_year = year.to_i if year.present?
++
++        available_years.include?(requested_year) ? requested_year : available_years.first
++      end
++  end
++
++  def initialize(account, start_month: nil, end_month: nil, expected_start_month: nil, expected_end_month: nil, selected_year: nil, available_years: nil)
++    raise ArgumentError, "account is required" if account.nil?
++
++    @account = account
++    @expected_end_month = (expected_end_month || end_month || self.class.default_expected_end_month).to_date.beginning_of_month
++    resolved_expected_start_month = (expected_start_month || start_month || self.class.default_expected_start_month(account, fallback_end_month: @expected_end_month)).to_date.beginning_of_month
++    @expected_start_month = resolved_expected_start_month > @expected_end_month ? @expected_end_month : resolved_expected_start_month
++    @start_month = (start_month || @expected_start_month).to_date.beginning_of_month
++    @end_month = (end_month || @expected_end_month).to_date.beginning_of_month
++    @selected_year = selected_year
++    @available_years = available_years || self.class.years_for(account)
++  end
++
++  def months
++    @months ||= begin
++      current = start_month
++      result = []
++
++      while current <= end_month
++        result << build_month(current)
++        current = current.next_month
++      end
++
++      result
++    end
++  end
++
++  def summary_counts
++    months.group_by(&:status).transform_values(&:count)
++  end
++
++  private
++
++    def build_month(month)
++      return Month.new(date: month, status: "not_expected", statements: [], ambiguous_statements: []) unless expected_month?(month)
++
++      linked_statements = statements_covering(linked_statement_scope, month)
++      ambiguous_statements = statements_covering(ambiguous_statement_scope, month)
++
++      status = if linked_statements.size > 1
++        "duplicate"
++      elsif linked_statements.any? { |statement| statement.reconciliation_mismatched?(balance_lookup: balance_lookup) }
++        "mismatched"
++      elsif linked_statements.one?
++        "covered"
++      elsif ambiguous_statements.any?
++        "ambiguous"
++      else
++        "missing"
++      end
++
++      Month.new(date: month, status: status, statements: linked_statements, ambiguous_statements: ambiguous_statements)
++    end
++
++    def expected_month?(month)
++      month >= expected_start_month && month <= expected_end_month
++    end
++
++    def linked_statement_scope
++      @linked_statement_scope ||= account.account_statements
++        .where("period_start_on <= ? AND period_end_on >= ?", end_month.end_of_month, start_month)
++        .ordered
++        .to_a
++    end
++
++    def ambiguous_statement_scope
++      @ambiguous_statement_scope ||= account.family.account_statements
++        .unmatched
++        .where(suggested_account: account)
++        .where("period_start_on <= ? AND period_end_on >= ?", end_month.end_of_month, start_month)
++        .ordered
++        .to_a
++    end
++
++    def statements_covering(statements, month)
++      month_start = month.to_date.beginning_of_month
++      month_end = month_start.end_of_month
++
++      statements.select do |statement|
++        statement.period_start_on.present? &&
++          statement.period_end_on.present? &&
++          statement.period_start_on <= month_end &&
++          statement.period_end_on >= month_start
++      end
++    end
++
++    def balance_lookup
++      @balance_lookup ||= begin
++        currencies = linked_statement_scope.map(&:statement_currency).compact.uniq
++        dates = linked_statement_scope.flat_map { |statement| [ statement.period_start_on, statement.period_end_on ] }.compact.uniq
++        balances = if currencies.any? && dates.any?
++          account.balances.where(currency: currencies, date: dates).to_a
++        else
++          []
++        end
++        by_key = balances.index_by { |balance| [ balance.date, balance.currency ] }
++
++        ->(date, currency) { by_key[[ date, currency ]] }
++      end
++    end
++end
+diff --git a/app/models/account_statement/metadata_detector.rb b/app/models/account_statement/metadata_detector.rb
+new file mode 100644
+index 0000000000..e8079d5b8d
+--- /dev/null
++++ b/app/models/account_statement/metadata_detector.rb
+@@ -0,0 +1,221 @@
++# frozen_string_literal: true
++
++require "csv"
++require "stringio"
++
++class AccountStatement::MetadataDetector
++  DATE_PATTERNS = [
++    /(?<![a-z0-9])\d{4}[-_\.]\d{1,2}[-_\.]\d{1,2}(?![a-z0-9])/,
++    /(?<![a-z0-9])\d{1,2}[-_\.]\d{1,2}[-_\.]\d{4}(?![a-z0-9])/,
++    /(?<![a-z0-9])\d{8}(?![a-z0-9])/
++  ].freeze
++
++  MONTH_PATTERN = /
++    (?<![a-z0-9])
++    (?:
++      (?<year_first>\d{4})[-_\.](?<month_first>0?[1-9]|1[0-2])
++      |
++      (?<month_name>jan(?:uary)?|feb(?:ruary)?|mar(?:ch)?|apr(?:il)?|may|jun(?:e)?|jul(?:y)?|aug(?:ust)?|sep(?:t(?:ember)?)?|oct(?:ober)?|nov(?:ember)?|dec(?:ember)?)
++      [-_\s\.]+(?<year_second>\d{4})
++    )
++    (?![a-z0-9])
++  /ix.freeze
++
++  LAST4_PATTERN = /(?:^|[^a-z0-9])(?:x{2,}|ending|last\s*4|acct|account|card)[^\d]*(\d{4})(?=\D|$)/i.freeze
++  GENERIC_FILENAME_HINTS = [
++    "statement",
++    "statements",
++    "bank statement",
++    "bank statements",
++    "account statement",
++    "account statements",
++    "credit card statement",
++    "card statement"
++  ].freeze
++  MAX_CSV_COLUMNS = 100
++  MAX_CSV_DATE_SAMPLES = 250
++  MAX_CSV_SAMPLE_BYTES = 256
++
++  attr_reader :statement, :content
++
++  def initialize(statement, content:)
++    @statement = statement
++    @content = content
++  end
++
++  def apply
++    output = statement.sanitized_parser_output || {}
++    metadata_sources = []
++
++    if detect_from_filename
++      metadata_sources << "filename"
++    end
++
++    if statement.csv? && detect_from_csv(output)
++      metadata_sources << "csv_dates"
++    elsif statement.xlsx?
++      output["spreadsheet_detection"] = "filename_only"
++    elsif statement.pdf?
++      output["pdf_detection"] = "filename_only"
++    end
++
++    output["metadata_sources"] = metadata_sources
++    statement.sanitized_parser_output = output
++    statement.parser_confidence ||= if metadata_sources.include?("csv_dates")
++      0.65
++    elsif metadata_sources.any?
++      0.45
++    else
++      0.1
++    end
++  end
++
++  private
++
++    def detect_from_filename
++      basename = File.basename(statement.filename.to_s, ".*")
++      return false if basename.blank?
++
++      detected = false
++
++      if (last4 = basename.match(LAST4_PATTERN)&.captures&.first)
++        statement.account_last4_hint ||= last4
++        detected = true
++      end
++
++      dates = DATE_PATTERNS.flat_map { |pattern| basename.scan(pattern) }
++                           .map { |match| Array(match).first }
++                           .filter_map { |value| parse_date(value) }
++                           .uniq
++                           .sort
++
++      if dates.size >= 2
++        statement.period_start_on ||= dates.first
++        statement.period_end_on ||= dates.last
++        detected = true
++      elsif dates.size == 1
++        statement.period_start_on ||= dates.first.beginning_of_month
++        statement.period_end_on ||= dates.first.end_of_month
++        detected = true
++      elsif (month_date = parse_month_from_filename(basename))
++        statement.period_start_on ||= month_date.beginning_of_month
++        statement.period_end_on ||= month_date.end_of_month
++        detected = true
++      end
++
++      hint = basename
++        .gsub(LAST4_PATTERN, "")
++        .gsub(/\b\d{4}[-_\.]\d{1,2}(?:[-_\.]\d{1,2})?\b/, "")
++        .gsub(/\b\d{8}\b/, "")
++        .tr("_-", " ")
++        .gsub(/\b(?:19|20)\d{2}\b/, "")
++        .gsub(/\b(?:0?[1-9]|1[0-2])\b/, "")
++        .squish
++        .presence
++
++      if (meaningful_hint = meaningful_filename_hint(hint))
++        statement.institution_name_hint ||= meaningful_hint
++        statement.account_name_hint ||= meaningful_hint
++        detected = true
++      end
++
++      detected
++    end
++
++    def detect_from_csv(output)
++      csv = CSV.new(StringIO.new(content.to_s), headers: true, liberal_parsing: true)
++      first_row = csv.shift
++      return false if first_row.blank?
++
++      headers = first_row.headers.compact.map(&:to_s)
++      return false if headers.size > MAX_CSV_COLUMNS
++
++      date_header = headers.find { |header| csv_sample_text(header).to_s.match?(/date|posted|transaction/i) }
++      return false if date_header.blank?
++
++      samples = [ csv_sample_text(first_row[date_header]) ].compact_blank
++      csv.each do |row|
++        break if samples.size >= MAX_CSV_DATE_SAMPLES
++
++        sample = csv_sample_text(row[date_header])
++        samples << sample if sample.present?
++      end
++      return false if samples.blank?
++
++      date_format = Import.detect_date_format(samples)
++      dates = samples.filter_map { |sample| parse_date_with_format(sample, date_format) }.uniq.sort
++      return false if dates.blank?
++
++      statement.period_start_on ||= dates.first
++      statement.period_end_on ||= dates.last
++      output["csv"] = {
++        "date_header" => date_header.to_s,
++        "date_format" => date_format,
++        "rows_sampled" => samples.size
++      }
++      true
++    rescue CSV::MalformedCSVError
++      false
++    end
++
++    def csv_sample_text(value)
++      text = value.to_s
++      return nil if text.bytesize > MAX_CSV_SAMPLE_BYTES
++
++      text
++    end
++
++    def meaningful_filename_hint(hint)
++      return nil if hint.blank?
++
++      normalized = hint.downcase.gsub(/[^a-z0-9]+/, " ").squish
++      without_generic_words = normalized
++        .gsub(/\b(?:bank|account|card|credit|debit|statement|statements)\b/, "")
++        .squish
++
++      return nil if GENERIC_FILENAME_HINTS.include?(normalized) || without_generic_words.blank?
++
++      hint
++    end
++
++    def parse_date(value)
++      text = value.to_s.tr("_", "-")
++      date = if text.match?(/\A\d{8}\z/)
++        Date.strptime(text, "%Y%m%d")
++      else
++        Date.parse(text)
++      end
++
++      AccountStatement::MetadataDetector.reasonable_date?(date) ? date : nil
++    rescue Date::Error, ArgumentError
++      nil
++    end
++
++    def parse_date_with_format(value, format)
++      date = Date.strptime(value.to_s, format)
++      AccountStatement::MetadataDetector.reasonable_date?(date) ? date : nil
++    rescue Date::Error, ArgumentError
++      nil
++    end
++
++    def parse_month_from_filename(basename)
++      match = basename.match(MONTH_PATTERN)
++      return nil unless match
++
++      year = (match[:year_first] || match[:year_second]).to_i
++      month = if match[:month_first]
++        match[:month_first].to_i
++      else
++        Date::ABBR_MONTHNAMES.index(match[:month_name][0, 3].capitalize)
++      end
++
++      date = Date.new(year, month, 1)
++      AccountStatement::MetadataDetector.reasonable_date?(date) ? date : nil
++    rescue Date::Error, NoMethodError
++      nil
++    end
++
++    def self.reasonable_date?(date)
++      Import.reasonable_date_range.cover?(date)
++    end
++end
+diff --git a/app/models/family.rb b/app/models/family.rb
+index fb211d78c7..1687737014 100644
+--- a/app/models/family.rb
++++ b/app/models/family.rb
+@@ -28,6 +28,7 @@ class Family < ApplicationRecord
+ 
+   has_many :imports, dependent: :destroy
+   has_many :family_exports, dependent: :destroy
++  has_many :account_statements, dependent: :destroy
+ 
+   has_many :entries, through: :accounts
+   has_many :transactions, through: :accounts
+diff --git a/app/views/account_statements/index.html.erb b/app/views/account_statements/index.html.erb
+new file mode 100644
+index 0000000000..dba3f16774
+--- /dev/null
++++ b/app/views/account_statements/index.html.erb
+@@ -0,0 +1,170 @@
++<%= content_for :page_title, t(".title") %>
++
++<%= settings_section title: t(".title") do %>
++  <div class="space-y-4">
++    <div class="rounded-xl bg-container-inset p-4">
++      <div class="flex items-start justify-between gap-3 mb-4">
++        <div>
++          <p class="text-sm font-medium text-primary"><%= t(".upload_title") %></p>
++          <p class="text-xs text-secondary"><%= t(".upload_description") %></p>
++        </div>
++        <div class="text-right">
++          <p class="text-xs text-secondary"><%= t(".storage_used") %></p>
++          <p class="text-sm font-medium text-primary"><%= number_to_human_size(@total_storage_bytes) %></p>
++        </div>
++      </div>
++
++      <%= styled_form_with url: account_statements_path, scope: :account_statement, multipart: true, class: "grid gap-3 lg:grid-cols-[1fr_16rem_auto] lg:items-end" do |form| %>
++        <div>
++          <%= form.label :files, t("account_statements.form.files_label"), class: "form-field__label" %>
++          <%= form.file_field :files,
++                              multiple: true,
++                              accept: AccountStatement::ACCEPTED_FILE_EXTENSIONS.join(","),
++                              class: "form-field__input" %>
++          <p class="text-xs text-secondary mt-2"><%= t("account_statements.form.files_hint", max_size: AccountStatement::MAX_FILE_SIZE / 1.megabyte) %></p>
++        </div>
++        <%= form.collection_select :account_id,
++                                   @accounts,
++                                   :id,
++                                   :name,
++                                   { include_blank: t(".leave_unmatched"), label: t(".account_label") },
++                                   { data: { testid: "account-statement-account-select" } } %>
++        <div>
++          <%= form.submit t("account_statements.form.inbox_upload") %>
++        </div>
++      <% end %>
++    </div>
++
++    <div class="rounded-xl bg-container-inset space-y-1 p-1">
++      <div class="flex items-center gap-1.5 px-4 py-2 text-xs font-medium text-secondary uppercase">
++        <p><%= t(".unmatched_title") %></p>
++        <span class="text-subdued">&middot;</span>
++        <p><%= @unmatched_pagy.count %></p>
++      </div>
++
++      <div class="bg-container rounded-lg shadow-border-xs overflow-x-auto">
++        <% if @unmatched_statements.any? %>
++          <table class="w-full">
++            <thead>
++              <tr class="text-xs uppercase font-medium text-secondary border-b border-divider">
++                <th class="px-3 py-3 text-left min-w-56"><%= t("account_statements.table.file") %></th>
++                <th class="px-3 py-3 text-left min-w-44"><%= t("account_statements.table.period") %></th>
++                <th class="px-3 py-3 text-left min-w-48"><%= t("account_statements.table.suggestion") %></th>
++                <th class="px-3 py-3 text-right min-w-24"><%= t("account_statements.table.actions") %></th>
++              </tr>
++            </thead>
++            <tbody>
++              <% @unmatched_statements.each do |statement| %>
++                <tr id="<%= dom_id(statement) %>" class="border-b border-subdued hover:bg-surface-hover">
++                  <td class="px-3 py-3">
++                    <%= link_to account_statement_path(statement), class: "flex items-center gap-2 min-w-0 text-sm font-medium text-primary hover:underline" do %>
++                      <%= icon(account_statement_file_icon(statement), size: "sm") %>
++                      <span class="truncate"><%= statement.filename %></span>
++                    <% end %>
++                    <p class="text-xs text-secondary"><%= number_to_human_size(statement.byte_size) %></p>
++                  </td>
++                  <td class="px-3 py-3 text-sm text-secondary"><%= account_statement_period(statement) %></td>
++                  <td class="px-3 py-3">
++                    <% if statement.suggested_account.present? %>
++                      <div class="flex flex-col gap-1">
++                        <p class="text-sm font-medium text-primary"><%= statement.suggested_account.name %></p>
++                        <p class="text-xs text-secondary"><%= t(".confidence", confidence: number_to_percentage(statement.match_confidence.to_d * 100, precision: 0)) %></p>
++                      </div>
++                    <% else %>
++                      <span class="text-sm text-secondary"><%= t(".no_suggestion") %></span>
++                    <% end %>
++                  </td>
++                  <td class="px-3 py-3">
++                    <div class="flex items-center justify-end gap-3">
++                      <% if statement.suggested_account.present? %>
++                        <%= button_to link_account_statement_path(statement),
++                                      method: :patch,
++                                      params: { account_id: statement.suggested_account_id },
++                                      class: "flex items-center",
++                                      aria: { label: t("account_statements.table.link_suggestion") } do %>
++                          <%= icon("link", class: "w-5 h-5 text-primary") %>
++                        <% end %>
++                        <%= button_to reject_account_statement_path(statement),
++                                      method: :patch,
++                                      class: "flex items-center",
++                                      aria: { label: t("account_statements.table.reject") } do %>
++                          <%= icon("x", class: "w-5 h-5 text-secondary") %>
++                        <% end %>
++                      <% end %>
++                      <%= link_to account_statement_path(statement), aria: { label: t("account_statements.table.view") } do %>
++                        <%= icon("eye", class: "w-5 h-5 text-primary") %>
++                      <% end %>
++                    </div>
++                  </td>
++                </tr>
++              <% end %>
++            </tbody>
++          </table>
++        <% else %>
++          <p class="text-sm text-secondary text-center py-8 font-medium"><%= t(".empty_unmatched") %></p>
++        <% end %>
++      </div>
++      <% if @unmatched_pagy.pages > 1 %>
++        <div class="px-3 py-2">
++          <%= render "shared/pagination", pagy: @unmatched_pagy %>
++        </div>
++      <% end %>
++    </div>
++
++    <div class="rounded-xl bg-container-inset space-y-1 p-1">
++      <div class="flex items-center gap-1.5 px-4 py-2 text-xs font-medium text-secondary uppercase">
++        <p><%= t(".linked_title") %></p>
++        <span class="text-subdued">&middot;</span>
++        <p><%= @linked_pagy.count %></p>
++      </div>
++
++      <div class="bg-container rounded-lg shadow-border-xs overflow-x-auto">
++        <% if @linked_statements.any? %>
++          <table class="w-full">
++            <thead>
++              <tr class="text-xs uppercase font-medium text-secondary border-b border-divider">
++                <th class="px-3 py-3 text-left min-w-56"><%= t("account_statements.table.file") %></th>
++                <th class="px-3 py-3 text-left min-w-44"><%= t("account_statements.table.account") %></th>
++                <th class="px-3 py-3 text-left min-w-44"><%= t("account_statements.table.period") %></th>
++                <th class="px-3 py-3 text-right min-w-24"><%= t("account_statements.table.actions") %></th>
++              </tr>
++            </thead>
++            <tbody>
++              <% @linked_statements.each do |statement| %>
++                <tr id="<%= dom_id(statement) %>" class="border-b border-subdued hover:bg-surface-hover">
++                  <td class="px-3 py-3">
++                    <%= link_to account_statement_path(statement), class: "flex items-center gap-2 min-w-0 text-sm font-medium text-primary hover:underline" do %>
++                      <%= icon(account_statement_file_icon(statement), size: "sm") %>
++                      <span class="truncate"><%= statement.filename %></span>
++                    <% end %>
++                  </td>
++                  <td class="px-3 py-3 text-sm text-secondary"><%= statement.account&.name %></td>
++                  <td class="px-3 py-3 text-sm text-secondary"><%= account_statement_period(statement) %></td>
++                  <td class="px-3 py-3">
++                    <div class="flex items-center justify-end gap-3">
++                      <%= link_to account_statement_path(statement), aria: { label: t("account_statements.table.view") } do %>
++                        <%= icon("eye", class: "w-5 h-5 text-primary") %>
++                      <% end %>
++                      <% if statement.original_file.attached? %>
++                        <%= link_to rails_blob_path(statement.original_file, disposition: "attachment"), aria: { label: t("account_statements.table.download") } do %>
++                          <%= icon("download", class: "w-5 h-5 text-primary") %>
++                        <% end %>
++                      <% end %>
++                    </div>
++                  </td>
++                </tr>
++              <% end %>
++            </tbody>
++          </table>
++        <% else %>
++          <p class="text-sm text-secondary text-center py-8 font-medium"><%= t(".empty_linked") %></p>
++        <% end %>
++      </div>
++      <% if @linked_pagy.pages > 1 %>
++        <div class="px-3 py-2">
++          <%= render "shared/pagination", pagy: @linked_pagy %>
++        </div>
++      <% end %>
++    </div>
++  </div>
++<% end %>
+diff --git a/app/views/account_statements/show.html.erb b/app/views/account_statements/show.html.erb
+new file mode 100644
+index 0000000000..e320fc79ad
+--- /dev/null
++++ b/app/views/account_statements/show.html.erb
+@@ -0,0 +1,180 @@
++<%= content_for :page_title, @statement.filename %>
++
++<%= settings_section title: t(".title") do %>
++  <div class="space-y-4">
++    <div class="rounded-xl bg-container-inset p-4">
++      <div class="flex flex-col gap-4 md:flex-row md:items-start md:justify-between">
++        <div class="min-w-0">
++          <div class="flex items-center gap-2">
++            <%= icon(account_statement_file_icon(@statement), size: "sm") %>
++            <h2 class="text-lg font-medium text-primary truncate"><%= @statement.filename %></h2>
++          </div>
++          <div class="mt-2 flex flex-wrap items-center gap-2 text-xs text-secondary">
++            <%= account_statement_status_badge(@statement) %>
++            <span><%= number_to_human_size(@statement.byte_size) %></span>
++            <span><%= @statement.content_type %></span>
++          </div>
++        </div>
++
++        <div class="flex items-center gap-3">
++          <% if @statement.original_file.attached? %>
++            <%= link_to rails_blob_path(@statement.original_file, disposition: "attachment"),
++                        class: "inline-flex items-center gap-2 text-sm font-medium text-primary hover:text-primary-hover" do %>
++              <%= icon("download", size: "sm") %>
++              <%= t(".download") %>
++            <% end %>
++          <% end %>
++          <% if @can_manage_statement %>
++            <%= button_to account_statement_path(@statement),
++                          method: :delete,
++                          class: "inline-flex items-center gap-2 text-sm font-medium text-destructive",
++                          data: { turbo_confirm: CustomConfirm.for_resource_deletion("statement") } do %>
++              <%= icon("trash-2", size: "sm", color: "destructive") %>
++              <%= t(".delete") %>
++            <% end %>
++          <% end %>
++        </div>
++      </div>
++    </div>
++
++    <div class="grid gap-4 lg:grid-cols-[1fr_22rem]">
++      <div class="rounded-xl bg-container-inset p-4">
++        <h3 class="text-sm font-medium text-primary mb-3"><%= t(".metadata_title") %></h3>
++
++        <% if @can_manage_statement %>
++          <%= styled_form_with model: @statement, url: account_statement_path(@statement), method: :patch, class: "space-y-4" do |form| %>
++            <div class="grid gap-3 md:grid-cols-2">
++              <%= form.text_field :institution_name_hint, label: t(".institution_name_hint") %>
++              <%= form.text_field :account_name_hint, label: t(".account_name_hint") %>
++              <%= form.text_field :account_last4_hint, label: t(".account_last4_hint") %>
++              <%= form.select :currency,
++                              account_statement_currency_options(@statement),
++                              { label: t(".currency"), selected: @statement.statement_currency } %>
++              <%= form.date_field :period_start_on, label: t(".period_start_on") %>
++              <%= form.date_field :period_end_on, label: t(".period_end_on") %>
++              <%= form.number_field :opening_balance, label: t(".opening_balance"), step: "0.01" %>
++              <%= form.number_field :closing_balance, label: t(".closing_balance"), step: "0.01" %>
++            </div>
++
++            <%= form.submit t(".save") %>
++          <% end %>
++        <% else %>
++          <dl class="grid gap-3 md:grid-cols-2 text-sm">
++            <div>
++              <dt class="text-xs text-secondary"><%= t(".account_label") %></dt>
++              <dd class="text-primary"><%= @statement.account&.name || t(".unmatched_account") %></dd>
++            </div>
++            <div>
++              <dt class="text-xs text-secondary"><%= t(".institution_name_hint") %></dt>
++              <dd class="text-primary"><%= @statement.institution_name_hint.presence || t(".unknown_value") %></dd>
++            </div>
++            <div>
++              <dt class="text-xs text-secondary"><%= t(".account_name_hint") %></dt>
++              <dd class="text-primary"><%= @statement.account_name_hint.presence || t(".unknown_value") %></dd>
++            </div>
++            <div>
++              <dt class="text-xs text-secondary"><%= t(".account_last4_hint") %></dt>
++              <dd class="text-primary"><%= @statement.account_last4_hint.presence || t(".unknown_value") %></dd>
++            </div>
++            <div>
++              <dt class="text-xs text-secondary"><%= t(".currency") %></dt>
++              <dd class="text-primary"><%= @statement.statement_currency %></dd>
++            </div>
++            <div>
++              <dt class="text-xs text-secondary"><%= t("account_statements.table.period") %></dt>
++              <dd class="text-primary"><%= account_statement_period(@statement) %></dd>
++            </div>
++            <div>
++              <dt class="text-xs text-secondary"><%= t(".opening_balance") %></dt>
++              <dd class="text-primary privacy-sensitive"><%= account_statement_balance_label(@statement, :opening_balance) %></dd>
++            </div>
++            <div>
++              <dt class="text-xs text-secondary"><%= t(".closing_balance") %></dt>
++              <dd class="text-primary privacy-sensitive"><%= account_statement_balance_label(@statement, :closing_balance) %></dd>
++            </div>
++          </dl>
++        <% end %>
++      </div>
++
++      <div class="space-y-4">
++        <div class="rounded-xl bg-container-inset p-4">
++          <h3 class="text-sm font-medium text-primary mb-3"><%= t(".linking_title") %></h3>
++
++          <% if @statement.account.present? %>
++            <p class="text-sm text-secondary mb-3">
++              <%= t(".linked_to", account: @statement.account.name) %>
++            </p>
++            <% if @can_manage_statement %>
++              <%= button_to unlink_account_statement_path(@statement),
++                            method: :patch,
++                            class: "inline-flex items-center gap-2 text-sm font-medium text-primary" do %>
++                <%= icon("unlink", size: "sm") %>
++                <%= t(".unlink") %>
++              <% end %>
++            <% end %>
++          <% elsif @statement.suggested_account.present? %>
++            <p class="text-sm text-secondary mb-3">
++              <%= t(".suggested_account", account: @statement.suggested_account.name, confidence: number_to_percentage(@statement.match_confidence.to_d * 100, precision: 0)) %>
++            </p>
++            <% if @can_manage_statement %>
++              <div class="flex items-center gap-3">
++                <%= button_to link_account_statement_path(@statement),
++                              method: :patch,
++                              params: { account_id: @statement.suggested_account_id },
++                              class: "inline-flex items-center gap-2 text-sm font-medium text-primary" do %>
++                  <%= icon("link", size: "sm") %>
++                  <%= t(".link_suggestion") %>
++                <% end %>
++                <%= button_to reject_account_statement_path(@statement),
++                              method: :patch,
++                              class: "inline-flex items-center gap-2 text-sm font-medium text-secondary" do %>
++                  <%= icon("x", size: "sm") %>
++                  <%= t(".reject") %>
++                <% end %>
++              </div>
++            <% end %>
++          <% else %>
++            <p class="text-sm text-secondary"><%= t(".no_suggestion") %></p>
++          <% end %>
++        </div>
++
++        <div class="rounded-xl bg-container-inset p-4">
++          <h3 class="text-sm font-medium text-primary mb-3"><%= t(".reconciliation_title") %></h3>
++
++          <% if @reconciliation_checks.any? %>
++            <div class="space-y-3">
++              <% @reconciliation_checks.each do |check| %>
++                <div class="rounded-lg bg-container shadow-border-xs p-3">
++                  <div class="flex items-center justify-between gap-3">
++                    <p class="text-sm font-medium text-primary"><%= account_statement_reconciliation_label(check) %></p>
++                    <% if check[:status] == "matched" %>
++                      <%= render "shared/badge", color: "success" do %><%= t("account_statements.reconciliation.matched") %><% end %>
++                    <% else %>
++                      <%= render "shared/badge", color: "error" do %><%= t("account_statements.reconciliation.mismatched") %><% end %>
++                    <% end %>
++                  </div>
++                  <dl class="mt-3 space-y-1 text-xs text-secondary">
++                    <div class="flex justify-between gap-3">
++                      <dt><%= t(".statement_amount") %></dt>
++                      <dd class="privacy-sensitive"><%= Money.new(check[:statement_amount], @statement.statement_currency).format %></dd>
++                    </div>
++                    <div class="flex justify-between gap-3">
++                      <dt><%= t(".ledger_amount") %></dt>
++                      <dd class="privacy-sensitive"><%= Money.new(check[:ledger_amount], @statement.statement_currency).format %></dd>
++                    </div>
++                    <div class="flex justify-between gap-3">
++                      <dt><%= t(".difference") %></dt>
++                      <dd class="privacy-sensitive"><%= Money.new(check[:difference], @statement.statement_currency).format %></dd>
++                    </div>
++                  </dl>
++                </div>
++              <% end %>
++            </div>
++          <% else %>
++            <p class="text-sm text-secondary"><%= t(".reconciliation_unavailable") %></p>
++          <% end %>
++        </div>
++      </div>
++    </div>
++  </div>
++<% end %>
+diff --git a/app/views/accounts/show.html.erb b/app/views/accounts/show.html.erb
+index 170f12986e..a2c663b6be 100644
+--- a/app/views/accounts/show.html.erb
++++ b/app/views/accounts/show.html.erb
+@@ -2,7 +2,11 @@
+       account: @account,
+       chart_view: @chart_view,
+       chart_period: @period,
+-      active_tab: @tab
++      active_tab: @tab,
++      statement_coverage: @statement_coverage,
++      statements: @account_statements,
++      reconciliation_statuses: @statement_reconciliation_statuses,
++      can_manage_statements: @can_manage_statements
+     ) do |account_page| %>
+   <%= account_page.with_activity_feed(feed_data: @activity_feed_data, pagy: @pagy, search: @q[:search]) %>
+ <% end %>
+diff --git a/app/views/accounts/show/_menu.html.erb b/app/views/accounts/show/_menu.html.erb
+index 45a39fe18a..cb577369e7 100644
+--- a/app/views/accounts/show/_menu.html.erb
++++ b/app/views/accounts/show/_menu.html.erb
+@@ -6,6 +6,7 @@
+     <% menu.with_item(variant: "link", text: "Edit", href: edit_account_path(account), icon: "pencil-line", data: { turbo_frame: :modal }) %>
+   <% end %>
+   <% menu.with_item(variant: "link", text: "Sharing", href: account_sharing_path(account), icon: "users", data: { turbo_frame: :modal }) %>
++  <% menu.with_item(variant: "link", text: t(".statements"), href: account_path(account, tab: "statements"), icon: "archive") %>
+ 
+   <% if permission.in?([ :owner, :full_control ]) %>
+     <% if account.supports_trades? %>
+diff --git a/app/views/accounts/show/_statements.html.erb b/app/views/accounts/show/_statements.html.erb
+new file mode 100644
+index 0000000000..3a5d4a11ae
+--- /dev/null
++++ b/app/views/accounts/show/_statements.html.erb
+@@ -0,0 +1,124 @@
++<%# locals: (account:, coverage:, statements:, reconciliation_statuses:, can_manage_statements:) %>
++
++<div class="space-y-4">
++  <div class="rounded-xl bg-container-inset p-1">
++    <div class="flex flex-col gap-3 px-4 py-3 lg:flex-row lg:items-start lg:justify-between">
++      <div>
++        <p class="text-sm font-medium text-primary"><%= t("account_statements.account_tab.coverage_title") %></p>
++        <p class="text-xs text-secondary"><%= t("account_statements.account_tab.coverage_description") %></p>
++        <p class="text-xs text-secondary"><%= account_statement_coverage_range(coverage) %></p>
++      </div>
++      <div class="flex flex-wrap items-center gap-3">
++        <%= form_with url: account_path(account), method: :get, data: { controller: "auto-submit-form" } do |form| %>
++          <%= form.hidden_field :tab, value: "statements" %>
++          <%= form.select :statement_year,
++                          coverage.available_years.map { |year| [ year, year ] },
++                          { selected: coverage.selected_year },
++                          class: "bg-container border border-secondary rounded-lg px-3 py-2 text-sm pr-7 cursor-pointer text-primary focus:outline-hidden focus:ring-0",
++                          data: { "auto-submit-form-target": "auto" },
++                          aria: { label: t("account_statements.account_tab.year_label") } %>
++        <% end %>
++        <%= link_to account_statements_path,
++                    class: "inline-flex items-center gap-2 text-sm font-medium text-primary hover:text-primary-hover" do %>
++          <%= icon("inbox", size: "sm") %>
++          <%= t("account_statements.account_tab.open_inbox") %>
++        <% end %>
++      </div>
++    </div>
++
++    <div class="grid grid-cols-2 sm:grid-cols-3 lg:grid-cols-6 gap-2 bg-container rounded-lg shadow-border-xs p-3">
++      <% coverage.months.each do |month| %>
++        <div class="rounded-lg ring px-3 py-2 <%= account_statement_coverage_classes(month.status) %>">
++          <p class="text-xs font-medium"><%= account_statement_coverage_label(month) %></p>
++          <p class="text-xs capitalize"><%= t("account_statements.coverage.status.#{month.status}") %></p>
++        </div>
++      <% end %>
++    </div>
++  </div>
++
++  <% if can_manage_statements %>
++    <div class="rounded-xl bg-container-inset p-4">
++      <%= styled_form_with url: account_statements_path, scope: :account_statement, multipart: true, class: "space-y-3" do |form| %>
++        <%= form.hidden_field :account_id, value: account.id %>
++        <div>
++          <%= form.label :files, t("account_statements.form.files_label"), class: "form-field__label" %>
++          <%= form.file_field :files,
++                              multiple: true,
++                              accept: AccountStatement::ACCEPTED_FILE_EXTENSIONS.join(","),
++                              class: "form-field__input" %>
++          <p class="text-xs text-secondary mt-2"><%= t("account_statements.form.files_hint", max_size: AccountStatement::MAX_FILE_SIZE / 1.megabyte) %></p>
++        </div>
++        <%= form.submit t("account_statements.form.account_upload") %>
++      <% end %>
++    </div>
++  <% end %>
++
++  <div class="rounded-xl bg-container-inset p-1">
++    <div class="flex items-center gap-1.5 px-4 py-2 text-xs font-medium text-secondary uppercase">
++      <p><%= t("account_statements.account_tab.statements_title") %></p>
++      <span class="text-subdued">&middot;</span>
++      <p><%= statements.size %></p>
++    </div>
++
++    <div class="bg-container rounded-lg shadow-border-xs overflow-x-auto">
++      <% if statements.any? %>
++        <table class="w-full">
++          <thead>
++            <tr class="text-xs uppercase font-medium text-secondary border-b border-divider">
++              <th class="px-3 py-3 text-left min-w-56"><%= t("account_statements.table.file") %></th>
++              <th class="px-3 py-3 text-left min-w-44"><%= t("account_statements.table.period") %></th>
++              <th class="px-3 py-3 text-left min-w-32"><%= t("account_statements.table.reconciliation") %></th>
++              <th class="px-3 py-3 text-right min-w-24"><%= t("account_statements.table.actions") %></th>
++            </tr>
++          </thead>
++          <tbody>
++            <% statements.each do |statement| %>
++              <tr id="<%= dom_id(statement) %>" class="border-b border-subdued hover:bg-surface-hover">
++                <td class="px-3 py-3">
++                  <%= link_to account_statement_path(statement), class: "flex items-center gap-2 min-w-0 text-sm font-medium text-primary hover:underline" do %>
++                    <%= icon(account_statement_file_icon(statement), size: "sm") %>
++                    <span class="truncate"><%= statement.filename %></span>
++                  <% end %>
++                  <p class="text-xs text-secondary"><%= number_to_human_size(statement.byte_size) %></p>
++                </td>
++                <td class="px-3 py-3 text-sm text-secondary"><%= account_statement_period(statement) %></td>
++                <td class="px-3 py-3">
++                  <% case reconciliation_statuses[statement.id] %>
++                  <% when "matched" %>
++                    <%= render "shared/badge", color: "success" do %><%= t("account_statements.reconciliation.matched") %><% end %>
++                  <% when "mismatched" %>
++                    <%= render "shared/badge", color: "error" do %><%= t("account_statements.reconciliation.mismatched") %><% end %>
++                  <% else %>
++                    <%= render "shared/badge" do %><%= t("account_statements.reconciliation.unavailable") %><% end %>
++                  <% end %>
++                </td>
++                <td class="px-3 py-3">
++                  <div class="flex items-center justify-end gap-3">
++                    <%= link_to account_statement_path(statement), aria: { label: t("account_statements.table.view") } do %>
++                      <%= icon("eye", class: "w-5 h-5 text-primary") %>
++                    <% end %>
++                    <% if statement.original_file.attached? %>
++                      <%= link_to rails_blob_path(statement.original_file, disposition: "attachment"), aria: { label: t("account_statements.table.download") } do %>
++                        <%= icon("download", class: "w-5 h-5 text-primary") %>
++                      <% end %>
++                    <% end %>
++                    <% if can_manage_statements %>
++                      <%= button_to unlink_account_statement_path(statement),
++                                    method: :patch,
++                                    class: "flex items-center",
++                                    aria: { label: t("account_statements.table.unlink") } do %>
++                        <%= icon("unlink", class: "w-5 h-5 text-secondary") %>
++                      <% end %>
++                    <% end %>
++                  </div>
++                </td>
++              </tr>
++            <% end %>
++          </tbody>
++        </table>
++      <% else %>
++        <p class="text-sm text-secondary text-center py-8 font-medium"><%= t("account_statements.account_tab.empty") %></p>
++      <% end %>
++    </div>
++  </div>
++</div>
+diff --git a/app/views/accounts/show/_statements_frame.html.erb b/app/views/accounts/show/_statements_frame.html.erb
+new file mode 100644
+index 0000000000..acccc4190e
+--- /dev/null
++++ b/app/views/accounts/show/_statements_frame.html.erb
+@@ -0,0 +1,10 @@
++<%# locals: (account:, coverage:, statements:, reconciliation_statuses:, can_manage_statements:) %>
++
++<%= turbo_frame_tag dom_id(account, :statements_tab) do %>
++  <%= render "accounts/show/statements",
++             account: account,
++             coverage: coverage,
++             statements: statements,
++             reconciliation_statuses: reconciliation_statuses,
++             can_manage_statements: can_manage_statements %>
++<% end %>
+diff --git a/app/views/settings/_settings_nav.html.erb b/app/views/settings/_settings_nav.html.erb
+index 94df67ae20..19bd4a241a 100644
+--- a/app/views/settings/_settings_nav.html.erb
++++ b/app/views/settings/_settings_nav.html.erb
+@@ -19,7 +19,8 @@ nav_sections = [
+       { label: t(".tags_label"), path: tags_path, icon: "tags" },
+       { label: t(".rules_label"), path: rules_path, icon: "git-branch" },
+       { label: t(".merchants_label"), path: family_merchants_path, icon: "store" },
+-      { label: t(".recurring_transactions_label"), path: recurring_transactions_path, icon: "repeat" }
++      { label: t(".recurring_transactions_label"), path: recurring_transactions_path, icon: "repeat" },
++      { label: t(".statement_vault_label"), path: account_statements_path, icon: "archive", if: Current.user&.admin? }
+     ]
+   },
+   (
+diff --git a/config/brakeman.ignore b/config/brakeman.ignore
+index ca044eb6ce..d6b23c8f82 100644
+--- a/config/brakeman.ignore
++++ b/config/brakeman.ignore
+@@ -46,29 +46,6 @@
+       ],
+       "note": ""
+     },
+-    {
+-      "warning_type": "Mass Assignment",
+-      "warning_code": 105,
+-      "fingerprint": "85e2c11853dd6c69b1953a6ec3ad661cd0ce3df55e4e5beff92365b6ed601171",
+-      "check_name": "PermitAttributes",
+-      "message": "Potentially dangerous key allowed for mass assignment",
+-      "file": "app/controllers/api/v1/transactions_controller.rb",
+-      "line": 255,
+-      "link": "https://brakemanscanner.org/docs/warning_types/mass_assignment/",
+-      "code": "params.require(:transaction).permit(:account_id, :date, :amount, :name, :description, :notes, :currency, :category_id, :merchant_id, :nature, :tag_ids => ([]))",
+-      "render_path": null,
+-      "location": {
+-        "type": "method",
+-        "class": "Api::V1::TransactionsController",
+-        "method": "transaction_params"
+-      },
+-      "user_input": ":account_id",
+-      "confidence": "High",
+-      "cwe_id": [
+-        915
+-      ],
+-      "note": "account_id is properly validated in create action - line 79 ensures account belongs to user's family: family.accounts.find(transaction_params[:account_id])"
+-    },
+     {
+       "warning_type": "Mass Assignment",
+       "warning_code": 105,
+diff --git a/config/initializers/active_storage_authorization.rb b/config/initializers/active_storage_authorization.rb
+index 7766dc3c3e..c856faa085 100644
+--- a/config/initializers/active_storage_authorization.rb
++++ b/config/initializers/active_storage_authorization.rb
+@@ -2,35 +2,95 @@
+ Rails.application.config.to_prepare do
+   module ActiveStorageAttachmentAuthorization
+     extend ActiveSupport::Concern
++    PROTECTED_RECORD_TYPES = %w[Transaction AccountStatement].freeze
+ 
+     included do
+       include Authentication
+-      before_action :authorize_transaction_attachment, if: :transaction_attachment?
++      before_action :authorize_protected_attachment
+     end
+ 
+     private
+ 
+-      def authorize_transaction_attachment
+-        attachment = ActiveStorage::Attachment.find_by(blob: authorized_blob)
+-        return unless attachment&.record_type == "Transaction"
++      def authorize_protected_attachment
++        # Direct uploads create unattached blobs; model/controller code authorizes the later attachment.
++        return if is_a?(ActiveStorage::DirectUploadsController)
++        return unless authorized_blob
+ 
+-        transaction = attachment.record
++        attachments = authorized_attachments
++        raise ActiveRecord::RecordNotFound if attachments.empty?
++
++        protected_attachments = attachments.select { |attachment| attachment.record_type.in?(PROTECTED_RECORD_TYPES) }
++        return if protected_attachments.empty?
++        return if protected_attachments.all? { |attachment| protected_attachment_authorized?(attachment) }
++
++        raise ActiveRecord::RecordNotFound
++      end
+ 
+-        # Check if current user has access to this transaction's family
+-        unless Current.family == transaction.entry.account.family
+-          raise ActiveRecord::RecordNotFound
++      def protected_attachment_authorized?(attachment)
++        case attachment.record_type
++        when "Transaction"
++          transaction_attachment_authorized?(attachment)
++        when "AccountStatement"
++          account_statement_attachment_authorized?(attachment)
++        else
++          false
+         end
+       end
+ 
+-      def transaction_attachment?
+-        return false unless authorized_blob
++      def transaction_attachment_authorized?(attachment)
++        transaction = attachment.record
++        return false if transaction.nil?
++
++        Current.family == transaction.entry.account.family
++      rescue ActiveRecord::RecordNotFound, NoMethodError
++        false
++      end
++
++      def account_statement_attachment_authorized?(attachment)
++        statement = attachment.record
++        return false if statement.nil?
++
++        statement.viewable_by?(Current.user)
++      rescue ActiveRecord::RecordNotFound
++        false
++      end
++
++      def authorized_attachments
++        return nil unless authorized_blob
+ 
+-        attachment = ActiveStorage::Attachment.find_by(blob: authorized_blob)
+-        attachment&.record_type == "Transaction"
++        @authorized_attachments ||= ActiveStorage::Attachment.where(blob: authorized_blob).to_a
+       end
+ 
+       def authorized_blob
+-        @blob || @representation&.blob
++        @blob || @representation&.blob || disk_service_blob
++      end
++
++      def disk_service_blob
++        return nil unless is_a?(ActiveStorage::DiskController) && action_name == "show"
++
++        key = decode_verified_key&.fetch(:key, nil)
++        return nil if key.blank?
++
++        blob_key = key.to_s[%r{\Avariants/([^/]+)/}, 1] || key
++        ActiveStorage::Blob.find_by(key: blob_key)
++      rescue ActiveStorage::InvalidKeyError
++        nil
++      end
++
++      def new_session_url
++        Rails.application.routes.url_helpers.new_session_url(active_storage_auth_url_options)
++      end
++
++      def new_registration_url
++        Rails.application.routes.url_helpers.new_registration_url(active_storage_auth_url_options)
++      end
++
++      def active_storage_auth_url_options
++        {
++          protocol: request.protocol,
++          host: request.host,
++          port: request.optional_port
++        }.compact
+       end
+   end
+ 
+@@ -38,8 +98,10 @@ def authorized_blob
+     ActiveStorage::Blobs::RedirectController,
+     ActiveStorage::Blobs::ProxyController,
+     ActiveStorage::Representations::RedirectController,
+-    ActiveStorage::Representations::ProxyController
+-  ].each do |controller|
++    ActiveStorage::Representations::ProxyController,
++    (ActiveStorage::DiskController if defined?(ActiveStorage::DiskController)),
++    (ActiveStorage::DirectUploadsController if defined?(ActiveStorage::DirectUploadsController))
++  ].compact.each do |controller|
+     controller.include ActiveStorageAttachmentAuthorization
+   end
+ end
+diff --git a/config/locales/models/account_statement/en.yml b/config/locales/models/account_statement/en.yml
+new file mode 100644
+index 0000000000..d801052d45
+--- /dev/null
++++ b/config/locales/models/account_statement/en.yml
+@@ -0,0 +1,30 @@
++---
++en:
++  activerecord:
++    attributes:
++      account_statement:
++        account: Account
++        account_last4_hint: Account last four
++        account_name_hint: Account name hint
++        closing_balance: Closing balance
++        content_sha256: Content digest
++        currency: Currency
++        filename: Filename
++        institution_name_hint: Institution hint
++        opening_balance: Opening balance
++        original_file: Statement file
++        period_end_on: Period end
++        period_start_on: Period start
++    errors:
++      models:
++        account_statement:
++          attributes:
++            checksum:
++              duplicate_statement_file: has already been uploaded for this family
++            content_sha256:
++              duplicate_statement_file: has already been uploaded for this family
++            original_file:
++              invalid_format: must be a PDF, CSV, or XLSX file
++              too_large: is too large. Maximum size is %{max_mb}MB
++            period_end_on:
++              on_or_after_start: must be on or after the period start
+diff --git a/config/locales/views/account_statements/en.yml b/config/locales/views/account_statements/en.yml
+new file mode 100644
+index 0000000000..78e21ae574
+--- /dev/null
++++ b/config/locales/views/account_statements/en.yml
+@@ -0,0 +1,116 @@
++---
++en:
++  account_statements:
++    account_tab:
++      coverage_title: Statement coverage
++      coverage_description: Historical months backed by uploaded statements and balance checks.
++      coverage_range: "%{start} - %{end}"
++      empty: No statements linked to this account yet.
++      open_inbox: Inbox
++      statements_title: Statements
++      year_label: Coverage year
++    balance:
++      unknown: Unknown
++    coverage:
++      status:
++        ambiguous: Ambiguous
++        covered: Covered
++        duplicate: Duplicate
++        mismatched: Mismatched
++        missing: Missing
++        not_expected: Not expected
++    create:
++      duplicates:
++        one: 1 duplicate statement was skipped.
++        other: "%{count} duplicate statements were skipped."
++      invalid_file_type: Upload a PDF, CSV, or XLSX statement under the size limit.
++      no_files: Select at least one statement file.
++      success:
++        one: 1 statement uploaded.
++        other: "%{count} statements uploaded."
++    destroy:
++      failure: Statement could not be deleted.
++      success: Statement deleted.
++    form:
++      account_upload: Upload statement
++      files_hint: PDF, CSV, or XLSX. %{max_size}MB max per file.
++      files_label: Statement files
++      inbox_upload: Upload
++    index:
++      account_label: Account
++      confidence: "%{confidence} match"
++      empty_linked: No linked statements yet.
++      empty_unmatched: The statement inbox is clear.
++      leave_unmatched: Leave unmatched
++      linked_title: Linked statements
++      no_suggestion: No suggestion
++      storage_used: Storage used
++      title: Statement Vault
++      unmatched_title: Unmatched inbox
++      upload_description: Upload statements to the inbox, or choose an account to link immediately.
++      upload_title: Upload statements
++    link:
++      no_account: Choose an account before linking this statement.
++      success: Linked statement to %{account}.
++    period:
++      unknown: Period unknown
++    reconciliation:
++      checks:
++        closing_balance: Closing balance
++        opening_balance: Opening balance
++        period_movement: Period movement
++        unknown_check: Unknown check
++      matched: Matched
++      mismatched: Mismatched
++      unavailable: Not checked
++    reject:
++      success: Statement match rejected.
++    show:
++      account_label: Account
++      account_last4_hint: Account last four
++      account_name_hint: Account name hint
++      closing_balance: Closing balance
++      currency: Currency
++      delete: Delete
++      difference: Difference
++      download: Download
++      institution_name_hint: Institution hint
++      ledger_amount: Sure ledger
++      linked_to: Linked to %{account}.
++      linking_title: Account link
++      link_suggestion: Link suggestion
++      metadata_title: Statement metadata
++      no_suggestion: No account suggestion yet.
++      opening_balance: Opening balance
++      period_end_on: Period end
++      period_start_on: Period start
++      reconciliation_title: Reconciliation
++      reconciliation_unavailable: Add a statement period and opening or closing balance, then make sure Sure has balance history for those dates.
++      reject: Reject
++      save: Save statement
++      statement_amount: Statement
++      suggested_account: Suggested account is %{account} (%{confidence} confidence).
++      title: Statement
++      unlink: Unlink
++      unmatched_account: Unmatched inbox
++      unknown_value: Unknown
++    status:
++      linked: Linked
++      rejected: Rejected
++      unmatched: Unmatched
++    table:
++      account: Account
++      actions: Actions
++      download: Download
++      file: File
++      link_suggestion: Link suggestion
++      period: Period
++      reconciliation: Reconciliation
++      reject: Reject suggestion
++      suggestion: Suggestion
++      unlink: Unlink
++      view: View
++    unlink:
++      success: Statement moved back to the unmatched inbox.
++    update:
++      success: Statement updated.
+diff --git a/config/locales/views/accounts/en.yml b/config/locales/views/accounts/en.yml
+index 852a2bc28f..70ba87ec02 100644
+--- a/config/locales/views/accounts/en.yml
++++ b/config/locales/views/accounts/en.yml
+@@ -62,6 +62,11 @@ en:
+       title: What would you like to add?
+     show:
+       limited_fx_history_warning: "Exchange rate history is only available from %{date} onwards. Transactions before this date use approximate currency conversions — this can happen when the FX provider only offers a limited historical window."
++      tabs:
++        activity: Activity
++        holdings: Holdings
++        overview: Overview
++        statements: Statements
+       activity:
+         amount: Amount
+         balance: Balance
+@@ -98,6 +103,7 @@ en:
+         import_trades: Import trades
+         import_transactions: Import transactions
+         manage: Manage accounts
++        statements: Statements
+     update:
+       success: "%{type} account updated"
+     sidebar:
+diff --git a/config/locales/views/settings/en.yml b/config/locales/views/settings/en.yml
+index 4ac65a9f39..2904c9a998 100644
+--- a/config/locales/views/settings/en.yml
++++ b/config/locales/views/settings/en.yml
+@@ -161,8 +161,10 @@ en:
+       general_section_title: General
+       imports_label: Imports
+       exports_label: Exports
++      llm_usage_label: LLM Usage
+       logout: Logout
+       merchants_label: Merchants
++      providers_label: Providers
+       guides_label: Guides
+       other_section_title: More
+       preferences_label: Preferences
+@@ -171,6 +173,7 @@ en:
+       rules_label: Rules
+       security_label: Security
+       self_hosting_label: Self-Hosting
++      statement_vault_label: Statement Vault
+       tags_label: Tags
+       transactions_section_title: Transactions
+       whats_new_label: What's new
+diff --git a/config/locales/views/settings/fr.yml b/config/locales/views/settings/fr.yml
+index a3cb0aec70..6faca441d8 100644
+--- a/config/locales/views/settings/fr.yml
++++ b/config/locales/views/settings/fr.yml
+@@ -159,8 +159,10 @@ fr:
+       general_section_title: Général
+       imports_label: Importations
+       exports_label: Exportations
++      llm_usage_label: Utilisation LLM
+       logout: Se déconnecter
+       merchants_label: Marchands
++      providers_label: Fournisseurs
+       guides_label: Guides
+       other_section_title: Plus
+       preferences_label: Préférences
+@@ -169,6 +171,7 @@ fr:
+       rules_label: Règles
+       security_label: Sécurité
+       self_hosting_label: Auto-hébergement
++      statement_vault_label: Coffre des relevés
+       tags_label: Étiquettes
+       transactions_section_title: Transactions
+       whats_new_label: Dernières nouvelles
+diff --git a/config/routes.rb b/config/routes.rb
+index ac61dcecbc..36673f125d 100644
+--- a/config/routes.rb
++++ b/config/routes.rb
+@@ -434,6 +434,14 @@
+     resource :sharing, only: [ :show, :update ], controller: "account_sharings"
+   end
+ 
++  resources :account_statements, only: %i[index show create update destroy] do
++    member do
++      patch :link
++      patch :unlink
++      patch :reject
++    end
++  end
++
+   # Convenience routes for polymorphic paths
+   # Example: account_path(Account.new(accountable: Depository.new)) => /depositories/123
+   direct :edit_account do |model, options|
+diff --git a/db/migrate/20260505120000_create_account_statements.rb b/db/migrate/20260505120000_create_account_statements.rb
+new file mode 100644
+index 0000000000..d31f73cfcc
+--- /dev/null
++++ b/db/migrate/20260505120000_create_account_statements.rb
+@@ -0,0 +1,91 @@
++# frozen_string_literal: true
++
++class CreateAccountStatements < ActiveRecord::Migration[7.2]
++  def change
++    create_table :account_statements, id: :uuid do |t|
++      t.references :family, null: false, foreign_key: { on_delete: :cascade }, type: :uuid
++      t.references :account, null: true, type: :uuid, foreign_key: { to_table: :accounts, on_delete: :nullify }
++      t.references :suggested_account, null: true, type: :uuid, foreign_key: { to_table: :accounts, on_delete: :nullify }
++
++      t.string :filename, null: false, limit: 255
++      t.string :content_type, null: false, limit: 100
++      t.bigint :byte_size, null: false
++      t.string :checksum, null: false, limit: 64
++      t.string :content_sha256
++      t.string :source, null: false, default: "manual_upload"
++      t.string :upload_status, null: false, default: "stored"
++
++      t.string :institution_name_hint, limit: 200
++      t.string :account_name_hint, limit: 200
++      t.string :account_last4_hint, limit: 4
++      t.date :period_start_on
++      t.date :period_end_on
++      t.decimal :opening_balance, precision: 19, scale: 4
++      t.decimal :closing_balance, precision: 19, scale: 4
++      t.string :currency, limit: 3
++
++      t.decimal :parser_confidence, precision: 5, scale: 4
++      t.decimal :match_confidence, precision: 5, scale: 4
++      t.string :review_status, null: false, default: "unmatched"
++      t.jsonb :sanitized_parser_output, null: false, default: {}
++
++      t.timestamps
++
++      t.index [ :family_id, :checksum ], name: "index_account_statements_on_family_checksum"
++      t.index [ :family_id, :content_sha256 ],
++              unique: true,
++              where: "content_sha256 IS NOT NULL",
++              name: "index_account_statements_on_family_content_sha256"
++      t.index [ :family_id, :review_status ], name: "index_account_statements_on_family_review_status"
++      t.index [ :account_id, :period_start_on, :period_end_on ], name: "index_account_statements_on_account_period"
++      t.index [ :suggested_account_id, :review_status ], name: "index_account_statements_on_suggested_account_review"
++    end
++
++    add_check_constraint :account_statements, "byte_size > 0", name: "chk_account_statements_byte_size_positive"
++    add_check_constraint :account_statements,
++                         "char_length(filename) <= 255",
++                         name: "chk_account_statements_filename_length"
++    add_check_constraint :account_statements,
++                         "char_length(content_type) <= 100",
++                         name: "chk_account_statements_content_type_length"
++    add_check_constraint :account_statements,
++                         "char_length(checksum) <= 64",
++                         name: "chk_account_statements_checksum_length"
++    add_check_constraint :account_statements,
++                         "institution_name_hint IS NULL OR char_length(institution_name_hint) <= 200",
++                         name: "chk_account_statements_institution_hint_length"
++    add_check_constraint :account_statements,
++                         "account_name_hint IS NULL OR char_length(account_name_hint) <= 200",
++                         name: "chk_account_statements_account_name_hint_length"
++    add_check_constraint :account_statements,
++                         "account_last4_hint IS NULL OR char_length(account_last4_hint) <= 4",
++                         name: "chk_account_statements_account_last4_hint_length"
++    add_check_constraint :account_statements,
++                         "currency IS NULL OR char_length(currency) <= 3",
++                         name: "chk_account_statements_currency_length"
++    add_check_constraint :account_statements,
++                         "period_start_on IS NULL OR period_end_on IS NULL OR period_start_on <= period_end_on",
++                         name: "chk_account_statements_period_order"
++    add_check_constraint :account_statements,
++                         "parser_confidence IS NULL OR (parser_confidence >= 0 AND parser_confidence <= 1)",
++                         name: "chk_account_statements_parser_confidence"
++    add_check_constraint :account_statements,
++                         "match_confidence IS NULL OR (match_confidence >= 0 AND match_confidence <= 1)",
++                         name: "chk_account_statements_match_confidence"
++    add_check_constraint :account_statements,
++                         "byte_size <= 26214400",
++                         name: "chk_account_statements_byte_size_max"
++    add_check_constraint :account_statements,
++                         "source IN ('manual_upload')",
++                         name: "chk_account_statements_source"
++    add_check_constraint :account_statements,
++                         "upload_status IN ('stored', 'failed')",
++                         name: "chk_account_statements_upload_status"
++    add_check_constraint :account_statements,
++                         "review_status IN ('unmatched', 'linked', 'rejected')",
++                         name: "chk_account_statements_review_status"
++    add_check_constraint :account_statements,
++                         "content_sha256 IS NULL OR content_sha256 ~ '^[0-9a-f]{64}$'",
++                         name: "chk_account_statements_content_sha256"
++  end
++end
+diff --git a/db/schema.rb b/db/schema.rb
+index 8b3cef7376..943e4dfe33 100644
+--- a/db/schema.rb
++++ b/db/schema.rb
+@@ -43,6 +43,57 @@
+     t.check_constraint "permission::text = ANY (ARRAY['full_control'::character varying::text, 'read_write'::character varying::text, 'read_only'::character varying::text])", name: "chk_account_shares_permission"
+   end
+ 
++  create_table "account_statements", id: :uuid, default: -> { "gen_random_uuid()" }, force: :cascade do |t|
++    t.uuid "family_id", null: false
++    t.uuid "account_id"
++    t.uuid "suggested_account_id"
++    t.string "filename", limit: 255, null: false
++    t.string "content_type", limit: 100, null: false
++    t.bigint "byte_size", null: false
++    t.string "checksum", limit: 64, null: false
++    t.string "source", default: "manual_upload", null: false
++    t.string "upload_status", default: "stored", null: false
++    t.string "institution_name_hint", limit: 200
++    t.string "account_name_hint", limit: 200
++    t.string "account_last4_hint", limit: 4
++    t.date "period_start_on"
++    t.date "period_end_on"
++    t.decimal "opening_balance", precision: 19, scale: 4
++    t.decimal "closing_balance", precision: 19, scale: 4
++    t.string "currency", limit: 3
++    t.decimal "parser_confidence", precision: 5, scale: 4
++    t.decimal "match_confidence", precision: 5, scale: 4
++    t.string "review_status", default: "unmatched", null: false
++    t.jsonb "sanitized_parser_output", default: {}, null: false
++    t.datetime "created_at", null: false
++    t.datetime "updated_at", null: false
++    t.string "content_sha256"
++    t.index ["account_id", "period_start_on", "period_end_on"], name: "index_account_statements_on_account_period"
++    t.index ["account_id"], name: "index_account_statements_on_account_id"
++    t.index ["family_id", "checksum"], name: "index_account_statements_on_family_checksum"
++    t.index ["family_id", "content_sha256"], name: "index_account_statements_on_family_content_sha256", unique: true, where: "(content_sha256 IS NOT NULL)"
++    t.index ["family_id", "review_status"], name: "index_account_statements_on_family_review_status"
++    t.index ["family_id"], name: "index_account_statements_on_family_id"
++    t.index ["suggested_account_id", "review_status"], name: "index_account_statements_on_suggested_account_review"
++    t.index ["suggested_account_id"], name: "index_account_statements_on_suggested_account_id"
++    t.check_constraint "byte_size <= 26214400", name: "chk_account_statements_byte_size_max"
++    t.check_constraint "byte_size > 0", name: "chk_account_statements_byte_size_positive"
++    t.check_constraint "account_last4_hint IS NULL OR char_length(account_last4_hint::text) <= 4", name: "chk_account_statements_account_last4_hint_length"
++    t.check_constraint "account_name_hint IS NULL OR char_length(account_name_hint::text) <= 200", name: "chk_account_statements_account_name_hint_length"
++    t.check_constraint "char_length(checksum::text) <= 64", name: "chk_account_statements_checksum_length"
++    t.check_constraint "char_length(content_type::text) <= 100", name: "chk_account_statements_content_type_length"
++    t.check_constraint "content_sha256 IS NULL OR content_sha256::text ~ '^[0-9a-f]{64}$'::text", name: "chk_account_statements_content_sha256"
++    t.check_constraint "currency IS NULL OR char_length(currency::text) <= 3", name: "chk_account_statements_currency_length"
++    t.check_constraint "char_length(filename::text) <= 255", name: "chk_account_statements_filename_length"
++    t.check_constraint "institution_name_hint IS NULL OR char_length(institution_name_hint::text) <= 200", name: "chk_account_statements_institution_hint_length"
++    t.check_constraint "match_confidence IS NULL OR match_confidence >= 0::numeric AND match_confidence <= 1::numeric", name: "chk_account_statements_match_confidence"
++    t.check_constraint "parser_confidence IS NULL OR parser_confidence >= 0::numeric AND parser_confidence <= 1::numeric", name: "chk_account_statements_parser_confidence"
++    t.check_constraint "period_start_on IS NULL OR period_end_on IS NULL OR period_start_on <= period_end_on", name: "chk_account_statements_period_order"
++    t.check_constraint "review_status::text = ANY (ARRAY['unmatched'::character varying::text, 'linked'::character varying::text, 'rejected'::character varying::text])", name: "chk_account_statements_review_status"
++    t.check_constraint "source::text = 'manual_upload'::text", name: "chk_account_statements_source"
++    t.check_constraint "upload_status::text = ANY (ARRAY['stored'::character varying::text, 'failed'::character varying::text])", name: "chk_account_statements_upload_status"
++  end
++
+   create_table "accounts", id: :uuid, default: -> { "gen_random_uuid()" }, force: :cascade do |t|
+     t.string "subtype"
+     t.uuid "family_id", null: false
+@@ -1798,6 +1849,9 @@
+   add_foreign_key "account_providers", "accounts", on_delete: :cascade
+   add_foreign_key "account_shares", "accounts"
+   add_foreign_key "account_shares", "users"
++  add_foreign_key "account_statements", "accounts", column: "suggested_account_id", on_delete: :nullify
++  add_foreign_key "account_statements", "accounts", on_delete: :nullify
++  add_foreign_key "account_statements", "families", on_delete: :cascade
+   add_foreign_key "accounts", "families"
+   add_foreign_key "accounts", "imports"
+   add_foreign_key "accounts", "plaid_accounts"
+diff --git a/test/controllers/account_statements_controller_test.rb b/test/controllers/account_statements_controller_test.rb
+new file mode 100644
+index 0000000000..01739f0dcb
+--- /dev/null
++++ b/test/controllers/account_statements_controller_test.rb
+@@ -0,0 +1,483 @@
++require "test_helper"
++
++class AccountStatementsControllerTest < ActionDispatch::IntegrationTest
++  setup do
++    ensure_tailwind_build
++    sign_in @user = users(:family_admin)
++    @account = accounts(:depository)
++  end
++
++  test "shows statement vault" do
++    get account_statements_url
++    assert_response :success
++    assert_select "h1", text: I18n.t("account_statements.index.title")
++  end
++
++  test "statement vault only lists linked statements for accessible accounts" do
++    accessible_statement = AccountStatement.create_from_upload!(
++      family: @account.family,
++      account: @account,
++      file: uploaded_file(filename: "accessible_statement.csv", content_type: "text/csv", content: "date,amount\n2024-01-01,1\n")
++    )
++    private_account = accounts(:other_asset)
++    private_statement = AccountStatement.create_from_upload!(
++      family: private_account.family,
++      account: private_account,
++      file: uploaded_file(filename: "private_statement.csv", content_type: "text/csv", content: "date,amount\n2024-01-02,2\n")
++    )
++    sign_in users(:family_member)
++
++    get account_statements_url
++
++    assert_response :success
++    assert_includes response.body, accessible_statement.filename
++    refute_includes response.body, private_statement.filename
++    refute_includes response.body, private_account.name
++  end
++
++  test "non manager cannot open statement vault" do
++    sign_in family_guest
++
++    get account_statements_url
++
++    assert_redirected_to accounts_url
++    assert_equal I18n.t("accounts.not_authorized"), flash[:alert]
++  end
++
++  test "non manager cannot view unmatched statement" do
++    statement = AccountStatement.create_from_upload!(
++      family: @account.family,
++      account: nil,
++      file: uploaded_file(filename: "statement.csv", content_type: "text/csv")
++    )
++    sign_in family_guest
++
++    get account_statement_url(statement)
++
++    assert_response :not_found
++  end
++
++  test "uploads statement to account without importing transactions" do
++    assert_difference "AccountStatement.count", 1 do
++      assert_no_difference [ "Import.count", "Entry.count", "Transaction.count" ] do
++        post account_statements_url, params: {
++          account_statement: {
++            account_id: @account.id,
++            files: [ uploaded_file(filename: "Checking_2024-01.csv", content_type: "text/csv") ]
++          }
++        }
++      end
++    end
++
++    statement = AccountStatement.order(:created_at).last
++    assert_equal @account, statement.account
++    assert statement.linked?
++    assert_redirected_to account_url(@account, tab: "statements")
++  end
++
++  test "member with writable account access can upload linked statement" do
++    sign_in users(:family_member)
++
++    assert_difference "AccountStatement.count", 1 do
++      post account_statements_url, params: {
++        account_statement: {
++          account_id: @account.id,
++          files: [ uploaded_file(filename: "member_statement.csv", content_type: "text/csv") ]
++        }
++      }
++    end
++
++    statement = AccountStatement.order(:created_at).last
++    assert_equal @account, statement.account
++    assert_redirected_to account_url(@account, tab: "statements")
++  end
++
++  test "uploads unmatched statement to inbox" do
++    assert_difference "AccountStatement.count", 1 do
++      post account_statements_url, params: {
++        account_statement: {
++          files: [ uploaded_file(filename: "Unknown_2024-01.csv", content_type: "text/csv") ]
++        }
++      }
++    end
++
++    statement = AccountStatement.order(:created_at).last
++    assert_nil statement.account
++    assert statement.unmatched?
++    assert_redirected_to account_statement_url(statement)
++  end
++
++  test "skips duplicate statement upload" do
++    AccountStatement.create_from_upload!(
++      family: @account.family,
++      account: @account,
++      file: uploaded_file(filename: "statement.csv", content_type: "text/csv", content: "date,amount\n2024-01-01,1\n")
++    )
++
++    assert_no_difference "AccountStatement.count" do
++      post account_statements_url, params: {
++        account_statement: {
++          account_id: @account.id,
++          files: [ uploaded_file(filename: "duplicate.csv", content_type: "text/csv", content: "date,amount\n2024-01-01,1\n") ]
++        }
++      }
++    end
++
++    assert_redirected_to account_url(@account, tab: "statements")
++    assert_equal I18n.t("account_statements.create.duplicates", count: 1), flash[:alert]
++  end
++
++  test "continues upload loop after a validation error" do
++    invalid_record = AccountStatement.new
++    invalid_record.errors.add(:filename, "is invalid")
++
++    assert_difference "AccountStatement.count", 1 do
++      created_statement = AccountStatement.create_from_upload!(
++        family: @account.family,
++        account: @account,
++        file: uploaded_file(filename: "valid-result.csv", content_type: "text/csv", content: "date,amount\n2024-01-02,2\n")
++      )
++      upload_sequence = sequence("statement upload processing")
++      AccountStatement.expects(:create_from_prepared_upload!).in_sequence(upload_sequence).raises(ActiveRecord::RecordInvalid.new(invalid_record))
++      AccountStatement.expects(:create_from_prepared_upload!).in_sequence(upload_sequence).returns(created_statement)
++
++      post account_statements_url, params: {
++        account_statement: {
++          account_id: @account.id,
++          files: [
++            uploaded_file(filename: "invalid.csv", content_type: "text/csv", content: "date,amount\n2024-01-01,1\n"),
++            uploaded_file(filename: "valid.csv", content_type: "text/csv", content: "date,amount\n2024-01-02,2\n")
++          ]
++        }
++      }
++    end
++
++    assert_redirected_to account_url(@account, tab: "statements")
++    assert_equal I18n.t("account_statements.create.success", count: 1), flash[:notice]
++    assert_includes flash[:alert], invalid_record.errors.full_messages.to_sentence
++  end
++
++  test "rejects invalid statement file type" do
++    assert_no_difference "AccountStatement.count" do
++      post account_statements_url, params: {
++        account_statement: {
++          files: [ uploaded_file(filename: "statement.bin", content_type: "application/octet-stream", content: "\x00\x01\x02".b) ]
++        }
++      }
++    end
++
++    assert_redirected_to account_statements_url
++    assert_equal I18n.t("account_statements.create.invalid_file_type"), flash[:alert]
++  end
++
++  test "continues upload loop after an invalid file type" do
++    assert_difference "AccountStatement.count", 1 do
++      post account_statements_url, params: {
++        account_statement: {
++          files: [
++            uploaded_file(filename: "statement.bin", content_type: "application/octet-stream", content: "\x00\x01\x02".b),
++            uploaded_file(filename: "valid.csv", content_type: "text/csv", content: "date,amount\n2024-01-02,2\n")
++          ]
++        }
++      }
++    end
++
++    statement = AccountStatement.order(:created_at).last
++    assert_redirected_to account_statement_url(statement)
++    assert_equal I18n.t("account_statements.create.success", count: 1), flash[:notice]
++    assert_includes flash[:alert], I18n.t("account_statements.create.invalid_file_type")
++  end
++
++  test "rejects txt and xls statement uploads" do
++    [
++      uploaded_file(filename: "statement.txt", content_type: "text/plain"),
++      uploaded_file(filename: "statement.xls", content_type: "application/vnd.ms-excel")
++    ].each do |file|
++      assert_no_difference "AccountStatement.count" do
++        post account_statements_url, params: {
++          account_statement: {
++            files: [ file ]
++          }
++        }
++      end
++
++      assert_redirected_to account_statements_url
++      assert_equal I18n.t("account_statements.create.invalid_file_type"), flash[:alert]
++    end
++  end
++
++  test "rejects empty csv and xlsx statement uploads" do
++    [
++      uploaded_file(filename: "empty.csv", content_type: "text/csv", content: ""),
++      uploaded_file(
++        filename: "empty.xlsx",
++        content_type: "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
++        content: ""
++      )
++    ].each do |file|
++      assert_no_difference "AccountStatement.count" do
++        post account_statements_url, params: {
++          account_statement: {
++            files: [ file ]
++          }
++        }
++      end
++
++      assert_redirected_to account_statements_url
++      assert_equal I18n.t("account_statements.create.invalid_file_type"), flash[:alert]
++    end
++  end
++
++  test "rejects oversized statement upload" do
++    original_max_file_size = AccountStatement::MAX_FILE_SIZE
++    silence_warnings { AccountStatement.const_set(:MAX_FILE_SIZE, 16) }
++
++    begin
++      assert_no_difference "AccountStatement.count" do
++        post account_statements_url, params: {
++          account_statement: {
++            files: [
++              uploaded_file(
++                filename: "oversized.csv",
++                content_type: "text/csv",
++                content: "x" * (AccountStatement::MAX_FILE_SIZE + 1)
++              )
++            ]
++          }
++        }
++      end
++    ensure
++      silence_warnings { AccountStatement.const_set(:MAX_FILE_SIZE, original_max_file_size) }
++    end
++
++    assert_redirected_to account_statements_url
++    assert_equal I18n.t("account_statements.create.invalid_file_type"), flash[:alert]
++  end
++
++  test "rejects cross-family account id" do
++    other_account = Account.create!(
++      family: families(:empty),
++      owner: users(:empty),
++      name: "Other family account",
++      balance: 0,
++      currency: "USD",
++      accountable: Depository.new
++    )
++
++    assert_no_difference "AccountStatement.count" do
++      post account_statements_url, params: {
++        account_statement: {
++          account_id: other_account.id,
++          files: [ uploaded_file(filename: "statement.csv", content_type: "text/csv") ]
++        }
++      }
++    end
++    assert_response :not_found
++  end
++
++  test "read only shared user cannot upload to account" do
++    sign_in users(:family_member)
++    account = accounts(:credit_card)
++
++    assert_no_difference "AccountStatement.count" do
++      post account_statements_url, params: {
++        account_statement: {
++          account_id: account.id,
++          files: [ uploaded_file(filename: "statement.csv", content_type: "text/csv") ]
++        }
++      }
++    end
++
++    assert_redirected_to account_url(account)
++    assert_equal I18n.t("accounts.not_authorized"), flash[:alert]
++  end
++
++  test "read only shared user sees statement detail without edit controls" do
++    account = accounts(:credit_card)
++    statement = AccountStatement.create_from_upload!(
++      family: @account.family,
++      account: account,
++      file: uploaded_file(filename: "readonly_statement.csv", content_type: "text/csv")
++    )
++    sign_in users(:family_member)
++
++    get account_statement_url(statement)
++
++    assert_response :success
++    assert_select "input[name='account_statement[period_start_on]']", 0
++    assert_select "select[name='account_statement[account_id]']", 0
++    assert_select "button", text: I18n.t("account_statements.show.delete"), count: 0
++    assert_select "button", text: I18n.t("account_statements.show.save"), count: 0
++    assert_select "button", text: I18n.t("account_statements.show.unlink"), count: 0
++  end
++
++  test "metadata form does not expose account select for managers" do
++    statement = AccountStatement.create_from_upload!(
++      family: @account.family,
++      account: @account,
++      file: uploaded_file(filename: "manager_statement.csv", content_type: "text/csv")
++    )
++
++    get account_statement_url(statement)
++
++    assert_response :success
++    assert_select "input[name='account_statement[period_start_on]']", 1
++    assert_select "input[name='account_statement[currency]']", 0
++    assert_select "select[name='account_statement[currency]'] option[value='USD']"
++    assert_select "select[name='account_statement[account_id]']", 0
++  end
++
++  test "links suggested statement" do
++    statement = AccountStatement.create_from_upload!(
++      family: @account.family,
++      account: nil,
++      file: uploaded_file(filename: "statement.csv", content_type: "text/csv", content: "date,amount\n2024-01-01,1\n")
++    )
++    statement.update!(suggested_account: @account, match_confidence: 0.9)
++
++    patch link_account_statement_url(statement), params: { account_id: @account.id }
++
++    assert_redirected_to account_url(@account, tab: "statements")
++    statement.reload
++    assert_equal @account, statement.account
++    assert statement.linked?
++  end
++
++  test "read only shared user cannot relink linked statement to writable account" do
++    source_account = accounts(:credit_card)
++    target_account = accounts(:depository)
++    statement = AccountStatement.create_from_upload!(
++      family: source_account.family,
++      account: source_account,
++      file: uploaded_file(filename: "readonly_relink.csv", content_type: "text/csv", content: "date,amount\n2024-01-01,1\n")
++    )
++    sign_in users(:family_member)
++
++    patch link_account_statement_url(statement), params: { account_id: target_account.id }
++
++    assert_redirected_to account_url(source_account)
++    assert_equal I18n.t("accounts.not_authorized"), flash[:alert]
++    assert_equal source_account, statement.reload.account
++  end
++
++  test "link shows friendly error when no target account is available" do
++    statement = AccountStatement.create_from_upload!(
++      family: @account.family,
++      account: nil,
++      file: uploaded_file(filename: "statement.csv", content_type: "text/csv", content: "date,amount\n2024-01-01,1\n")
++    )
++
++    patch link_account_statement_url(statement)
++
++    assert_redirected_to account_statement_url(statement)
++    assert_equal I18n.t("account_statements.link.no_account"), flash[:alert]
++    statement.reload
++    assert_nil statement.account
++    assert statement.unmatched?
++  end
++
++  test "unlinks statement back to inbox" do
++    statement = AccountStatement.create_from_upload!(
++      family: @account.family,
++      account: @account,
++      file: uploaded_file(filename: "statement.csv", content_type: "text/csv", content: "date,amount\n2024-01-01,1\n")
++    )
++
++    patch unlink_account_statement_url(statement)
++
++    assert_redirected_to account_statement_url(statement)
++    statement.reload
++    assert_nil statement.account
++    assert statement.unmatched?
++  end
++
++  test "rejects suggestion" do
++    statement = AccountStatement.create_from_upload!(
++      family: @account.family,
++      account: nil,
++      file: uploaded_file(filename: "statement.csv", content_type: "text/csv", content: "date,amount\n2024-01-01,1\n")
++    )
++    statement.update!(suggested_account: @account, match_confidence: 0.9)
++
++    patch reject_account_statement_url(statement)
++
++    assert_redirected_to account_statements_url
++    statement.reload
++    assert statement.rejected?
++    assert_nil statement.suggested_account
++  end
++
++  test "updates metadata" do
++    statement = AccountStatement.create_from_upload!(
++      family: @account.family,
++      account: @account,
++      file: uploaded_file(filename: "statement.csv", content_type: "text/csv", content: "date,amount\n2024-01-01,1\n")
++    )
++
++    patch account_statement_url(statement), params: {
++      account_statement: {
++        period_start_on: "2024-01-01",
++        period_end_on: "2024-01-31",
++        closing_balance: "123.45",
++        currency: "usd"
++      }
++    }
++
++    assert_redirected_to account_statement_url(statement)
++    statement.reload
++    assert_equal Date.new(2024, 1, 31), statement.period_end_on
++    assert_equal 123.45.to_d, statement.closing_balance
++    assert_equal "USD", statement.currency
++  end
++
++  test "metadata update links selected account" do
++    statement = AccountStatement.create_from_upload!(
++      family: @account.family,
++      account: nil,
++      file: uploaded_file(filename: "statement.csv", content_type: "text/csv", content: "date,amount\n2024-01-01,1\n")
++    )
++
++    patch account_statement_url(statement), params: {
++      account_statement: {
++        account_id: @account.id,
++        period_start_on: "2024-01-01",
++        period_end_on: "2024-01-31"
++      }
++    }
++
++    assert_redirected_to account_statement_url(statement)
++    statement.reload
++    assert_equal @account, statement.account
++    assert statement.linked?
++  end
++
++  test "deletes statement" do
++    statement = AccountStatement.create_from_upload!(
++      family: @account.family,
++      account: @account,
++      file: uploaded_file(filename: "statement.csv", content_type: "text/csv", content: "date,amount\n2024-01-01,1\n")
++    )
++
++    assert_difference "AccountStatement.count", -1 do
++      delete account_statement_url(statement)
++    end
++
++    assert_redirected_to account_url(@account, tab: "statements")
++  end
++
++  test "destroy reports failure when statement cannot be deleted" do
++    statement = AccountStatement.create_from_upload!(
++      family: @account.family,
++      account: @account,
++      file: uploaded_file(filename: "statement.csv", content_type: "text/csv", content: "date,amount\n2024-01-01,1\n")
++    )
++    AccountStatement.any_instance.stubs(:destroy).returns(false)
++
++    assert_no_difference "AccountStatement.count" do
++      delete account_statement_url(statement)
++    end
++
++    assert_redirected_to account_url(@account, tab: "statements")
++    assert_equal I18n.t("account_statements.destroy.failure"), flash[:alert]
++  end
++end
+diff --git a/test/controllers/accounts_controller_test.rb b/test/controllers/accounts_controller_test.rb
+index cda1e81e70..4b7604c3e9 100644
+--- a/test/controllers/accounts_controller_test.rb
++++ b/test/controllers/accounts_controller_test.rb
+@@ -19,6 +19,83 @@ class AccountsControllerTest < ActionDispatch::IntegrationTest
+     assert_response :success
+   end
+ 
++  test "show lazily loads statement tab data unless statements tab is active" do
++    AccountStatement::Coverage.expects(:for_year).never
++    AccountStatement.expects(:reconciliation_statuses_for).never
++
++    get account_url(@account)
++
++    assert_response :success
++    assert_select "select[name='statement_year']", count: 0
++    statements_path = account_path(@account, tab: "statements")
++    assert_select "turbo-frame[src='#{statements_path}']"
++  end
++
++  test "statements tab shows coverage and upload for statement managers with account write access" do
++    get account_url(@account, tab: "statements")
++
++    assert_response :success
++    assert_select "input[type=file][accept='.pdf,.csv,.xlsx']"
++    assert_select "select[name='statement_year']"
++    assert_select "p", text: I18n.l(Date.current.prev_month.beginning_of_month, format: "%b %Y")
++  end
++
++  test "statements tab lazy frame returns matching frame content" do
++    frame_id = dom_id(@account, :statements_tab)
++
++    get account_url(@account, tab: "statements"), headers: { "Turbo-Frame" => frame_id }
++
++    assert_response :success
++    assert_select "turbo-frame##{frame_id}", count: 1
++    assert_select "select[name='statement_year']"
++    assert_select "turbo-frame##{dom_id(@account, :container)}", count: 0
++  end
++
++  test "statements tab filters historical coverage by year" do
++    account = Account.create!(
++      family: @user.family,
++      owner: @user,
++      name: "Historical Checking",
++      balance: 0,
++      currency: "USD",
++      accountable: Depository.new
++    )
++    statement = AccountStatement.create_from_upload!(
++      family: @user.family,
++      account: account,
++      file: uploaded_file(filename: "historical.csv", content_type: "text/csv")
++    )
++    statement.update!(period_start_on: Date.new(2024, 2, 1), period_end_on: Date.new(2024, 2, 29))
++
++    travel_to Date.new(2026, 5, 6) do
++      get account_url(account, tab: "statements")
++
++      assert_response :success
++      assert_select "select[name='statement_year'] option[selected='selected']", text: "2026"
++      assert_select "p", text: "May 2026"
++      assert_select "p", text: "Not expected"
++
++      get account_url(account, tab: "statements", statement_year: 2024)
++
++      assert_response :success
++      assert_select "select[name='statement_year'] option[selected='selected']", text: "2024"
++      assert_select "p", text: "Jan 2024"
++      assert_select "p", text: "Feb 2024"
++      assert_select "p", text: "Covered"
++      assert_select "p", text: "Missing"
++      assert_select "p", text: "Not expected"
++    end
++  end
++
++  test "statements tab hides upload for read only account access" do
++    sign_in users(:family_member)
++
++    get account_url(accounts(:credit_card), tab: "statements")
++
++    assert_response :success
++    assert_select "input[type=file]", count: 0
++  end
++
+   test "account activity marks trade amounts as privacy-sensitive" do
+     trade_entry = entries(:trade)
+     expected_amount = ApplicationController.helpers.format_money(-trade_entry.amount_money)
+diff --git a/test/fixtures/account_statements.yml b/test/fixtures/account_statements.yml
+new file mode 100644
+index 0000000000..868eb8b975
+--- /dev/null
++++ b/test/fixtures/account_statements.yml
+@@ -0,0 +1 @@
++# Empty fixture file so account_statements is cleaned with the rest of the test fixture set.
+diff --git a/test/helpers/account_statements_helper_test.rb b/test/helpers/account_statements_helper_test.rb
+new file mode 100644
+index 0000000000..567468bdad
+--- /dev/null
++++ b/test/helpers/account_statements_helper_test.rb
+@@ -0,0 +1,15 @@
++require "test_helper"
++
++class AccountStatementsHelperTest < ActionView::TestCase
++  test "reconciliation label falls back for invalid checks" do
++    opening_balance = I18n.t("account_statements.reconciliation.checks.opening_balance")
++    closing_balance = I18n.t("account_statements.reconciliation.checks.closing_balance")
++    unknown_check = I18n.t("account_statements.reconciliation.checks.unknown_check")
++
++    assert_equal opening_balance, account_statement_reconciliation_label({ key: "opening_balance" })
++    assert_equal closing_balance, account_statement_reconciliation_label({ "key" => "closing_balance" })
++    assert_equal unknown_check, account_statement_reconciliation_label({})
++    assert_equal unknown_check, account_statement_reconciliation_label(nil)
++    assert_equal unknown_check, account_statement_reconciliation_label([])
++  end
++end
+diff --git a/test/integration/active_storage_authorization_test.rb b/test/integration/active_storage_authorization_test.rb
+index 75698a536d..9c30d4f91b 100644
+--- a/test/integration/active_storage_authorization_test.rb
++++ b/test/integration/active_storage_authorization_test.rb
+@@ -12,6 +12,16 @@ class ActiveStorageAuthorizationTest < ActionDispatch::IntegrationTest
+       content_type: "application/pdf"
+     )
+     @attachment_a = @transaction_a.attachments.first
++
++    @statement_a = AccountStatement.create_from_upload!(
++      family: @user_a.family,
++      account: @transaction_a.entry.account,
++      file: uploaded_file(
++        filename: "statement.pdf",
++        content_type: "application/pdf",
++        content: "%PDF-1.4 Family A Secret Statement"
++      )
++    )
+   end
+ 
+   test "user can access attachments within their own family" do
+@@ -29,6 +39,33 @@ class ActiveStorageAuthorizationTest < ActionDispatch::IntegrationTest
+     assert_match(/rails\/active_storage\/disk/, response.header["Location"])
+   end
+ 
++  test "disk service urls require authentication" do
++    sign_in @user_a
++
++    get rails_blob_path(@statement_a.original_file)
++    assert_response :redirect
++    disk_url = response.location
++    sign_out @user_a
++
++    get disk_url
++
++    assert_redirected_to new_session_url
++  end
++
++  test "disk service urls enforce statement blob authorization" do
++    sign_in @user_a
++
++    get rails_blob_path(@statement_a.original_file)
++    assert_response :redirect
++    disk_url = response.location
++    sign_out @user_a
++    sign_in @user_b
++
++    get disk_url
++
++    assert_response :not_found
++  end
++
+   test "user cannot access attachments from a different family" do
+     sign_in @user_b
+ 
+@@ -55,4 +92,213 @@ class ActiveStorageAuthorizationTest < ActionDispatch::IntegrationTest
+ 
+     assert_response :not_found
+   end
++
++  test "user cannot access statement blob from a different family" do
++    sign_in @user_b
++
++    get rails_blob_path(@statement_a.original_file)
++
++    assert_response :not_found
++  end
++
++  test "unauthenticated user is redirected before statement blob access" do
++    get rails_blob_path(@statement_a.original_file)
++
++    assert_redirected_to new_session_url
++  end
++
++  test "user cannot access linked statement blob for an inaccessible account" do
++    private_account = accounts(:other_asset)
++    statement = AccountStatement.create_from_upload!(
++      family: @user_a.family,
++      account: private_account,
++      file: uploaded_file(
++        filename: "private_statement.pdf",
++        content_type: "application/pdf",
++        content: "%PDF-1.4 Private Family Statement"
++      )
++    )
++
++    sign_in users(:family_member)
++
++    get rails_blob_path(statement.original_file)
++
++    assert_response :not_found
++  end
++
++  test "user can access linked statement blob for a shared account" do
++    statement = AccountStatement.create_from_upload!(
++      family: @user_a.family,
++      account: accounts(:credit_card),
++      file: uploaded_file(
++        filename: "shared_statement.pdf",
++        content_type: "application/pdf",
++        content: "%PDF-1.4 Shared Family Statement"
++      )
++    )
++
++    sign_in users(:family_member)
++
++    get rails_blob_path(statement.original_file)
++
++    assert_response :redirect
++    follow_redirect!
++    assert_response :success
++    assert_match(/rails\/active_storage\/disk/, request.path)
++  end
++
++  test "guest cannot access unmatched statement blob" do
++    statement = AccountStatement.create_from_upload!(
++      family: @user_a.family,
++      account: nil,
++      file: uploaded_file(
++        filename: "unmatched_statement.pdf",
++        content_type: "application/pdf",
++        content: "%PDF-1.4 Unmatched Family Statement"
++      )
++    )
++
++    sign_in family_guest
++
++    get rails_blob_path(statement.original_file)
++
++    assert_response :not_found
++  end
++
++  test "orphaned statement attachment fails closed" do
++    attachment = @statement_a.original_file.attachment
++    attachment.update_columns(record_id: SecureRandom.uuid)
++
++    sign_in @user_a
++
++    get rails_blob_path(attachment)
++
++    assert_response :not_found
++  end
++
++  test "unattached blobs fail closed" do
++    blob = ActiveStorage::Blob.create_and_upload!(
++      io: StringIO.new("unattached statement"),
++      filename: "unattached.csv",
++      content_type: "text/csv"
++    )
++
++    sign_in @user_a
++
++    get rails_blob_path(blob)
++
++    assert_response :not_found
++  end
++
++  test "blob authorization checks protected attachments even when blob is also attached elsewhere" do
++    document = FamilyDocument.create!(family: @user_a.family, filename: "shared.pdf", status: "ready")
++    document.file.attach(@statement_a.original_file.blob)
++
++    sign_in @user_b
++
++    get rails_blob_path(document.file)
++
++    assert_response :not_found
++  end
++
++  test "blob authorization denies when any protected attachment is unauthorized" do
++    statement_b = AccountStatement.new(
++      family: @user_b.family,
++      filename: "shared_statement.pdf",
++      content_type: @statement_a.content_type,
++      byte_size: @statement_a.byte_size,
++      checksum: @statement_a.checksum,
++      content_sha256: @statement_a.content_sha256,
++      currency: @user_b.family.currency
++    )
++    statement_b.original_file.attach(@statement_a.original_file.blob)
++    statement_b.save!
++
++    sign_in @user_a
++
++    get rails_blob_path(@statement_a.original_file)
++
++    assert_response :not_found
++  end
++
++  test "unknown protected attachment types fail closed" do
++    blob = ActiveStorage::Blob.create_and_upload!(
++      io: StringIO.new("unknown protected attachment"),
++      filename: "unknown.csv",
++      content_type: "text/csv"
++    )
++    ActiveStorage::Attachment.insert!(
++      {
++      name: "file",
++      record_type: "ProtectedAttachmentProbe",
++      record_id: SecureRandom.uuid,
++      blob_id: blob.id,
++      created_at: Time.current
++      }
++    )
++
++    with_protected_record_types("Transaction", "AccountStatement", "ProtectedAttachmentProbe") do
++      sign_in @user_a
++
++      get rails_blob_path(blob)
++
++      assert_response :not_found
++    end
++  end
++
++  test "direct uploads require authentication" do
++    post rails_direct_uploads_path, params: {
++      blob: {
++        filename: "statement.csv",
++        byte_size: 1,
++        checksum: Digest::MD5.base64digest("1"),
++        content_type: "text/csv"
++      }
++    }, as: :json
++
++    assert_redirected_to new_session_url
++  end
++
++  test "authenticated direct uploads can create unattached blobs" do
++    sign_in @user_a
++
++    post rails_direct_uploads_path, params: {
++      blob: {
++        filename: "statement.csv",
++        byte_size: 1,
++        checksum: Digest::MD5.base64digest("1"),
++        content_type: "text/csv"
++      }
++    }, as: :json
++
++    assert_response :success
++    assert response.parsed_body["signed_id"].present?
++  end
++
++  test "orphaned transaction attachment fails closed" do
++    @attachment_a.update_columns(record_id: SecureRandom.uuid)
++
++    sign_in @user_a
++
++    get rails_blob_path(@attachment_a)
++
++    assert_response :not_found
++  end
++
++  private
++
++    def sign_out(user)
++      user.sessions.each { |session| delete session_path(session) }
++    end
++
++    def with_protected_record_types(*types)
++      previous_types = ActiveStorageAttachmentAuthorization::PROTECTED_RECORD_TYPES
++      ActiveStorageAttachmentAuthorization.send(:remove_const, :PROTECTED_RECORD_TYPES)
++      ActiveStorageAttachmentAuthorization.const_set(:PROTECTED_RECORD_TYPES, types.flatten.freeze)
++
++      yield
++    ensure
++      ActiveStorageAttachmentAuthorization.send(:remove_const, :PROTECTED_RECORD_TYPES)
++      ActiveStorageAttachmentAuthorization.const_set(:PROTECTED_RECORD_TYPES, previous_types)
++    end
+ end
+diff --git a/test/models/account_statement_test.rb b/test/models/account_statement_test.rb
+new file mode 100644
+index 0000000000..a2829a0c99
+--- /dev/null
++++ b/test/models/account_statement_test.rb
+@@ -0,0 +1,770 @@
++require "test_helper"
++
++class AccountStatementTest < ActiveSupport::TestCase
++  setup do
++    @family = families(:dylan_family)
++    @account = accounts(:depository)
++  end
++
++  OversizedDeclaredUpload = Struct.new(:original_filename, keyword_init: true) do
++    def size
++      AccountStatement::MAX_FILE_SIZE + 1
++    end
++
++    def read(*)
++      raise "oversized upload should be rejected before reading"
++    end
++  end
++
++  class UploadWithoutDeclaredSize
++    attr_reader :original_filename, :content_type
++
++    def initialize(filename:, content_type:, content:)
++      @original_filename = filename
++      @content_type = content_type
++      @io = StringIO.new(content)
++    end
++
++    def read(length)
++      @io.read(length)
++    end
++
++    def rewind
++      @io.rewind
++    end
++  end
++
++  test "creates linked statement from upload without importing transactions" do
++    assert_no_difference [ "Import.count", "Entry.count", "Transaction.count" ] do
++      statement = AccountStatement.create_from_upload!(
++        family: @family,
++        account: @account,
++        file: uploaded_file(
++          filename: "Chase_2024-01_account_6789.csv",
++          content_type: "text/csv",
++          content: "date,description,amount\n2024-01-01,Coffee,-5.00\n2024-01-31,Deposit,100.00\n"
++        )
++      )
++
++      assert statement.linked?
++      assert_equal @account, statement.account
++      assert_equal Date.new(2024, 1, 1), statement.period_start_on
++      assert_equal Date.new(2024, 1, 31), statement.period_end_on
++      assert_equal "USD", statement.currency
++      assert_equal Digest::SHA256.hexdigest("date,description,amount\n2024-01-01,Coffee,-5.00\n2024-01-31,Deposit,100.00\n"), statement.content_sha256
++      assert statement.original_file.attached?
++    end
++  end
++
++  test "suggests obvious account match without linking inbox upload" do
++    @account.update!(institution_name: "Chase Bank 6789", notes: "Private note")
++
++    statement = AccountStatement.create_from_upload!(
++      family: @family,
++      account: nil,
++      file: uploaded_file(
++        filename: "Chase_Bank_2024-01_account_6789.pdf",
++        content_type: "application/pdf",
++        content: "%PDF-1.4 statement"
++      )
++    )
++
++    assert statement.unmatched?
++    assert_nil statement.account
++    assert_equal @account, statement.suggested_account
++    assert_operator statement.match_confidence, :>=, 0.7
++  end
++
++  test "rejects duplicate sha256 within family" do
++    file_content = "date,description,amount\n2024-01-01,Coffee,-5.00\n"
++    AccountStatement.create_from_upload!(
++      family: @family,
++      account: @account,
++      file: uploaded_file(filename: "statement.csv", content_type: "text/csv", content: file_content)
++    )
++
++    error = assert_raises(AccountStatement::DuplicateUploadError) do
++      AccountStatement.create_from_upload!(
++        family: @family,
++        account: @account,
++        file: uploaded_file(filename: "statement-copy.csv", content_type: "text/csv", content: file_content)
++      )
++    end
++
++    assert_equal "statement.csv", error.statement.filename
++  end
++
++  test "allows distinct files with same md5 checksum and different sha256" do
++    Digest::MD5.stubs(:base64digest).returns("same-md5-checksum")
++
++    assert_difference "AccountStatement.count", 2 do
++      AccountStatement.create_from_upload!(
++        family: @family,
++        account: @account,
++        file: uploaded_file(filename: "statement-a.csv", content_type: "text/csv", content: "date,amount\n2024-01-01,1\n")
++      )
++
++      AccountStatement.create_from_upload!(
++        family: @family,
++        account: @account,
++        file: uploaded_file(filename: "statement-b.csv", content_type: "text/csv", content: "date,amount\n2024-01-02,2\n")
++      )
++    end
++  end
++
++  test "uses md5 checksum fallback for legacy statements without sha256" do
++    Digest::MD5.stubs(:base64digest).returns("legacy-md5-checksum")
++    existing = AccountStatement.create_from_upload!(
++      family: @family,
++      account: @account,
++      file: uploaded_file(filename: "legacy.csv", content_type: "text/csv", content: "date,amount\n2024-01-01,1\n")
++    )
++    existing.update_columns(content_sha256: nil)
++
++    error = assert_raises(AccountStatement::DuplicateUploadError) do
++      AccountStatement.create_from_upload!(
++        family: @family,
++        account: @account,
++        file: uploaded_file(filename: "legacy-copy.csv", content_type: "text/csv", content: "date,amount\n2024-01-02,2\n")
++      )
++    end
++
++    assert_equal existing, error.statement
++  end
++
++  test "reports duplicate upload after database uniqueness race" do
++    file_content = "date,description,amount\n2024-01-01,Coffee,-5.00\n"
++    existing = AccountStatement.create_from_upload!(
++      family: @family,
++      account: @account,
++      file: uploaded_file(filename: "statement.csv", content_type: "text/csv", content: file_content)
++    )
++    prepared_upload = AccountStatement.prepare_upload!(
++      uploaded_file(filename: "statement-copy.csv", content_type: "text/csv", content: file_content)
++    )
++
++    AccountStatement.stubs(:duplicate_for).returns(nil, existing)
++    AccountStatement.any_instance.stubs(:save!).raises(ActiveRecord::RecordNotUnique.new("duplicate"))
++
++    error = assert_raises(AccountStatement::DuplicateUploadError) do
++      AccountStatement.create_from_prepared_upload!(
++        family: @family,
++        account: @account,
++        prepared_upload: prepared_upload
++      )
++    end
++
++    assert_equal existing, error.statement
++  end
++
++  test "purges staged blob when database uniqueness race is re-raised" do
++    prepared_upload = AccountStatement.prepare_upload!(
++      uploaded_file(filename: "statement-copy.csv", content_type: "text/csv", content: "date,amount\n2024-01-01,1\n")
++    )
++
++    AccountStatement.stubs(:duplicate_for).returns(nil)
++    AccountStatement.any_instance.stubs(:save!).raises(ActiveRecord::RecordNotUnique.new("duplicate"))
++
++    assert_no_difference [ "ActiveStorage::Blob.count", "ActiveStorage::Attachment.count" ] do
++      assert_raises(ActiveRecord::RecordNotUnique) do
++        AccountStatement.create_from_prepared_upload!(
++          family: @family,
++          account: @account,
++          prepared_upload: prepared_upload
++        )
++      end
++    end
++  end
++
++  test "purges staged blob when metadata detection fails after attach" do
++    AccountStatement::MetadataDetector.any_instance.stubs(:apply).raises(StandardError, "parser failed")
++
++    assert_no_difference [ "ActiveStorage::Blob.count", "ActiveStorage::Attachment.count" ] do
++      assert_raises(StandardError) do
++        AccountStatement.create_from_upload!(
++          family: @family,
++          account: @account,
++          file: uploaded_file(filename: "statement.csv", content_type: "text/csv", content: "date,amount\n2024-01-01,1\n")
++        )
++      end
++    end
++  end
++
++  test "with_account scope keeps account linkage semantics while enum predicate follows review status" do
++    linked_statement = AccountStatement.create_from_upload!(
++      family: @family,
++      account: @account,
++      file: uploaded_file(filename: "linked.csv", content_type: "text/csv", content: "date,amount\n2024-01-01,1\n")
++    )
++    accountless_statement = AccountStatement.create_from_upload!(
++      family: @family,
++      account: nil,
++      file: uploaded_file(filename: "accountless.csv", content_type: "text/csv", content: "date,amount\n2024-01-02,2\n")
++    )
++    accountless_statement.update_columns(review_status: "linked")
++
++    assert accountless_statement.reload.linked?
++    assert_includes @family.account_statements.with_account, linked_statement
++    assert_not_includes @family.account_statements.with_account, accountless_statement
++    assert_not_includes @family.account_statements.unmatched, accountless_statement
++  end
++
++  test "allows same checksum in different families" do
++    file_content = "date,description,amount\n2024-01-01,Coffee,-5.00\n"
++
++    assert_difference "AccountStatement.count", 2 do
++      AccountStatement.create_from_upload!(
++        family: @family,
++        account: @account,
++        file: uploaded_file(filename: "statement.csv", content_type: "text/csv", content: file_content)
++      )
++
++      AccountStatement.create_from_upload!(
++        family: families(:empty),
++        account: nil,
++        file: uploaded_file(filename: "statement.csv", content_type: "text/csv", content: file_content)
++      )
++    end
++  end
++
++  test "validates linked account family" do
++    statement = AccountStatement.create_from_upload!(
++      family: @family,
++      account: @account,
++      file: uploaded_file(filename: "statement.csv", content_type: "text/csv", content: "date,amount\n2024-01-01,1\n")
++    )
++
++    statement.account = Account.create!(
++      family: families(:empty),
++      owner: users(:empty),
++      name: "Other family account",
++      balance: 0,
++      currency: "USD",
++      accountable: Depository.new
++    )
++
++    assert_not statement.valid?
++    assert_includes statement.errors[:account], "is invalid"
++  end
++
++  test "validates statement currency codes" do
++    statement = AccountStatement.create_from_upload!(
++      family: @family,
++      account: @account,
++      file: uploaded_file(filename: "statement.csv", content_type: "text/csv", content: "date,amount\n2024-01-01,1\n")
++    )
++
++    statement.currency = "NOPE"
++
++    assert_not statement.valid?
++    assert_includes statement.errors[:currency], "is invalid"
++  end
++
++  test "rejects unsupported file extension even when mime type is broadly allowed" do
++    assert_raises(AccountStatement::InvalidUploadError) do
++      AccountStatement.create_from_upload!(
++        family: @family,
++        account: @account,
++        file: uploaded_file(filename: "statement.txt", content_type: "text/plain", content: "date,amount\n2024-01-01,1\n")
++      )
++    end
++
++    assert_raises(AccountStatement::InvalidUploadError) do
++      AccountStatement.create_from_upload!(
++        family: @family,
++        account: @account,
++        file: uploaded_file(filename: "statement.xls", content_type: "application/vnd.ms-excel", content: "date,amount\n2024-01-01,1\n")
++      )
++    end
++  end
++
++  test "rejects empty csv and xlsx statement uploads" do
++    [
++      uploaded_file(filename: "empty.csv", content_type: "text/csv", content: ""),
++      uploaded_file(
++        filename: "empty.xlsx",
++        content_type: "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
++        content: ""
++      )
++    ].each do |file|
++      assert_no_difference "AccountStatement.count" do
++        assert_raises(AccountStatement::InvalidUploadError) do
++          AccountStatement.create_from_upload!(family: @family, account: @account, file: file)
++        end
++      end
++    end
++  end
++
++  test "rejects declared oversized upload before reading content" do
++    assert_raises(AccountStatement::InvalidUploadError) do
++      AccountStatement.prepare_upload!(OversizedDeclaredUpload.new(original_filename: "oversized.csv"))
++    end
++  end
++
++  test "streams unknown-size uploads and rejects when content exceeds size limit" do
++    file = UploadWithoutDeclaredSize.new(
++      filename: "oversized.csv",
++      content_type: "text/csv",
++      content: "x" * (AccountStatement::MAX_FILE_SIZE + 1)
++    )
++
++    assert_raises(AccountStatement::InvalidUploadError) do
++      AccountStatement.prepare_upload!(file)
++    end
++  end
++
++  test "stores sanitized csv parser output without raw rows" do
++    statement = AccountStatement.create_from_upload!(
++      family: @family,
++      account: @account,
++      file: uploaded_file(
++        filename: "Checking_2024-01.csv",
++        content_type: "text/csv",
++        content: "posted_at,description,amount\n2024-01-01,Coffee Shop,-5.00\n2024-01-31,Payroll,100.00\n"
++      )
++    )
++
++    assert_equal Date.new(2024, 1, 1), statement.period_start_on
++    assert_equal Date.new(2024, 1, 31), statement.period_end_on
++    assert_equal "posted_at", statement.sanitized_parser_output.dig("csv", "date_header")
++    assert_equal 2, statement.sanitized_parser_output.dig("csv", "rows_sampled")
++    assert_not_includes statement.sanitized_parser_output.to_json, "Coffee Shop"
++    assert_not_includes statement.sanitized_parser_output.to_json, "Payroll"
++  end
++
++  test "detects filename dates separated by underscores" do
++    statement = AccountStatement.create_from_upload!(
++      family: @family,
++      account: @account,
++      file: uploaded_file(
++        filename: "statement_2024_01_31.csv",
++        content_type: "text/csv",
++        content: "description,amount\nCoffee,-5.00\n"
++      )
++    )
++
++    assert_equal Date.new(2024, 1, 1), statement.period_start_on
++    assert_equal Date.new(2024, 1, 31), statement.period_end_on
++  end
++
++  test "ignores unreasonable filename dates" do
++    statement = AccountStatement.create_from_upload!(
++      family: @family,
++      account: @account,
++      file: uploaded_file(
++        filename: "statement_1969_01_31.csv",
++        content_type: "text/csv",
++        content: "description,amount\nCoffee,-5.00\n"
++      )
++    )
++
++    assert_nil statement.period_start_on
++    assert_nil statement.period_end_on
++  end
++
++  test "samples csv metadata without parsing raw rows into sanitized output" do
++    rows = 300.times.map { |index| "2024-01-#{(index % 28) + 1},Row #{index}" }.join("\n")
++    statement = AccountStatement.create_from_upload!(
++      family: @family,
++      account: @account,
++      file: uploaded_file(
++        filename: "Checking_2024-01.csv",
++        content_type: "text/csv",
++        content: "posted_at,description\n#{rows}\n"
++      )
++    )
++
++    assert_equal 250, statement.sanitized_parser_output.dig("csv", "rows_sampled")
++    assert_not_includes statement.sanitized_parser_output.to_json, "Row 299"
++  end
++
++  test "bounds csv metadata detection column count" do
++    headers = [ "posted_at", *101.times.map { |index| "column_#{index}" } ].join(",")
++    values = [ "2024-01-01", *101.times.map { "value" } ].join(",")
++
++    statement = AccountStatement.create_from_upload!(
++      family: @family,
++      account: @account,
++      file: uploaded_file(
++        filename: "Checking.csv",
++        content_type: "text/csv",
++        content: "#{headers}\n#{values}\n"
++      )
++    )
++
++    assert_nil statement.sanitized_parser_output["csv"]
++  end
++
++  test "bounds csv metadata detection sample length" do
++    oversized_date = "2024-01-01" + ("x" * AccountStatement::MetadataDetector::MAX_CSV_SAMPLE_BYTES)
++
++    statement = AccountStatement.create_from_upload!(
++      family: @family,
++      account: @account,
++      file: uploaded_file(
++        filename: "Checking.csv",
++        content_type: "text/csv",
++        content: "posted_at,description\n#{oversized_date},oversized\n"
++      )
++    )
++
++    assert_nil statement.sanitized_parser_output["csv"]
++    assert_not_includes statement.sanitized_parser_output.to_json, oversized_date
++  end
++
++  test "preserves sanitized pdf metadata output" do
++    statement = AccountStatement.create_from_upload!(
++      family: @family,
++      account: nil,
++      file: uploaded_file(
++        filename: "Statement.pdf",
++        content_type: "application/pdf",
++        content: "%PDF-1.4 statement"
++      )
++    )
++
++    assert_equal "filename_only", statement.sanitized_parser_output["pdf_detection"]
++    assert_empty statement.sanitized_parser_output["metadata_sources"]
++    assert_nil statement.institution_name_hint
++    assert_nil statement.account_name_hint
++    assert_equal 0.1.to_d, statement.parser_confidence
++  end
++
++  test "stores an actual pdf document fixture as a statement" do
++    fixture_path = file_fixture("imports/sample_bank_statement.pdf")
++    statement = AccountStatement.create_from_upload!(
++      family: @family,
++      account: @account,
++      file: Rack::Test::UploadedFile.new(
++        fixture_path,
++        "application/pdf",
++        true,
++        original_filename: "sample_bank_statement_2024-01.pdf"
++      )
++    )
++
++    assert statement.linked?
++    assert statement.original_file.attached?
++    assert_equal "application/pdf", statement.content_type
++    assert_equal fixture_path.size, statement.byte_size
++    assert_equal Digest::SHA256.file(fixture_path).hexdigest, statement.content_sha256
++    assert_equal "filename_only", statement.sanitized_parser_output["pdf_detection"]
++    assert_equal [ "filename" ], statement.sanitized_parser_output["metadata_sources"]
++    assert_equal Date.new(2024, 1, 1), statement.period_start_on
++    assert_equal Date.new(2024, 1, 31), statement.period_end_on
++    assert statement.original_file.blob.download.start_with?("%PDF-")
++  end
++
++  test "handles malformed csv metadata detection without raw parser output" do
++    statement = AccountStatement.create_from_upload!(
++      family: @family,
++      account: nil,
++      file: uploaded_file(
++        filename: "Unknown 2024-02.csv",
++        content_type: "text/csv",
++        content: "date,description\n\"unterminated"
++      )
++    )
++
++    assert_equal Date.new(2024, 2, 1), statement.period_start_on
++    assert_equal Date.new(2024, 2, 29), statement.period_end_on
++    assert_nil statement.sanitized_parser_output["csv"]
++    assert_not_includes statement.sanitized_parser_output.to_json, "unterminated"
++  end
++
++  test "reports reconciliation unavailable when balances are missing" do
++    statement = AccountStatement.create_from_upload!(
++      family: @family,
++      account: @account,
++      file: uploaded_file(filename: "statement.csv", content_type: "text/csv", content: "date,amount\n2024-01-01,1\n")
++    )
++    statement.update!(
++      period_start_on: Date.new(2024, 1, 1),
++      period_end_on: Date.new(2024, 1, 31),
++      closing_balance: 100
++    )
++
++    assert_empty statement.reconciliation_checks
++    assert_equal "unavailable", statement.reconciliation_status
++  end
++
++  test "coverage requires account" do
++    error = assert_raises(ArgumentError) do
++      AccountStatement::Coverage.new(nil)
++    end
++    assert_match(/account is required/, error.message)
++  end
++
++  test "database constraints reject invalid persisted status values" do
++    attrs = {
++      family_id: @family.id,
++      filename: "statement.csv",
++      content_type: "text/csv",
++      byte_size: 1,
++      checksum: SecureRandom.base64(16),
++      source: "provider_sync",
++      upload_status: "stored",
++      review_status: "unmatched"
++    }
++
++    assert_raises(ActiveRecord::StatementInvalid) do
++      AccountStatement.transaction(requires_new: true) do
++        AccountStatement.insert_all!([ attrs ], record_timestamps: true)
++      end
++    end
++  end
++
++  test "database constraints reject empty persisted statement byte sizes" do
++    attrs = {
++      family_id: @family.id,
++      filename: "empty.csv",
++      content_type: "text/csv",
++      byte_size: 0,
++      checksum: SecureRandom.base64(16),
++      source: "manual_upload",
++      upload_status: "stored",
++      review_status: "unmatched"
++    }
++
++    assert_raises(ActiveRecord::StatementInvalid) do
++      AccountStatement.transaction(requires_new: true) do
++        AccountStatement.insert_all!([ attrs ], record_timestamps: true)
++      end
++    end
++  end
++
++  test "moves linked statements to inbox when account is deleted" do
++    account = Account.create!(
++      family: @family,
++      owner: users(:family_admin),
++      name: "Temporary Checking",
++      balance: 0,
++      currency: "USD",
++      accountable: Depository.new
++    )
++    statement = AccountStatement.create_from_upload!(
++      family: @family,
++      account: account,
++      file: uploaded_file(filename: "statement.csv", content_type: "text/csv", content: "date,amount\n2024-01-01,1\n")
++    )
++
++    account.destroy!
++
++    statement.reload
++    assert_nil statement.account
++    assert statement.unmatched?
++    assert_includes @family.account_statements.unmatched, statement
++  end
++
++  test "unlink clears invalid recomputed suggestion" do
++    statement = AccountStatement.create_from_upload!(
++      family: @family,
++      account: @account,
++      file: uploaded_file(filename: "statement.csv", content_type: "text/csv", content: "date,amount\n2024-01-01,1\n")
++    )
++    other_account = Account.create!(
++      family: families(:empty),
++      owner: users(:empty),
++      name: "Other family account",
++      balance: 0,
++      currency: "USD",
++      accountable: Depository.new
++    )
++    invalid_match = AccountStatement::AccountMatcher::Match.new(account: other_account, confidence: 0.9)
++    AccountStatement::AccountMatcher.any_instance.stubs(:best_match).returns(invalid_match)
++
++    statement.unlink!
++
++    statement.reload
++    assert_nil statement.account
++    assert_nil statement.suggested_account
++    assert_nil statement.match_confidence
++    assert statement.unmatched?
++  end
++
++  test "preserves explicit rejected review status" do
++    statement = AccountStatement.create_from_upload!(
++      family: @family,
++      account: @account,
++      file: uploaded_file(filename: "statement.csv", content_type: "text/csv", content: "date,amount\n2024-01-01,1\n")
++    )
++
++    statement.reject_match!
++
++    assert statement.rejected?
++    assert_equal @account, statement.account
++  end
++
++  test "preserves rejected review status across unrelated saves" do
++    statement = AccountStatement.create_from_upload!(
++      family: @family,
++      account: @account,
++      file: uploaded_file(filename: "statement.csv", content_type: "text/csv", content: "date,amount\n2024-01-01,1\n")
++    )
++    statement.reject_match!
++
++    statement.update!(period_start_on: Date.new(2024, 1, 1))
++
++    assert statement.rejected?
++    assert_equal @account, statement.account
++  end
++
++  test "allows intentional review status changes away from rejected" do
++    statement = AccountStatement.create_from_upload!(
++      family: @family,
++      account: @account,
++      file: uploaded_file(filename: "statement.csv", content_type: "text/csv", content: "date,amount\n2024-01-01,1\n")
++    )
++    statement.reject_match!
++
++    statement.link_to_account!(@account)
++
++    assert statement.linked?
++    assert_equal @account, statement.account
++  end
++
++  test "normalizes account last four hint when matching accounts" do
++    @account.update!(institution_name: "Acme Bank ABCD", notes: "Private note")
++
++    statement = AccountStatement.new(
++      family: @family,
++      institution_name_hint: "Acme",
++      account_last4_hint: "ABCD",
++      currency: @account.currency
++    )
++
++    match = AccountStatement::AccountMatcher.new(statement).best_match
++
++    assert_equal @account, match.account
++    assert_operator match.confidence, :>=, 0.75.to_d
++  end
++
++  test "does not match account last four hints from account notes" do
++    @account.update!(institution_name: "Acme Bank", notes: "Masked statement suffix abcd")
++
++    statement = AccountStatement.new(
++      family: @family,
++      account_last4_hint: "ABCD",
++      currency: @account.currency
++    )
++
++    assert_nil AccountStatement::AccountMatcher.new(statement).best_match
++  end
++
++  test "coverage year selection spans historical account data through last completed month" do
++    account = Account.create!(
++      family: @family,
++      owner: users(:family_admin),
++      name: "Historical Checking",
++      balance: 0,
++      currency: "USD",
++      accountable: Depository.new
++    )
++
++    travel_to Date.new(2026, 5, 6) do
++      create_statement(account: account, month: Date.new(2024, 2, 1), content: "historical")
++
++      current_year_coverage = AccountStatement::Coverage.for_year(account, nil)
++      historical_coverage = AccountStatement::Coverage.for_year(account, 2024)
++
++      assert_equal 2026, current_year_coverage.selected_year
++      assert_equal [ 2026, 2025, 2024 ], current_year_coverage.available_years
++
++      historical_statuses = historical_coverage.months.index_by(&:date).transform_values(&:status)
++      assert_equal "not_expected", historical_statuses[Date.new(2024, 1, 1)]
++      assert_equal "covered", historical_statuses[Date.new(2024, 2, 1)]
++      assert_equal "missing", historical_statuses[Date.new(2024, 3, 1)]
++
++      current_statuses = current_year_coverage.months.index_by(&:date).transform_values(&:status)
++      assert_equal "missing", current_statuses[Date.new(2026, 4, 1)]
++      assert_equal "not_expected", current_statuses[Date.new(2026, 5, 1)]
++    end
++  end
++
++  test "coverage start can come from balances entries and suggested statements" do
++    account = Account.create!(
++      family: @family,
++      owner: users(:family_admin),
++      name: "Archive Checking",
++      balance: 0,
++      currency: "USD",
++      accountable: Depository.new
++    )
++
++    account.entries.create!(
++      name: "Old transaction",
++      date: Date.new(2021, 6, 15),
++      amount: 10,
++      currency: "USD",
++      entryable: Transaction.new
++    )
++    account.balances.create!(date: Date.new(2020, 3, 31), balance: 100, currency: "USD")
++    create_statement(account: nil, suggested_account: account, month: Date.new(2019, 7, 1), content: "suggested")
++
++    travel_to Date.new(2026, 5, 6) do
++      coverage = AccountStatement::Coverage.for_year(account, 2019)
++      statuses = coverage.months.index_by(&:date).transform_values(&:status)
++
++      assert_equal [ 2026, 2025, 2024, 2023, 2022, 2021, 2020, 2019 ], coverage.available_years
++      assert_equal "not_expected", statuses[Date.new(2019, 6, 1)]
++      assert_equal "ambiguous", statuses[Date.new(2019, 7, 1)]
++    end
++  end
++
++  test "coverage marks covered duplicate ambiguous and mismatched months" do
++    covered_month = 5.months.ago.to_date.beginning_of_month
++    missing_month = 4.months.ago.to_date.beginning_of_month
++    duplicate_month = 3.months.ago.to_date.beginning_of_month
++    ambiguous_month = 2.months.ago.to_date.beginning_of_month
++    mismatched_month = 1.month.ago.to_date.beginning_of_month
++
++    create_statement(account: @account, month: covered_month, content: "covered")
++    create_statement(account: @account, month: duplicate_month, content: "duplicate-a")
++    create_statement(account: @account, month: duplicate_month, content: "duplicate-b")
++    create_statement(account: nil, suggested_account: @account, month: ambiguous_month, content: "ambiguous")
++    create_statement(account: @account, month: mismatched_month, content: "mismatched", closing_balance: 120)
++
++    @account.balances.create!(
++      date: mismatched_month.end_of_month,
++      balance: 100,
++      currency: "USD",
++      start_cash_balance: 100,
++      cash_inflows: 0,
++      cash_outflows: 0
++    )
++
++    coverage = AccountStatement::Coverage.new(
++      @account,
++      start_month: covered_month,
++      end_month: mismatched_month
++    )
++
++    statuses = coverage.months.index_by(&:date).transform_values(&:status)
++    assert_equal "covered", statuses[covered_month]
++    assert_equal "missing", statuses[missing_month]
++    assert_equal "duplicate", statuses[duplicate_month]
++    assert_equal "ambiguous", statuses[ambiguous_month]
++    assert_equal "mismatched", statuses[mismatched_month]
++  end
++
++  private
++
++    def create_statement(account:, month:, content:, suggested_account: nil, closing_balance: nil)
++      statement = AccountStatement.create_from_upload!(
++        family: @family,
++        account: account,
++        file: uploaded_file(
++          filename: "statement_#{content}_#{month.strftime('%Y-%m')}.csv",
++          content_type: "text/csv",
++          content: "date,amount\n#{month},1\n#{month.end_of_month},2\n#{content}\n"
++        )
++      )
++      statement.update!(
++        suggested_account: suggested_account,
++        period_start_on: month,
++        period_end_on: month.end_of_month,
++        closing_balance: closing_balance
++      )
++      statement
++    end
++end
+diff --git a/test/models/account_test.rb b/test/models/account_test.rb
+index 766b5ab2fc..a903f5d861 100644
+--- a/test/models/account_test.rb
++++ b/test/models/account_test.rb
+@@ -205,6 +205,42 @@ class AccountTest < ActiveSupport::TestCase
+     assert_not ActiveStorage::Attachment.exists?(attachment_id)
+   end
+ 
++  test "destroying account moves linked statements to inbox after commit" do
++    statement = AccountStatement.create_from_upload!(
++      family: @family,
++      account: @account,
++      file: uploaded_file(filename: "statement.csv", content_type: "text/csv", content: "date,amount\n2024-01-01,1\n")
++    )
++    statement.update!(match_confidence: 0.8)
++
++    @account.destroy!
++
++    statement.reload
++    assert_nil statement.account_id
++    assert_equal "unmatched", statement.review_status
++    assert_nil statement.match_confidence
++  end
++
++  test "rolled back account destroy keeps linked statements unchanged" do
++    statement = AccountStatement.create_from_upload!(
++      family: @family,
++      account: @account,
++      file: uploaded_file(filename: "statement.csv", content_type: "text/csv", content: "date,amount\n2024-01-01,1\n")
++    )
++    statement.update!(match_confidence: 0.8)
++
++    Account.transaction do
++      @account.destroy!
++      raise ActiveRecord::Rollback
++    end
++
++    statement.reload
++    assert Account.exists?(@account.id)
++    assert_equal @account.id, statement.account_id
++    assert_equal "linked", statement.review_status
++    assert_equal 0.8.to_d, statement.match_confidence
++  end
++
+   # Account sharing tests
+ 
+   test "owned_by? returns true for account owner" do
+diff --git a/test/system/settings_test.rb b/test/system/settings_test.rb
+index 4aef39d0e1..1107c2aed4 100644
+--- a/test/system/settings_test.rb
++++ b/test/system/settings_test.rb
+@@ -26,6 +26,8 @@ class SettingsTest < ApplicationSystemTestCase
+ 
+     # Add admin settings if user is admin
+     if @user.admin?
++      merchants_index = @settings_links.index([ "Merchants", family_merchants_path ])
++      @settings_links.insert(merchants_index + 1, [ "Statement Vault", account_statements_path ])
+       @settings_links += [
+         [ "AI Prompts", settings_ai_prompts_path ],
+         [ "API Key", settings_api_key_path ]
+@@ -40,7 +42,7 @@ class SettingsTest < ApplicationSystemTestCase
+       assert_current_path accounts_path, ignore_query: true
+ 
+       @settings_links.each do |name, path|
+-        click_link name
++        click_link name, match: :first
+         assert_selector "h1", text: name
+         assert_current_path path
+       end
+@@ -52,9 +54,10 @@ class SettingsTest < ApplicationSystemTestCase
+     Rails.application.config.app_mode.stubs(:self_hosted?).returns(true)
+     Provider::Registry.stubs(:get_provider).with(:twelve_data).returns(nil)
+     Provider::Registry.stubs(:get_provider).with(:yahoo_finance).returns(nil)
++    Provider::Registry.stubs(:get_provider).with(:github).returns(stub(fetch_latest_release_notes: nil))
+     open_settings_from_sidebar
+     assert_selector "li", text: "Self-Hosting"
+-    click_link "Self-Hosting"
++    click_link "Self-Hosting", match: :first
+     assert_current_path settings_hosting_path
+     assert_selector "h1", text: "Self-Hosting"
+     find("select#setting_onboarding_state").select("Invite-only")
+@@ -92,15 +95,17 @@ class SettingsTest < ApplicationSystemTestCase
+       assert_no_selector "li", text: "AI Prompts"
+       assert_no_selector "li", text: "API Key"
+       assert_no_selector "li", text: "Bank sync"
++      assert_no_selector "li", text: "Statement Vault"
+     end
+   end
+ 
+   private
+ 
+     def open_settings_from_sidebar
+-      within "div[data-testid=user-menu]" do
+-        find("button").click
++      user_menu = find("div[data-testid=user-menu]", match: :first, visible: :visible)
++      within user_menu do
++        find("[data-DS--menu-target='button']", match: :first).click
++        click_link "Settings", match: :first
+       end
+-      click_link "Settings"
+     end
+ end
+diff --git a/test/test_helper.rb b/test/test_helper.rb
+index 8eb66de7ee..461ebe3a62 100644
+--- a/test/test_helper.rb
++++ b/test/test_helper.rb
+@@ -23,6 +23,8 @@
+ require "mocha/minitest"
+ require "aasm/minitest"
+ require "webmock/minitest"
++require "rack/test"
++require "tempfile"
+ require "uri"
+ 
+ VCR.configure do |config|
+@@ -104,6 +106,27 @@ def user_password_test
+       "maybetestpassword817983172"
+     end
+ 
++    def uploaded_file(filename:, content_type:, content: "date,amount\n2024-01-01,1\n")
++      tempfile = Tempfile.new([ File.basename(filename, ".*"), File.extname(filename) ])
++      tempfile.binmode
++      tempfile.write(content)
++      tempfile.rewind
++
++      Rack::Test::UploadedFile.new(tempfile.path, content_type, true, original_filename: filename)
++    end
++
++    def family_guest
++      @family_guest ||= users(:family_admin).family.users.create!(
++        first_name: "Readonly",
++        last_name: "Guest",
++        email: "readonly-guest@example.com",
++        password: user_password_test,
++        role: "guest",
++        onboarded_at: Time.current,
++        ui_layout: "dashboard"
++      )
++    end
++
+     # Ensures the Investment Contributions category exists for a family
+     # Used in transfer tests where this bootstrapped category is required
+     # Uses family locale to ensure consistent naming
