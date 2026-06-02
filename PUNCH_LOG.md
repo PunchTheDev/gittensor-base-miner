@@ -4,6 +4,33 @@ Milestone trail for the base-miner benchmark. Discord is the primary channel; th
 
 ---
 
+## 2026-06-02 — Agent: non-uniform timeouts and multi-fence diff extraction (commit 3361337)
+
+### Non-uniform timeout allocation
+
+Previously: `timeout = 120s / 6 calls = 20s per call` — uniform distribution.
+
+Problem: act step (generating a large multi-file diff) was under-allocated; plan step (short analysis) was over-allocated.
+
+New allocation:
+- `plan_timeout = 120s × 15% = 18s` — analysis output is moderate length
+- `act_timeout = 120s × 40% = 48s` — diff output can be large (many hunks, many files)
+- `verify_timeout = 120s × 15% = 18s` — LGTM or corrected diff per iteration
+
+Also: `plan_tokens` reduced from `budget // 3 = 16.6k` to `budget // 4 = 12.5k` — analysis rarely exceeds 4k tokens; this cap is still generous and avoids wasting the plan call.
+
+### Multi-fence diff extraction
+
+Previously: `re.search(r"```(?:diff)?...", ...)` — only captured the FIRST fenced diff block.
+
+Problem: models sometimes put each changed file in its own ` ```diff ` fence when generating complex multi-file patches. With `re.search`, everything after the first fence was silently dropped — the agent appeared to succeed but produced an incomplete patch.
+
+Fix: `_extract_diff()` now uses `re.finditer` to collect ALL fenced diff blocks and joins them with `\n`. Also added `patch` as a recognized fence language (```` ```patch ````).
+
+Verified: test with two-fence input correctly joins both `diff --git` sections.
+
+---
+
 ## 2026-06-02 — Agent: test file windowing + new-file format example; Go lang fix (commits e9f22c1–0a2354e)
 
 ### gitminer.py: Go language classification fix (commit e9f22c1)
