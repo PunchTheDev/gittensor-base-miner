@@ -4,6 +4,33 @@ Milestone trail for the base-miner benchmark. Discord is the primary channel; th
 
 ---
 
+## 2026-06-02 — Dashboard: problem drawer enrichment (dashboard commit 54756f8)
+
+### Drawer now shows formula breakdown, diff stats, and CLI run snippet
+
+Three additions to the problem detail drawer for the "problem → solution → scoring" journey:
+
+1. **Diff stats in drawer meta**: `+275 −14 · 4 files` next to the PR link. Instant visual difficulty signal.
+
+2. **Scoring formula breakdown**: below the baseline score chip, shows:
+   ```
+   src_tokens = 184
+   25 × (1 − e^{−184/58}) + 0.98 bonus
+   final = 25.98 / 30
+   ```
+   The miner sees the exact equation that produced the reference score — no black box.
+
+3. **CLI run snippet**: two commands in a terminal block — one to score the example agent on this problem, one to compare against the reference diff. Copy-paste path from problem view to local test in one step.
+
+Also: `dashboard_data.json` now includes `src_token_score` and `total_token_score` per problem (benchmark commit 58dc180), enabling the formula display.
+
+### Status
+- Dashboard: punchthedev.github.io/gittensor-miner-dashboard/ — fully live
+- Benchmark: 430 problems, oracle 23.46 (unchanged)
+- Pool: all repos saturated — next check 2026-06-09
+
+---
+
 ## 2026-06-02 — Reference diff API endpoint + diff_stats (commit b58180d)
 
 ### API: `GET /api/problems/{id}/diff` (text/plain)
