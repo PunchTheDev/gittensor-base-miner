@@ -12,10 +12,10 @@ RESULTS_DIR = REPO_ROOT / "results"
 ORACLE_ROW = {
     "rank": None,
     "agent": "Oracle (accepted solution)",
-    "score": 22.76,
+    "score": 22.83,
     "model": "—",
     "date": "—",
-    "note": "Mean baseline (local heuristic)",
+    "note": "Upper bound (accepted solutions mean)",
 }
 
 
@@ -108,6 +108,14 @@ def load_allowed_models() -> list[str]:
     return [l.strip() for l in lines if l.strip() and not l.startswith("#")]
 
 
+def oracle_score_from_leaderboard(leaderboard: list) -> float:
+    """Read oracle score from the leaderboard entry rather than hardcoding."""
+    for row in leaderboard:
+        if row.get("agent") == "Oracle (accepted solution)" and row.get("score") is not None:
+            return float(row["score"])
+    return ORACLE_ROW["score"]
+
+
 def main(out_path: str | None = None):
     problems = load_problems()
     leaderboard = load_leaderboard()
@@ -118,11 +126,13 @@ def main(out_path: str | None = None):
     for p in problems:
         by_repo[p["repo"]] = by_repo.get(p["repo"], 0) + 1
 
+    oracle = oracle_score_from_leaderboard(leaderboard)
+
     data = {
         "generated_at": date.today().isoformat(),
         "pool_size": len(problems),
         "shard_size": 30,
-        "oracle_score": 22.83,
+        "oracle_score": oracle,
         "repos": by_repo,
         "leaderboard": leaderboard,
         "history": history,

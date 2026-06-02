@@ -11,7 +11,7 @@ Items move here from STATE.md when they become long-term improvement opportuniti
 - [x] Add `DASHBOARD_DEPLOY_TOKEN` GitHub Actions secret — set automatically via gh auth token
 - [x] Add `SHARD_SECRET` GitHub Actions secret — set automatically (random 32-byte hex)
 - [x] Confirm frozen model preference — `deepseek/deepseek-chat` (operator confirmed)
-- [ ] Verify `OPENROUTER_KEY` value in "Github Actions Environment" is the correct production key
+- [x] Verify `OPENROUTER_KEY` value in "Github Actions Environment" — confirmed correct by operator
 - [ ] Submit repo for Gittensor registration and wait for team approval
 
 See `REGISTRATION.md` for the full step-by-step checklist.
