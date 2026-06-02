@@ -210,6 +210,12 @@ Improvements over a naive single-shot approach:
   are more likely to have offsets that are more than 25 lines off when the model estimates from
   a windowed view. The unambiguous-match safety guard (single match required) prevents false
   positives — a wider radius finds more correct offsets without introducing wrong ones.
+- Verify prose-critique follow-up: when the verify step returns a textual critique (no corrected
+  diff extracted), the next iteration previously re-sent the full VERIFY_PROMPT with the same
+  diff (~4-6KB repeated context) and all 7 criteria. Now it sends VERIFY_FOLLOWUP_PROMPT — a
+  short "produce the corrected diff now" message (~80 chars). The model already has its analysis
+  in context; asking it to output the diff is more directed and saves significant token budget
+  on every prose-critique retry path.
 """
 
 from __future__ import annotations
@@ -477,6 +483,12 @@ Your last diff:
 
 Fix the specific problem listed above and output a corrected unified diff \
 starting with `diff --git` and containing at least one `@@` hunk. Nothing else.
+"""
+
+VERIFY_FOLLOWUP_PROMPT = """\
+Based on your analysis above, produce the corrected unified diff now.
+Do not repeat the analysis. Output ONLY the diff — starts with `diff --git`, \
+no markdown fences, no prose.
 """
 
 # Language-specific notes appended to SYSTEM_PROMPT when detected
@@ -2074,6 +2086,12 @@ class ExampleAgent(BaseAgent):
             log.append("[context] history NOT compacted (act returned empty/invalid — keeping source context)")
 
         # --- Turn 3+: Verify + Repair ---
+        # Track when the previous verify iteration returned a prose critique
+        # (no corrected diff). In that case, use a short targeted follow-up
+        # ("produce the diff now") instead of resending the full VERIFY_PROMPT
+        # — saves 3-5KB of repeated context and is more directive.
+        pending_prose_critique = False
+
         for attempt in range(MAX_REPAIR_ATTEMPTS):
             problem_desc = _diagnose_diff(diff)
 
@@ -2083,6 +2101,7 @@ class ExampleAgent(BaseAgent):
                 # resend ACT_PROMPT instead of REPAIR_FORMAT_PROMPT — the model has
                 # nothing to fix and needs to produce the diff from scratch using the
                 # source files still in context.
+                pending_prose_critique = False
                 if "empty output" in problem_desc:
                     history.append({"role": "user", "content": ACT_PROMPT})
                     log.append(f"[repair {attempt} (empty-retry act)]")
@@ -2101,37 +2120,45 @@ class ExampleAgent(BaseAgent):
                 continue
 
             # Diff looks structurally valid — ask for semantic verification.
-            # Inject extracted assertions so the model can cross-check each one
-            # rather than relying solely on the earlier conversation context.
-            body_snippet = (problem.issue_body or "")[:3000]
-            assertions_text = _extract_assertions(test_files)
-            assertions_section = (
-                ASSERTIONS_SECTION_TEMPLATE.format(assertions=assertions_text)
-                if assertions_text else ""
-            )
-            # New-file requirements: remind verify if any files must be created.
-            required_new = [f.path for f in new_tests] + [f.path for f in new_impls]
-            if required_new:
-                new_files_section = NEW_FILES_VERIFY_SECTION_TEMPLATE.format(
-                    files="\n".join(f"- `{p}`" for p in required_new)
-                )
-                new_files_check = (
-                    f"Does the diff add ALL {len(required_new)} required new file(s) listed above "
-                    f"as `new file mode 100644` blocks? Missing any file means the test command fails."
-                )
+            # If the previous iteration returned a prose critique (no diff), skip
+            # the full VERIFY_PROMPT (which would repeat the same diff and all
+            # criteria again — ~4-6KB) and send a short targeted follow-up instead.
+            if pending_prose_critique:
+                history.append({"role": "user", "content": VERIFY_FOLLOWUP_PROMPT})
+                log.append(f"[verify {attempt} (followup after prose critique)]")
             else:
-                new_files_section = ""
-                new_files_check = "N/A (no new files required)"
-            verify_user = VERIFY_PROMPT.format(
-                diff=diff,
-                title=problem.issue_title,
-                body=body_snippet,
-                test_cmd=test_cmd_str,
-                assertions_section=assertions_section,
-                new_files_section=new_files_section,
-                new_files_check=new_files_check,
-            )
-            history.append({"role": "user", "content": verify_user})
+                # First verify call, or previous call produced a corrected diff:
+                # inject extracted assertions so the model can cross-check each one.
+                body_snippet = (problem.issue_body or "")[:3000]
+                assertions_text = _extract_assertions(test_files)
+                assertions_section = (
+                    ASSERTIONS_SECTION_TEMPLATE.format(assertions=assertions_text)
+                    if assertions_text else ""
+                )
+                # New-file requirements: remind verify if any files must be created.
+                required_new = [f.path for f in new_tests] + [f.path for f in new_impls]
+                if required_new:
+                    new_files_section = NEW_FILES_VERIFY_SECTION_TEMPLATE.format(
+                        files="\n".join(f"- `{p}`" for p in required_new)
+                    )
+                    new_files_check = (
+                        f"Does the diff add ALL {len(required_new)} required new file(s) listed above "
+                        f"as `new file mode 100644` blocks? Missing any file means the test command fails."
+                    )
+                else:
+                    new_files_section = ""
+                    new_files_check = "N/A (no new files required)"
+                verify_user = VERIFY_PROMPT.format(
+                    diff=diff,
+                    title=problem.issue_title,
+                    body=body_snippet,
+                    test_cmd=test_cmd_str,
+                    assertions_section=assertions_section,
+                    new_files_section=new_files_section,
+                    new_files_check=new_files_check,
+                )
+                history.append({"role": "user", "content": verify_user})
+            pending_prose_critique = False
             verdict = _call(history, self.model, api_key, verify_tokens, verify_timeout, temperature=0)
             log.append(f"[verify {attempt}]\n{verdict}")
 
@@ -2177,13 +2204,15 @@ class ExampleAgent(BaseAgent):
                     })
             else:
                 # Prose critique without a corrected diff.
-                # Store the critique in history so the next verify iteration
-                # sees it and can self-correct by producing a diff this time.
+                # Store the critique in history so the next verify iteration sees it.
+                # Use VERIFY_FOLLOWUP_PROMPT on the next call (shorter, more directed)
+                # rather than re-sending the full VERIFY_PROMPT with the same diff.
                 # Only continue if we have iterations remaining — on the last
                 # attempt, break and keep the current diff.
                 if attempt < MAX_REPAIR_ATTEMPTS - 1:
                     history.append({"role": "assistant", "content": verdict})
-                    log.append(f"[verify {attempt}] prose critique — retrying with feedback")
+                    pending_prose_critique = True
+                    log.append(f"[verify {attempt}] prose critique — followup next iteration")
                 else:
                     break
 
