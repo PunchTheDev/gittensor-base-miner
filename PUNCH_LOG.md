@@ -4,6 +4,28 @@ Milestone trail for the base-miner benchmark. Discord is the primary channel; th
 
 ---
 
+## 2026-06-02 — Agent: test-first reasoning (commit dea0933)
+
+### Agent improvement
+- **Test-first reasoning**: `OBSERVE_PROMPT` restructured so step 1 is now "Test contract" — the agent enumerates every assertion, every function/class the test calls, and expected input → output *before* planning the implementation
+- **Act prompt reinforcement**: ACT_PROMPT now says "mentally verify each test assertion from step 1 maps to a concrete line in your diff" — closes the loop between planning and code
+- **Test section label updated**: "read first — these define the contract your implementation must satisfy"
+- **Module docstring updated**: reflects new test-first reasoning as first-listed improvement
+
+Key motivation: previous agent could produce a plan that passed casual reading but missed specific assertions. Test-first forces the model to derive what code must exist from what the test checks, rather than writing code and hoping tests agree.
+
+### Registration checklist
+- REGISTRATION.md count corrected: 324/13 → 360/20
+
+### Status
+- Pool: 360 problems, oracle 22.83 (all repos saturated)
+- Agent: test-first reasoning, ranked context, file windowing, repair loop (commit dea0933)
+- Dashboard: http://localhost:8082 (serving)
+- API: http://localhost:8083 (serving)
+- Pending: Gittensor registration, nginx hookup
+
+---
+
 ## 2026-06-02 — Pool 354→360: vouch + sure refresh (commit 1c6e3ac)
 
 ### Pool expansion (+6 problems)
