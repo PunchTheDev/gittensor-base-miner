@@ -893,6 +893,7 @@ def _window_file(
     keywords: set[str],
     context_lines: int = 40,
     threshold: int = 300,
+    show_line_numbers: bool = True,
 ) -> tuple[str, bool]:
     """Return the relevant sections of a file and whether windowing was applied.
 
@@ -955,11 +956,16 @@ def _window_file(
                 f"... [lines {prev_end + 1}-{start} omitted"
                 f" — next visible line is {start + 1}]\n"
             )
-        # Prefix each visible line with its 1-based number so the model can
-        # write accurate @@ -N hunk offsets without counting from the top.
-        # Format: "  42 | actual line content"  (numbers are display-only)
         for i, line in enumerate(lines[start:end], start=start + 1):
-            parts.append(f"{i:{width}d} | {line}" if line.endswith("\n") else f"{i:{width}d} | {line}\n")
+            # Prefix each visible line with its 1-based number so the model can
+            # write accurate @@ -N hunk offsets without counting from the top.
+            # Format: "  42 | actual line content"  (numbers are display-only)
+            # For test files (show_line_numbers=False) we omit the numbers since
+            # the agent does not write diffs against test files.
+            if show_line_numbers:
+                parts.append(f"{i:{width}d} | {line}" if line.endswith("\n") else f"{i:{width}d} | {line}\n")
+            else:
+                parts.append(line if line.endswith("\n") else line + "\n")
         prev_end = end
     if prev_end < len(lines):
         parts.append(
@@ -975,12 +981,18 @@ def _format_files(
     keywords: set[str] | None = None,
     context_lines: int = 40,
     threshold: int = 300,
+    show_line_numbers: bool = True,
 ) -> str:
     parts = []
     for f in files:
         lang = f.language or ""
         if keywords:
-            content, windowed = _window_file(f.content, keywords, context_lines=context_lines, threshold=threshold)
+            content, windowed = _window_file(
+                f.content, keywords,
+                context_lines=context_lines,
+                threshold=threshold,
+                show_line_numbers=show_line_numbers,
+            )
             total_lines = f.content.count("\n") + 1
             header = (
                 f"### {f.path} ({total_lines} lines total — relevant sections shown)"
@@ -1217,7 +1229,10 @@ class ExampleAgent(BaseAgent):
 
         test_section = (
             TEST_SECTION_TEMPLATE.format(
-                test_files=_format_files(test_files, keywords, context_lines=80, threshold=200)
+                test_files=_format_files(
+                    test_files, keywords,
+                    context_lines=80, threshold=200, show_line_numbers=False,
+                )
             )
             if test_files else ""
         )
