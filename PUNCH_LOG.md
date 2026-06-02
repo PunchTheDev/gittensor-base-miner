@@ -4,6 +4,28 @@ Milestone trail for the base-miner benchmark. Discord is the primary channel; th
 
 ---
 
+## 2026-06-02 — Agent: repair source context + Ruby refute assertions (benchmark commit df24da2)
+
+### What shipped
+
+**`repair()` source file injection**
+- Root cause: the repair method builds a fresh conversation from only the failed diff + test output — no source files. The model must diagnose logic errors without seeing the actual file state, making it easy to repeat the same mistake.
+- Fix: `_changed_paths_from_diff(failed_patch.diff)` extracts all files touched by the failed patch; their original source content is injected into the repair prompt as a "Source files before your patch" section. The model can now spot off-by-one logic, missing branches, wrong type annotations.
+- Budget cap: 3 files × 4 KB each (12 KB max) to keep the repair prompt compact. Files not in `file_lookup` (generated/vendored) are silently skipped.
+- `TEST_REPAIR_PROMPT` updated with `{source_section}` placeholder; empty string when no files found.
+
+**`_extract_assertions` Ruby Minitest refute patterns**
+- Added: `refute `, `refute_equal `, `refute_nil `, `refute_includes `, `refute_match `, `refute_empty `
+- The 37 `we-promise/sure` pool problems use Minitest (ActiveSupport::TestCase), which has symmetrical `assert`/`refute` assertion pairs. Previously all `refute_*` lines were invisible to the verify step's assertion cross-check.
+- Space suffix (not `(`) for Ruby compatibility: Ruby Minitest supports both `refute_equal expected, actual` and `refute_equal(expected, actual)`.
+
+### Status
+- Benchmark: 430 problems, oracle **13.34** (tree-sitter), 20 repos (commit df24da2)
+- Pool: fully saturated — next check 2026-06-16
+- Pending: Gittensor registration, nginx hookup
+
+---
+
 ## 2026-06-02 — Agent: full-sequence offset disambiguation (benchmark commit 2c49e4c)
 
 ### What shipped
