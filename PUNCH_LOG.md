@@ -1356,3 +1356,43 @@ Fix: `_fix_new_starts()` as stage 7 of `_post_process` — runs after `_fix_hunk
 - Benchmark: 430 problems, oracle 23.46 (unchanged)
 - Pool: all repos saturated — next check 2026-06-09
 - Pending: Gittensor registration, nginx hookup
+
+---
+
+## Step N+1 — 2026-06-02: Tree-sitter Scorer + Oracle Recalibration
+
+### What shipped
+
+**`benchmark/harness/tree_sitter_scorer.py`** — new module
+- Adapted from gittensor's actual DAS scoring engine (MIT)
+- Uses the same `benchmark/harness/weights/programming_languages.json` + `token_weights.json` as the DAS validator
+- AST symmetric diff: parses old and new file content, computes added/deleted node count weighted by structural bonus and leaf token weights
+- Language weight multipliers: Go/Java/C/Rust 2.0×, Python 1.5×, JS 1.15×, etc.
+- Test files weighted at 0.05× (separate src_score vs total_score streams)
+- tree-sitter==0.24.0 pinned in requirements.txt (same version as gittensor pyproject.toml)
+
+**`benchmark/harness/score.py`** updated
+- Primary scorer: tree-sitter (via `score_file_pairs`); heuristic as fallback
+- `_parse_diff_paths()`: extracts (path, status) from diff headers
+- `_build_file_pairs()`: reads old file contents before applying patch
+- `_fill_new_contents()`: reads new file contents after applying patch
+- `score_diff_quality()`: quality-only scoring without test running (for baselines)
+- Commit fetch retry: if `git worktree add` fails for missing commit, fetches from origin explicitly
+
+**`scripts/baseline_scores.py`** updated
+- Now calls `score_diff_quality()` for each reference diff (tree-sitter, no test suite)
+- Added `--limit N` flag for partial runs
+
+**Oracle mean recalibrated**: 23.46 (heuristic) → **13.34** (tree-sitter)
+- Full 430-problem run completed
+- Mean: 13.34, Median: 12.06, Max: 30.00, Min: 0.00
+- Phase-rs problems score near 0 due to oracle_effect/mod.rs being 1.67 MB (exceeds DAS 1MB limit) — consistent with DAS behavior
+- `results/leaderboard.json` oracle row updated; `dashboard_data.json` regenerated and pushed
+
+**Note**: Docker CI scorer (`runner.py` inline `score_result.py`) still uses heuristic — backlog item to update after registration once file-content capture in Phase 1 is wired.
+
+### Status
+- Benchmark: 430 problems, oracle **13.34** (tree-sitter, calibrated), 20 repos
+- Scoring: tree-sitter AST scorer active for local eval; matches DAS validator
+- Pool: all repos saturated — next check 2026-06-09
+- Pending: Gittensor registration, nginx hookup
