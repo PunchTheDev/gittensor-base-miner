@@ -138,3 +138,16 @@ Local harness over-estimates DAS reference scores by median 3.4×. Root cause: t
 
 1. Verify `OPENROUTER_KEY` in GitHub Actions Environment is the correct production key.
 2. Gittensor registration — team handles approval; hyperparameters.json is ready.
+
+---
+
+## 2026-06-02 — CLI DX: validate + leaderboard commands
+
+- **`gitminer validate`** (commits 487ede7, daa9456): new command that applies a patch to a problem's base commit and reports PASS/FAIL with diff stat. Uses the repo cache for speed. `--run-tests` also runs the problem's test command locally. Fills the gap between generating a patch and running a full 30-problem eval.
+- **`gitminer leaderboard`** (commit 69e7b04): prints current rankings in the terminal without needing to visit the dashboard. Shows oracle score and dashboard link when no ranked submissions exist yet.
+- **`--no-sandbox` calibration note** (commit daa9456): eval output now shows a reminder that local heuristic scores run 3–5× above Docker CI scores, so miners interpret them correctly.
+
+### Waiting on operator
+
+1. Verify `OPENROUTER_KEY` in GitHub Actions Environment is the correct production key.
+2. Gittensor registration — team handles approval; hyperparameters.json is ready.
