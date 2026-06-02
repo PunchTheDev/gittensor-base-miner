@@ -9,12 +9,13 @@ Usage:
     python gitminer.py serve-api --port 9000
 
 Endpoints:
-    GET /api/health         liveness check
-    GET /api/stats          pool-level statistics
-    GET /api/shard          current weekly shard (30 problems)
-    GET /api/problems       full problem list (filterable, paginated)
-    GET /api/problems/{id}  one problem by ID
-    GET /api/leaderboard    current ranked submissions
+    GET /api/health              liveness check
+    GET /api/stats               pool-level statistics
+    GET /api/shard               current weekly shard (30 problems)
+    GET /api/problems            full problem list (filterable, paginated)
+    GET /api/problems/{id}       one problem by ID (includes diff_stats)
+    GET /api/problems/{id}/diff  raw unified diff of the accepted solution
+    GET /api/leaderboard         current ranked submissions
 """
 
 from __future__ import annotations
@@ -128,6 +129,19 @@ def _problem_summary(meta: dict, baselines: dict[str, float]) -> dict:
     }
 
 
+def _diff_stats(problem_id: str) -> dict:
+    """Parse reference.diff and return add/remove/files counts."""
+    ref = POOL_DIR / problem_id / "reference.diff"
+    if not ref.exists():
+        return {"add": 0, "remove": 0, "files": 0, "bytes": 0}
+    content = ref.read_text(errors="replace")
+    lines = content.splitlines()
+    add = sum(1 for l in lines if l.startswith("+") and not l.startswith("+++"))
+    remove = sum(1 for l in lines if l.startswith("-") and not l.startswith("---"))
+    files = sum(1 for l in lines if l.startswith("diff --git "))
+    return {"add": add, "remove": remove, "files": files, "bytes": len(content.encode())}
+
+
 def _infer_language(test_cmd: list[str]) -> str:
     cmd = " ".join(test_cmd).lower()
     if "pytest" in cmd or "python" in cmd:
@@ -164,7 +178,10 @@ class Handler(BaseHTTPRequestHandler):
 
         try:
             body = self._route(path, qs)
-            self._send(200, body)
+            if isinstance(body, str):
+                self._send_text(200, body)
+            else:
+                self._send(200, body)
         except _NotFound as e:
             self._send(404, {"error": str(e)})
         except Exception as e:
@@ -182,8 +199,11 @@ class Handler(BaseHTTPRequestHandler):
         if path == "/api/problems":
             return self._problems(qs)
         if path.startswith("/api/problems/"):
-            pid = path[len("/api/problems/"):]
-            return self._problem(pid)
+            rest = path[len("/api/problems/"):]
+            if rest.endswith("/diff"):
+                pid = rest[: -len("/diff")]
+                return self._problem_diff(pid)
+            return self._problem(rest)
         raise _NotFound(f"Unknown endpoint: {path}")
 
     def _health(self) -> dict:
@@ -309,7 +329,15 @@ class Handler(BaseHTTPRequestHandler):
             "das_token_score": meta.get("das_token_score"),
             "time_limit_seconds": meta.get("time_limit_seconds", 120),
             "output_token_budget": meta.get("output_token_budget", 50000),
+            "diff_stats": _diff_stats(pid),
+            "diff_url": f"/api/problems/{pid}/diff",
         }
+
+    def _problem_diff(self, pid: str) -> str:
+        ref = POOL_DIR / pid / "reference.diff"
+        if not ref.exists():
+            raise _NotFound(f"No reference diff for problem {pid!r}")
+        return ref.read_text(errors="replace")
 
     def _leaderboard(self) -> dict:
         if not LEADERBOARD.exists():
@@ -327,6 +355,16 @@ class Handler(BaseHTTPRequestHandler):
         self.end_headers()
         self.wfile.write(payload)
 
+    def _send_text(self, status: int, body: str) -> None:
+        payload = body.encode()
+        self.send_response(status)
+        for k, v in CORS_HEADERS.items():
+            self.send_header(k, v)
+        self.send_header("Content-Type", "text/plain; charset=utf-8")
+        self.send_header("Content-Length", str(len(payload)))
+        self.end_headers()
+        self.wfile.write(payload)
+
 
 class _NotFound(Exception):
     pass
@@ -339,12 +377,13 @@ class _NotFound(Exception):
 def serve(host: str = "0.0.0.0", port: int = 8083) -> None:
     server = ThreadingHTTPServer((host, port), Handler)
     print(f"Gittensor Base-Miner API listening on http://{host}:{port}")
-    print("  GET /api/health         liveness check")
-    print("  GET /api/stats          pool statistics")
-    print("  GET /api/shard          current weekly shard")
-    print("  GET /api/problems       problem list (filterable)")
-    print("  GET /api/problems/{id}  single problem detail")
-    print("  GET /api/leaderboard    current leaderboard")
+    print("  GET /api/health              liveness check")
+    print("  GET /api/stats               pool statistics")
+    print("  GET /api/shard               current weekly shard")
+    print("  GET /api/problems            problem list (filterable)")
+    print("  GET /api/problems/{id}       single problem detail")
+    print("  GET /api/problems/{id}/diff  raw reference diff (text/plain)")
+    print("  GET /api/leaderboard         current leaderboard")
     print()
     try:
         server.serve_forever()

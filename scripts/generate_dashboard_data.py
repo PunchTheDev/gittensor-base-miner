@@ -37,6 +37,19 @@ TEST_PATH_PATTERNS = (
 )
 
 
+def diff_stats_for(problem_dir: pathlib.Path) -> dict:
+    """Return add/remove/files/bytes for the reference diff."""
+    ref = problem_dir / "reference.diff"
+    if not ref.exists():
+        return {"add": 0, "remove": 0, "files": 0, "bytes": 0}
+    content = ref.read_text(errors="replace")
+    lines = content.splitlines()
+    add = sum(1 for l in lines if l.startswith("+") and not l.startswith("+++"))
+    remove = sum(1 for l in lines if l.startswith("-") and not l.startswith("---"))
+    files = sum(1 for l in lines if l.startswith("diff --git "))
+    return {"add": add, "remove": remove, "files": files, "bytes": len(content.encode())}
+
+
 def context_files_for(problem_dir: pathlib.Path) -> tuple[list[str], list[str]]:
     """Return (all_files, test_files) as sorted relative path lists."""
     ctx = problem_dir / "context"
@@ -73,6 +86,7 @@ def load_problems():
         issue_body = meta.get("issue_body") or ""
         pid = meta.get("id")
         ctx_files, test_files = context_files_for(p)
+        stats = diff_stats_for(p)
         problems.append(
             {
                 "id": pid,
@@ -88,6 +102,7 @@ def load_problems():
                 "das_structural_score": float(meta.get("das_structural_score") or 0),
                 "das_total_nodes": meta.get("das_total_nodes"),
                 "baseline_score": baselines.get(pid),
+                "diff_stats": stats,
                 "test_cmd": meta.get("test_cmd") or [],
                 "base_commit": meta.get("base_commit", ""),
                 "pr_url": f"https://github.com/{repo}/pull/{pr}",
