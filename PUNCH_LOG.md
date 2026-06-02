@@ -4,6 +4,38 @@ Milestone trail for the base-miner benchmark. Discord is the primary channel; th
 
 ---
 
+## 2026-06-02 — Missing-header fix + fuzzy hunk-offset correction (commit 0ad4298)
+
+### Agent: `_fix_diff_headers` — auto-insert missing `--- a/` / `+++ b/` headers
+
+`git apply` requires `--- a/<path>` and `+++ b/<path>` lines between the `diff --git` header and the first `@@` hunk. Models in repair mode often jump straight from `diff --git` to `@@`, producing diffs that fail immediately. `_fix_diff_headers()` detects these blocks and inserts the required headers derived from the `diff --git a/<path> b/<path>` line itself. New-file blocks use `--- /dev/null`. Applied as part of `_post_process` on every intermediate diff.
+
+### Agent: `_fix_hunk_offsets` — fuzzy context-line start-offset correction
+
+`_fix_hunk_counts` corrects the `b/d` count fields in `@@ -a,b +c,d @@` headers. It cannot fix the `a/c` *start offset* fields — those require knowing where the context lines actually appear in the file. A wrong start offset causes `git apply` to reject a diff even when the content is correct.
+
+`_fix_hunk_offsets(diff, file_lookup)` fixes this:
+1. For each hunk, extracts leading context lines (unchanged ` `-prefixed lines) and the first removal line as a fingerprint.
+2. Searches for those lines in the actual file content within ±25 lines of the stated offset.
+3. If the match is unambiguous (exactly 1 location), corrects the `@@ -N` and `+N` values with the same delta.
+4. Safe fallback: if no match or multiple matches (ambiguous), keeps the original offset.
+
+`file_lookup` is built from the problem's context files and passed through `_post_process`. For files not in context (e.g. secondary `__init__.py` additions), offset correction is skipped. Applied before `_fix_hunk_counts` so counts are computed on the corrected structure.
+
+### `_post_process` pipeline order (updated)
+1. Strip `N |` display artifacts
+2. Trim trailing prose
+3. Insert missing `--- a/` / `+++ b/` headers (`_fix_diff_headers`)
+4. Correct wrong `@@ -N` start offsets (`_fix_hunk_offsets`, needs file_lookup)
+5. Recompute `@@ -a,b +c,d @@` hunk counts (`_fix_hunk_counts`)
+
+### Status
+- Benchmark: 423 problems, oracle 23.36 (unchanged)
+- Post-processing: 5-stage pipeline covering all major `git apply` failure modes
+- Pool: fully saturated (check 2026-06-09)
+
+---
+
 ## 2026-06-02 — Oracle mean update + hunk map in plan step (commits ba036fb, 31dcf29, 38d1809)
 
 ### Oracle mean update: 23.08 → 23.36 (commit ba036fb)
