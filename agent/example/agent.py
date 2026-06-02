@@ -1251,6 +1251,14 @@ def _diagnose_diff(diff: str) -> str:
         if line.startswith("@@"):
             if not re.match(r"@@ -\d+(?:,\d+)? \+\d+(?:,\d+)? @@", line):
                 return f"malformed hunk header: {line!r}"
+    # Check that the diff actually changes something (at least one + or - line)
+    has_change = any(
+        (ln.startswith("+") and not ln.startswith("+++"))
+        or (ln.startswith("-") and not ln.startswith("---"))
+        for ln in diff.splitlines()
+    )
+    if not has_change:
+        return "diff contains only context lines — no lines were added or removed"
     return ""
 
 
