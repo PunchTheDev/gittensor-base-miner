@@ -4,30 +4,40 @@
 
 Submissions are scored by replaying real Gittensor issues in an isolated sandbox and evaluating the candidate patch with Gittensor's own scoring engine.
 
+**Correctness gates quality.** A patch that doesn't pass the test suite scores 0, regardless of code quality.
+
+## Formula
+
+Mirrors Gittensor's native scoring formula exactly (constants from `gittensor/constants.py`):
+
 ```
-final_score = correctness_score × quality_score
+base_score   = 25 × (1 − exp(−src_tokens / 58.0))   # quality term, 0–25
+bonus_score  = min(contribution_score / 1500, 1) × 5 # cross-category bonus, 0–5
+final_score  = base_score + bonus_score               # 0–30 total
 ```
 
-**Correctness gates quality.** A patch that doesn't pass the test suite scores 0, regardless of code quality metrics.
+If tests do not pass, `final_score = 0`.
 
-## Correctness score
+## Correctness check
 
 1. Apply the patch to the repository at `base_commit` (the commit just before the issue was filed).
 2. Run the test suite (`test_cmd` from `meta.json`).
-3. If all tests pass: `correctness_score = 1.0`. Otherwise: `0.0`.
+3. If all tests pass, proceed to quality scoring. Otherwise `final_score = 0`.
 
-The test suite is the arbiter of correctness. An agent that finds a *better* fix than the reference solution is not penalized — if it passes the tests, it earns a correctness score.
+The test suite is the arbiter of correctness. An agent that finds a *better* fix than the reference solution is not penalized — if it passes the tests, it earns a full quality score.
 
-## Quality score
+## Quality scoring
 
-Approximates Gittensor's native AST token scoring:
+`src_tokens` is computed by Gittensor's tree-sitter pipeline:
 
-- Parse the diff using tree-sitter per language.
+- Parse the diff per language using tree-sitter.
 - Sum weighted structural nodes (functions, classes, etc.) and leaf tokens.
 - Apply language weights (Rust/C/Go = 2.0×, Python = 1.5×, JS = 1.15×, etc.).
-- Saturate through a sigmoid: `1 - exp(-token_score / saturation_scale)`.
+- Saturate through the exponential: `25 × (1 − exp(−src_tokens / 58.0))`.
 
-The quality score rewards meaningful, structured code changes. Comments and whitespace score 0. Copy-pasted boilerplate saturates quickly.
+Meaningful, structured code changes score higher. Comments and whitespace score 0. Copy-pasted boilerplate saturates quickly at around 25/30.
+
+The local heuristic scorer approximates `src_tokens` via raw diff token counts. Local scores typically run 3–5× above DAS reference scores — use them for relative comparison only. Docker CI gives the authoritative score.
 
 ## Problem curation criteria
 
