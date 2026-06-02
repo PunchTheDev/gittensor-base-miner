@@ -4,6 +4,22 @@ Milestone trail for the base-miner benchmark. Discord is the primary channel; th
 
 ---
 
+## 2026-06-02 — Verify prose-critique followup, long-body head+tail (commits a1b4584, 9e40ddc)
+
+### Verify prose-critique follow-up prompt
+
+When the verify step returns a textual critique (no corrected diff extracted), the next iteration previously re-sent the full VERIFY_PROMPT with the same diff — ~4-6KB of repeated context and all 7 criteria. The model had already analysed the diff; asking it to re-analyse was redundant.
+
+Fix: when the previous verify iteration gave a prose critique, the next call uses `VERIFY_FOLLOWUP_PROMPT`: "Based on your analysis above, produce the corrected unified diff now." (~80 chars vs. ~4-6KB). The `pending_prose_critique` flag tracks this state across loop iterations.
+
+### Long issue body head+tail for verify
+
+After the act step, `history[1]` (the full observe context) is compacted to a 150-char summary. The verify prompt becomes the model's only view of the issue body — and it was truncated to the first 3000 chars. 31% of pool problems (133/430) have issue bodies longer than 3000 chars; the max is 16,200 chars.
+
+Fix: for bodies longer than 3000 chars, the verify prompt now shows `body[:2500] + "[...]" + body[-500:]`. The last 500 chars often contain edge-case requirements, gotchas, or clarifying examples that the model needs to verify completeness. Total length stays ~3050 chars.
+
+---
+
 ## 2026-06-02 — Verify token budget, assertion limit, hunk search radius (commit a5d1235)
 
 ### Verify token budget raised to match act
