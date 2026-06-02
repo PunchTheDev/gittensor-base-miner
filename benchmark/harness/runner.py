@@ -5,18 +5,23 @@ Executes scoring for a single benchmark problem inside an isolated container:
   - Hard time limit enforced via subprocess timeout + docker kill
   - Memory cap via --memory
   - Phase 1 (setup + test): language-specific image — Python/Node/Rust/JDK;
-    network allowed for git clone, package manager fetches, dep installs
-  - Phase 2 (score): python:3.12-slim, network blocked (--network none);
-    scorer reads only staging files produced in Phase 1
+    network allowed for git clone, package manager fetches, dep installs.
+    Also captures old/new file contents for tree-sitter scoring.
+  - Phase 2 (score): ghcr.io/punchthedev/gitminer-scorer:latest (tree-sitter
+    pre-installed), network blocked (--network none). Reads staging files from
+    Phase 1 and emits a JSON score.
   - Secrets (OPENROUTER_KEY etc.) never passed to containers — no model cheating
   - Ephemeral: container is removed after each run (--rm)
+
+Fallback chain:
+  - If SCORE_IMAGE is unavailable, falls back to python:3.12-slim with heuristic
+    token scoring (same as pre-tree-sitter behaviour).
 
 Usage:
     from benchmark.harness.runner import run_in_sandbox
     result = run_in_sandbox(problem_dir, patch_path)
 
 For local development without Docker, score.score_patch() is called directly.
-Daytona CI integration lives in ci/daytona.yml and calls this module.
 """
 
 from __future__ import annotations
@@ -32,18 +37,217 @@ from pathlib import Path
 
 MEMORY_LIMIT = "2g"
 CPU_LIMIT = "2.0"
-SCORE_IMAGE = "python:3.12-slim"  # always Python — scorer is stdlib-only Python
+
+# Custom scorer image — python:3.12-slim + tree-sitter pre-installed.
+# Built by .github/workflows/build-scorer.yml and pushed to GHCR.
+# The fallback image uses the heuristic scorer when tree-sitter is absent.
+SCORE_IMAGE = "ghcr.io/punchthedev/gitminer-scorer:latest"
+SCORE_IMAGE_FALLBACK = "python:3.12-slim"
+
 KILL_GRACE = 15  # seconds docker waits after stop signal before SIGKILL
 
 # Language-specific Docker images for Phase 1 (clone → install deps → run tests).
-# Images are chosen to match the dominant toolchain version on the repos in the pool.
 _LANG_IMAGES: dict[str, str] = {
     "python": "python:3.12-slim",
     "npm":    "node:20-slim",
     "cargo":  "rust:1.82-slim",
-    # gradlew wrapper ships its own Gradle; we only need a JDK.
     "./gradlew": "eclipse-temurin:21-jdk-jammy",
 }
+
+# Scorer assets bundled with the harness — copied to staging for Phase 2.
+_HARNESS_DIR = Path(__file__).parent
+_TS_SCORER_SRC = _HARNESS_DIR / "tree_sitter_scorer.py"
+_WEIGHTS_DIR = _HARNESS_DIR / "weights"
+
+# ---------------------------------------------------------------------------
+# File-content capture script (runs in Phase 1, writes staging/file_pairs.json)
+# ---------------------------------------------------------------------------
+_CAPTURE_SCRIPT = '''\
+#!/usr/bin/env python3
+"""
+Capture old/new file contents for tree-sitter scoring.
+
+Called twice from setup_and_test.sh:
+  python3 /staging/capture_files.py old /staging/candidate.diff
+  python3 /staging/capture_files.py new /staging/candidate.diff
+
+Writes /staging/file_pairs.json:
+  {"old": {"path": "content"|null, ...}, "new": {"path": "content"|null, ...}}
+
+File content is capped at 1 MB per file (same limit as the DAS scorer).
+"""
+import json, re, sys
+from pathlib import Path
+
+MAX_BYTES = 1_000_000
+PHASE = sys.argv[1]          # "old" or "new"
+DIFF_PATH = sys.argv[2]
+REPO = Path("/repo")
+STAGING = Path("/staging")
+FP_PATH = STAGING / "file_pairs.json"
+
+
+def _read(p: Path) -> "str | None":
+    if not p.exists():
+        return None
+    try:
+        raw = p.read_bytes()
+        if len(raw) > MAX_BYTES:
+            return None  # skip oversized files (matches DAS 1 MB limit)
+        return raw.decode("utf-8", errors="replace")
+    except Exception:
+        return None
+
+
+diff_text = Path(DIFF_PATH).read_text(errors="replace")
+paths = []
+for line in diff_text.splitlines():
+    if line.startswith("diff --git "):
+        m = re.search(r" b/(.+)$", line)
+        if m:
+            paths.append(m.group(1))
+
+if PHASE == "old":
+    data = {p: _read(REPO / p) for p in paths}
+    FP_PATH.write_text(json.dumps({"old": data, "new": {}}))
+elif PHASE == "new":
+    try:
+        existing = json.loads(FP_PATH.read_text())
+    except Exception:
+        existing = {"old": {}, "new": {}}
+    existing["new"] = {p: _read(REPO / p) for p in paths}
+    FP_PATH.write_text(json.dumps(existing))
+'''
+
+# ---------------------------------------------------------------------------
+# Phase 2 scorer script (runs inside SCORE_IMAGE, network-isolated)
+# ---------------------------------------------------------------------------
+_SCORE_RESULT_SCRIPT = '''\
+"""
+Phase 2 scorer — reads staging artifacts from Phase 1, emits JSON score.
+
+Primary: tree-sitter AST scorer (when ts_scorer.py + weights present in staging).
+Fallback: heuristic diff-token count (always available, ~2x above DAS).
+"""
+import json, math, pathlib, re, sys
+
+MERGED_PR_BASE_SCORE = 25
+SRC_TOK_SATURATION_SCALE = 58.0
+MAX_CONTRIBUTION_BONUS = 5
+CONTRIBUTION_SCORE_FOR_FULL_BONUS = 1500
+
+staging = pathlib.Path("/staging")
+patch_status = (staging / "patch_status").read_text().strip() if (staging / "patch_status").exists() else "failed"
+meta = json.loads((staging / "meta.json").read_text()) if (staging / "meta.json").exists() else {}
+problem_id = meta.get("id", "unknown")
+saturation_scale = float(meta.get("src_tok_saturation_scale", SRC_TOK_SATURATION_SCALE))
+
+if patch_status != "applied":
+    print(json.dumps({"problem_id": problem_id, "patch_applied": False,
+                       "tests_passed": False, "base_score": 0.0, "final_score": 0.0}))
+    sys.exit(0)
+
+test_rc = int((staging / "test_rc").read_text().strip()) if (staging / "test_rc").exists() else 1
+tests_passed = test_rc == 0
+test_out = (staging / "test_out.txt").read_text(errors="replace") if (staging / "test_out.txt").exists() else ""
+
+if not tests_passed:
+    print(json.dumps({"problem_id": problem_id, "patch_applied": True, "tests_passed": False,
+                       "test_output": test_out[-2000:], "base_score": 0.0, "final_score": 0.0}))
+    sys.exit(0)
+
+
+def _compute_base(src_tok: float, total_tok: float) -> float:
+    initial = MERGED_PR_BASE_SCORE * (1.0 - math.exp(-src_tok / saturation_scale))
+    bonus = round(min(1.0, total_tok / CONTRIBUTION_SCORE_FOR_FULL_BONUS) * MAX_CONTRIBUTION_BONUS, 2)
+    return round(initial + bonus, 2)
+
+
+# ---------------------------------------------------------------------------
+# Primary: tree-sitter scorer
+# ---------------------------------------------------------------------------
+def _try_tree_sitter() -> "tuple[float, float] | None":
+    fp_path = staging / "file_pairs.json"
+    ts_path = staging / "ts_scorer.py"
+    if not fp_path.exists() or not ts_path.exists():
+        return None
+
+    try:
+        import importlib.util, sys as _sys
+        spec = importlib.util.spec_from_file_location("ts_scorer", str(ts_path))
+        ts = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(ts)
+        # ts_scorer resolves _WEIGHTS_DIR as Path(__file__).parent / "weights",
+        # which becomes /staging/weights/ — the weights we copied in _prepare_staging.
+
+        if not ts.available():
+            return None
+
+        fp_data = json.loads(fp_path.read_text())
+        old_map = fp_data.get("old", {})
+        new_map = fp_data.get("new", {})
+
+        pairs = [
+            ts.FilePair(p, old_map.get(p), new_map.get(p))
+            for p in set(old_map) | set(new_map)
+        ]
+        return ts.score_file_pairs(pairs)
+    except Exception:
+        return None
+
+
+ts_result = _try_tree_sitter()
+if ts_result is not None:
+    src_tok, total_tok = ts_result
+    scoring_method = "tree-sitter"
+else:
+    # Fallback heuristic
+    STRUCT_WORDS = ("def ", "class ", "async def ", "fn ", "impl ", "struct ",
+                    "func ", "interface ", "enum ", "trait ", "type ")
+    SKIP_STARTS = ("#", "//", "/*", "*", "<!--", "pass", "...")
+    DELIM = re.compile(r"[\\s()\\[\\]{},;:=<>!&|.@#$%^~]+")
+
+    patch_text = (staging / "candidate.diff").read_text(errors="replace")
+    src_tok = 0.0
+    total_tok = 0.0
+    in_test = False
+
+    for line in patch_text.splitlines():
+        if line.startswith("diff --git"):
+            m = re.search("b/(.+)$", line)
+            if m:
+                p = m.group(1)
+                in_test = ("/test" in p or p.startswith("test") or
+                           "_test." in p or p.split("/")[-1].startswith("test_") or "spec." in p)
+            continue
+        if not line.startswith("+") or line.startswith("+++"):
+            continue
+        content = line[1:].strip()
+        if not content or any(content.startswith(s) for s in SKIP_STARTS):
+            continue
+        tokens = [t for t in DELIM.split(content) if len(t) > 1 and not t.isdigit()]
+        if not tokens:
+            continue
+        is_structural = any(kw in content for kw in STRUCT_WORDS)
+        line_score = len(tokens) * (2.5 if is_structural else 1.0)
+        total_tok += line_score
+        if not in_test:
+            src_tok += line_score
+
+    scoring_method = "heuristic"
+
+base_score = _compute_base(src_tok, total_tok)
+print(json.dumps({
+    "problem_id": problem_id,
+    "patch_applied": True,
+    "tests_passed": True,
+    "source_token_score": round(src_tok, 2),
+    "total_token_score": round(total_tok, 2),
+    "scoring_method": scoring_method,
+    "base_score": base_score,
+    "final_score": base_score,
+}))
+'''
 
 
 def _docker_available() -> bool:
@@ -75,13 +279,11 @@ def run_in_sandbox(problem_dir: Path, patch_path: Path) -> dict:
 # ---------------------------------------------------------------------------
 
 def _lang_image(test_cmd: list[str]) -> str:
-    """Return the Docker image best suited for the given test command."""
     runner = test_cmd[0] if test_cmd else "python"
     return _LANG_IMAGES.get(runner, "python:3.12-slim")
 
 
 def _install_block(test_cmd: list[str]) -> str:
-    """Return the language-specific dependency installation commands."""
     runner = test_cmd[0] if test_cmd else "python"
 
     if runner == "python":
@@ -107,7 +309,6 @@ def _install_block(test_cmd: list[str]) -> str:
         """)
 
     if runner == "cargo":
-        # Rust: warm the registry cache so test compile doesn't time out
         return textwrap.dedent("""\
             cargo fetch --quiet 2>/dev/null || true
         """)
@@ -118,18 +319,26 @@ def _install_block(test_cmd: list[str]) -> str:
             ./gradlew dependencies --quiet 2>/dev/null || true
         """)
 
-    return ""  # unknown runner — no install step
+    return ""
 
 
 def _git_apt_block(runner: str) -> str:
-    """Packages needed beyond git for the given runner's base image."""
-    # node:20-slim and rust:1.82-slim ship without git; eclipse-temurin has it.
+    """Packages needed beyond git for the given runner's base image.
+
+    python3-minimal is added for npm/cargo images so capture_files.py can run
+    in Phase 1 to serialize file contents for the Phase 2 tree-sitter scorer.
+    """
     if runner in ("npm", "cargo"):
-        return "apt-get update -qq >/dev/null && apt-get install -y -qq git >/dev/null"
+        return (
+            "apt-get update -qq >/dev/null && "
+            "apt-get install -y -qq git python3-minimal >/dev/null"
+        )
     if runner == "./gradlew":
-        # eclipse-temurin:21-jdk-jammy has git already; still safe to skip reinstall
-        return "git --version >/dev/null 2>&1 || (apt-get update -qq >/dev/null && apt-get install -y -qq git >/dev/null)"
-    # python:3.12-slim
+        return (
+            "git --version >/dev/null 2>&1 || "
+            "(apt-get update -qq >/dev/null && apt-get install -y -qq git >/dev/null)"
+        )
+    # python:3.12-slim — has python3, needs git
     return "apt-get update -qq >/dev/null && apt-get install -y -qq git >/dev/null"
 
 
@@ -137,6 +346,18 @@ def _prepare_staging(staging: Path, meta: dict, patch_path: Path) -> None:
     """Write all files the container needs into the staging directory."""
     shutil.copy(patch_path, staging / "candidate.diff")
     (staging / "meta.json").write_text(json.dumps(meta))
+
+    # Copy tree-sitter scorer + weights so Phase 2 can use them without network.
+    if _TS_SCORER_SRC.exists():
+        shutil.copy(_TS_SCORER_SRC, staging / "ts_scorer.py")
+    if _WEIGHTS_DIR.is_dir():
+        staging_weights = staging / "weights"
+        staging_weights.mkdir(exist_ok=True)
+        for w in _WEIGHTS_DIR.iterdir():
+            shutil.copy(w, staging_weights / w.name)
+
+    # File-content capture script — runs in Phase 1 before/after git apply.
+    (staging / "capture_files.py").write_text(_CAPTURE_SCRIPT)
 
     test_cmd: list[str] = meta.get("test_cmd", ["python", "-m", "pytest", "--tb=short", "-q"])
     test_cmd_str = " ".join(test_cmd)
@@ -156,10 +377,13 @@ def _prepare_staging(staging: Path, meta: dict, patch_path: Path) -> None:
         cd /repo
         git checkout --quiet {meta["base_commit"]}
 
-        # Install dependencies (best-effort — a failed install still allows scoring)
+        # Install dependencies (best-effort)
         {install_block.rstrip()}
 
-        # Apply patch — write outcome so scorer can read it
+        # Capture old file contents BEFORE applying the patch.
+        python3 /staging/capture_files.py old /staging/candidate.diff || true
+
+        # Apply patch — write outcome so Phase 2 can read it.
         if git apply /staging/candidate.diff; then
             echo "applied" > /staging/patch_status
         else
@@ -167,98 +391,16 @@ def _prepare_staging(staging: Path, meta: dict, patch_path: Path) -> None:
             exit 0
         fi
 
-        # Run tests — capture output + exit code
+        # Capture new file contents AFTER applying the patch.
+        python3 /staging/capture_files.py new /staging/candidate.diff || true
+
+        # Run tests — capture output + exit code.
         {test_cmd_str} > /staging/test_out.txt 2>&1
         echo $? > /staging/test_rc
     """))
     (staging / "setup_and_test.sh").chmod(0o755)
 
-    # Python scorer: reads results from staging, prints JSON, exits 0 always.
-    # Self-contained stdlib-only script — runs inside bare python:3.12-slim container.
-    # Mirrors score.py's Gittensor formula; keep in sync when score.py changes.
-    #
-    # Escaping note: this string is written via write_text(), so each \\ in this
-    # source becomes a single \ in the file. Regex patterns use single-char classes
-    # and avoid quote chars to sidestep double-escaping.
-    (staging / "score_result.py").write_text(textwrap.dedent("""\
-        import json, math, pathlib, re, sys
-
-        MERGED_PR_BASE_SCORE = 25
-        SRC_TOK_SATURATION_SCALE = 58.0
-        MAX_CONTRIBUTION_BONUS = 5
-        CONTRIBUTION_SCORE_FOR_FULL_BONUS = 1500
-
-        staging = pathlib.Path("/staging")
-
-        patch_status = (staging / "patch_status").read_text().strip() if (staging / "patch_status").exists() else "failed"
-        meta_raw = (staging / "meta.json").read_text() if (staging / "meta.json").exists() else "{}"
-        meta = json.loads(meta_raw)
-        problem_id = meta.get("id", "unknown")
-
-        if patch_status != "applied":
-            print(json.dumps({"problem_id": problem_id, "patch_applied": False,
-                               "tests_passed": False, "base_score": 0.0, "final_score": 0.0}))
-            sys.exit(0)
-
-        test_rc = int((staging / "test_rc").read_text().strip()) if (staging / "test_rc").exists() else 1
-        tests_passed = test_rc == 0
-        test_out = (staging / "test_out.txt").read_text(errors="replace") if (staging / "test_out.txt").exists() else ""
-
-        if not tests_passed:
-            print(json.dumps({"problem_id": problem_id, "patch_applied": True, "tests_passed": False,
-                               "test_output": test_out[-2000:], "base_score": 0.0, "final_score": 0.0}))
-            sys.exit(0)
-
-        saturation_scale = float(meta.get("src_tok_saturation_scale", SRC_TOK_SATURATION_SCALE))
-
-        # Token scoring — approximates score.py's Gittensor formula
-        # Structural keywords get a 1.5x bonus; comments and blanks are skipped.
-        STRUCT_WORDS = ("def ", "class ", "async def ", "fn ", "impl ", "struct ",
-                        "func ", "interface ", "enum ", "trait ", "type ")
-        SKIP_STARTS = ("#", "//", "/*", "*", "<!--", "pass", "...")
-        DELIM = re.compile(r"[\\s()\\[\\]{},;:=<>!&|.@#$%^~]+")
-
-        patch_text = (staging / "candidate.diff").read_text()
-        src_score = 0.0
-        total_score = 0.0
-        in_test = False
-
-        for line in patch_text.splitlines():
-            if line.startswith("diff --git"):
-                m = re.search("b/(.+)$", line)
-                if m:
-                    p = m.group(1)
-                    in_test = ("/test" in p or p.startswith("test") or
-                               "_test." in p or p.split("/")[-1].startswith("test_") or "spec." in p)
-                continue
-            if not line.startswith("+") or line.startswith("+++"):
-                continue
-            content = line[1:].strip()
-            if not content or any(content.startswith(s) for s in SKIP_STARTS):
-                continue
-            tokens = [t for t in DELIM.split(content) if len(t) > 1 and not t.isdigit()]
-            if not tokens:
-                continue
-            is_structural = any(kw in content for kw in STRUCT_WORDS)
-            line_score = len(tokens) * (2.5 if is_structural else 1.0)
-            total_score += line_score
-            if not in_test:
-                src_score += line_score
-
-        initial = MERGED_PR_BASE_SCORE * (1.0 - math.exp(-src_score / saturation_scale))
-        bonus_pct = min(1.0, total_score / CONTRIBUTION_SCORE_FOR_FULL_BONUS)
-        base_score = round(initial + bonus_pct * MAX_CONTRIBUTION_BONUS, 2)
-
-        print(json.dumps({
-            "problem_id": problem_id,
-            "patch_applied": True,
-            "tests_passed": True,
-            "source_token_score": round(src_score, 2),
-            "total_token_score": round(total_score, 2),
-            "base_score": base_score,
-            "final_score": base_score,
-        }))
-    """))
+    (staging / "score_result.py").write_text(_SCORE_RESULT_SCRIPT)
 
 
 def _run_container(staging: Path, meta: dict, time_limit: int) -> dict:
@@ -269,10 +411,7 @@ def _run_container(staging: Path, meta: dict, time_limit: int) -> dict:
     test_cmd: list[str] = meta.get("test_cmd", ["python", "-m", "pytest", "--tb=short", "-q"])
     setup_image = _lang_image(test_cmd)
 
-    # Phase 1: setup + test — use the language-specific image so the right
-    # toolchain (Node, Rust, JDK, Python) is available without installing it.
-    # Network is allowed here for git clone, package manager, and dep fetches.
-    # Secrets are never passed so the agent can't call external model APIs.
+    # Phase 1: setup + test + file content capture.
     setup_cmd = [
         "docker", "run", "--rm",
         "--name", container_name,
@@ -295,13 +434,14 @@ def _run_container(staging: Path, meta: dict, time_limit: int) -> dict:
         subprocess.run(["docker", "kill", container_name], capture_output=True)
         return _timeout_result(problem_id)
 
-    # Phase 2: score from artifacts written to staging.
-    # Always uses SCORE_IMAGE (Python) — scorer is stdlib-only Python regardless of language.
+    # Phase 2: score from staging artifacts.
+    # Uses SCORE_IMAGE (tree-sitter pre-installed); falls back if image unavailable.
+    score_image = _resolve_score_image()
     score_cmd = [
         "docker", "run", "--rm",
         "--network", "none",
         "-v", f"{staging}:/staging",
-        SCORE_IMAGE,
+        score_image,
         "python3", "/staging/score_result.py",
     ]
 
@@ -310,7 +450,7 @@ def _run_container(staging: Path, meta: dict, time_limit: int) -> dict:
             score_cmd,
             capture_output=True,
             text=True,
-            timeout=30,
+            timeout=60,
         )
     except subprocess.TimeoutExpired:
         return _error_result(problem_id, "scorer timeout")
@@ -324,6 +464,24 @@ def _run_container(staging: Path, meta: dict, time_limit: int) -> dict:
                 continue
 
     return _error_result(problem_id, score_proc.stderr[-300:] if score_proc.stderr else "no output")
+
+
+_score_image_cache: str | None = None
+
+
+def _resolve_score_image() -> str:
+    """Return SCORE_IMAGE if it can be pulled, else fall back to plain python:3.12-slim."""
+    global _score_image_cache
+    if _score_image_cache is not None:
+        return _score_image_cache
+
+    r = subprocess.run(
+        ["docker", "pull", "--quiet", SCORE_IMAGE],
+        capture_output=True,
+        timeout=120,
+    )
+    _score_image_cache = SCORE_IMAGE if r.returncode == 0 else SCORE_IMAGE_FALLBACK
+    return _score_image_cache
 
 
 def _timeout_result(problem_id: str) -> dict:
