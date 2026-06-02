@@ -1761,3 +1761,31 @@ The SYSTEM_PROMPT said "source-token quality — the number of meaningful code t
 - Benchmark: 430 problems, oracle 13.34, 20 repos (commit `63e5cf6`)
 - Agent: quality scoring guidance sharpened in system, act, observe, verify prompts
 - Pool: checked entrius/gittensor — no new qualifying PRs; next DAS check ~2026-06-09
+
+---
+
+## 2026-06-02 — Operator feedback: expand pool to prestigious external repos
+
+Operator noted that genie-claw (tagged "openclaw" in GitHub topics) was underrepresented
+and asked for more impressive, novel problem sources beyond DAS-registered repos.
+
+**Investigation**:
+- genie-claw: 152 DAS PRs but only 16 problems — fully saturated (all qualify already pass)
+- DAS API returned 3,175 total PRs; all 20 registered repos already in pool
+- No new DAS repos registered; expansion requires external sources
+
+**Action**: New script `scripts/expand_pool_external.py` — fetches merged PRs from
+prestigious external GitHub repos via GitHub API (no DAS dependency).
+
+**Target repos selected** (self-contained test suites, no external service deps):
+- `pytest-dev/pytest` (14k stars) — Python testing framework
+- `pallets/click` (18k stars) — Python CLI toolkit
+- `pallets/werkzeug` (7k stars) — Python WSGI utils
+- `encode/starlette` (12k stars) — Python ASGI framework
+
+**Result**: +96 new problems (430 → 526). Pool now spans 17 repos.
+
+### Status
+- Benchmark: **526 problems** (+96), oracle 13.34, 17 repos active (commit `b6fc588`)
+- New script: `scripts/expand_pool_external.py`
+- Docker CI: no changes needed — Python repos use same `pip install -e .` install path
