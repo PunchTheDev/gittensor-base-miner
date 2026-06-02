@@ -3,13 +3,14 @@
 gitminer — CLI for the Gittensor Base-Miner Benchmark.
 
 Subcommands:
-    eval      Score an agent against the current shard (or all problems)
-    validate  Check that a patch applies cleanly to a problem's base commit
-    problems  List benchmark problems with optional filters
-    cache     Pre-warm the local repo cache (speeds up --no-sandbox evals)
-    hash      Compute the commit-reveal SHA-256 hash for a patch file
-    shard     Print the current week's 30-problem shard IDs
-    submit    Validate an agent, generate its commit-reveal hash, and print (or open) a PR
+    eval        Score an agent against the current shard (or all problems)
+    validate    Check that a patch applies cleanly to a problem's base commit
+    leaderboard Show current leaderboard in the terminal
+    problems    List benchmark problems with optional filters
+    cache       Pre-warm the local repo cache (speeds up --no-sandbox evals)
+    hash        Compute the commit-reveal SHA-256 hash for a patch file
+    shard       Print the current week's 30-problem shard IDs
+    submit      Validate an agent, generate its commit-reveal hash, and print (or open) a PR
 
 Usage:
     python gitminer.py eval agent/submissions/myhandle/agent.py
@@ -399,6 +400,54 @@ def cmd_problems(args: argparse.Namespace) -> None:
     print(f"\n{len(rows[:limit])} of {len(rows)} problems shown.")
 
 
+def cmd_leaderboard(args: argparse.Namespace) -> None:
+    """Print the current leaderboard from results/leaderboard.json."""
+    lb_path = REPO_ROOT / "results" / "leaderboard.json"
+    if not lb_path.exists():
+        print("Leaderboard not found. Check results/leaderboard.json.")
+        return
+
+    rows = json.loads(lb_path.read_text())
+    # Separate oracle row from ranked entries
+    oracle = next((r for r in rows if r.get("rank") is None), None)
+    ranked = [r for r in rows if r.get("rank") is not None]
+
+    if not ranked:
+        print("\nNo submissions yet — be the first to submit an agent!")
+        if oracle and oracle.get("score") is not None:
+            print(f"\nOracle (reference diffs): {oracle['score']:.2f} / 30.00  ← score to beat")
+        print(f"\nDashboard: https://punchthedev.github.io/gittensor-miner-dashboard/")
+        return
+
+    handle_w = max(len(r.get("agent", "")) for r in ranked)
+    handle_w = max(handle_w, 8)
+    model_w = max(len(r.get("model", "")) for r in ranked)
+    model_w = max(model_w, 5)
+
+    header = f"{'Rank':>4}  {'Agent':<{handle_w}}  {'Score':>8}  {'Model':<{model_w}}  {'Date'}"
+    print()
+    print(header)
+    print("─" * len(header))
+
+    for row in ranked:
+        rank = row.get("rank", "?")
+        handle = row.get("agent", "—")
+        score = row.get("score")
+        model = row.get("model", "—")
+        date = (row.get("date") or "")[:10]
+
+        rank_str = f"#{rank:>3}"
+        score_str = f"{score:>7.2f}" if score is not None else "  pending"
+
+        print(f"{rank_str}  {handle:<{handle_w}}  {score_str}  {model:<{model_w}}  {date}")
+
+    print()
+    if oracle and oracle.get("score") is not None:
+        print(f"Oracle (reference diffs): {oracle['score']:.2f} / 30.00")
+    print(f"Dashboard: https://punchthedev.github.io/gittensor-miner-dashboard/")
+    print()
+
+
 def cmd_validate(args: argparse.Namespace) -> None:
     """
     Check that a patch applies cleanly to a problem's base commit.
@@ -591,6 +640,10 @@ def main() -> None:
     p_validate.add_argument("--run-tests", action="store_true",
                             help="Also run the problem's test command after applying the patch")
     p_validate.set_defaults(func=cmd_validate)
+
+    # leaderboard
+    p_lb = sub.add_parser("leaderboard", help="Show current leaderboard in the terminal")
+    p_lb.set_defaults(func=cmd_leaderboard)
 
     # problems
     p_problems = sub.add_parser("problems", help="List benchmark problems with optional filters")

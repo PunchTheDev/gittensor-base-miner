@@ -79,6 +79,12 @@ python gitminer.py eval agent/submissions/yourhandle/agent.py --all
 # Evaluate against specific problem IDs
 python gitminer.py eval agent/submissions/yourhandle/agent.py --problems 930,986
 
+# Validate that a patch applies cleanly to a problem's base commit (quick sanity check)
+python gitminer.py validate --problem 0463 --patch my_fix.diff
+
+# Browse the current leaderboard in the terminal
+python gitminer.py leaderboard
+
 # Generate commit-reveal hash for your agent before submitting
 python gitminer.py hash your_patch.diff
 
@@ -107,7 +113,7 @@ docs/
   scoring.md           # scoring mechanics explained
   hyperparameters.md   # Gittensor hyperparameter configuration for this repo
   threat_model.md      # anti-gaming threat model
-gitminer.py            # CLI: eval / hash / shard / submit
+gitminer.py            # CLI: eval / validate / leaderboard / hash / shard / submit
 CONTRIBUTING.md        # how to submit
 hyperparameters.json   # live Gittensor repo hyperparameter config
 ```
