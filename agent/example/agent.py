@@ -1625,7 +1625,12 @@ def _fix_hunk_offsets(diff: str, file_lookup: dict[str, str]) -> str:
     _SEARCH_RADIUS = 50    # lines either side of stated offset to search
     _MIN_CTX_LINES = 1    # minimum context lines needed before trying correction
 
-    def find_context_offset(file_lines: list[str], ctx: list[str], stated_n: int) -> int | None:
+    def find_context_offset(
+        file_lines: list[str],
+        ctx: list[str],
+        stated_n: int,
+        old_sequence: list[str] | None = None,
+    ) -> int | None:
         """Return the 1-indexed line where ctx[0] starts, or None if ambiguous.
 
         Requires len(ctx) >= 2 for leading-context matching so a single common
@@ -1633,10 +1638,10 @@ def _fix_hunk_offsets(diff: str, file_lookup: dict[str, str]) -> str:
         context (usually a removal line used as fingerprint), still tries but
         accepts only an unambiguous match within ±10 lines.
 
-        Two-pass: tries exact content match first; falls back to stripped content
-        match (both sides stripped) when the model wrote context lines with
-        different indentation (tabs vs spaces).  Same unambiguous-match guard
-        applies to both passes.
+        Three-pass: exact leading-context match; full-sequence match when leading
+        context is ambiguous (matches the complete set of old-file lines the hunk
+        touches — context + removals — to uniquely locate repetitive blocks);
+        stripped-content fallback for indentation mismatches.
         """
         if not ctx:
             return None
@@ -1644,7 +1649,7 @@ def _fix_hunk_offsets(diff: str, file_lookup: dict[str, str]) -> str:
         lo = max(0, stated_n - radius - 1)
         hi = min(len(file_lines), stated_n + radius)
 
-        # Pass 1: exact match
+        # Pass 1: exact leading-context match
         matches: list[int] = []
         for idx in range(lo, hi):
             if file_lines[idx] == ctx[0]:
@@ -1655,6 +1660,27 @@ def _fix_hunk_offsets(diff: str, file_lookup: dict[str, str]) -> str:
                     matches.append(idx + 1)
         if len(matches) == 1:
             return matches[0]
+
+        # Pass 1b: full-sequence disambiguation.
+        # When leading context is ambiguous (repetitive blocks in Go/Rust factory files,
+        # config stanzas, etc.), search for the complete old-file line sequence that the
+        # hunk covers: context lines + removal lines, in order.  This sequence is usually
+        # unique even when the leading lines alone are not.
+        if len(matches) > 1 and old_sequence and len(old_sequence) >= 4:
+            seq_matches: list[int] = []
+            seq_lo = max(0, stated_n - radius - 1)
+            seq_hi = min(len(file_lines) - len(old_sequence) + 1, stated_n + radius)
+            for idx in range(seq_lo, seq_hi):
+                if (
+                    file_lines[idx] == old_sequence[0]
+                    and all(
+                        file_lines[idx + j] == old_sequence[j]
+                        for j in range(len(old_sequence))
+                    )
+                ):
+                    seq_matches.append(idx + 1)
+            if len(seq_matches) == 1:
+                return seq_matches[0]
 
         # Pass 2: stripped-content fallback (handles tab/space indentation mismatches)
         if matches:
@@ -1690,55 +1716,68 @@ def _fix_hunk_offsets(diff: str, file_lookup: dict[str, str]) -> str:
             result.append(line)
             i += 1
             continue
-        m_hunk = re.match(r"^@@ -(\d+)(?:,\d+)? \+(\d+)(?:,\d+)? @@(.*)", line)
+        m_hunk = re.match(r"^@@ -(\d+)(?:,(\d+))? \+(\d+)(?:,\d+)? @@(.*)", line)
         if m_hunk and file_lines is not None:
             old_start = int(m_hunk.group(1))
-            new_start = m_hunk.group(2)
-            suffix = m_hunk.group(3)
+            old_b = int(m_hunk.group(2)) if m_hunk.group(2) else 1
+            new_start = m_hunk.group(3)
+            suffix = m_hunk.group(4)
             if old_start == 0:
                 # New-file hunk — nothing to correct
                 result.append(line)
                 i += 1
                 continue
-            # Collect leading context lines (unchanged lines before the first +/-)
-            ctx: list[str] = []
-            j = i + 1
-            while j < len(lines) and len(ctx) < 5:
-                hl = lines[j]
+            # Collect all hunk lines first (for leading ctx + old_sequence below)
+            hunk_body: list[str] = []
+            jb = i + 1
+            while jb < len(lines):
+                hl = lines[jb]
                 if hl.startswith("diff --git") or hl.startswith("@@"):
                     break
+                hunk_body.append(hl)
+                jb += 1
+            # Leading context lines (unchanged lines before the first +/-)
+            ctx: list[str] = []
+            for hl in hunk_body:
+                if len(ctx) >= 5:
+                    break
                 if hl.startswith(" "):
-                    ctx.append(hl[1:])  # strip leading space → actual file content
+                    ctx.append(hl[1:])
                 else:
-                    break  # first +/- line — stop collecting leading context
-                j += 1
+                    break
             # If fewer than 2 leading context lines, also try the first removal line
             # as a fingerprint (deletion must exist at the stated location).
             if len(ctx) < 2:
-                j2 = i + 1
-                while j2 < len(lines):
-                    hl = lines[j2]
+                for hl in hunk_body:
                     if hl.startswith("-") and not hl.startswith("---"):
-                        # Use leading context + first removal as the matching sequence
                         ctx_fallback = ctx + [hl[1:]]
                         if len(ctx_fallback) >= 1:
                             ctx = ctx_fallback
                         break
                     if hl.startswith(" "):
-                        j2 += 1
                         continue
                     break
-                    j2 += 1
+            # Full old-file sequence: context + removal lines in hunk order.
+            # Used as a stronger fingerprint when leading context alone is ambiguous.
+            old_sequence: list[str] = []
+            for hl in hunk_body:
+                if hl.startswith(" "):
+                    old_sequence.append(hl[1:])
+                elif hl.startswith("-") and not hl.startswith("---"):
+                    old_sequence.append(hl[1:])
+                # + lines are new content — not in old file, so not part of the sequence
             if len(ctx) >= _MIN_CTX_LINES:
-                correct = find_context_offset(file_lines, ctx, old_start)
+                correct = find_context_offset(
+                    file_lines, ctx, old_start,
+                    old_sequence=old_sequence if len(old_sequence) >= 4 else None,
+                )
                 if correct is not None and correct != old_start:
-                    # Recompute new_start with the same delta
+                    # Recompute new_start with the same delta; counts come from m_hunk
                     delta = correct - old_start
                     corrected_new = int(new_start) + delta
-                    m_old = re.match(r"^@@ -\d+(?:,(\d+))? \+\d+(?:,(\d+))? @@", line)
-                    old_count = m_old.group(1) if m_old and m_old.group(1) else "1"
-                    new_count = m_old.group(2) if m_old and m_old.group(2) else "1"
-                    line = f"@@ -{correct},{old_count} +{corrected_new},{new_count} @@{suffix}"
+                    m_new_count = re.match(r"^@@ -\d+(?:,\d+)? \+\d+(?:,(\d+))? @@", line)
+                    new_count = m_new_count.group(1) if m_new_count and m_new_count.group(1) else "1"
+                    line = f"@@ -{correct},{old_b} +{corrected_new},{new_count} @@{suffix}"
             result.append(line)
             i += 1
             continue
