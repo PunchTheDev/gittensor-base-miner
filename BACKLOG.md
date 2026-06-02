@@ -34,7 +34,7 @@ See `REGISTRATION.md` for the full step-by-step checklist.
 
 ### Anti-Gaming (hardening)
 - [x] Patch similarity check: Jaccard similarity check in eval CI (`scripts/check_similarity.py`, commit cafaec0)
-- [ ] Rate limiting: enforce max N submissions per handle per week in `record_submission.yml`
+- [x] Rate limiting: max 5 submissions per handle per 7-day window in `eval.yml` (`scripts/check_rate_limit.py`, non-blocking flag)
 
 ### Hyperparameters
 - [ ] Map `issue_discovery_share` to pool curation reward mechanics once registration is approved
