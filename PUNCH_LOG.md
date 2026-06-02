@@ -218,3 +218,27 @@ Rewrote `agent/example/agent.py` with three meaningful improvements over the old
 Updated all 3-5× calibration notes to reflect actual measured data: local scores run ~2× above DAS (measured across 289 reference diffs with known DAS scores: local mean 23.47 vs DAS mean 10.78). Updated in `score.py`, `gitminer.py`, and `results/baselines.json`.
 
 Pending: OPENROUTER_KEY verification, Gittensor registration.
+
+---
+
+## 2026-06-02 — Pool quality, dashboard fix, agent tuning
+
+### Pool quality (benchmark commits 331df8c, 834388e)
+
+- **Removed problem 1187** (entrius/gittensor PR #1187): deletion-only refactor (removes dead `get_github_id` wrapper). Scores 0 on token-overlap regardless of correctness — unusable as a benchmark problem.
+- **Added `has_additions()` guard to `build_pool.py`**: future problems must add ≥5 lines. Deletion-only diffs are now filtered out at ingestion.
+- Pool: 343 → 342 problems. Oracle mean updated: 22.76 → 22.83.
+- Synced oracle score across leaderboard.json, record_result.py, evaluate.py, gitminer.py, generate_dashboard_data.py.
+
+### Dashboard overhaul (dashboard commit f068d1b — previous step)
+
+- Fixed critical `pl is not defined` crash that prevented entire page from rendering.
+- Full UI overhaul: loading spinner, sticky header + Submit CTA, gradient stat cards, rank medals, dedicated Allowed Models pill grid, dynamic pool count, table surface cards, graceful error state.
+- Docker deployment files added (Dockerfile, docker-compose.yml, systemd unit).
+
+### Example agent tuning (commit 834388e)
+
+- **Verify turn grounded**: VERIFY_PROMPT now shows the original issue title so the model knows what it's validating against (was verifying diff in isolation).
+- **temperature=0 for diff turns**: act and repair calls use temp=0 for format precision; planning turn keeps 0.2 for open-ended reasoning.
+
+Pending: nginx hookup, Gittensor registration.
