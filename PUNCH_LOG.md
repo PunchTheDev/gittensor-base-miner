@@ -4,6 +4,42 @@ Milestone trail for the base-miner benchmark. Discord is the primary channel; th
 
 ---
 
+## 2026-06-02 — REST API + mine daemon (commit 019ab38)
+
+### REST API (`api/server.py`, `gitminer serve-api`)
+
+Added a full JSON REST API so miners can fetch benchmark data programmatically — no scraping needed:
+
+- `GET /api/health` — liveness + pool size
+- `GET /api/stats` — pool-level stats (language/difficulty distribution, mean baseline, repo count)
+- `GET /api/shard` — current weekly 30-problem shard with rotation date
+- `GET /api/problems` — paginated, filterable problem list (`?lang=py&difficulty=hard&limit=10&q=search`)
+- `GET /api/problems/{id}` — full problem detail (meta, file tree, context paths, DAS scores)
+- `GET /api/leaderboard` — ranked submissions
+
+The server uses Python stdlib only (ThreadingHTTPServer + json) — no new deps. CORS-open for browser clients. Launch with `python gitminer.py serve-api [--host HOST] [--port PORT]`.
+
+### Mine daemon (`gitminer mine`)
+
+Added `mine` subcommand — the "idle compute" product concept:
+
+- Runs your agent against the current shard (same eval as CI)
+- If you beat the champion: prints commit-reveal hash + step-by-step PR instructions
+- `--loop` mode sleeps until next shard rotation (Monday 00:00 UTC) and repeats
+- The pitch: point it at your agent and walk away — your machine contributes code, earns TAO, and improves the network's best coding agent
+
+```bash
+python gitminer.py mine --agent agent/submissions/myhandle/agent.py --loop
+```
+
+### Docs and README
+
+- `docs/api.md`: full API reference with endpoint descriptions, query params, example responses, Python snippet
+- README: updated badge (342 problems), added "idle compute" vision paragraph, API + mine examples in CLI section, repo structure updated
+- CONTRIBUTING.md: new "Autonomous mining" and "REST API" sections
+
+---
+
 ## 2026-06-01 — Repo scaffold live
 
 **Milestone: Initial repo structure created and pushed to GitHub.**
