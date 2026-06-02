@@ -324,6 +324,16 @@ Improvements over a naive single-shot approach:
   Node.js `assert.*` uses lowercase which doesn't match testify's `assert.Equal(` (uppercase).
   Affected repos: jsonbored/gittensory (31 problems), jsonbored/awesome-claude (21 problems),
   infiniflow/ragflow async test suites, and any Go test using `t.Error`.
+- `_extract_assertions` keyword-windowing for large test files: when `keywords` is provided
+  and a test file exceeds 200 lines, `_window_file` (±80 lines around keyword hits) is applied
+  before scanning for assertions. Root cause: for large test files like `api.test.ts` in
+  jsonbored/gittensory (562 assertions per file), `_extract_assertions` previously always
+  captured the FIRST 50 assertion lines — the old, existing tests at the top of the file.
+  The newly-added assertions being tested by the specific issue appear AFTER the existing ones,
+  typically in a keyword-relevant section (they reference the new function/endpoint name from
+  the issue title). Windowing ensures the 50 captured assertions are from the correct region,
+  giving the verify step meaningful ground truth to cross-check the diff against.
+  Passes `keywords` to `_extract_assertions` at the call site in the verify loop.
 """
 
 from __future__ import annotations
@@ -1474,7 +1484,11 @@ def _format_files(
 # ---------------------------------------------------------------------------
 
 
-def _extract_assertions(test_files: list[FileContext], limit: int = 50) -> str:
+def _extract_assertions(
+    test_files: list[FileContext],
+    limit: int = 50,
+    keywords: set[str] | None = None,
+) -> str:
     """Extract assertion lines from test files for the verify prompt.
 
     Assertions are the ground truth the diff must satisfy.  Injecting them
@@ -1486,6 +1500,13 @@ def _extract_assertions(test_files: list[FileContext], limit: int = 50) -> str:
     Go (testify + t.Error/t.Fatal), TypeScript/Jest (sync + async await expect),
     Kotlin (kotlin.test), Java, Ruby Minitest, Rails integration tests,
     Node.js built-in assert module, and Python mock/spy assertions (contains check).
+
+    When `keywords` is provided and a test file exceeds 200 lines, the content
+    is windowed to keyword-relevant sections (±80 lines) before scanning for
+    assertions.  This ensures that for large test files (e.g. a 562-assertion
+    api.test.ts), we capture the assertions around the NEWLY added test cases
+    (which are keyword-relevant) rather than always returning the first 50
+    lines of the file (which cover old, existing tests).
     """
     _ASSERT_PREFIXES = (
         "assert ",          # Python / general
@@ -1606,17 +1627,49 @@ def _extract_assertions(test_files: list[FileContext], limit: int = 50) -> str:
     )
     lines: list[str] = []
     seen: set[str] = set()
+
+    def is_assertion(s: str) -> bool:
+        return any(s.startswith(p) for p in _ASSERT_PREFIXES) or any(p in s for p in _ASSERT_CONTAINS)
+
     for f in test_files:
-        for raw in f.content.splitlines():
-            stripped = raw.strip()
-            if stripped not in seen and (
-                any(stripped.startswith(p) for p in _ASSERT_PREFIXES)
-                or any(p in stripped for p in _ASSERT_CONTAINS)
-            ):
-                lines.append(stripped)
-                seen.add(stripped)
-            if len(lines) >= limit:
-                break
+        content = f.content
+        kw_assertions: list[str] = []   # assertion lines that contain a keyword
+        other_assertions: list[str] = []  # assertion lines without keywords
+
+        if keywords and content.count("\n") > 200:
+            # Large test file: scan line-by-line and bucket assertions as
+            # keyword-relevant vs non-keyword.  Fill the limit with keyword
+            # assertions first so that newly-added test cases (which reference
+            # the new function/endpoint in the issue title) are always captured,
+            # even when the file has hundreds of existing unrelated assertions
+            # before them.
+            kw_lower = {kw for kw in keywords if len(kw) > 3}
+            for raw in content.splitlines():
+                stripped = raw.strip()
+                if stripped in seen or not is_assertion(stripped):
+                    continue
+                line_lower = stripped.lower()
+                if kw_lower and any(kw in line_lower for kw in kw_lower):
+                    kw_assertions.append(stripped)
+                else:
+                    other_assertions.append(stripped)
+            # Keyword assertions first, then fill remainder with non-keyword ones
+            for s in kw_assertions + other_assertions:
+                if s not in seen:
+                    lines.append(s)
+                    seen.add(s)
+                if len(lines) >= limit:
+                    break
+        else:
+            # Small file or no keywords: scan in file order (original behaviour)
+            for raw in content.splitlines():
+                stripped = raw.strip()
+                if stripped not in seen and is_assertion(stripped):
+                    lines.append(stripped)
+                    seen.add(stripped)
+                if len(lines) >= limit:
+                    break
+
         if len(lines) >= limit:
             break
     return "\n".join(lines)
@@ -2664,7 +2717,7 @@ class ExampleAgent(BaseAgent):
                     body_snippet = body_raw[:2500] + "\n[...]\n" + body_raw[-500:]
                 else:
                     body_snippet = body_raw
-                assertions_text = _extract_assertions(test_files)
+                assertions_text = _extract_assertions(test_files, keywords=keywords)
                 assertions_section = (
                     ASSERTIONS_SECTION_TEMPLATE.format(assertions=assertions_text)
                     if assertions_text else ""
