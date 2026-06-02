@@ -119,6 +119,10 @@ Improvements over a naive single-shot approach:
 - Scala support: LANG_NOTES["scala"] with trait/sealed/case-class reminders;
   `_is_test_file` recognises `*Spec.scala`; `_compute_header_end` handles `.scala` imports;
   `_resolve_test_imports` resolves Scala JVM-style imports to `.scala` source files.
+- Hunk map in plan step (step 6): asks the model to list each planned change with its
+  file path and `N |` start line before writing the diff, pre-computing `@@ -N` offsets
+  so the ACT step can use them directly rather than re-deriving under time pressure. ACT
+  prompt references the hunk map to focus attention on using the pre-computed line numbers.
 """
 
 from __future__ import annotations
@@ -208,6 +212,10 @@ Analyse this test-first, then plan. Answer in order:
    constants, type annotations) also need updating? If you add a new public symbol, \
    check whether any `__init__.py` or `index.ts`/`index.js` listed in the \
    "Module export files" section above needs a new export line.
+6. **Hunk map** — for every change you plan, state: file path, the `N |` start line \
+   from the source display above, and what's being added/removed. Example: \
+   `mistral.go:45 — replace Embed stub with real HTTP call (adds ~30 lines)`. \
+   This pre-computes your `@@ -N` offsets so the diff is correct on the first try.
 
 Be precise and thorough — a complete implementation that handles all test cases and \
 edge cases scores higher than a minimal stub.
@@ -265,8 +273,9 @@ not leave stubs. The source files section above shows the expected structure.
 ACT_PROMPT = """\
 Based on your analysis above, produce the unified diff.
 
-Before writing: mentally verify each test assertion from step 1 of your analysis \
-maps to a concrete line in your diff. If any assertion is unaccounted for, add it.
+Before writing: use the hunk map from step 6 of your analysis — each entry gives \
+you the file path and `@@ -N` start line directly. Cross-check every test assertion \
+from step 1 maps to a concrete line in your diff; add any that are missing.
 
 Requirements:
 - Start with `diff --git a/<path> b/<path>`
