@@ -5,6 +5,63 @@ import pathlib
 import sys
 from datetime import date
 
+# Repo → language category mapping (all Gittensor DAS registered repos)
+REPO_CATEGORY: dict[str, str] = {
+    "entrius/gittensor": "python",
+    "entrius/allways": "python",
+    "entrius/das-github-mirror": "python",
+    "entrius/allways-ui": "typescript",
+    "entrius/gittensor-ui": "typescript",
+    "entrius/oc-1": "typescript",
+    "aglover1221/product-data-extractor": "python",
+    "cogniax/tao-pulse-app": "typescript",
+    "e35ventura/taopedia": "python",
+    "e35ventura/taopedia-articles": "python",
+    "geniepod/genie-claw": "rust",
+    "infiniflow/ragflow": "python",
+    "jsonbored/awesome-claude": "typescript",
+    "jsonbored/gittensory": "typescript",
+    "mkdev11/gittensor-hub": "typescript",
+    "vouchdev/vouch": "typescript",
+    "phase-rs/phase": "rust",
+    "seroperson/jvm-live-reload": "jvm",
+    "touchpilot/touchpilot": "jvm",
+    "we-promise/sure": "ruby",
+}
+
+# Shard sampling budget per category (sums to ~30)
+SHARD_BUDGET: dict[str, int] = {
+    "python": 12,
+    "typescript": 8,
+    "rust": 5,
+    "jvm": 3,
+    "ruby": 2,
+}
+
+
+def repo_category(repo: str) -> str:
+    """Return language category for a repo, lower-cased."""
+    return REPO_CATEGORY.get(repo.lower(), REPO_CATEGORY.get(repo, "other"))
+
+
+def difficulty_tier(baseline_score: float | None) -> str:
+    """Classify a problem by difficulty based on oracle (reference) baseline score.
+
+    Higher baseline = richer diff = more AST tokens = harder to fully match.
+    Lower baseline = surgical fix = precise match required = also hard but in a different way.
+    We use three tiers that approximately thirds the pool:
+      easy   >= 15  (rich diffs, many AST changes, agent has more signal)
+      medium  5–15  (moderate-sized fixes)
+      hard   <  5   (tiny or very targeted changes, hardest to reproduce exactly)
+    """
+    if baseline_score is None:
+        return "medium"
+    if baseline_score >= 15:
+        return "easy"
+    if baseline_score >= 5:
+        return "medium"
+    return "hard"
+
 REPO_ROOT = pathlib.Path(__file__).parent.parent
 PROBLEMS_DIR = REPO_ROOT / "benchmark" / "problems"
 RESULTS_DIR = REPO_ROOT / "results"
@@ -111,10 +168,14 @@ def load_problems():
         pid = meta.get("id")
         ctx_files, test_files = context_files_for(p)
         stats = diff_stats_for(p)
+        b_score = baselines.get(pid, {}).get("base_score") if isinstance(baselines.get(pid), dict) else baselines.get(pid)
+        cat = repo_category(repo)
         problems.append(
             {
                 "id": pid,
                 "repo": repo,
+                "category": cat,
+                "difficulty": difficulty_tier(b_score),
                 "pr": pr,
                 "issue": issue,
                 "title": (meta.get("issue_title") or "")[:120],
@@ -125,7 +186,7 @@ def load_problems():
                 "das_token_score": float(meta.get("das_token_score") or 0),
                 "das_structural_score": float(meta.get("das_structural_score") or 0),
                 "das_total_nodes": meta.get("das_total_nodes"),
-                "baseline_score": baselines.get(pid, {}).get("base_score") if isinstance(baselines.get(pid), dict) else baselines.get(pid),
+                "baseline_score": b_score,
                 "src_token_score": (baselines.get(pid) or {}).get("source_token_score"),
                 "total_token_score": (baselines.get(pid) or {}).get("total_token_score"),
                 "diff_stats": stats,
@@ -190,8 +251,12 @@ def main(out_path: str | None = None):
     allowed_models = load_allowed_models()
 
     by_repo: dict[str, int] = {}
+    by_category: dict[str, int] = {}
+    by_difficulty: dict[str, int] = {}
     for p in problems:
         by_repo[p["repo"]] = by_repo.get(p["repo"], 0) + 1
+        by_category[p["category"]] = by_category.get(p["category"], 0) + 1
+        by_difficulty[p["difficulty"]] = by_difficulty.get(p["difficulty"], 0) + 1
 
     oracle = oracle_score_from_leaderboard(leaderboard)
 
@@ -199,8 +264,11 @@ def main(out_path: str | None = None):
         "generated_at": date.today().isoformat(),
         "pool_size": len(problems),
         "shard_size": 30,
+        "shard_budget": SHARD_BUDGET,
         "oracle_score": oracle,
         "repos": by_repo,
+        "categories": by_category,
+        "difficulty_counts": by_difficulty,
         "leaderboard": leaderboard,
         "history": history,
         "allowed_models": allowed_models,
