@@ -334,6 +334,15 @@ Improvements over a naive single-shot approach:
   the issue title). Windowing ensures the 50 captured assertions are from the correct region,
   giving the verify step meaningful ground truth to cross-check the diff against.
   Passes `keywords` to `_extract_assertions` at the call site in the verify loop.
+- Verify loop: `pending_partial_repair` flag prevents back-to-back user messages. When the
+  model returns a partial repair (fewer files than the current diff), the loop appends a
+  "missing files" user message and sets `pending_partial_repair = True`. On the next
+  iteration, the loop calls the model directly without prepending another user message —
+  previously it appended VERIFY_PROMPT a second time, creating two consecutive user messages
+  which can cause a 400 error on strict backends (e.g. DeepSeek via OpenRouter) and confuses
+  the model about which diff is current.  Root cause: the `pending_prose_critique` mechanism
+  handled the prose-critique case correctly, but the symmetric partial-repair case had no
+  corresponding guard.
 """
 
 from __future__ import annotations
@@ -2669,7 +2678,14 @@ class ExampleAgent(BaseAgent):
         # (no corrected diff). In that case, use a short targeted follow-up
         # ("produce the diff now") instead of resending the full VERIFY_PROMPT
         # — saves 3-5KB of repeated context and is more directive.
+        #
+        # pending_partial_repair: set when the model returned fewer files than
+        # the current diff.  The missing-files feedback was already appended as
+        # a user message; the next iteration must call the model without adding
+        # another user message first (avoids back-to-back user messages that
+        # confuse some model backends and lead to a 400 error).
         pending_prose_critique = False
+        pending_partial_repair = False
 
         for attempt in range(MAX_REPAIR_ATTEMPTS):
             problem_desc = _diagnose_diff(diff)
@@ -2681,6 +2697,7 @@ class ExampleAgent(BaseAgent):
                 # nothing to fix and needs to produce the diff from scratch using the
                 # source files still in context.
                 pending_prose_critique = False
+                pending_partial_repair = False
                 if "empty output" in problem_desc:
                     history.append({"role": "user", "content": ACT_PROMPT})
                     log.append(f"[repair {attempt} (empty-retry act)]")
@@ -2699,10 +2716,16 @@ class ExampleAgent(BaseAgent):
                 continue
 
             # Diff looks structurally valid — ask for semantic verification.
-            # If the previous iteration returned a prose critique (no diff), skip
-            # the full VERIFY_PROMPT (which would repeat the same diff and all
-            # criteria again — ~4-6KB) and send a short targeted follow-up instead.
-            if pending_prose_critique:
+            # Three cases for the user message to send:
+            #   1. pending_partial_repair: missing-files message already appended;
+            #      call the model without adding another user message.
+            #   2. pending_prose_critique: prose critique was given; send a short
+            #      "produce the diff now" follow-up instead of the full VERIFY_PROMPT.
+            #   3. Normal: send the full VERIFY_PROMPT.
+            if pending_partial_repair:
+                log.append(f"[verify {attempt} (followup after partial repair)]")
+                pending_partial_repair = False
+            elif pending_prose_critique:
                 history.append({"role": "user", "content": VERIFY_FOLLOWUP_PROMPT})
                 log.append(f"[verify {attempt} (followup after prose critique)]")
             else:
@@ -2773,6 +2796,7 @@ class ExampleAgent(BaseAgent):
                 # silently drop changes to the other files.
                 if _count_diff_files(repaired) >= _count_diff_files(diff):
                     diff = repaired
+                    pending_partial_repair = False
                     log.append(f"[diff v{attempt + 1}]\n{diff}")
                     # Store the cleaned diff in history — not the raw verdict which may
                     # contain prose mixed with the diff.  Subsequent verify/repair calls
@@ -2802,6 +2826,10 @@ class ExampleAgent(BaseAgent):
                             f"You must include ALL {n_cur} files. Produce a complete unified diff."
                         ),
                     })
+                    # The missing-files message is now the last user turn.
+                    # Signal the next iteration to call the model directly without
+                    # prepending another user message (avoids back-to-back user msgs).
+                    pending_partial_repair = True
             else:
                 # Prose critique without a corrected diff.
                 # Store the critique in history so the next verify iteration sees it.
@@ -2809,6 +2837,7 @@ class ExampleAgent(BaseAgent):
                 # rather than re-sending the full VERIFY_PROMPT with the same diff.
                 # Only continue if we have iterations remaining — on the last
                 # attempt, break and keep the current diff.
+                pending_partial_repair = False
                 if attempt < MAX_REPAIR_ATTEMPTS - 1:
                     history.append({"role": "assistant", "content": verdict})
                     pending_prose_critique = True
