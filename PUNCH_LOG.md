@@ -1789,3 +1789,30 @@ prestigious external GitHub repos via GitHub API (no DAS dependency).
 - Benchmark: **526 problems** (+96), oracle 13.34, 17 repos active (commit `b6fc588`)
 - New script: `scripts/expand_pool_external.py`
 - Docker CI: no changes needed — Python repos use same `pip install -e .` install path
+
+---
+
+## 2026-06-02 — Pool expansion +52, oracle recalibrated to 10.12
+
+**Baseline recomputation across all 526 problems**:
+- Ran `scripts/baseline_scores.py` for all 526 problems (first full run since external expansion)
+- Oracle mean drops from 13.34 → 10.52 (external repos score lower: mean 4.70 vs DAS 13.34)
+- Reason: external PRs (pytest, click, werkzeug, starlette) are more surgical than DAS PRs
+- Updated `results/leaderboard.json` and `scripts/generate_dashboard_data.py`
+
+**Further pool expansion +52 problems** from 3 prestigious Python repos:
+- `pydantic/pydantic` (14k stars): +30 problems — pure Python data validation, self-contained tests
+- `marshmallow-code/marshmallow` (6k stars): +15 problems — pure Python serialization
+- `tiangolo/fastapi` (90k stars): +7 problems — web framework, depends on starlette (already in CI)
+- Repos tried but rejected: `encode/httpx` (0 qualifying), `sqlalchemy/sqlalchemy` (0), `scrapy/scrapy` (30 but Twisted reactor risk)
+
+**Final state**:
+- Pool: **578 problems** (526 → 578, +10%)
+- Oracle: **10.12** (recalibrated across all 578 reference diffs)
+- External repos now: pytest-dev/pytest, pallets/click, pallets/werkzeug, encode/starlette, pydantic/pydantic, marshmallow-code/marshmallow, tiangolo/fastapi
+- Dashboard data regenerated and pushed
+
+### Status
+- Benchmark: **578 problems**, oracle **10.12** (tree-sitter calibrated), commit `bd41391`
+- Pool: DAS repos saturated; external expansion now at 7 repos
+- Next pool check: ~2026-06-09 for new DAS registrations; consider celery, aiohttp if they have isolated tests
