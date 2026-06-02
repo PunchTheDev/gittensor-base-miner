@@ -140,6 +140,19 @@ Improvements over a naive single-shot approach:
   already correct; only replaces when the stripped content matches exactly (safety guard
   ensures we never silently move a hunk to the wrong location). This is stage 5 of 6 in
   `_post_process`.
+- Verify: new-file presence check (criterion 6): when the problem requires new files to be
+  created (`new_tests` or `new_impls`), the verify prompt lists them explicitly and asks the
+  model to confirm each is present as a `new file mode 100644` diff block. Previously verify
+  had no way to know about required new files — it would say LGTM even if the agent forgot to
+  add a file. Affects ~60% of pool problems (new test files) and ~33% (new impl files).
+- Verify body snippet extended 1500 → 3000 chars: issue requirements stated after character
+  1500 were invisible to the verify step, causing it to miss completeness checks for longer
+  issue bodies.
+- Partial repair: feedback loop instead of silent break: when verify returns a valid diff that
+  covers fewer files than the current diff, previously the loop would break and submit the
+  multi-file original silently. Now it sends targeted feedback ("your fix only covered N/M
+  files, include all M") and continues the verify loop — giving the model a chance to produce
+  a complete multi-file correction.
 """
 
 from __future__ import annotations
@@ -323,7 +336,7 @@ Issue: {title}
 {body}
 
 Test command that must pass: `{test_cmd}`
-{assertions_section}
+{assertions_section}{new_files_section}\
 You produced this diff:
 
 ```diff
@@ -338,11 +351,18 @@ Check it against these criteria:
 4. Are all new symbols, functions, or classes properly imported in every file that uses them?
 5. Is the implementation complete — does it handle edge cases, or is it a bare stub that \
    only handles the happy path?
+6. {new_files_check}
 
 If the diff is correct and complete, respond with exactly: LGTM
 
 If it needs fixing, respond with the corrected diff only (no prose, starts with `diff --git`).
 If the implementation is a bare minimum that should be more thorough, expand it and respond with the improved diff.
+"""
+
+NEW_FILES_VERIFY_SECTION_TEMPLATE = """\
+Required new files (each MUST appear in the diff as `new file mode 100644`):
+{files}
+
 """
 
 ASSERTIONS_SECTION_TEMPLATE = """\
@@ -1934,18 +1954,33 @@ class ExampleAgent(BaseAgent):
             # Diff looks structurally valid — ask for semantic verification.
             # Inject extracted assertions so the model can cross-check each one
             # rather than relying solely on the earlier conversation context.
-            body_snippet = (problem.issue_body or "")[:1500]
+            body_snippet = (problem.issue_body or "")[:3000]
             assertions_text = _extract_assertions(test_files)
             assertions_section = (
                 ASSERTIONS_SECTION_TEMPLATE.format(assertions=assertions_text)
                 if assertions_text else ""
             )
+            # New-file requirements: remind verify if any files must be created.
+            required_new = [f.path for f in new_tests] + [f.path for f in new_impls]
+            if required_new:
+                new_files_section = NEW_FILES_VERIFY_SECTION_TEMPLATE.format(
+                    files="\n".join(f"- `{p}`" for p in required_new)
+                )
+                new_files_check = (
+                    f"Does the diff add ALL {len(required_new)} required new file(s) listed above "
+                    f"as `new file mode 100644` blocks? Missing any file means the test command fails."
+                )
+            else:
+                new_files_section = ""
+                new_files_check = "N/A (no new files required)"
             verify_user = VERIFY_PROMPT.format(
                 diff=diff,
                 title=problem.issue_title,
                 body=body_snippet,
                 test_cmd=test_cmd_str,
                 assertions_section=assertions_section,
+                new_files_section=new_files_section,
+                new_files_check=new_files_check,
             )
             history.append({"role": "user", "content": verify_user})
             verdict = _call(history, self.model, api_key, verify_tokens, verify_timeout, temperature=0)
@@ -1974,11 +2009,23 @@ class ExampleAgent(BaseAgent):
                     # see the same artifact-free version they would produce via _post_process.
                     history.append({"role": "assistant", "content": repaired})
                 else:
+                    # Partial repair: model only fixed some files. Keep the current diff
+                    # but give targeted feedback so the next verify pass fixes all files.
+                    n_cur = _count_diff_files(diff)
+                    n_rep = _count_diff_files(repaired)
                     log.append(
-                        f"[verify {attempt}] partial repair ({_count_diff_files(repaired)} < "
-                        f"{_count_diff_files(diff)} files) — keeping current diff"
+                        f"[verify {attempt}] partial repair ({n_rep} < {n_cur} files) — "
+                        "feeding back multi-file requirement"
                     )
-                    break
+                    history.append({"role": "assistant", "content": repaired})
+                    history.append({
+                        "role": "user",
+                        "content": (
+                            f"Your corrected diff only covers {n_rep} file(s) but the original "
+                            f"diff touched {n_cur} file(s). You must include ALL {n_cur} files in "
+                            f"your response. Produce a complete unified diff covering all files."
+                        ),
+                    })
             else:
                 # Prose critique without a new diff — accept current result
                 break
