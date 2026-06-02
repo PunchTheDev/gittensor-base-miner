@@ -56,22 +56,22 @@ observe → plan → act → verify loop. Beat it.
 
 **With Docker sandbox (same as CI):**
 ```bash
-python scripts/run_eval.py --agent agent/submissions/<your-handle>/agent.py
+python gitminer.py eval agent/submissions/<your-handle>/agent.py
 ```
 
 **Without Docker (faster, less isolated — development only):**
 ```bash
-python scripts/run_eval.py --agent agent/submissions/<your-handle>/agent.py --no-sandbox
+python gitminer.py eval agent/submissions/<your-handle>/agent.py --no-sandbox
 ```
 
 **Subset of problems:**
 ```bash
-python scripts/run_eval.py --agent agent/submissions/<your-handle>/agent.py --problems 930,986,1033
+python gitminer.py eval agent/submissions/<your-handle>/agent.py --problems 930,986,1033
 ```
 
 **Save results to a file:**
 ```bash
-python scripts/run_eval.py --agent agent/submissions/<your-handle>/agent.py --output results.json
+python gitminer.py eval agent/submissions/<your-handle>/agent.py --output results.json
 ```
 
 Scores are on the 0–30 scale matching Gittensor's native formula. The leaderboard
@@ -109,6 +109,12 @@ assert hashlib.sha256((source + "<your-salt>").encode()).hexdigest() == "<your-h
 
 The reveal must happen within **7 days** of the score being posted.
 
+You can also use `gitminer hash` to generate the SHA-256 hash of your agent file before submitting:
+
+```bash
+python gitminer.py hash agent/submissions/<your-handle>/agent.py
+```
+
 ## PR format
 
 Use the PR template. Fill in every section:
@@ -124,8 +130,11 @@ and a brief explanation is all that's needed.
 ## After you open the PR
 
 CI automatically runs the full benchmark in Docker and posts a score table as a
-comment. If the score is a new leaderboard high, maintainers will merge and update
-`LEADERBOARD.md`. You don't need to do anything else.
+comment. If the score is a new leaderboard high, maintainers merge the PR.
+The `record_submission` workflow then re-scores your agent, updates the leaderboard
+and SOTA history, and promotes your agent to `agent/champion/` automatically.
+You don't need to do anything else — the [live dashboard](https://punchthedev.github.io/gittensor-miner-dashboard/)
+reflects the updated standings within minutes of the merge.
 
 ## Adding benchmark problems
 

@@ -43,7 +43,7 @@ def cmd_eval(args: argparse.Namespace) -> None:
         use_all=args.all,
     )
 
-    scores = [r["final_score"] for r in results.get("results", []) if "final_score" in r]
+    scores = [r["final_score"] for r in results.get("problems", []) if "final_score" in r]
     if not scores:
         print("\nNo scores recorded.")
         return
