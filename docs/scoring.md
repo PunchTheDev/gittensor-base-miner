@@ -2,7 +2,7 @@
 
 ## Overview
 
-Submissions are scored by replaying real Gittensor issues in an isolated sandbox and evaluating the candidate patch with Gittensor's own scoring engine.
+Submissions are scored by replaying real Gittensor issues in an isolated sandbox using **Gittensor's native tree-sitter scoring engine** — the same AST-based scorer the DAS validator uses. Local scores match validator output closely.
 
 **Correctness gates quality.** A patch that doesn't pass the test suite scores 0, regardless of code quality.
 
@@ -28,16 +28,18 @@ The test suite is the arbiter of correctness. An agent that finds a *better* fix
 
 ## Quality scoring
 
-`src_tokens` is computed by Gittensor's tree-sitter pipeline:
+`src_tokens` is computed by Gittensor's tree-sitter AST pipeline:
 
-- Parse the diff per language using tree-sitter.
-- Sum weighted structural nodes (functions, classes, etc.) and leaf tokens.
-- Apply language weights (Rust/C/Go = 2.0×, Python = 1.5×, JS = 1.15×, etc.).
-- Saturate through the exponential: `25 × (1 − exp(−src_tokens / 58.0))`.
+1. For each changed file, parse the old and new versions into a tree-sitter AST.
+2. Compute the **symmetric difference** of AST node signatures between old and new.
+3. Weight each changed node: structural nodes (functions, classes, loops) get bonus weight; leaf tokens (identifiers, literals) get base weight; comments score 0.
+4. Apply a language weight multiplier (Go/Java/C/Rust = 2.0×, Python = 1.5×, JS = 1.15×, etc.).
+5. Separate source-file score from test-file score (test files are weighted at 0.05×).
+6. `src_tokens` = total weighted score from non-test files only.
 
-Meaningful, structured code changes score higher. Comments and whitespace score 0. Copy-pasted boilerplate saturates quickly at around 25/30.
+Meaningful, structured code changes score higher. Comments and whitespace score 0. Copy-pasted boilerplate scores low. The scoring is fully deterministic — no LLM judge at any point.
 
-The local heuristic scorer approximates `src_tokens` via raw diff token counts. Local scores typically run 3–5× above DAS reference scores — use them for relative comparison only. Docker CI gives the authoritative score.
+Weight files (`benchmark/harness/weights/`) are copied directly from the Gittensor validator. Docker CI uses the identical pipeline end-to-end.
 
 ## Problem curation criteria
 

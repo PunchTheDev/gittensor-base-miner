@@ -1,7 +1,7 @@
 """
 Scores a candidate patch against a benchmark problem.
 
-Mirrors Gittensor's native scoring formula:
+Mirrors Gittensor's native scoring formula exactly:
   base_score = MERGED_PR_BASE_SCORE * (1 - exp(-src_tok / scale))
              + min(total_score / CONTRIBUTION_SCORE_FOR_FULL_BONUS, 1) * MAX_CONTRIBUTION_BONUS
 
@@ -14,12 +14,12 @@ Mirrors Gittensor's native scoring formula:
 Correctness gates everything: tests must pass before quality is computed.
 Final score is the base_score (0–30 scale, same as Gittensor native).
 
-Full precision scoring uses Gittensor's tree-sitter pipeline in Docker CI.
-This local implementation approximates src_tok via a token-counting heuristic
-on the unified diff. Local scores typically run ~2× higher than Gittensor's
-DAS validator scores (measured against 289 reference diffs with known DAS
-scores: local mean 23.47 vs DAS mean 10.78). Use local scores for relative
-iteration only; Docker CI gives the authoritative benchmark score.
+Scoring path (primary): uses the actual Gittensor tree-sitter AST scorer
+from benchmark/harness/tree_sitter_scorer.py — same weights JSON, same
+structural/leaf node taxonomy. Produces scores that match DAS output.
+
+Fallback (when tree_sitter is unavailable): heuristic token count on the
+diff. Heuristic scores run ~2× above DAS; flag is set in scoring_note.
 
 Usage:
     python benchmark/harness/score.py --problem benchmark/problems/930/ --patch my.diff
@@ -37,6 +37,12 @@ import subprocess
 import sys
 import tempfile
 from pathlib import Path
+
+# Ensure repo root is on sys.path so benchmark.harness imports work whether
+# this module is run as a script or imported as a package.
+_REPO_ROOT = Path(__file__).parent.parent.parent
+if str(_REPO_ROOT) not in sys.path:
+    sys.path.insert(0, str(_REPO_ROOT))
 
 # Gittensor native constants (gittensor/constants.py)
 MERGED_PR_BASE_SCORE = 25
@@ -224,6 +230,67 @@ def compute_base_score(
     return round(initial + contribution_bonus, 2)
 
 
+def score_diff_quality(problem_dir: Path, patch_path: Path) -> tuple[float, float, float]:
+    """
+    Compute tree-sitter quality score without running tests.
+
+    Used by baseline_scores.py to score reference diffs quickly.
+    Returns (source_token_score, total_token_score, base_score).
+    Falls back to heuristic if tree-sitter is unavailable.
+    """
+    meta = load_problem_meta(problem_dir)
+    saturation_scale = float(meta.get("src_tok_saturation_scale", SRC_TOK_SATURATION_SCALE))
+    diff_text = patch_path.read_text()
+
+    cached = _cached_repo(meta["repo_url"])
+    base_commit = meta["base_commit"]
+
+    with tempfile.TemporaryDirectory(prefix="bminer_qual_") as tmpdir:
+        worktree = Path(tmpdir) / "repo"
+        r = subprocess.run(
+            ["git", "-C", str(cached), "worktree", "add",
+             "--detach", "--force", str(worktree), base_commit],
+            capture_output=True,
+        )
+        if r.returncode != 0:
+            # Commit may be missing from cached clone — fetch it explicitly.
+            subprocess.run(
+                ["git", "-C", str(cached), "fetch", "--quiet", "origin", base_commit],
+                capture_output=True,
+            )
+            subprocess.run(
+                ["git", "-C", str(cached), "worktree", "add",
+                 "--detach", "--force", str(worktree), base_commit],
+                check=True, capture_output=True,
+            )
+        try:
+            file_pairs = _build_file_pairs(worktree, diff_text)
+            apply_patch(worktree, patch_path)
+            if file_pairs is not None:
+                _fill_new_contents(worktree, file_pairs)
+        finally:
+            subprocess.run(
+                ["git", "-C", str(cached), "worktree", "remove", "--force", str(worktree)],
+                capture_output=True,
+            )
+
+    # Try tree-sitter
+    if file_pairs is not None:
+        try:
+            from benchmark.harness.tree_sitter_scorer import score_file_pairs, available
+            if available():
+                result = score_file_pairs(file_pairs)
+                if result is not None:
+                    src_tok, total_tok = result
+                    return src_tok, total_tok, compute_base_score(src_tok, total_tok, saturation_scale)
+        except Exception:
+            pass
+
+    # Fallback: heuristic
+    src_tok, total_tok = approximate_src_token_score(diff_text, saturation_scale)
+    return src_tok, total_tok, compute_base_score(src_tok, total_tok, saturation_scale)
+
+
 def score_patch(problem_dir: Path, patch_path: Path) -> dict:
     meta = load_problem_meta(problem_dir)
     saturation_scale = float(meta.get("src_tok_saturation_scale", SRC_TOK_SATURATION_SCALE))
@@ -232,14 +299,26 @@ def score_patch(problem_dir: Path, patch_path: Path) -> dict:
     # Each problem gets an isolated git worktree checked out at the exact base commit.
     cached = _cached_repo(meta["repo_url"])
 
+    base_commit = meta["base_commit"]
+
     with tempfile.TemporaryDirectory(prefix="bminer_") as tmpdir:
         worktree = Path(tmpdir) / "repo"
 
-        subprocess.run(
+        r = subprocess.run(
             ["git", "-C", str(cached), "worktree", "add",
-             "--detach", "--force", str(worktree), meta["base_commit"]],
-            check=True, capture_output=True,
+             "--detach", "--force", str(worktree), base_commit],
+            capture_output=True,
         )
+        if r.returncode != 0:
+            subprocess.run(
+                ["git", "-C", str(cached), "fetch", "--quiet", "origin", base_commit],
+                capture_output=True,
+            )
+            subprocess.run(
+                ["git", "-C", str(cached), "worktree", "add",
+                 "--detach", "--force", str(worktree), base_commit],
+                check=True, capture_output=True,
+            )
         try:
             return _score_in_worktree(worktree, meta, patch_path, saturation_scale)
         finally:
@@ -249,10 +328,99 @@ def score_patch(problem_dir: Path, patch_path: Path) -> dict:
             )
 
 
+def _parse_diff_paths(diff_text: str) -> list[tuple[str, str]]:
+    """Return [(path, status)] from diff headers. Status: 'added'|'removed'|'modified'."""
+    results = []
+    current_old: str | None = None
+    current_new: str | None = None
+    is_new = False
+    is_removed = False
+
+    for line in diff_text.splitlines():
+        if line.startswith("diff --git "):
+            if current_new is not None:
+                status = "added" if is_new else ("removed" if is_removed else "modified")
+                path = current_new if current_new != "/dev/null" else (current_old or "")
+                path = path.removeprefix("b/")
+                results.append((path, status))
+            current_old = None
+            current_new = None
+            is_new = False
+            is_removed = False
+        elif line.startswith("--- "):
+            current_old = line[4:]
+        elif line.startswith("+++ "):
+            current_new = line[4:]
+        elif line.startswith("new file mode"):
+            is_new = True
+        elif line.startswith("deleted file mode"):
+            is_removed = True
+
+    if current_new is not None:
+        status = "added" if is_new else ("removed" if is_removed else "modified")
+        path = current_new if current_new != "/dev/null" else (current_old or "")
+        path = path.removeprefix("b/")
+        results.append((path, status))
+
+    return results
+
+
+def _read_file_safe(path: Path) -> str | None:
+    """Read a file as text; return None on error or if binary."""
+    if not path.exists():
+        return None
+    try:
+        return path.read_text(encoding="utf-8", errors="replace")
+    except Exception:
+        return None
+
+
+def _build_file_pairs(repo_dir: Path, diff_text: str) -> "list | None":
+    """
+    Extract old/new file content pairs for tree-sitter scoring.
+
+    Must be called BEFORE applying the patch (to capture old content).
+    Returns a list of FilePair objects, or None if the import fails.
+    """
+    try:
+        from benchmark.harness.tree_sitter_scorer import FilePair
+    except ImportError:
+        return None
+
+    paths = _parse_diff_paths(diff_text)
+    pairs = []
+
+    for rel_path, status in paths:
+        abs_path = repo_dir / rel_path
+        if status == "added":
+            pairs.append(FilePair(rel_path, old_content=None, new_content=None))
+        elif status == "removed":
+            old = _read_file_safe(abs_path)
+            pairs.append(FilePair(rel_path, old_content=old, new_content=None))
+        else:
+            old = _read_file_safe(abs_path)
+            pairs.append(FilePair(rel_path, old_content=old, new_content=None))
+
+    return pairs
+
+
+def _fill_new_contents(repo_dir: Path, pairs: list) -> None:
+    """Fill new_content on each FilePair after the patch has been applied."""
+    for pair in pairs:
+        if pair.new_content is None and pair.old_content is not None or \
+                pair.new_content is None and pair.old_content is None:
+            abs_path = repo_dir / pair.path
+            pair.new_content = _read_file_safe(abs_path)
+
+
 def _score_in_worktree(
     repo_dir: Path, meta: dict, patch_path: Path, saturation_scale: float
 ) -> dict:
     problem_id = meta["id"]
+    diff_text = patch_path.read_text()
+
+    # Capture old file contents before applying the patch.
+    file_pairs = _build_file_pairs(repo_dir, diff_text)
 
     patch_applied = apply_patch(repo_dir, patch_path)
     if not patch_applied:
@@ -264,6 +432,10 @@ def _score_in_worktree(
             "base_score": 0.0,
             "final_score": 0.0,
         }
+
+    # Capture new file contents after applying the patch.
+    if file_pairs is not None:
+        _fill_new_contents(repo_dir, file_pairs)
 
     raw_cmd = meta.get("test_cmd", ["python3", "-m", "pytest", "--tb=short", "-q"])
     test_cmd = [
@@ -283,19 +455,36 @@ def _score_in_worktree(
             "final_score": 0.0,
         }
 
-    diff_text = patch_path.read_text()
-    src_tok, total_tok = approximate_src_token_score(diff_text, saturation_scale)
-    base_score = compute_base_score(src_tok, total_tok, saturation_scale)
+    # Primary: tree-sitter AST scorer (matches DAS scoring engine)
+    tree_sitter_result = None
+    if file_pairs is not None:
+        try:
+            from benchmark.harness.tree_sitter_scorer import score_file_pairs, available
+            if available():
+                tree_sitter_result = score_file_pairs(file_pairs)
+        except Exception:
+            pass
 
-    scoring_note = (
-        "local approximation (~2× above DAS on average) — "
-        "CI uses Gittensor tree-sitter pipeline for authoritative score"
-    )
-    if all_skipped:
+    if tree_sitter_result is not None:
+        src_tok, total_tok = tree_sitter_result
+        scoring_method = "tree-sitter"
+        scoring_note = "Gittensor native tree-sitter AST scorer (matches DAS)"
+    else:
+        # Fallback: heuristic diff-token count
+        src_tok, total_tok = approximate_src_token_score(diff_text, saturation_scale)
+        scoring_method = "heuristic"
         scoring_note = (
-            "tests skipped locally (missing heavy deps e.g. bittensor) — "
-            "quality score estimated from diff; Docker CI runs full correctness check"
+            "heuristic diff-token approximation (~2× above DAS) — "
+            "install tree-sitter and tree-sitter-language-pack for accurate scoring"
         )
+
+    if all_skipped:
+        scoring_note += (
+            " | tests skipped locally (missing heavy deps) — "
+            "Docker CI runs full correctness check"
+        )
+
+    base_score = compute_base_score(src_tok, total_tok, saturation_scale)
 
     return {
         "problem_id": problem_id,
@@ -304,6 +493,7 @@ def _score_in_worktree(
         "tests_skipped_locally": all_skipped,
         "source_token_score": round(src_tok, 2),
         "total_token_score": round(total_tok, 2),
+        "scoring_method": scoring_method,
         "base_score": base_score,
         # Multipliers (time_decay, review_quality, label, issue) require GitHub
         # API data — local scoring sets them to 1.0 as a conservative estimate.
