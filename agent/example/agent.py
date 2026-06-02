@@ -4,16 +4,25 @@ Reference agent: ranked-context observe → plan → act → verify loop.
 Demonstrates the scaffolding pattern — same frozen model, better wrapper.
 Miners compete to outperform this baseline.
 
+Scoring model: correctness gates quality. Tests must pass first; then the
+score is driven by the number of meaningful source-code tokens in the diff
+(Gittensor's src_token_score formula). This agent is tuned to produce
+complete, well-structured implementations — not minimal one-liners — because
+a thorough fix that passes tests scores significantly higher than a bare stub.
+
 Improvements over a naive single-shot approach:
 - Context files ranked by keyword relevance to the issue — most relevant first,
   over-long context truncated rather than blindly dumped into the prompt
 - Large files windowed to relevant sections only (±40 lines around keyword hits)
   so more files fit in the context budget without blowing the token limit
-- Explicit file-and-line hypothesis required in the planning turn so the act
-  turn has a precise target
+- Explicit file-and-line hypothesis required plus secondary-file completeness
+  check so the implementation is thorough, not minimal
+- Score-aware prompting: system prompt and act prompt explain that complete
+  implementations score higher than stubs
 - Structural diff validation beyond the basic `@@` presence check — catches
   malformed hunk headers before committing to the result
 - Wider repair window (3 attempts, up from 2) with targeted feedback per failure mode
+- Verify turn also checks implementation completeness — may expand a bare fix
 - Structured reasoning log for transparency
 """
 
@@ -47,8 +56,14 @@ MAX_CONTEXT_CHARS = 40_000
 
 SYSTEM_PROMPT = """\
 You are an expert software engineer. You receive a GitHub issue and the \
-relevant source files, and your job is to produce a correct, minimal fix \
+relevant source files, and your job is to produce a correct, complete fix \
 as a valid unified diff.
+
+Scoring note: your patch is scored on (1) test correctness — it must pass — \
+and (2) source-token quality — the number of meaningful code tokens you add \
+to non-test files. A complete, well-structured implementation that covers all \
+edge cases and adds clear helper logic scores higher than a one-liner that \
+technically passes but leaves the fix fragile or incomplete.
 """
 
 OBSERVE_PROMPT = """\
@@ -78,10 +93,13 @@ Analyse the issue carefully. Answer in order:
 
 1. **Root cause** — one or two sentences.
 2. **Hypothesis** — which specific file(s) and line range(s) need to change?
-3. **Minimal change** — describe the change precisely, no code yet.
-4. **Test check** — given the test above, will `{test_cmd_short}` pass? Walk through the assertion.
+3. **Implementation plan** — describe what you will add/change precisely, including \
+   any helper functions, error handling, or edge cases needed for a complete fix.
+4. **Completeness check** — what else might need to change to ensure nothing \
+   related is broken? List any secondary files.
+5. **Test check** — given the test above, will `{test_cmd_short}` pass? Walk through the assertion.
 
-Be concise and precise.
+Be precise and thorough — a complete implementation scores higher than a minimal stub.
 """
 
 TEST_SECTION_TEMPLATE = """\
@@ -97,8 +115,10 @@ Requirements:
 - Start with `diff --git a/<path> b/<path>`
 - Include `--- a/<path>` and `+++ b/<path>` headers
 - Each hunk starts with `@@ -<start>,<count> +<start>,<count> @@`
-- Only touch the lines identified in your hypothesis
-- No refactors, no style fixes, no unrelated changes
+- Implement the fix completely — include helper functions, proper error \
+  handling, and any secondary changes identified in your plan
+- Do NOT change unrelated logic, but do implement the full fix as described
+- Higher-quality, complete implementations score better than minimal stubs
 - Output ONLY the diff — no markdown fences, no prose
 """
 
@@ -120,10 +140,12 @@ Check it against these criteria:
 2. Is every `@@` hunk header syntactically correct (line numbers make sense)?
 3. Are there missing changes or accidental deletions?
 4. Will running `{test_cmd}` pass after applying this diff?
+5. Is the implementation complete — does it handle edge cases, or is it a bare stub?
 
 If the diff is correct and complete, respond with exactly: LGTM
 
 If it needs fixing, respond with the corrected diff only (no prose, starts with `diff --git`).
+If the implementation is a bare minimum that should be more thorough, expand it and respond with the improved diff.
 """
 
 REPAIR_FORMAT_PROMPT = """\
