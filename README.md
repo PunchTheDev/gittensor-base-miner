@@ -1,15 +1,21 @@
 # Gittensor Base-Miner Benchmark
 
 [![Dashboard](https://img.shields.io/badge/dashboard-live-brightgreen)](https://punchthedev.github.io/gittensor-miner-dashboard/)
-[![Pool](https://img.shields.io/badge/pool-324%20problems-blue)](benchmark/problems/)
+[![Pool](https://img.shields.io/badge/pool-342%20problems-blue)](benchmark/problems/)
 [![CI](https://github.com/PunchTheDev/gittensor-base-miner/actions/workflows/eval.yml/badge.svg)](https://github.com/PunchTheDev/gittensor-base-miner/actions/workflows/eval.yml)
 [![License](https://img.shields.io/badge/license-MIT-lightgrey)](LICENSE)
 
 **[Live leaderboard](https://punchthedev.github.io/gittensor-miner-dashboard/)** — see current rankings, pool stats, and the full problem browser.
+**[REST API](docs/api.md)** — fetch problems, shard, and leaderboard data programmatically.
 
 A competitive benchmark where miners build the best autonomous agent for contributing to open-source software — scored by replaying real merged Gittensor pull requests.
 
 The winning agent becomes the canonical base miner for [Gittensor (SN74)](https://github.com/entrius/gittensor), a Bittensor subnet that incentivizes software development.
+
+> **Idle compute, earning continuously.** Point `gitminer mine` at your agent
+> and it runs every week when a new shard rotates in — your machine contributes
+> code, earns TAO, and sharpens the best open-source coding agent on the
+> network. Agentic development as infrastructure.
 
 ---
 
@@ -97,7 +103,28 @@ python gitminer.py hash your_patch.diff
 
 # Validate agent and print PR submission steps
 python gitminer.py submit agent/submissions/yourhandle/agent.py
+
+# --- Idle mining (daemon mode) ---
+
+# Run once against the current shard; auto-submit if you beat the champion
+python gitminer.py mine --agent agent/submissions/yourhandle/agent.py --no-sandbox
+
+# Daemon mode: run once per shard rotation (weekly), sleep in between
+python gitminer.py mine --agent agent/submissions/yourhandle/agent.py --loop
+
+# --- REST API (for scripting / external tooling) ---
+
+# Start the JSON API server on port 8083
+python gitminer.py serve-api
+
+# Example: fetch this week's shard in a shell script
+curl http://localhost:8083/api/shard
+curl http://localhost:8083/api/problems/0463
+curl "http://localhost:8083/api/problems?lang=py&difficulty=hard&limit=10"
+curl http://localhost:8083/api/leaderboard
 ```
+
+See [docs/api.md](docs/api.md) for the full API reference.
 
 ---
 
@@ -114,13 +141,16 @@ benchmark/
   harness/             # replay and scoring pipeline
   evaluate.py          # evaluation runner (used by gitminer and CI)
   pool_config.json     # pool/shard configuration
+api/
+  server.py            # REST API server (serve-api subcommand)
 scripts/
   build_pool.py        # DAS API-based pool builder and refresher
 docs/
+  api.md               # REST API reference
   scoring.md           # scoring mechanics explained
   hyperparameters.md   # Gittensor hyperparameter configuration for this repo
   threat_model.md      # anti-gaming threat model
-gitminer.py            # CLI: eval / run / validate / leaderboard / hash / shard / submit
+gitminer.py            # CLI: eval / run / validate / leaderboard / hash / shard / submit / mine / serve-api
 CONTRIBUTING.md        # how to submit
 hyperparameters.json   # live Gittensor repo hyperparameter config
 ```

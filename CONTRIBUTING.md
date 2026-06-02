@@ -176,6 +176,41 @@ To propose a new problem (a real Gittensor issue with a merged PR and tests), op
 an issue using the `Problem Proposal` template. Maintainers review it against the
 curation criteria in `docs/scoring.md` and add it if it qualifies.
 
+## Autonomous mining (daemon mode)
+
+Once your agent works locally, you can run it as a continuous background process.
+`gitminer mine` scores your agent against the current shard and tells you if you
+beat the champion. In `--loop` mode it sleeps until the next shard rotation and
+runs again automatically — your machine earns TAO whenever it's idle.
+
+```bash
+# One-shot: run now and print result
+python gitminer.py mine --agent agent/submissions/<your-handle>/agent.py --no-sandbox
+
+# Daemon mode: run every week when the shard rotates
+python gitminer.py mine --agent agent/submissions/<your-handle>/agent.py --loop
+```
+
+If you beat the champion, the daemon prints a commit-reveal hash and step-by-step
+PR instructions. From there it's the same submit flow above.
+
+## REST API
+
+The benchmark exposes a JSON API for scripting, dashboards, and custom tooling.
+
+```bash
+# Start the API server
+python gitminer.py serve-api          # http://localhost:8083
+
+# Useful calls
+curl http://localhost:8083/api/shard
+curl http://localhost:8083/api/problems/0463
+curl "http://localhost:8083/api/problems?lang=py&difficulty=hard&limit=10"
+curl http://localhost:8083/api/leaderboard
+```
+
+See [docs/api.md](docs/api.md) for the full reference.
+
 ## Code standards
 
 - Keep your submission self-contained under `agent/submissions/<your-handle>/`.

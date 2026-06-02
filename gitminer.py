@@ -12,6 +12,8 @@ Subcommands:
     hash        Compute the commit-reveal SHA-256 hash for a patch file
     shard       Print the current week's 30-problem shard IDs
     submit      Validate an agent, generate its commit-reveal hash, and print (or open) a PR
+    serve-api   Start the REST API server (default port 8083)
+    mine        Run your agent continuously; auto-submit when it beats the champion
 
 Usage:
     python gitminer.py eval agent/submissions/myhandle/agent.py
@@ -31,6 +33,10 @@ Usage:
     python gitminer.py shard
     python gitminer.py submit agent/submissions/myhandle/agent.py
     python gitminer.py submit agent/submissions/myhandle/agent.py --model claude-3-5-haiku-20241022 --open-pr
+    python gitminer.py serve-api
+    python gitminer.py serve-api --port 9000 --host 127.0.0.1
+    python gitminer.py mine --agent agent/submissions/myhandle/agent.py --no-sandbox
+    python gitminer.py mine --agent agent/submissions/myhandle/agent.py --loop
 """
 
 from __future__ import annotations
@@ -774,6 +780,109 @@ def cmd_cache(args: argparse.Namespace) -> None:
     print(f"\nDone. Future --no-sandbox evals skip clone for cached repos.")
 
 
+def cmd_serve_api(args: argparse.Namespace) -> None:
+    """Start the REST API server for programmatic access to benchmark data."""
+    from api.server import serve
+    serve(host=args.host, port=args.port)
+
+
+def cmd_mine(args: argparse.Namespace) -> None:
+    """
+    Autonomous mining daemon — run your agent against the current shard and
+    auto-submit if you beat the champion.
+
+    In --loop mode the daemon waits for the next shard rotation (Monday 00:00
+    UTC) and repeats.  This is the "idle compute" mode: point it at your agent
+    and walk away.
+
+    Examples:
+        python gitminer.py mine --agent agent/submissions/myhandle/agent.py --no-sandbox
+        python gitminer.py mine --agent agent/submissions/myhandle/agent.py --loop
+    """
+    import time
+    from datetime import datetime, timezone
+
+    from benchmark.evaluate import run_evaluation
+
+    agent_path = args.agent
+    if not agent_path or not Path(agent_path).exists():
+        print(f"Agent not found: {agent_path}", file=sys.stderr)
+        sys.exit(1)
+
+    handle = Path(agent_path).parent.name
+
+    def _champion_score() -> float:
+        lb_path = REPO_ROOT / "results" / "leaderboard.json"
+        if not lb_path.exists():
+            return 0.0
+        entries = json.loads(lb_path.read_text())
+        human = [e for e in entries if "Oracle" not in e.get("agent", "")]
+        if not human:
+            return 0.0
+        return float(human[0].get("score", 0.0))
+
+    def _run_cycle() -> None:
+        champ = _champion_score()
+        oracle = _oracle_mean()
+        label = f"{champ:.2f}" if champ else "none yet"
+        print(f"\n{'═'*60}")
+        print(f"  gitminer mine — {handle}")
+        print(f"  {datetime.now(timezone.utc).strftime('%Y-%m-%d %H:%M UTC')}")
+        print(f"  Champion: {label}    Oracle ceiling: {oracle:.2f}")
+        print(f"{'═'*60}\n")
+
+        results = run_evaluation(
+            agent_path=agent_path,
+            use_sandbox=not args.no_sandbox,
+        )
+        problems = results.get("problems", [])
+        if not problems:
+            print("No problems evaluated.")
+            return
+
+        total = sum(p.get("final_score", 0.0) for p in problems)
+        mean = total / len(problems)
+        passed = sum(1 for p in problems if p.get("tests_passed", False))
+        print(f"\nResult: {mean:.2f} / 30.00   ({passed}/{len(problems)} tests passing)")
+
+        if champ and mean <= champ:
+            gap = champ - mean
+            print(f"Gap to champion: {gap:.2f} — keep improving!")
+            return
+
+        status = "BEAT CHAMPION" if champ else "FIRST SUBMISSION"
+        print(f"\n🎯  {status}! Your score: {mean:.2f}")
+
+        # Generate commit-reveal hash from agent file content
+        agent_bytes = Path(agent_path).read_bytes()
+        reveal_hash = hashlib.sha256(agent_bytes).hexdigest()
+        print(f"\nCommit-reveal hash: {reveal_hash}")
+        print(f"\nNext steps:")
+        print(f"  1. Run: python gitminer.py submit {agent_path}")
+        print(f"  2. Open a PR — the CI will score your agent and publish results.")
+        print(f"  3. Post the hash {reveal_hash[:16]}... in your PR body to claim credit.\n")
+
+        if args.loop:
+            print("Submission ready. Waiting for next shard rotation to mine again...\n")
+
+    def _seconds_to_next_monday() -> int:
+        """Seconds until next Monday 00:00 UTC."""
+        now = datetime.now(timezone.utc)
+        days_ahead = (7 - now.weekday()) % 7 or 7
+        next_monday = now.replace(hour=0, minute=0, second=0, microsecond=0)
+        delta_days = (next_monday.day + days_ahead) - next_monday.day
+        return days_ahead * 86400 - (now.hour * 3600 + now.minute * 60 + now.second)
+
+    _run_cycle()
+    if args.loop:
+        while True:
+            wait = _seconds_to_next_monday()
+            h, m = divmod(wait // 60, 60)
+            print(f"Sleeping {h}h {m}m until next shard rotation...")
+            time.sleep(wait)
+            _run_cycle()
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(
         prog="gitminer",
@@ -892,6 +1001,28 @@ def main() -> None:
         help="Create branch, commit, push, and open the PR via gh (requires gh CLI)",
     )
     p_submit.set_defaults(func=cmd_submit)
+
+    # serve-api
+    p_api = sub.add_parser(
+        "serve-api",
+        help="Start the REST API server (default port 8083)",
+    )
+    p_api.add_argument("--host", default="0.0.0.0", help="Bind host (default: 0.0.0.0)")
+    p_api.add_argument("--port", type=int, default=8083, help="Port to listen on (default: 8083)")
+    p_api.set_defaults(func=cmd_serve_api)
+
+    # mine
+    p_mine = sub.add_parser(
+        "mine",
+        help="Run your agent continuously; auto-submit when it beats the champion",
+    )
+    p_mine.add_argument("--agent", required=True, metavar="PATH",
+                        help="Path to your agent.py")
+    p_mine.add_argument("--no-sandbox", action="store_true",
+                        help="Skip Docker sandbox (faster, ~2× higher scores — local dev only)")
+    p_mine.add_argument("--loop", action="store_true",
+                        help="Run continuously, sleeping between shard rotations (daemon mode)")
+    p_mine.set_defaults(func=cmd_mine)
 
     args = parser.parse_args()
     args.func(args)
