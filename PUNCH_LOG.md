@@ -2045,3 +2045,27 @@ Repos evaluated and rejected: `celery/celery` (Redis/RabbitMQ integration tests)
 - Pool: 430 problems, DAS-only, all pool repos cached locally
 - All CLI commands verified: `info`, `shard`, `validate`, `problems`, `run`, `mine`
 - Pipeline fully operational — awaiting Gittensor registration approval
+
+---
+
+## 2026-06-02 — Pipeline correctness fixes
+
+**eval.yml CI comment**:
+- Stale difficulty thresholds in PR comment builder: was `≥25 = easy, ≥18 = medium` — should be `≥15 = easy, <5 = hard` (matching dashboard/CLI since the API consistency fix)
+- Removed `problemLang()` function that inferred language from test_cmd strings — replaced with `p.category` read directly from the results JSON (already present since the category system was added)
+- Column header updated: `Lang` → `Category`
+
+**record_result.py — per-problem breakdown**:
+- The dashboard's `openSubmissionDrawer()` reads `row.breakdown` to display per-problem drill-down for miner submissions — but `record_result.py` never populated this field
+- Fix: extract `[{problem_id, score, passed, category}]` from `results.json` and store as `breakdown` in the leaderboard entry
+- Now when miners submit and their entry appears on the leaderboard, clicking it shows the full per-problem breakdown (headline feature the operator requested)
+
+**refresh_pool.yml — oracle recalibration**:
+- Weekly pool refresh added new problems but oracle score was never recalibrated: new problems had `null` baseline_score in dashboard, oracle stayed at old value
+- Fix: added `pip install -r requirements.txt` (needed for tree-sitter) + `python scripts/baseline_scores.py` after `build_pool.py`
+- Oracle now auto-updates in the commit message: `"Add N problems to pool (total: T, oracle: X.XX)"`
+
+### Status
+- Benchmark: **430 problems**, oracle **11.83**, commits `6d4deb0`, `31c7a18`, `d957b22`
+- All three fixes are in production (pushed to main)
+- Next DAS pool check: ~2026-06-16
