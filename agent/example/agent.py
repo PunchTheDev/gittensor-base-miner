@@ -304,6 +304,11 @@ Improvements over a naive single-shot approach:
   Root cause: `self.assert*` does not start with `assert ` (has `self.` prefix), so every
   Python test that uses `unittest.TestCase` subclass methods was silently skipped, leaving
   the verify step blind to the actual test requirements.  521 occurrences in pool.
+- `_fix_diff_headers` new-file `--- /dev/null` correction: for blocks with `new file mode 100644`,
+  the old `---` line is now corrected to `--- /dev/null` if the model wrote `--- a/<path>` instead.
+  Previously the function only inserted `--- /dev/null` when the `---` line was absent entirely.
+  If the model wrote `--- a/newfile.py` (wrong), git apply tries to read a file that doesn't exist
+  yet and fails with "no such file or directory".  226/430 pool problems require new files (53%).
 - `_extract_assertions` mock/spy assertion contains-check: added secondary `_ASSERT_CONTAINS`
   tuple checked via `in` (not `startswith`), covering `mock_obj.assert_called_once_with(...)`,
   `.assert_not_called()`, `.assert_any_call()`, `.assert_has_calls()`.  Root cause: mock
@@ -1664,9 +1669,12 @@ def _fix_diff_headers(diff: str) -> str:
     skip these, jumping straight from `diff --git` to `@@`.  Without them
     git apply exits with "patch does not apply".
 
-    This function rebuilds missing headers from the `diff --git a/<path> b/<path>`
-    line.  Blocks that already have both headers are left untouched.  `new file
-    mode` blocks use `/dev/null` for the old path; all other blocks use the a-path.
+    Also fixes `--- a/path` → `--- /dev/null` for new-file blocks: when the
+    model writes `new file mode 100644` but uses the file path instead of
+    `/dev/null` for the old path, `git apply` fails trying to read the
+    non-existent original.
+
+    Blocks with correct headers are left untouched.
     """
     lines = diff.splitlines()
     result: list[str] = []
@@ -1682,24 +1690,40 @@ def _fix_diff_headers(diff: str) -> str:
         result.append(line)
         i += 1
         # Collect the meta-lines that follow: index, mode, new file mode, etc.
+        # Stop before --- / +++ / @@ / diff --git so we can inspect what follows.
         meta: list[str] = []
         is_new_file = False
-        while i < len(lines) and not lines[i].startswith("---") and not lines[i].startswith("@@") and not lines[i].startswith("diff --git"):
+        while i < len(lines) and not lines[i].startswith("---") and not lines[i].startswith("+++") and not lines[i].startswith("@@") and not lines[i].startswith("diff --git"):
             if lines[i].startswith("new file"):
                 is_new_file = True
             meta.append(lines[i])
             i += 1
         result.extend(meta)
-        # Check whether --- / +++ are already present in meta lines
-        has_minus = any(ml.startswith("---") for ml in meta)
-        has_plus = any(ml.startswith("+++") for ml in meta)
-        # Insert headers if either is missing and we're about to hit a @@ hunk
-        if i < len(lines) and lines[i].startswith("@@") and (not has_minus or not has_plus):
-            if not has_minus:
-                old_path = "/dev/null" if is_new_file else f"a/{a_path}"
-                result.append(f"--- {old_path}")
-            if not has_plus:
-                result.append(f"+++ b/{b_path}")
+        # Check whether --- / +++ are already present as the next lines
+        # (they weren't in meta — the loop stopped before them).
+        has_minus = i < len(lines) and lines[i].startswith("---")
+        has_plus = (i + 1) < len(lines) and lines[i + 1].startswith("+++") if has_minus else (i < len(lines) and lines[i].startswith("+++"))
+
+        if has_minus:
+            minus_line = lines[i]
+            # For new-file blocks, the old path must be /dev/null.
+            # The model sometimes writes `--- a/<path>` instead — fix it.
+            if is_new_file and minus_line != "--- /dev/null":
+                result.append("--- /dev/null")
+            else:
+                result.append(minus_line)
+            i += 1
+        elif i < len(lines) and lines[i].startswith("@@"):
+            # --- is missing entirely — insert correct old path
+            old_path = "/dev/null" if is_new_file else f"a/{a_path}"
+            result.append(f"--- {old_path}")
+
+        # Now handle +++
+        if i < len(lines) and lines[i].startswith("+++"):
+            result.append(lines[i])
+            i += 1
+        elif not has_plus and i < len(lines) and lines[i].startswith("@@"):
+            result.append(f"+++ b/{b_path}")
     return "\n".join(result)
 
 
