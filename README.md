@@ -85,7 +85,7 @@ python gitminer.py run --problem 0463 --score --no-sandbox --repair 3   # if tes
 python gitminer.py eval agent/submissions/yourhandle/agent.py --no-sandbox
 
 # Calibration check: score reference diffs to verify the full pipeline (no agent or API key needed)
-python gitminer.py eval --oracle --no-sandbox   # expected mean: ~23.46 / 30.00
+python gitminer.py eval --oracle --no-sandbox   # expected mean: ~11.83 / 30.00
 
 # Evaluate against all 430 pool problems
 python gitminer.py eval agent/submissions/yourhandle/agent.py --all

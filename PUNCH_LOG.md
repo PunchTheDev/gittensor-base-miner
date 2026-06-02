@@ -1859,3 +1859,25 @@ Repos evaluated and rejected: `celery/celery` (Redis/RabbitMQ integration tests)
 - External repos now: pytest, click, werkzeug, starlette, pydantic, marshmallow, fastapi, jinja, attrs, pylint, sphinx, networkx, sympy (13 external)
 - Pool: DAS repos saturated; external now at 13 repos
 - Next pool check: ~2026-06-09 for new DAS registrations
+
+---
+
+## 2026-06-02 — Restrict pool to Gittensor DAS contributions only
+
+**Operator direction**: All benchmark problems must come from the Gittensor network only. The Gittensor API (`api.gittensor.io/prs`) is the authoritative source of contribution data.
+
+**Investigation**: DAS API currently has 3,187 PRs across 18 repos. Not "hundreds of repos" — the current Gittensor network has 18 registered repos. All 18 are already in our `registered_repos` list.
+
+**Action**: Removed all 300 problems from 13 external repos (pytest, click, werkzeug, starlette, pydantic, marshmallow, fastapi, jinja, attrs, pylint, sphinx, networkx, sympy). These were not Gittensor network contributions.
+
+**Pool reverts to DAS-only**:
+- Pool size: 730 → **430 problems** (13 DAS repos with qualifying PRs)
+- Oracle recalibrated: 9.04 → **11.83** (DAS problems score higher — larger, richer diffs vs external surgical fixes)
+- `pool_config.json`: removed `external_repos` key, pool_size=430
+- `results/baselines.json`, `results/leaderboard.json`, `docs/dashboard_data.json` all updated
+
+### Status
+- Benchmark: **430 problems**, oracle **11.83**, DAS-only sources
+- Pool: 18 DAS repos total; 13 have qualifying problems (linked issue + test files)
+- Remaining 5 DAS repos have 0 qualifying PRs (no linked issues or no test files)
+- Next DAS check: ~2026-06-09 for new repo registrations

@@ -9,14 +9,31 @@ REPO_ROOT = pathlib.Path(__file__).parent.parent
 PROBLEMS_DIR = REPO_ROOT / "benchmark" / "problems"
 RESULTS_DIR = REPO_ROOT / "results"
 
-ORACLE_ROW = {
-    "rank": None,
-    "agent": "Oracle (accepted solution)",
-    "score": 10.12,
-    "model": "—",
-    "date": "—",
-    "note": "Mean tree-sitter score across 578 accepted solutions (matches DAS validator)",
-}
+def _load_oracle_row() -> dict:
+    baseline_file = RESULTS_DIR / "baselines.json"
+    score = None
+    count = None
+    if baseline_file.exists():
+        try:
+            data = json.loads(baseline_file.read_text())
+            score = round(data["mean_score"], 2)
+            count = data["count"]
+        except Exception:
+            pass
+    if score is None:
+        score = 9.04  # fallback
+        count = 430
+    return {
+        "rank": None,
+        "agent": "Oracle (accepted solution)",
+        "score": score,
+        "model": "—",
+        "date": "—",
+        "note": f"Mean tree-sitter score across {count} accepted solutions (Gittensor DAS only)",
+    }
+
+
+ORACLE_ROW = _load_oracle_row()
 
 
 def load_baselines() -> dict[str, dict]:
