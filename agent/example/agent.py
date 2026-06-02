@@ -26,9 +26,9 @@ Improvements over a naive single-shot approach:
   visible line is 261") so the model can write accurate @@ -N hunk offsets
 - Explicit file-and-line hypothesis required plus secondary-file completeness
   check so the implementation is thorough, not minimal
-- Language-specific notes: Rust/TypeScript/Ruby system-prompt additions remind
-  the model of language conventions (trait bounds, exports, require statements)
-  that generic instructions miss
+- Language-specific system-prompt notes: Go/Rust/TypeScript/Ruby/Python/Kotlin/Java
+  remind the model of language conventions (trait bounds, exports, type hints,
+  companion objects, interface implementations) that generic instructions miss
 - Score-aware prompting: system prompt and act prompt explain that complete
   implementations score higher than stubs
 - Structural diff validation beyond the basic `@@` presence check — catches
@@ -36,14 +36,15 @@ Improvements over a naive single-shot approach:
   show `N | line content` so the model can read `@@ -N` offsets directly
 - Issue title tokens weighted 3× over body tokens in file ranking (titles name
   the exact function/module; bodies describe the symptom)
-- Language-specific notes: Rust/TypeScript/Ruby/Python system-prompt additions
-  remind the model of language conventions (trait bounds, exports, type hints)
 - Repair loop shows first+last lines of test output (assertion error at top,
   summary at bottom) rather than only the last N lines
 - Verify criteria cross-check `@@ -N` line numbers against `N |` markers,
   check for missing imports, and expand bare stubs
 - Wider repair window (3 attempts, up from 2) with failure-mode categorization
 - Structured reasoning log for transparency
+- `_is_test_file` detects Kotlin/Java/Scala test classes (e.g. FooTest.kt)
+- Kotlin/Java import resolution in `_resolve_test_imports`: maps `import dev.foo.Bar`
+  to `Bar.kt` or `Bar.java` in the file tree
 """
 
 from __future__ import annotations
@@ -265,6 +266,22 @@ LANG_NOTES: dict[str, str] = {
         "return named error types, not bare strings; zero-value structs must satisfy "
         "interface constraints — all methods must be implemented, no `panic(\"TODO\")`."
     ),
+    "kt": (
+        "This is a Kotlin/Android codebase. Key reminders: data classes must declare "
+        "all fields the tests access; sealed classes and enums must cover every variant "
+        "the tests reference; companion object constants (e.g. tool names) must match "
+        "exactly what the test checks; add `@Test` annotation to new test helpers when "
+        "asked; do not leave `TODO()` stubs — implement the full body; add the correct "
+        "`import` for any new class or function you reference; if the test instantiates "
+        "a class directly, ensure its primary constructor matches what the test uses."
+    ),
+    "java": (
+        "This is a Java codebase. Key reminders: implement every method of any interface "
+        "the test uses — no partial implementations; add the correct `import` statements "
+        "at the top of every file that references a new class; public classes must match "
+        "their filename exactly; use `@Override` on interface method implementations; "
+        "checked exceptions must be declared or caught — don't swallow them silently."
+    ),
 }
 
 
@@ -296,6 +313,8 @@ def _is_test_file(f: FileContext) -> bool:
         or name.startswith("test_") or name.endswith("_test.py")
         or ".test." in name or ".spec." in name
         or name.startswith("spec_") or name.endswith("_spec.rb")
+        # Kotlin/Java: classes ending in Test (e.g. AndroidToolRetryPolicyTest.kt)
+        or re.search(r"test\.(kt|java|scala)$", name) is not None
     )
 
 
@@ -325,6 +344,7 @@ def _resolve_test_imports(
     - TypeScript/JS: ``import { X } from './utils/helpers'`` → resolved relative path
     - Ruby: ``require_relative '../lib/foo'`` → resolved relative path
     - Rust: ``use crate::foo::bar;`` → ``src/foo/bar.rs`` or ``src/foo/bar/mod.rs``
+    - Kotlin/Java: ``import dev.foo.bar.MyClass`` → ``src/main/.../MyClass.kt|java``
     """
     tree_set = set(file_tree)
     resolved: set[str] = set()
@@ -420,6 +440,27 @@ def _resolve_test_imports(
                         for f in tree_set:
                             if f.startswith(local_path + "/") and f.endswith(".go"):
                                 resolved.add(f)
+
+        elif ext in ("kt", "java"):
+            # `import dev.touchpilot.app.tools.AndroidToolRetryPolicy` →
+            # look for any file named `AndroidToolRetryPolicy.kt` or `.java` anywhere
+            # in the tree (JVM packages don't map 1:1 to directory paths across projects)
+            for m in re.finditer(r"^import\s+([\w.]+)", content, re.MULTILINE):
+                fqn = m.group(1)
+                # Skip standard library and well-known third-party packages
+                if fqn.startswith(("kotlin.", "java.", "android.", "androidx.",
+                                    "org.junit", "kotlin.test", "org.mockito",
+                                    "io.mockk", "com.google")):
+                    continue
+                class_name = fqn.rsplit(".", 1)[-1]
+                if not class_name or not class_name[0].isupper():
+                    continue  # skip package-level imports without a class name
+                # Match any .kt or .java file whose basename matches the class name
+                for f in tree_set:
+                    basename = f.rsplit("/", 1)[-1]
+                    if basename in (class_name + ".kt", class_name + ".java"):
+                        resolved.add(f)
+                        break
 
     return resolved
 
