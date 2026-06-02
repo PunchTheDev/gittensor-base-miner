@@ -1533,3 +1533,29 @@ Two separate gaps in `_extract_assertions`:
 - Benchmark: 430 problems, oracle 13.34, 20 repos (commit `0293629`)
 - Agent: Ruby Minitest assertions, deduplication + all prior improvements
 - Pool: fully saturated; check ~2026-06-09 for new DAS registrations
+
+---
+
+## Step: Fix line numbers missing in no-hit windowing fallback
+
+**Commit**: `2e82ba9`
+
+### Root cause
+`_window_file` has three paths for files over the 300-line windowing threshold:
+1. **Has keyword hits** → adds `N | ` line-number prefixes to all visible lines ✓
+2. **No hits → header fallback** → returned lines without `N | ` prefixes ✗
+3. **Small file (<300 lines)** → adds `N | ` prefixes ✓
+
+Path 2 was inconsistent: the header section (import block + first type defs) was
+returned with `"".join(lines[:peek]) + suffix` — no line numbers even when
+`show_line_numbers=True`. The model writing a diff against that file had to count
+from "line 1" manually to find the right `@@ -N` offsets, causing off-by-one errors.
+
+### Fix
+Applied the same `{i:{width}d} | line` formatting to the no-hit header section
+when `show_line_numbers=True`. No-op when `show_line_numbers=False` (test files).
+
+### Status
+- Benchmark: 430 problems, oracle 13.34, 20 repos (commit `2e82ba9`)
+- Agent: consistent line numbers in all windowing paths + all prior improvements
+- Pool: fully saturated; check ~2026-06-09 for new DAS registrations
