@@ -222,6 +222,15 @@ Improvements over a naive single-shot approach:
   pool problems exceed 3000 chars; max 16200). Now shows `body[:2500] + "[...]" + body[-500:]`
   for bodies > 3000 chars — preserving both the opening requirements and the trailing edge-case
   details/gotchas. Total length stays ~3000 chars.
+- Hunk source context injected into verify: `_hunk_source_snippets()` extracts the actual
+  source file lines at each hunk's `@@ -N` offset and injects them into the verify prompt.
+  After history compaction the verify model has no access to source files, so criterion 2
+  (hunk offset check) was previously a plausibility guess — "do the context lines look like
+  surrounding code?" — rather than a real check. Now the verify prompt shows e.g.:
+  `[src/drivers/mistral.go @@ -45] → 45: return nil, fmt.Errorf("not implemented")`, giving
+  the model what it needs to spot wrong offsets and context-line whitespace mismatches that
+  `_fix_hunk_offsets` / `_fix_context_lines` post-processors may not have caught. Limited
+  to 6 hunks (~1 KB addition to the verify prompt) to keep token usage small.
 """
 
 from __future__ import annotations
@@ -411,11 +420,12 @@ You produced this diff:
 ```diff
 {diff}
 ```
-
+{hunk_source_section}
 Check it against these criteria:
 1. Does the diff satisfy every test assertion listed above? Map each one to a concrete line.
-2. Are `@@ -N` hunk offsets plausible? Check that context lines in the diff match the \
-   surrounding code logic — wrong offsets cause `git apply` to fail.
+2. Are `@@ -N` hunk offsets correct? The source context section above shows the actual \
+   file lines at each hunk offset — verify that the context lines in your diff match \
+   exactly (same content, same whitespace). Wrong offsets cause `git apply` to fail.
 3. Are there missing changes or accidental deletions that would break unrelated tests?
 4. Are all new symbols, functions, or classes properly imported in every file that uses them?
 5. Is the implementation complete — does it handle edge cases, or is it a bare stub that \
@@ -429,6 +439,12 @@ If the diff is correct and complete, respond with exactly: LGTM
 
 If it needs fixing, respond with the corrected diff only (no prose, starts with `diff --git`).
 If the implementation is a bare minimum that should be more thorough, expand it and respond with the improved diff.
+"""
+
+HUNK_SOURCE_SECTION_TEMPLATE = """\
+
+Source context at hunk offsets (actual file lines — verify your diff context lines match):
+{snippets}
 """
 
 NEW_FILES_VERIFY_SECTION_TEMPLATE = """\
@@ -1717,6 +1733,71 @@ def _fix_context_lines(diff: str, file_lookup: dict[str, str]) -> str:
     return "\n".join(result)
 
 
+def _hunk_source_snippets(
+    diff: str,
+    file_lookup: dict[str, str],
+    max_hunks: int = 6,
+) -> str:
+    """Return formatted source lines around each hunk's @@ -N offset.
+
+    After history compaction the verify model cannot see source files.  Injecting
+    the actual source lines at each hunk's stated start offset lets the model
+    perform a real check: do the context lines in the diff match the source?
+
+    A mismatch signals a wrong @@ -N offset (git apply will reject the hunk
+    even if the content is correct).  Limited to max_hunks to keep the verify
+    prompt compact; covers the first N hunks across all files in the diff.
+    """
+    if not file_lookup or not diff:
+        return ""
+
+    current_file: str | None = None
+    hunk_count = 0
+    snippets: list[str] = []
+
+    for line in diff.splitlines():
+        if line.startswith("diff --git "):
+            m = re.match(r"^diff --git a/.+ b/(.+)$", line)
+            if m:
+                current_file = m.group(1)
+        elif line.startswith("+++ b/"):
+            current_file = line[6:].strip()
+        elif line.startswith("@@ -") and current_file and hunk_count < max_hunks:
+            m = re.match(r"^@@ -(\d+)", line)
+            if not m:
+                continue
+            start = int(m.group(1))
+            if start == 0:
+                continue  # new-file hunk — no source to show
+
+            src = file_lookup.get(current_file) or file_lookup.get(
+                current_file.rsplit("/", 1)[-1] if "/" in current_file else current_file
+            )
+            if not src:
+                continue
+
+            src_lines = src.splitlines()
+            total = len(src_lines)
+            if start > total:
+                continue
+
+            lo = max(0, start - 3)  # 2 lines before hunk start (0-indexed: start-3 to start-1)
+            hi = min(total, start + 2)  # 2 lines at/after hunk start
+
+            ctx: list[str] = []
+            for i in range(lo, hi):
+                marker = "→" if i == start - 1 else " "
+                ctx.append(f"  {marker} {i + 1}: {src_lines[i]}")
+
+            snippets.append(f"[{current_file} @@ -{start}]\n" + "\n".join(ctx))
+            hunk_count += 1
+
+    if not snippets:
+        return ""
+
+    return HUNK_SOURCE_SECTION_TEMPLATE.format(snippets="\n\n".join(snippets))
+
+
 def _post_process(diff: str, file_lookup: dict[str, str] | None = None) -> str:
     """Strip display artifacts, trim trailing prose, fix headers and hunk metadata.
 
@@ -2162,6 +2243,12 @@ class ExampleAgent(BaseAgent):
                 else:
                     new_files_section = ""
                     new_files_check = "N/A (no new files required)"
+                # Hunk source context: show actual source lines at each @@ -N offset
+                # so criterion 2 is a real check rather than a plausibility guess.
+                # Limited to 6 hunks (~1 KB) to keep the verify prompt compact.
+                hunk_source_section = _hunk_source_snippets(diff, file_lookup)
+                if hunk_source_section:
+                    log.append("[verify] hunk source context injected")
                 verify_user = VERIFY_PROMPT.format(
                     diff=diff,
                     title=problem.issue_title,
@@ -2170,6 +2257,7 @@ class ExampleAgent(BaseAgent):
                     assertions_section=assertions_section,
                     new_files_section=new_files_section,
                     new_files_check=new_files_check,
+                    hunk_source_section=hunk_source_section,
                 )
                 history.append({"role": "user", "content": verify_user})
             pending_prose_critique = False
