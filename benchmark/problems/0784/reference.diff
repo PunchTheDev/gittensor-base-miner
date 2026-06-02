@@ -1,0 +1,142 @@
+diff --git a/gittensor/validator/forward.py b/gittensor/validator/forward.py
+index 51bf1c15..b8f8ddef 100644
+--- a/gittensor/validator/forward.py
++++ b/gittensor/validator/forward.py
+@@ -62,7 +62,7 @@ async def forward(self: 'Validator') -> None:
+         token_config = load_token_config()
+ 
+         # 1. Score OSS contributions
+-        oss_rewards, miner_evaluations, cached_uids = await oss_contributions(
++        oss_rewards, miner_evaluations, cached_uids, penalized_uids = await oss_contributions(
+             self, miner_uids, master_repositories, programming_languages, token_config
+         )
+ 
+@@ -80,7 +80,7 @@ async def forward(self: 'Validator') -> None:
+         # 5. Blend 4 emission pools into final rewards
+         rewards = blend_emission_pools(oss_rewards, issue_rewards, miner_uids)
+ 
+-        self.update_scores(rewards, miner_uids)
++        self.update_scores(rewards, miner_uids, blacklisted_uids=sorted(penalized_uids))
+ 
+     await asyncio.sleep(VALIDATOR_WAIT)
+ 
+@@ -91,8 +91,8 @@ async def oss_contributions(
+     master_repositories: Dict[str, RepositoryConfig],
+     programming_languages: Dict,
+     token_config,
+-) -> Tuple[np.ndarray, Dict[int, MinerEvaluation], Set[int]]:
+-    """Score OSS contributions and return normalized rewards + miner evaluations + cached UIDs.
++) -> Tuple[np.ndarray, Dict[int, MinerEvaluation], Set[int], Set[int]]:
++    """Score OSS contributions and return normalized rewards + miner evaluations + cached UIDs + penalized UIDs.
+ 
+     Pure scoring — no DB storage or emission blending. Those are handled by forward().
+     """
+@@ -104,11 +104,11 @@ async def oss_contributions(
+     bt.logging.info(f'Token config: {tree_sitter_count} tree-sitter languages')
+     bt.logging.info(f'Neurons to evaluate: {len(miner_uids)}')
+ 
+-    rewards, miner_evaluations, cached_uids = await get_rewards(
++    rewards, miner_evaluations, cached_uids, penalized_uids = await get_rewards(
+         self, miner_uids, master_repositories, programming_languages, token_config
+     )
+ 
+-    return rewards, miner_evaluations, cached_uids
++    return rewards, miner_evaluations, cached_uids, penalized_uids
+ 
+ 
+ async def issue_discovery(
+diff --git a/gittensor/validator/oss_contributions/reward.py b/gittensor/validator/oss_contributions/reward.py
+index 798bbac2..748a0b54 100644
+--- a/gittensor/validator/oss_contributions/reward.py
++++ b/gittensor/validator/oss_contributions/reward.py
+@@ -2,7 +2,7 @@
+ # Copyright © 2025 Entrius
+ from __future__ import annotations
+ 
+-from typing import TYPE_CHECKING, Dict, Optional, Tuple
++from typing import TYPE_CHECKING, Dict, Optional, Set, Tuple
+ 
+ import bittensor as bt
+ import numpy as np
+@@ -99,11 +99,11 @@ async def get_rewards(
+     master_repositories: Dict[str, RepositoryConfig],
+     programming_languages: Dict[str, LanguageConfig],
+     token_config: TokenConfig,
+-) -> Tuple[np.ndarray, Dict[int, MinerEvaluation], set]:
++) -> Tuple[np.ndarray, Dict[int, MinerEvaluation], Set[int], Set[int]]:
+     """Score OSS contributions for all miners.
+ 
+     Returns:
+-        Tuple of (normalized_rewards_array, miner_evaluations, cached_uids).
++        Tuple of (normalized_rewards_array, miner_evaluations, cached_uids, penalized_uids).
+         DB storage and emission blending are handled by the caller (forward.py).
+     """
+ 
+@@ -160,4 +160,5 @@ async def get_rewards(
+         np.array([normalized_rewards.get(uid, 0.0) for uid in sorted(uids)]),
+         miner_evaluations,
+         cached_uids,
++        penalized_uids,
+     )
+diff --git a/tests/validator/test_duplicate_penalty_propagation.py b/tests/validator/test_duplicate_penalty_propagation.py
+new file mode 100644
+index 00000000..e5f2646c
+--- /dev/null
++++ b/tests/validator/test_duplicate_penalty_propagation.py
+@@ -0,0 +1,56 @@
++# The MIT License (MIT)
++# Copyright © 2025 Entrius
++
++"""
++Regression test for #782: penalized_uids returned by
++detect_and_penalize_miners_sharing_github must reach update_scores as
++blacklisted_uids so prior EMA history for duplicate-account cheaters is
++wiped instead of bleeding through alpha-blending.
++"""
++
++from typing import cast
++from unittest.mock import MagicMock
++
++import numpy as np
++
++from gittensor.classes import MinerEvaluation
++from gittensor.validator.oss_contributions.inspections import (
++    detect_and_penalize_miners_sharing_github,
++)
++from neurons.base.validator import BaseValidatorNeuron
++
++
++class _DummyValidator:
++    def __init__(self, scores: np.ndarray, alpha: float = 0.1):
++        self.scores = scores.astype(float, copy=True)
++        self.config = MagicMock()
++        self.config.neuron.moving_average_alpha = alpha
++
++
++def test_detected_duplicates_wipe_prior_ema_via_update_scores():
++    # Prior round: UID 1 and UID 2 posted PRs under the same GitHub account
++    # and accumulated EMA weight. UID 0 is honest. On the unfixed call
++    # pattern (no blacklisted_uids), cheater scores would decay only to
++    # 0.9 * 0.45 = 0.405 via EMA instead of being zeroed.
++    prior = np.array([0.1, 0.45, 0.45])
++    validator = _DummyValidator(scores=prior, alpha=0.1)
++
++    evaluations = {
++        0: MinerEvaluation(uid=0, hotkey='hotkey_0', github_id='gh_honest'),
++        1: MinerEvaluation(uid=1, hotkey='hotkey_1', github_id='gh_shared'),
++        2: MinerEvaluation(uid=2, hotkey='hotkey_2', github_id='gh_shared'),
++    }
++
++    penalized_uids = detect_and_penalize_miners_sharing_github(evaluations)
++
++    BaseValidatorNeuron.update_scores(
++        cast(BaseValidatorNeuron, validator),
++        np.zeros(3),
++        {0, 1, 2},
++        blacklisted_uids=sorted(penalized_uids),
++    )
++
++    assert validator.scores[1] == 0.0
++    assert validator.scores[2] == 0.0
++    assert validator.scores[0] > 0.0
++    assert np.isclose(validator.scores.sum(), 1.0)

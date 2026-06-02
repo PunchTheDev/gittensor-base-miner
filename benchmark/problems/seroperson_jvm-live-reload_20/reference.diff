@@ -1,0 +1,378 @@
+diff --git a/README.md b/README.md
+index 0270950..6b773a6 100644
+--- a/README.md
++++ b/README.md
+@@ -379,6 +379,7 @@ First, let's check the list of available options:
+ | `live.reload.grpc.proxy.tls.cert`   | `LIVE_RELOAD_GRPC_PROXY_TLS_CERT`   | `""`        | Path to a PEM-encoded certificate chain used by the proxy listener (paired with the key below)                                                      |
+ | `live.reload.grpc.proxy.tls.key`    | `LIVE_RELOAD_GRPC_PROXY_TLS_KEY`    | `""`        | Path to a PEM-encoded private key used by the proxy listener (when both this and the cert are set, the proxy listens with TLS instead of plaintext) |
+ | `live.reload.debug`                 | `LIVE_RELOAD_DEBUG`                 | `false`     | Whether to enable/disable debug output                                                                                                              |
++| `live.reload.thread.interrupt.timeout` | `LIVE_RELOAD_THREAD_INTERRUPT_TIMEOUT` | `15000`  | How long (ms) `ThreadInterruptShutdownHook` waits for the application's main thread to exit after `Thread.interrupt()`. If it doesn't, the reload aborts with an unrecoverable error rather than continuing with a stale thread. |
+ 
+ To change variables using build configuration, use the following key for `sbt`:
+ 
+diff --git a/core/build-link/src/main/java/me/seroperson/reload/live/BaseDevServerStart.java b/core/build-link/src/main/java/me/seroperson/reload/live/BaseDevServerStart.java
+index 34699ff..0f99ee5 100644
+--- a/core/build-link/src/main/java/me/seroperson/reload/live/BaseDevServerStart.java
++++ b/core/build-link/src/main/java/me/seroperson/reload/live/BaseDevServerStart.java
+@@ -144,26 +144,35 @@ protected synchronized void startInternal(ReloadGeneration generation) {
+ 
+   /** Stops the currently running application instance. */
+   protected synchronized void stopInternal() {
++    if (appThread == null && classLoader == null) {
++      return;
++    }
++
+     // Perform server-specific cleanup before stopping the application
+     cleanupServerForOldGeneration();
+ 
+-    if (appThread != null) {
+-      logger.debug("Stopping " + mainClass);
+-      runHooks(appThread, classLoader, shutdownHooks);
+-      appThread = null;
+-    }
++    Thread th = appThread;
++    ClassLoader cl = classLoader;
++    appThread = null;
++    classLoader = null;
+ 
+-    if (classLoader != null) {
+-      logger.debug("Cleaning up old ClassLoader");
+-      if (classLoader instanceof Closeable) {
+-        try {
+-          ((Closeable) classLoader).close();
+-        } catch (Exception e) {
+-          logger.error("Failed to close class loader", e);
++    try {
++      if (th != null) {
++        logger.debug("Stopping " + mainClass);
++        runHooks(th, cl, shutdownHooks);
++      }
++    } finally {
++      if (cl != null) {
++        logger.debug("Cleaning up old ClassLoader");
++        if (cl instanceof Closeable) {
++          try {
++            ((Closeable) cl).close();
++          } catch (Exception e) {
++            logger.error("Failed to close class loader", e);
++          }
+         }
++        System.gc();
+       }
+-      classLoader = null;
+-      System.gc();
+     }
+   }
+ 
+diff --git a/core/build-link/src/main/java/me/seroperson/reload/live/hook/ThreadInterruptShutdownHook.java b/core/build-link/src/main/java/me/seroperson/reload/live/hook/ThreadInterruptShutdownHook.java
+index 3d787b4..93ed9ec 100644
+--- a/core/build-link/src/main/java/me/seroperson/reload/live/hook/ThreadInterruptShutdownHook.java
++++ b/core/build-link/src/main/java/me/seroperson/reload/live/hook/ThreadInterruptShutdownHook.java
+@@ -1,5 +1,6 @@
+ package me.seroperson.reload.live.hook;
+ 
++import me.seroperson.reload.live.UnrecoverableException;
+ import me.seroperson.reload.live.build.BuildLogger;
+ import me.seroperson.reload.live.settings.DevServerSettings;
+ 
+@@ -18,11 +19,25 @@ public boolean isAvailable() {
+   @Override
+   public void hook(Thread th, ClassLoader cl, DevServerSettings settings, BuildLogger logger) {
+     th.interrupt();
+-    logger.debug("Waiting thread to finish");
++    long timeoutMs = settings.getThreadInterruptTimeoutMs();
++    logger.debug("Waiting up to " + timeoutMs + "ms for thread to finish");
+     try {
+-      th.join();
++      th.join(timeoutMs);
+     } catch (InterruptedException ex) {
++      Thread.currentThread().interrupt();
+       logger.error("Interrupted during join", ex);
++      return;
++    }
++    if (th.isAlive()) {
++      // main() ignored the interrupt.
++      throw new UnrecoverableException(
++          "Application thread '"
++              + th.getName()
++              + "' did not exit within "
++              + timeoutMs
++              + "ms after interrupt. Configure '"
++              + DevServerSettings.LiveReloadThreadInterruptTimeout
++              + "' to adjust the timeout.");
+     }
+   }
+ }
+diff --git a/core/build-link/src/main/java/me/seroperson/reload/live/settings/DevServerSettings.java b/core/build-link/src/main/java/me/seroperson/reload/live/settings/DevServerSettings.java
+index 825ef1a..f680d88 100644
+--- a/core/build-link/src/main/java/me/seroperson/reload/live/settings/DevServerSettings.java
++++ b/core/build-link/src/main/java/me/seroperson/reload/live/settings/DevServerSettings.java
+@@ -36,6 +36,8 @@ public final class DevServerSettings {
+   public static final String LiveReloadGrpcProxyTlsCert = "live.reload.grpc.proxy.tls.cert";
+   public static final String LiveReloadGrpcProxyTlsKey = "live.reload.grpc.proxy.tls.key";
+   public static final String LiveReloadIsDebug = "live.reload.debug";
++  public static final String LiveReloadThreadInterruptTimeout =
++      "live.reload.thread.interrupt.timeout";
+ 
+   private final Map<String, String> javaOptionProperties;
+   private final Map<String, String> argsProperties;
+@@ -79,6 +81,14 @@ public final class DevServerSettings {
+       new DevParameter<>(
+           LiveReloadIsDebug, "LIVE_RELOAD_DEBUG", false, String::valueOf, Boolean::parseBoolean);
+ 
++  private final DevParameter<Long> threadInterruptTimeoutMs =
++      new DevParameter<>(
++          LiveReloadThreadInterruptTimeout,
++          "LIVE_RELOAD_THREAD_INTERRUPT_TIMEOUT",
++          15000L,
++          String::valueOf,
++          Long::parseLong);
++
+   private final DevParameter<Integer> proxyGrpcPort =
+       new DevParameter<>(
+           LiveReloadProxyGrpcPort,
+@@ -187,6 +197,7 @@ public LinkedHashMap<String, String> getMergedProperties() {
+     grpcProxyTlsCert.putInto(merged);
+     grpcProxyTlsKey.putInto(merged);
+     debug.putInto(merged);
++    threadInterruptTimeoutMs.putInto(merged);
+     return merged;
+   }
+ 
+@@ -244,6 +255,19 @@ public boolean isDebug() {
+     return debug.getValueOrDefault(javaOptionProperties, argsProperties, pluginSettings);
+   }
+ 
++  /**
++   * Maximum time, in milliseconds, that {@code ThreadInterruptShutdownHook} will wait for the
++   * application's main thread to terminate after sending it an interrupt. If the thread is still
++   * alive when the timeout elapses, the hook throws an {@code UnrecoverableException} so the proxy
++   * tears the reload down instead of continuing with a stale thread.
++   *
++   * @return interrupt-join timeout in ms (default: 15000)
++   */
++  public Long getThreadInterruptTimeoutMs() {
++    return threadInterruptTimeoutMs.getValueOrDefault(
++        javaOptionProperties, argsProperties, pluginSettings);
++  }
++
+   /**
+    * Gets the GRPC port for the proxy server.
+    *
+diff --git a/core/webserver/src/main/java/me/seroperson/reload/live/webserver/ReloadHandler.java b/core/webserver/src/main/java/me/seroperson/reload/live/webserver/ReloadHandler.java
+index 120a04a..48f3491 100644
+--- a/core/webserver/src/main/java/me/seroperson/reload/live/webserver/ReloadHandler.java
++++ b/core/webserver/src/main/java/me/seroperson/reload/live/webserver/ReloadHandler.java
+@@ -33,9 +33,13 @@ public void handleRequest(HttpServerExchange httpServerExchange) throws Exceptio
+       logger.debug("Request successfully handled in ReloadHandler. Was reloaded: " + wasReloaded);
+     } catch (UnrecoverableException e) {
+       logger.error("Unrecoverable error during reloading", e);
+-      httpServerExchange.setStatusCode(404);
+-      httpServerExchange.endExchange();
+-      server.close();
++      httpServerExchange.setStatusCode(503);
++      httpServerExchange.getResponseSender().send("dev server stopped");
++      try {
++        server.close();
++      } catch (Exception closeEx) {
++        logger.error("Failed to close dev server after unrecoverable error", closeEx);
++      }
+     } catch (Exception e) {
+       logger.error("Error during reloading", e);
+       httpServerExchange.setStatusCode(500);
+diff --git a/mill/src/DevSettingsKeys.scala b/mill/src/DevSettingsKeys.scala
+index 939a8e2..bb01422 100644
+--- a/mill/src/DevSettingsKeys.scala
++++ b/mill/src/DevSettingsKeys.scala
+@@ -19,5 +19,6 @@ object DevSettingsKeys {
+   val LiveReloadGrpcProxyTlsCert: String = DevServerSettings.LiveReloadGrpcProxyTlsCert
+   val LiveReloadGrpcProxyTlsKey: String = DevServerSettings.LiveReloadGrpcProxyTlsKey
+   val LiveReloadIsDebug: String = DevServerSettings.LiveReloadIsDebug
++  val LiveReloadThreadInterruptTimeout: String = DevServerSettings.LiveReloadThreadInterruptTimeout
+   // format: on
+ }
+diff --git a/sbt/src/main/scala/me/seroperson/reload/live/sbt/LiveKeys.scala b/sbt/src/main/scala/me/seroperson/reload/live/sbt/LiveKeys.scala
+index 4618e0c..e4a829d 100644
+--- a/sbt/src/main/scala/me/seroperson/reload/live/sbt/LiveKeys.scala
++++ b/sbt/src/main/scala/me/seroperson/reload/live/sbt/LiveKeys.scala
+@@ -49,6 +49,7 @@ object LiveKeys {
+     val LiveReloadGrpcProxyTlsCert: String = DevServerSettings.LiveReloadGrpcProxyTlsCert
+     val LiveReloadGrpcProxyTlsKey: String = DevServerSettings.LiveReloadGrpcProxyTlsKey
+     val LiveReloadIsDebug: String = DevServerSettings.LiveReloadIsDebug
++    val LiveReloadThreadInterruptTimeout: String = DevServerSettings.LiveReloadThreadInterruptTimeout
+     // format: on
+   }
+ 
+diff --git a/sbt/src/test/resources/cask-hang/build.sbt b/sbt/src/test/resources/cask-hang/build.sbt
+new file mode 100644
+index 0000000..b059614
+--- /dev/null
++++ b/sbt/src/test/resources/cask-hang/build.sbt
+@@ -0,0 +1,30 @@
++enablePlugins(LiveReloadPlugin)
++enablePlugins(BuildInfoPlugin)
++
++scalaVersion := "2.13.16"
++resolvers += Resolver.mavenLocal
++libraryDependencies ++= Seq(
++  "com.lihaoyi" %% "cask" % "0.9.7"
++)
++
++val isSbt2 = settingKey[Boolean]("isSbt2")
++isSbt2 := (sbtBinaryVersion.value match {
++  case "2" => true
++  case _   => false
++})
++
++val proxyPort = settingKey[Int]("proxyPort")
++proxyPort := sys.props.get("testkit.proxyPort").map(_.toInt).getOrElse(if (isSbt2.value) 9001 else 9000)
++
++val port = settingKey[Int]("port")
++port := sys.props.get("testkit.port").map(_.toInt).getOrElse(if (isSbt2.value) 8081 else 8080)
++
++liveDevSettings := Seq(
++  DevSettingsKeys.LiveReloadProxyHttpPort -> proxyPort.value.toString,
++  DevSettingsKeys.LiveReloadHttpPort -> port.value.toString,
++  DevSettingsKeys.LiveReloadThreadInterruptTimeout -> "1000",
++  DevSettingsKeys.LiveReloadIsDebug -> "true"
++)
++
++buildInfoKeys := Seq[BuildInfoKey](port)
++buildInfoPackage := "me.seroperson"
+diff --git a/sbt/src/test/resources/cask-hang/changes/App.scala.1 b/sbt/src/test/resources/cask-hang/changes/App.scala.1
+new file mode 100644
+index 0000000..a08a30e
+--- /dev/null
++++ b/sbt/src/test/resources/cask-hang/changes/App.scala.1
+@@ -0,0 +1,27 @@
++object App extends cask.MainRoutes {
++
++  override def port: Int = me.seroperson.BuildInfo.port
++
++  @cask.get("/greet_reloaded")
++  def greet() = {
++    "World Hello"
++  }
++
++  @cask.get("/health")
++  def health(request: cask.Request) = {
++    ""
++  }
++
++  initialize()
++
++  override def main(args: Array[String]): Unit = {
++    super.main(args)
++    while (true) {
++      try {
++        Thread.sleep(Long.MaxValue)
++      } catch {
++        case _: InterruptedException => ()
++      }
++    }
++  }
++}
+diff --git a/sbt/src/test/resources/cask-hang/project/plugins.sbt b/sbt/src/test/resources/cask-hang/project/plugins.sbt
+new file mode 100644
+index 0000000..cf36c9e
+--- /dev/null
++++ b/sbt/src/test/resources/cask-hang/project/plugins.sbt
+@@ -0,0 +1,6 @@
++updateOptions := updateOptions.value.withLatestSnapshots(false)
++
++resolvers += Resolver.mavenLocal
++
++addSbtPlugin("me.seroperson" % "sbt-live-reload" % sys.props("project.version"))
++addSbtPlugin("com.eed3si9n" % "sbt-buildinfo" % "0.13.1")
+diff --git a/sbt/src/test/resources/cask-hang/src/main/scala/App.scala b/sbt/src/test/resources/cask-hang/src/main/scala/App.scala
+new file mode 100644
+index 0000000..9d70e3c
+--- /dev/null
++++ b/sbt/src/test/resources/cask-hang/src/main/scala/App.scala
+@@ -0,0 +1,28 @@
++object App extends cask.MainRoutes {
++
++  override def port: Int = me.seroperson.BuildInfo.port
++
++  @cask.get("/greet")
++  def greet() = {
++    "Hello World"
++  }
++
++  @cask.get("/health")
++  def health(request: cask.Request) = {
++    ""
++  }
++
++  initialize()
++
++  override def main(args: Array[String]): Unit = {
++    super.main(args)
++    // Simulate a main thread that never honours an interrupt.
++    while (true) {
++      try {
++        Thread.sleep(Long.MaxValue)
++      } catch {
++        case _: InterruptedException => ()
++      }
++    }
++  }
++}
+diff --git a/sbt/src/test/scala/me/seroperson/reload/live/LiveReloadBase.scala b/sbt/src/test/scala/me/seroperson/reload/live/LiveReloadBase.scala
+index 7903c72..a2e6a0d 100644
+--- a/sbt/src/test/scala/me/seroperson/reload/live/LiveReloadBase.scala
++++ b/sbt/src/test/scala/me/seroperson/reload/live/LiveReloadBase.scala
+@@ -1,5 +1,8 @@
+ package me.seroperson.reload.live
+ 
++import java.io.IOException
++import java.net.InetSocketAddress
++import java.net.Socket
+ import java.net.URI
+ import java.net.http.HttpClient
+ import java.net.http.HttpRequest
+@@ -83,6 +86,20 @@ trait LiveReloadBase extends AnyFunSuite {
+     finally runner.close()
+   }
+ 
++  /** Polls until a TCP connect to `port` is refused, ie. nothing is listening
++    */
++  protected def verifyPortClosed(port: Int): Unit = {
++    pollUntil(s"TCP connect to $port should be refused") {
++      val sock = new Socket()
++      try {
++        sock.connect(new InetSocketAddress("localhost", port), 1000)
++        throw new AssertionError(s"Port $port is still accepting connections")
++      } catch {
++        case _: IOException => ()
++      } finally sock.close()
++    }
++  }
++
+   protected def verifyHttp(
+       path: String,
+       expectedStatus: Int,
+diff --git a/sbt/src/test/scala/me/seroperson/reload/live/LiveReloadSpec.scala b/sbt/src/test/scala/me/seroperson/reload/live/LiveReloadSpec.scala
+index d482d3c..cf5a01b 100644
+--- a/sbt/src/test/scala/me/seroperson/reload/live/LiveReloadSpec.scala
++++ b/sbt/src/test/scala/me/seroperson/reload/live/LiveReloadSpec.scala
+@@ -32,6 +32,19 @@ class LiveReloadSpec extends LiveReloadBase {
+     }
+   }
+ 
++  testEach(
++    "cask - hung main thread triggers unrecoverable shutdown",
++    Seq("2.0.0-RC10")
++  ) { sbtVersion =>
++    withRunner("cask-hang", sbtVersion) { (runner, proxyPort) =>
++      runner.run("bgRun")
++      verifyHttp("greet", 200, Some("Hello World"), proxyPort)
++      runner.copyFile("changes/App.scala.1", "src/main/scala/App.scala")
++      verifyHttp("greet", 503, Some("dev server stopped"), proxyPort)
++      verifyPortClosed(proxyPort)
++    }
++  }
++
+   testEach("http4s - add new file triggers reload") { sbtVersion =>
+     withRunner("http4s-add-new-file", sbtVersion) { (runner, proxyPort) =>
+       runner.run("bgRun")

@@ -1,0 +1,665 @@
+diff --git a/apps/gittensory-extension/auth.js b/apps/gittensory-extension/auth.js
+new file mode 100644
+index 0000000..bc5d7b8
+--- /dev/null
++++ b/apps/gittensory-extension/auth.js
+@@ -0,0 +1,177 @@
++export const DEFAULT_API_ORIGIN = "https://gittensory-api.aethereal.dev";
++export const EXTENSION_SESSION_REQUIRED_MESSAGE = "Set an extension session token in Gittensory extension options.";
++export const EXTENSION_SESSION_EXPIRED_MESSAGE = "Extension session expired or revoked. Create a fresh extension token in Gittensory.";
++
++export const STORAGE_KEYS = {
++  apiOrigin: "apiOrigin",
++  sessionToken: "sessionToken",
++  sessionExpiresAt: "sessionExpiresAt",
++  sessionLogin: "sessionLogin",
++  sessionScopes: "sessionScopes",
++  lastAuthenticatedAt: "lastAuthenticatedAt",
++};
++
++const LOCAL_SESSION_KEYS = [
++  STORAGE_KEYS.sessionToken,
++  STORAGE_KEYS.sessionExpiresAt,
++  STORAGE_KEYS.sessionLogin,
++  STORAGE_KEYS.sessionScopes,
++  STORAGE_KEYS.lastAuthenticatedAt,
++];
++
++const GITHUB_TOKEN_PREFIX_PATTERN = /^(ghp|gho|ghu|ghs|ghr|github_pat)_/i;
++const GITTENSORY_SESSION_PATTERN = /^gts_[a-f0-9]{64}$/i;
++
++export function extensionStorage(chromeLike = globalThis.chrome) {
++  if (!chromeLike?.storage?.local || !chromeLike?.storage?.sync) {
++    throw new Error("Browser extension storage is unavailable.");
++  }
++  return { local: chromeLike.storage.local, sync: chromeLike.storage.sync };
++}
++
++export function normalizeApiOrigin(value) {
++  const raw = typeof value === "string" && value.trim() ? value.trim() : DEFAULT_API_ORIGIN;
++  try {
++    const url = new URL(raw);
++    if (url.protocol !== "https:" && url.hostname !== "localhost" && url.hostname !== "127.0.0.1") {
++      return DEFAULT_API_ORIGIN;
++    }
++    return url.origin;
++  } catch {
++    return DEFAULT_API_ORIGIN;
++  }
++}
++
++export function looksLikeGitHubPersonalAccessToken(value) {
++  return GITHUB_TOKEN_PREFIX_PATTERN.test(String(value ?? "").trim());
++}
++
++export function validateExtensionSessionToken(value) {
++  const token = String(value ?? "").trim();
++  if (!token) throw new Error(EXTENSION_SESSION_REQUIRED_MESSAGE);
++  if (looksLikeGitHubPersonalAccessToken(token)) {
++    throw new Error("GitHub personal access tokens are not accepted. Create a Gittensory extension token instead.");
++  }
++  if (!GITTENSORY_SESSION_PATTERN.test(token)) {
++    throw new Error("Extension tokens must be Gittensory session tokens that start with gts_.");
++  }
++  return token;
++}
++
++export async function loadExtensionSession(storage = extensionStorage()) {
++  const [syncState, localState] = await Promise.all([
++    storage.sync.get([STORAGE_KEYS.apiOrigin, ...LOCAL_SESSION_KEYS]),
++    storage.local.get(LOCAL_SESSION_KEYS),
++  ]);
++  await purgeLegacySyncSession(syncState, storage);
++  const sessionToken = typeof localState.sessionToken === "string" ? localState.sessionToken : "";
++  const expiresAt = typeof localState.sessionExpiresAt === "string" ? localState.sessionExpiresAt : "";
++  const sessionScopes = Array.isArray(localState.sessionScopes)
++    ? localState.sessionScopes.filter((scope) => typeof scope === "string")
++    : [];
++  return {
++    apiOrigin: normalizeApiOrigin(syncState.apiOrigin),
++    sessionToken,
++    expiresAt,
++    login: typeof localState.sessionLogin === "string" ? localState.sessionLogin : "",
++    scopes: sessionScopes,
++    lastAuthenticatedAt: typeof localState.lastAuthenticatedAt === "string" ? localState.lastAuthenticatedAt : "",
++    expired: isExpired(expiresAt),
++  };
++}
++
++export async function saveExtensionApiOrigin(apiOrigin, storage = extensionStorage()) {
++  await storage.sync.set({ [STORAGE_KEYS.apiOrigin]: normalizeApiOrigin(apiOrigin) });
++}
++
++export async function storeExtensionSessionToken(session, storage = extensionStorage()) {
++  const token = validateExtensionSessionToken(session?.token);
++  const next = {
++    [STORAGE_KEYS.sessionToken]: token,
++    [STORAGE_KEYS.sessionExpiresAt]: typeof session?.expiresAt === "string" ? session.expiresAt.trim() : "",
++    [STORAGE_KEYS.sessionLogin]: typeof session?.login === "string" ? session.login.trim() : "",
++    [STORAGE_KEYS.sessionScopes]: Array.isArray(session?.scopes)
++      ? session.scopes.filter((scope) => typeof scope === "string")
++      : [],
++    [STORAGE_KEYS.lastAuthenticatedAt]: new Date().toISOString(),
++  };
++  await storage.local.set(next);
++  await storage.sync.remove(LOCAL_SESSION_KEYS);
++  return next;
++}
++
++export async function clearExtensionSession(storage = extensionStorage()) {
++  await storage.local.remove(LOCAL_SESSION_KEYS);
++  await storage.sync.remove(LOCAL_SESSION_KEYS);
++}
++
++export async function requireUsableExtensionSession(storage = extensionStorage()) {
++  const session = await loadExtensionSession(storage);
++  if (!session.sessionToken) throw new Error(EXTENSION_SESSION_REQUIRED_MESSAGE);
++  if (session.expired) {
++    await clearExtensionSession(storage);
++    throw new Error(EXTENSION_SESSION_EXPIRED_MESSAGE);
++  }
++  return session;
++}
++
++export async function requestPullContext(target, options = {}) {
++  const storage = options.storage ?? extensionStorage();
++  const session = await requireUsableExtensionSession(storage);
++  const url = new URL("/v1/extension/pull-context", session.apiOrigin);
++  url.searchParams.set("owner", target.owner);
++  url.searchParams.set("repo", target.repo);
++  url.searchParams.set("pullNumber", String(target.pullNumber));
++  return fetchExtensionJson(url, session.sessionToken, { ...options, storage });
++}
++
++export async function logoutExtensionSession(options = {}) {
++  const storage = options.storage ?? extensionStorage();
++  const fetchImpl = options.fetchImpl ?? fetch;
++  const session = await loadExtensionSession(storage);
++  if (session.sessionToken && !session.expired) {
++    const url = new URL("/v1/auth/logout", session.apiOrigin);
++    await fetchImpl(url.toString(), {
++      method: "POST",
++      headers: {
++        accept: "application/json",
++        authorization: `Bearer ${session.sessionToken}`,
++      },
++    }).catch(() => undefined);
++  }
++  await clearExtensionSession(storage);
++  return { ok: true };
++}
++
++async function fetchExtensionJson(url, token, options = {}) {
++  const storage = options.storage ?? extensionStorage();
++  const fetchImpl = options.fetchImpl ?? fetch;
++  const response = await fetchImpl(url.toString(), {
++    headers: {
++      accept: "application/json",
++      authorization: `Bearer ${token}`,
++    },
++  });
++  const payload = await response.json().catch(() => ({}));
++  if (response.status === 401 || isExtensionAuthFailure(response.status, payload)) {
++    await clearExtensionSession(storage);
++    throw new Error(EXTENSION_SESSION_EXPIRED_MESSAGE);
++  }
++  if (!response.ok) throw new Error(typeof payload.error === "string" ? payload.error : `${response.status} ${response.statusText}`);
++  return payload;
++}
++
++function isExpired(expiresAt, now = Date.now()) {
++  if (!expiresAt) return false;
++  const time = Date.parse(expiresAt);
++  return Number.isFinite(time) && time <= now;
++}
++
++function isExtensionAuthFailure(status, payload) {
++  if (status !== 403) return false;
++  return ["browser_session_required", "extension_session_required", "insufficient_scope", "unauthorized"].includes(String(payload?.error ?? ""));
++}
++
++async function purgeLegacySyncSession(syncState, storage) {
++  if (LOCAL_SESSION_KEYS.some((key) => syncState[key] !== undefined)) await storage.sync.remove(LOCAL_SESSION_KEYS);
++}
+diff --git a/apps/gittensory-extension/background.js b/apps/gittensory-extension/background.js
+index a3b8f4a..6266b10 100644
+--- a/apps/gittensory-extension/background.js
++++ b/apps/gittensory-extension/background.js
+@@ -1,29 +1,8 @@
+-const DEFAULT_API_ORIGIN = "https://gittensory-api.aethereal.dev";
++import { logoutExtensionSession, requestPullContext } from "./auth.js";
+ 
+ chrome.runtime.onMessage.addListener((message, _sender, sendResponse) => {
+-  if (!message || message.type !== "gittensory:pull-context") return false;
+-  void loadPullContext(message)
+-    .then((payload) => sendResponse({ ok: true, payload }))
+-    .catch((error) => sendResponse({ ok: false, error: error instanceof Error ? error.message : String(error) }));
++  if (!message || !["gittensory:pull-context", "gittensory:logout"].includes(message.type)) return false;
++  const task = message.type === "gittensory:logout" ? logoutExtensionSession() : requestPullContext(message);
++  void task.then((payload) => sendResponse({ ok: true, payload })).catch((error) => sendResponse({ ok: false, error: error instanceof Error ? error.message : String(error) }));
+   return true;
+ });
+-
+-async function loadPullContext(message) {
+-  const settings = await chrome.storage.sync.get(["apiOrigin", "sessionToken"]);
+-  const apiOrigin = String(settings.apiOrigin || DEFAULT_API_ORIGIN).replace(/\/$/, "");
+-  const token = String(settings.sessionToken || "");
+-  if (!token) throw new Error("Set an extension session token in Gittensory extension options.");
+-  const url = new URL(`${apiOrigin}/v1/extension/pull-context`);
+-  url.searchParams.set("owner", message.owner);
+-  url.searchParams.set("repo", message.repo);
+-  url.searchParams.set("pullNumber", String(message.pullNumber));
+-  const response = await fetch(url.toString(), {
+-    headers: {
+-      accept: "application/json",
+-      authorization: `Bearer ${token}`,
+-    },
+-  });
+-  const payload = await response.json().catch(() => ({}));
+-  if (!response.ok) throw new Error(payload.error || `${response.status} ${response.statusText}`);
+-  return payload;
+-}
+diff --git a/apps/gittensory-extension/options.html b/apps/gittensory-extension/options.html
+index 6608838..452b956 100644
+--- a/apps/gittensory-extension/options.html
++++ b/apps/gittensory-extension/options.html
+@@ -39,6 +39,20 @@
+         font-weight: 700;
+         padding: 9px 12px;
+       }
++      button.secondary {
++        border: 1px solid rgba(255, 255, 255, 0.18);
++        background: transparent;
++        color: inherit;
++      }
++      button:disabled {
++        cursor: not-allowed;
++        opacity: 0.55;
++      }
++      .actions {
++        display: flex;
++        flex-wrap: wrap;
++        gap: 8px;
++      }
+       p {
+         color: rgba(244, 247, 245, 0.68);
+       }
+@@ -50,7 +64,7 @@
+   <body>
+     <main>
+       <h1>Gittensory extension</h1>
+-      <p>Paste an extension session token from the Gittensory app. The token is stored in browser sync storage and only sent to the Gittensory API.</p>
++      <p>Paste an extension session token from the Gittensory app. Session tokens stay in browser local storage, are never synced, and GitHub personal access tokens are rejected.</p>
+       <form id="settings">
+         <label>
+           API origin
+@@ -60,7 +74,16 @@ <h1>Gittensory extension</h1>
+           Extension session token
+           <input id="sessionToken" name="sessionToken" type="password" autocomplete="off" />
+         </label>
+-        <button type="submit">Save</button>
++        <label>
++          Expires at
++          <input id="sessionExpiresAt" name="sessionExpiresAt" placeholder="Optional ISO timestamp" autocomplete="off" />
++        </label>
++        <p id="sessionSummary"></p>
++        <div class="actions">
++          <button type="submit">Save</button>
++          <button id="logout" class="secondary" type="button">Log out</button>
++          <button id="clearLocal" class="secondary" type="button">Clear local</button>
++        </div>
+       </form>
+       <p id="status" role="status"></p>
+     </main>
+diff --git a/apps/gittensory-extension/options.js b/apps/gittensory-extension/options.js
+index 22bc44c..d71903b 100644
+--- a/apps/gittensory-extension/options.js
++++ b/apps/gittensory-extension/options.js
+@@ -1,23 +1,80 @@
+-const DEFAULT_API_ORIGIN = "https://gittensory-api.aethereal.dev";
++import {
++  DEFAULT_API_ORIGIN,
++  clearExtensionSession,
++  loadExtensionSession,
++  logoutExtensionSession,
++  saveExtensionApiOrigin,
++  storeExtensionSessionToken,
++} from "./auth.js";
+ 
+ const form = document.querySelector("#settings");
+ const status = document.querySelector("#status");
+ const apiOrigin = document.querySelector("#apiOrigin");
+ const sessionToken = document.querySelector("#sessionToken");
++const sessionExpiresAt = document.querySelector("#sessionExpiresAt");
++const sessionSummary = document.querySelector("#sessionSummary");
++const logout = document.querySelector("#logout");
++const clearLocal = document.querySelector("#clearLocal");
+ 
+-void chrome.storage.sync.get(["apiOrigin", "sessionToken"]).then((settings) => {
+-  apiOrigin.value = settings.apiOrigin || DEFAULT_API_ORIGIN;
+-  sessionToken.value = settings.sessionToken || "";
+-});
++void refreshSettings();
+ 
+ form.addEventListener("submit", async (event) => {
+   event.preventDefault();
+-  await chrome.storage.sync.set({
+-    apiOrigin: apiOrigin.value.trim() || DEFAULT_API_ORIGIN,
+-    sessionToken: sessionToken.value.trim(),
+-  });
+-  status.textContent = "Saved.";
++  try {
++    await saveExtensionApiOrigin(apiOrigin.value.trim() || DEFAULT_API_ORIGIN);
++    const token = sessionToken.value.trim();
++    if (token) {
++      await storeExtensionSessionToken({ token, expiresAt: sessionExpiresAt.value.trim(), scopes: ["extension:pull_context"] });
++    }
++    await refreshSettings();
++    showStatus(token ? "Extension session saved locally." : "Settings saved.");
++  } catch (error) {
++    showStatus(error instanceof Error ? error.message : String(error));
++  }
++});
++
++logout.addEventListener("click", async () => {
++  logout.disabled = true;
++  try {
++    await logoutExtensionSession();
++    await refreshSettings();
++    showStatus("Logged out and cleared the local extension session.");
++  } catch (error) {
++    await clearExtensionSession();
++    await refreshSettings();
++    showStatus(error instanceof Error ? error.message : String(error));
++  } finally {
++    logout.disabled = false;
++  }
++});
++
++clearLocal.addEventListener("click", async () => {
++  await clearExtensionSession();
++  await refreshSettings();
++  showStatus("Local extension session cleared.");
++});
++
++async function refreshSettings() {
++  const settings = await loadExtensionSession();
++  apiOrigin.value = settings.apiOrigin || DEFAULT_API_ORIGIN;
++  sessionToken.value = "";
++  sessionToken.placeholder = settings.sessionToken ? "Stored locally - leave blank to keep current token" : "Paste gts_ extension session token";
++  sessionExpiresAt.value = settings.expiresAt || "";
++  logout.disabled = !settings.sessionToken;
++  clearLocal.disabled = !settings.sessionToken;
++  if (!settings.sessionToken) {
++    sessionSummary.textContent = "No extension session stored.";
++  } else if (settings.expired) {
++    sessionSummary.textContent = "Stored extension session is expired. Save a fresh token or clear local state.";
++  } else {
++    const expires = settings.expiresAt ? ` Expires ${settings.expiresAt}.` : "";
++    sessionSummary.textContent = `Extension session stored in browser local storage.${expires}`;
++  }
++}
++
++function showStatus(message) {
++  status.textContent = message;
+   window.setTimeout(() => {
+     status.textContent = "";
+-  }, 1800);
+-});
++  }, 2600);
++}
+diff --git a/apps/gittensory-ui/public/openapi.json b/apps/gittensory-ui/public/openapi.json
+index cda631c..91a3fe5 100644
+--- a/apps/gittensory-ui/public/openapi.json
++++ b/apps/gittensory-ui/public/openapi.json
+@@ -9317,7 +9317,7 @@
+       "GittensoryBearer": {
+         "type": "http",
+         "scheme": "bearer",
+-        "description": "Static API/MCP token or GitHub device-flow Gittensory session token."
++        "description": "Static API/MCP token, GitHub device-flow Gittensory session token, or extension-scoped Gittensory session token where supported. GitHub personal access tokens are not accepted."
+       },
+       "GittensorySessionCookie": {
+         "type": "apiKey",
+@@ -10998,6 +10998,9 @@
+           },
+           "401": {
+             "description": "Unauthorized"
++          },
++          "403": {
++            "description": "Extension-scoped session required"
+           }
+         },
+         "security": [
+diff --git a/apps/gittensory-ui/src/routes/extension.tsx b/apps/gittensory-ui/src/routes/extension.tsx
+index 81d928f..4e489c0 100644
+--- a/apps/gittensory-ui/src/routes/extension.tsx
++++ b/apps/gittensory-ui/src/routes/extension.tsx
+@@ -105,7 +105,10 @@ function ExtensionPage() {
+         <Callout variant="safety">
+           <strong>Privacy posture.</strong> The extension does not read the PR diff, post comments,
+           or open issues. It calls the same private Gittensory API endpoints you already use, then
+-          renders the response in your local DOM. No analytics SDKs, no third-party trackers.
++          renders the response in your local DOM. Its permission boundary is storage, GitHub PR
++          pages, and the configured Gittensory API origin. Extension tokens are scoped to pull
++          context, stored in browser local storage rather than sync storage, and cleared on logout,
++          expiry, or revoked-session responses. GitHub personal access tokens are rejected.
+         </Callout>
+       </Section>
+     </>
+diff --git a/scripts/build-extension.mjs b/scripts/build-extension.mjs
+index c27be45..c84a5c4 100644
+--- a/scripts/build-extension.mjs
++++ b/scripts/build-extension.mjs
+@@ -18,7 +18,7 @@ rmSync(outDir, { recursive: true, force: true });
+ mkdirSync(outDir, { recursive: true });
+ mkdirSync(dirname(zipPath), { recursive: true });
+ 
+-for (const file of ["manifest.json", "background.js", "content.js", "styles.css", "options.html", "options.js"]) {
++for (const file of ["manifest.json", "auth.js", "background.js", "content.js", "styles.css", "options.html", "options.js"]) {
+   cpSync(resolve(source, file), resolve(outDir, file));
+ }
+ 
+diff --git a/src/api/routes.ts b/src/api/routes.ts
+index dadbdf5..f38da5e 100644
+--- a/src/api/routes.ts
++++ b/src/api/routes.ts
+@@ -776,6 +776,8 @@ export function createApp() {
+   });
+ 
+   app.get("/v1/extension/pull-context", async (c) => {
++    const identity = await authenticateRequestIdentity(c);
++    if (!identity || identity.kind !== "session" || !isExtensionScopedSession(identity)) return c.json({ error: "extension_session_required" }, 403);
+     const owner = c.req.query("owner") ?? "";
+     const repoName = c.req.query("repo") ?? "";
+     const pullNumber = Number(c.req.query("pullNumber") ?? "");
+diff --git a/src/openapi/spec.ts b/src/openapi/spec.ts
+index 86754a7..5c25d20 100644
+--- a/src/openapi/spec.ts
++++ b/src/openapi/spec.ts
+@@ -558,6 +558,7 @@ export function buildOpenApiSpec() {
+       200: { description: "Browser extension PR context overlay payload", content: { "application/json": { schema: z.record(z.unknown()) } } },
+       400: { description: "Invalid pull context query" },
+       401: { description: "Unauthorized" },
++      403: { description: "Extension-scoped session required" },
+     },
+   });
+   registry.registerPath({
+@@ -647,7 +648,7 @@ function applySecurityMetadata(document: GeneratedOpenApiDocument): GeneratedOpe
+       GittensoryBearer: {
+         type: "http",
+         scheme: "bearer",
+-        description: "Static API/MCP token or GitHub device-flow Gittensory session token.",
++        description: "Static API/MCP token, GitHub device-flow Gittensory session token, or extension-scoped Gittensory session token where supported. GitHub personal access tokens are not accepted.",
+       },
+       GittensorySessionCookie: {
+         type: "apiKey",
+diff --git a/test/integration/api.test.ts b/test/integration/api.test.ts
+index 49d301e..a64283b 100644
+--- a/test/integration/api.test.ts
++++ b/test/integration/api.test.ts
+@@ -1,5 +1,5 @@
+ import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+-import { createSessionForGitHubUser } from "../../src/auth/security";
++import { createSessionForGitHubUser, hashToken } from "../../src/auth/security";
+ import {
+   upsertBounty,
+   upsertBurdenForecast,
+@@ -1439,6 +1439,13 @@ describe("api routes", () => {
+     expect(extensionOverview.status).toBe(403);
+     await expect(extensionOverview.json()).resolves.toMatchObject({ error: "insufficient_scope" });
+ 
++    const staticExtensionContext = await app.request("/v1/extension/pull-context?owner=entrius&repo=allways-ui&pullNumber=12", { headers: apiHeaders(env) }, env);
++    expect(staticExtensionContext.status).toBe(403);
++    await expect(staticExtensionContext.json()).resolves.toMatchObject({ error: "extension_session_required" });
++    const fullBrowserSessionExtensionContext = await app.request("/v1/extension/pull-context?owner=entrius&repo=allways-ui&pullNumber=12", { headers: cookieHeaders }, env);
++    expect(fullBrowserSessionExtensionContext.status).toBe(403);
++    await expect(fullBrowserSessionExtensionContext.json()).resolves.toMatchObject({ error: "extension_session_required" });
++
+     const fallbackOriginEnv = createTestEnv({ ADMIN_GITHUB_LOGINS: "oktofeesh1" });
+     delete (fallbackOriginEnv as Partial<Env>).PUBLIC_API_ORIGIN;
+     const { token: noIdToken } = await createSessionForGitHubUser(fallbackOriginEnv, { login: "oktofeesh1" });
+@@ -1481,6 +1488,29 @@ describe("api routes", () => {
+       pullNumber: 99,
+       panels: expect.arrayContaining([expect.objectContaining({ label: "Contributor", badge: "unknown" })]),
+     });
++
++    const expiringExtensionSession = await app.request("/v1/auth/extension/session", { method: "POST", headers: cookieHeaders }, env);
++    expect(expiringExtensionSession.status).toBe(201);
++    const expiringExtensionSessionBody = (await expiringExtensionSession.json()) as { token: string };
++    await env.DB.prepare("update auth_sessions set expires_at = ? where token_hash = ?").bind("2020-01-01T00:00:00.000Z", await hashToken(expiringExtensionSessionBody.token)).run();
++    const expiredExtensionContext = await app.request(
++      "/v1/extension/pull-context?owner=entrius&repo=allways-ui&pullNumber=12",
++      { headers: { authorization: `Bearer ${expiringExtensionSessionBody.token}` } },
++      env,
++    );
++    expect(expiredExtensionContext.status).toBe(401);
++    await expect(expiredExtensionContext.json()).resolves.toMatchObject({ error: "unauthorized" });
++
++    const extensionLogout = await app.request("/v1/auth/logout", { method: "POST", headers: { authorization: `Bearer ${extensionSessionBody.token}` } }, env);
++    expect(extensionLogout.status).toBe(200);
++    await expect(extensionLogout.json()).resolves.toMatchObject({ ok: true, revoked: true });
++    const revokedExtensionContext = await app.request(
++      "/v1/extension/pull-context?owner=entrius&repo=allways-ui&pullNumber=12",
++      { headers: { authorization: `Bearer ${extensionSessionBody.token}` } },
++      env,
++    );
++    expect(revokedExtensionContext.status).toBe(401);
++    await expect(revokedExtensionContext.json()).resolves.toMatchObject({ error: "unauthorized" });
+   });
+ 
+   it("covers live app auth, validation, and internal job queue edge routes", async () => {
+diff --git a/test/unit/extension-auth.test.ts b/test/unit/extension-auth.test.ts
+new file mode 100644
+index 0000000..5201d6f
+--- /dev/null
++++ b/test/unit/extension-auth.test.ts
+@@ -0,0 +1,148 @@
++import { describe, expect, it, vi } from "vitest";
++
++// @ts-expect-error The extension runtime files are plain MV3 JavaScript, intentionally unbundled.
++import * as extensionAuth from "../../apps/gittensory-extension/auth.js";
++
++const {
++  EXTENSION_SESSION_EXPIRED_MESSAGE,
++  loadExtensionSession,
++  logoutExtensionSession,
++  requestPullContext,
++  saveExtensionApiOrigin,
++  storeExtensionSessionToken,
++  validateExtensionSessionToken,
++} = extensionAuth;
++
++const VALID_TOKEN = `gts_${"a".repeat(64)}`;
++
++describe("extension auth storage", () => {
++  it("stores session tokens only in extension local storage and keeps sync storage token-free", async () => {
++    const storage = fakeExtensionStorage({
++      sync: { apiOrigin: "https://gittensory-api.aethereal.dev/ignored/path", sessionToken: "legacy-sync-token" },
++    });
++
++    await saveExtensionApiOrigin("https://api.gittensory.test/v1", storage);
++    await storeExtensionSessionToken(
++      {
++        token: VALID_TOKEN,
++        expiresAt: "2030-01-01T00:00:00.000Z",
++        login: "oktofeesh1",
++        scopes: ["extension:pull_context", 123],
++      },
++      storage,
++    );
++
++    const session = await loadExtensionSession(storage);
++    expect(session).toMatchObject({
++      apiOrigin: "https://api.gittensory.test",
++      sessionToken: VALID_TOKEN,
++      expiresAt: "2030-01-01T00:00:00.000Z",
++      login: "oktofeesh1",
++      scopes: ["extension:pull_context"],
++      expired: false,
++    });
++    expect(storage.sync.dump()).toEqual({ apiOrigin: "https://api.gittensory.test" });
++    expect(storage.local.dump()).toMatchObject({ sessionToken: VALID_TOKEN, sessionScopes: ["extension:pull_context"] });
++  });
++
++  it("rejects GitHub personal access tokens and malformed tokens before storage", async () => {
++    const storage = fakeExtensionStorage();
++
++    expect(() => validateExtensionSessionToken("github_pat_123")).toThrow(/GitHub personal access tokens/i);
++    await expect(storeExtensionSessionToken({ token: "ghp_123" }, storage)).rejects.toThrow(/GitHub personal access tokens/i);
++    await expect(storeExtensionSessionToken({ token: "not-a-gittensory-session" }, storage)).rejects.toThrow(/gts_/i);
++    expect(storage.local.dump()).toEqual({});
++    expect(storage.sync.dump()).toEqual({});
++  });
++
++  it("clears locally expired sessions without calling the API", async () => {
++    const storage = fakeExtensionStorage({
++      sync: { apiOrigin: "https://api.gittensory.test" },
++      local: { sessionToken: VALID_TOKEN, sessionExpiresAt: "2020-01-01T00:00:00.000Z" },
++    });
++    const fetchImpl = vi.fn();
++
++    await expect(requestPullContext({ owner: "JSONbored", repo: "gittensory", pullNumber: 148 }, { storage, fetchImpl })).rejects.toThrow(EXTENSION_SESSION_EXPIRED_MESSAGE);
++
++    expect(fetchImpl).not.toHaveBeenCalled();
++    expect(storage.local.dump()).toEqual({});
++    expect(storage.sync.dump()).toEqual({ apiOrigin: "https://api.gittensory.test" });
++  });
++
++  it("clears revoked or insufficient-scope sessions returned by the API", async () => {
++    const storage = fakeExtensionStorage({
++      sync: { apiOrigin: "https://api.gittensory.test" },
++      local: { sessionToken: VALID_TOKEN, sessionExpiresAt: "2030-01-01T00:00:00.000Z" },
++    });
++    const fetchImpl = vi.fn(async () => jsonResponse(403, { error: "extension_session_required" }));
++
++    await expect(requestPullContext({ owner: "JSONbored", repo: "gittensory", pullNumber: 148 }, { storage, fetchImpl })).rejects.toThrow(EXTENSION_SESSION_EXPIRED_MESSAGE);
++
++    expect(fetchImpl).toHaveBeenCalledWith(
++      "https://api.gittensory.test/v1/extension/pull-context?owner=JSONbored&repo=gittensory&pullNumber=148",
++      expect.objectContaining({ headers: expect.objectContaining({ authorization: `Bearer ${VALID_TOKEN}` }) }),
++    );
++    expect(storage.local.dump()).toEqual({});
++  });
++
++  it("returns public-safe pull context payloads and logs out by revoking then clearing local state", async () => {
++    const storage = fakeExtensionStorage({
++      sync: { apiOrigin: "https://api.gittensory.test" },
++      local: { sessionToken: VALID_TOKEN, sessionExpiresAt: "2030-01-01T00:00:00.000Z" },
++    });
++    const fetchImpl = vi
++      .fn()
++      .mockResolvedValueOnce(jsonResponse(200, { panels: [{ label: "Boundary", rows: [{ k: "public", v: "no" }] }] }))
++      .mockRejectedValueOnce(new Error("already revoked"));
++
++    await expect(requestPullContext({ owner: "JSONbored", repo: "gittensory", pullNumber: 148 }, { storage, fetchImpl })).resolves.toMatchObject({
++      panels: [{ label: "Boundary", rows: [{ k: "public", v: "no" }] }],
++    });
++    await expect(logoutExtensionSession({ storage, fetchImpl })).resolves.toEqual({ ok: true });
++
++    expect(fetchImpl).toHaveBeenLastCalledWith(
++      "https://api.gittensory.test/v1/auth/logout",
++      expect.objectContaining({ method: "POST", headers: expect.objectContaining({ authorization: `Bearer ${VALID_TOKEN}` }) }),
++    );
++    expect(storage.local.dump()).toEqual({});
++    expect(storage.sync.dump()).toEqual({ apiOrigin: "https://api.gittensory.test" });
++  });
++});
++
++function jsonResponse(status: number, body: unknown) {
++  return {
++    ok: status >= 200 && status < 300,
++    status,
++    statusText: status === 200 ? "OK" : "Forbidden",
++    async json() {
++      return body;
++    },
++  };
++}
++
++function fakeExtensionStorage(seed: { local?: Record<string, unknown>; sync?: Record<string, unknown> } = {}) {
++  return {
++    local: fakeStorageArea(seed.local),
++    sync: fakeStorageArea(seed.sync),
++  };
++}
++
++function fakeStorageArea(seed: Record<string, unknown> = {}) {
++  const values = new Map(Object.entries(seed));
++  return {
++    async get(keys?: string | string[]) {
++      if (Array.isArray(keys)) return Object.fromEntries(keys.map((key) => [key, values.get(key)]));
++      if (typeof keys === "string") return { [keys]: values.get(keys) };
++      return Object.fromEntries(values);
++    },
++    async set(next: Record<string, unknown>) {
++      for (const [key, value] of Object.entries(next)) values.set(key, value);
++    },
++    async remove(keys: string | string[]) {
++      for (const key of Array.isArray(keys) ? keys : [keys]) values.delete(key);
++    },
++    dump() {
++      return Object.fromEntries(values);
++    },
++  };
++}

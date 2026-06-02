@@ -1,0 +1,410 @@
+diff --git a/crates/engine/src/game/casting_targets.rs b/crates/engine/src/game/casting_targets.rs
+index b683ff2fd1..b1be227f6b 100644
+--- a/crates/engine/src/game/casting_targets.rs
++++ b/crates/engine/src/game/casting_targets.rs
+@@ -1,6 +1,6 @@
+ use crate::types::ability::{
+-    AbilityCost, AbilityTag, AdditionalCost, Effect, ModalChoice, QuantityExpr, TargetRef,
+-    TargetSelectionMode,
++    AbilityCost, AbilityTag, AdditionalCost, Effect, ModalChoice, QuantityExpr, ResolvedAbility,
++    TargetRef, TargetSelectionMode,
+ };
+ use crate::types::events::GameEvent;
+ use crate::types::game_state::{GameState, PendingCast, StackEntry, StackEntryKind, WaitingFor};
+@@ -206,7 +206,7 @@ pub(crate) fn handle_select_targets(
+     // WaitingFor::DistributeAmong. For non-X spells, extract the fixed total now.
+     // For X-spells, distribution is deferred to after mana payment (engine.rs).
+     if let Some(ref unit) = pending.distribute {
+-        if let Some(total) = extract_fixed_distribution_total(&ability.effect) {
++        if let Some(total) = extract_distribution_total(state, &ability, &ability.effect) {
+             let assigned_targets = flatten_targets_in_chain(&ability);
+             // Store ability + targets on pending_cast for post-distribution resumption.
+             let mut pending_dist = PendingCast::new(
+@@ -495,6 +495,25 @@ pub(super) fn extract_fixed_distribution_total(effect: &Effect) -> Option<u32> {
+     }
+ }
+ 
++/// CR 601.2d + CR 603.3d: Resolve the distribution pool for damage/counter division.
++pub(super) fn extract_distribution_total(
++    state: &GameState,
++    ability: &ResolvedAbility,
++    effect: &Effect,
++) -> Option<u32> {
++    if let Some(fixed) = extract_fixed_distribution_total(effect) {
++        return Some(fixed);
++    }
++    let count_expr = match effect {
++        Effect::DealDamage { amount, .. } => amount,
++        Effect::PutCounter { count, .. } | Effect::AddCounter { count, .. } => count,
++        _ => return None,
++    };
++    let (inner, _) = count_expr.peel_up_to();
++    let total = super::quantity::resolve_quantity_with_targets(state, inner, ability).max(0) as u32;
++    (total > 0).then_some(total)
++}
++
+ /// CR 702.142b + CR 702.177a: If the activated ability at `ability_index` on
+ /// the source object has a keyword ability tag, emit the matching activation
+ /// event so "whenever you activate a [keyword] ability" triggers can see it.
+diff --git a/crates/engine/src/game/engine_stack.rs b/crates/engine/src/game/engine_stack.rs
+index ea5c88e9e7..7176b6808e 100644
+--- a/crates/engine/src/game/engine_stack.rs
++++ b/crates/engine/src/game/engine_stack.rs
+@@ -9,7 +9,7 @@ use super::ability_utils::{
+     assign_selected_slots_in_chain, assign_targets_in_chain, choose_target_for_ability,
+     flatten_targets_in_chain, validate_selected_targets_for_ability, TargetSelectionAdvance,
+ };
+-use super::casting_targets::extract_fixed_distribution_total;
++use super::casting_targets::extract_distribution_total;
+ use super::effects;
+ use super::engine::{resume_pending_continuation_if_priority, EngineError};
+ use super::triggers::PendingTrigger;
+@@ -39,7 +39,9 @@ pub(super) fn finalize_trigger_target_selection(
+     // counters among its targets, the controller announces that division while
+     // putting the ability on the stack, after targets have been chosen.
+     if let Some(unit) = distribute {
+-        if let Some(total) = extract_fixed_distribution_total(&trigger.ability.effect) {
++        if let Some(total) =
++            extract_distribution_total(state, &trigger.ability, &trigger.ability.effect)
++        {
+             if assigned_targets.len() == 1 {
+                 trigger.ability.distribution = Some(vec![(assigned_targets[0].clone(), total)]);
+             } else {
+diff --git a/crates/engine/src/game/triggers.rs b/crates/engine/src/game/triggers.rs
+index 2ddb819272..a7509a5618 100644
+--- a/crates/engine/src/game/triggers.rs
++++ b/crates/engine/src/game/triggers.rs
+@@ -2740,7 +2740,9 @@ fn dispatch_pending_trigger_context(
+                 events_out,
+             );
+             if let Some(unit) = trigger.distribute.clone() {
+-                if let Some(total) = super::casting_targets::extract_fixed_distribution_total(
++                if let Some(total) = super::casting_targets::extract_distribution_total(
++                    state,
++                    &trigger.ability,
+                     &trigger.ability.effect,
+                 ) {
+                     let assigned_targets =
+diff --git a/crates/engine/src/parser/oracle_effect/mod.rs b/crates/engine/src/parser/oracle_effect/mod.rs
+index 63a79a464f..c1a39867c8 100644
+--- a/crates/engine/src/parser/oracle_effect/mod.rs
++++ b/crates/engine/src/parser/oracle_effect/mod.rs
+@@ -12042,6 +12042,105 @@ pub(crate) fn rewrite_event_player_quantity_refs_to_scoped(def: &mut AbilityDefi
+     }
+ }
+ 
++/// True when a trigger's intervening-if references the controller gaining life
++/// this turn (Lathiel / Ocelot Pride class).
++pub(crate) fn trigger_condition_references_controller_life_gained(
++    condition: &crate::types::ability::TriggerCondition,
++) -> bool {
++    use crate::types::ability::TriggerCondition;
++    match condition {
++        TriggerCondition::GainedLife { .. } => true,
++        TriggerCondition::QuantityComparison { lhs, .. } => {
++            quantity_expr_references_controller_life_gained(lhs)
++        }
++        TriggerCondition::And { conditions } | TriggerCondition::Or { conditions } => conditions
++            .iter()
++            .any(trigger_condition_references_controller_life_gained),
++        TriggerCondition::Not { condition } => {
++            trigger_condition_references_controller_life_gained(condition)
++        }
++        _ => false,
++    }
++}
++
++fn quantity_expr_references_controller_life_gained(expr: &QuantityExpr) -> bool {
++    use crate::types::ability::{PlayerScope, QuantityRef};
++    match expr {
++        QuantityExpr::Ref {
++            qty:
++                QuantityRef::LifeGainedThisTurn {
++                    player: PlayerScope::Controller,
++                },
++        } => true,
++        QuantityExpr::Offset { inner, .. }
++        | QuantityExpr::Multiply { inner, .. }
++        | QuantityExpr::DivideRounded { inner, .. }
++        | QuantityExpr::UpTo { max: inner }
++        | QuantityExpr::Power {
++            exponent: inner, ..
++        } => quantity_expr_references_controller_life_gained(inner),
++        QuantityExpr::Sum { exprs } => exprs
++            .iter()
++            .any(quantity_expr_references_controller_life_gained),
++        QuantityExpr::Difference { left, right } => {
++            quantity_expr_references_controller_life_gained(left)
++                || quantity_expr_references_controller_life_gained(right)
++        }
++        _ => false,
++    }
++}
++
++/// CR 609.3 + CR 119.3: "distribute up to that many ..." on end-step life-gain
++/// triggers anaphorizes "that many" to life gained this turn, not
++/// `EventContextAmount` (which has no scalar on a phase trigger).
++pub(crate) fn rewrite_gained_life_that_many_distribution_refs(def: &mut AbilityDefinition) {
++    use crate::types::ability::{PlayerScope, QuantityRef};
++    if def.distribute.is_none() {
++        if let Some(sub) = def.sub_ability.as_mut() {
++            rewrite_gained_life_that_many_distribution_refs(sub);
++        }
++        if let Some(else_branch) = def.else_ability.as_mut() {
++            rewrite_gained_life_that_many_distribution_refs(else_branch);
++        }
++        return;
++    }
++
++    fn rewrite_qty(expr: &mut QuantityExpr) {
++        match expr {
++            QuantityExpr::Ref { qty } if matches!(*qty, QuantityRef::EventContextAmount) => {
++                *qty = QuantityRef::LifeGainedThisTurn {
++                    player: PlayerScope::Controller,
++                };
++            }
++            QuantityExpr::Offset { inner, .. }
++            | QuantityExpr::Multiply { inner, .. }
++            | QuantityExpr::DivideRounded { inner, .. }
++            | QuantityExpr::UpTo { max: inner }
++            | QuantityExpr::Power {
++                exponent: inner, ..
++            } => rewrite_qty(inner),
++            QuantityExpr::Sum { exprs } => {
++                for inner in exprs {
++                    rewrite_qty(inner);
++                }
++            }
++            QuantityExpr::Difference { left, right } => {
++                rewrite_qty(left);
++                rewrite_qty(right);
++            }
++            _ => {}
++        }
++    }
++
++    each_quantity_expr_mut(&mut def.effect, &mut rewrite_qty);
++    if let Some(sub) = def.sub_ability.as_mut() {
++        rewrite_gained_life_that_many_distribution_refs(sub);
++    }
++    if let Some(else_branch) = def.else_ability.as_mut() {
++        rewrite_gained_life_that_many_distribution_refs(else_branch);
++    }
++}
++
+ /// CR 107.1a: Back-apply a rounding mode to every `DivideRounded` in an ability
+ /// tree. Used by `parse_effect_chain_ir` after stripping a trailing
+ /// "Round down each time" / "Round up each time" sentence (Pox Plague), so
+@@ -17678,7 +17777,13 @@ fn try_parse_distribute_counters(lower: &str, text: &str) -> Option<ParsedEffect
+     let (after_lower, _) = tag::<_, _, OracleError<'_>>("distribute ")
+         .parse(lower)
+         .ok()?;
+-    let (count_expr, rest_lower) = super::oracle_util::parse_count_expr(after_lower)?;
++    let (count_expr, rest_lower) =
++        if let Ok((rest, _)) = tag::<_, _, OracleError<'_>>("up to ").parse(after_lower) {
++            let (inner, rest) = super::oracle_util::parse_count_expr(rest)?;
++            (QuantityExpr::up_to(inner), rest)
++        } else {
++            super::oracle_util::parse_count_expr(after_lower)?
++        };
+ 
+     // CR 122.1 + CR 122.1b: shared counter-type combinator handles multi-word
+     // keyword counter names. Keyword counters aren't a printed distribute
+diff --git a/crates/engine/src/parser/oracle_trigger.rs b/crates/engine/src/parser/oracle_trigger.rs
+index b4ce535e0a..2ea1eaece3 100644
+--- a/crates/engine/src/parser/oracle_trigger.rs
++++ b/crates/engine/src/parser/oracle_trigger.rs
+@@ -862,6 +862,17 @@ pub(crate) fn lower_trigger_ir(ir: &TriggerIr) -> TriggerDefinition {
+         (None, None) => None,
+     };
+ 
++    // CR 603.4: Intervening-if life-gain triggers check the gained-life
++    // condition when they trigger and resolve, so "that many" distribution
++    // references bind to the same turn-scoped life-gain quantity.
++    if def.condition.as_ref().is_some_and(
++        crate::parser::oracle_effect::trigger_condition_references_controller_life_gained,
++    ) {
++        if let Some(ability) = def.execute.as_deref_mut() {
++            crate::parser::oracle_effect::rewrite_gained_life_that_many_distribution_refs(ability);
++        }
++    }
++
+     // CR 109.4 + CR 603.7c: Surface TargetFilter::Player when execute
+     // references ControllerRef::TargetPlayer.
+     if def.valid_target.is_none() {
+diff --git a/crates/engine/tests/integration/lathiel_end_step_counters_repro.rs b/crates/engine/tests/integration/lathiel_end_step_counters_repro.rs
+new file mode 100644
+index 0000000000..1a86474eb8
+--- /dev/null
++++ b/crates/engine/tests/integration/lathiel_end_step_counters_repro.rs
+@@ -0,0 +1,104 @@
++//! Issue #1610: Lathiel, the Bounteous Dawn end-step distributed +1/+1 counters
++//! from life gained this turn.
++//!
++//! Oracle: "Lifelink. At the beginning of each end step, if you gained life this
++//! turn, distribute up to that many +1/+1 counters among any number of other
++//! target creatures."
++
++use super::rules::{run_combat, GameScenario, Phase, WaitingFor, P0, P1};
++use engine::types::ability::TargetRef;
++use engine::types::actions::GameAction;
++use engine::types::counter::CounterType;
++use engine::types::game_state::DistributionUnit;
++use engine::types::identifiers::ObjectId;
++
++const LATHIEL_ORACLE: &str = "Lifelink\nAt the beginning of each end step, if you gained life this turn, distribute up to that many +1/+1 counters among any number of other target creatures.";
++
++fn advance_to_end_step_trigger(runner: &mut super::rules::GameRunner) {
++    for _ in 0..80 {
++        match runner.state().waiting_for.clone() {
++            WaitingFor::TriggerTargetSelection { .. }
++            | WaitingFor::TargetSelection { .. }
++            | WaitingFor::DistributeAmong { .. } => return,
++            WaitingFor::Priority { .. } => {
++                if runner.act(GameAction::PassPriority).is_err() {
++                    return;
++                }
++            }
++            other => panic!("unexpected waiting state before end-step trigger: {other:?}"),
++        }
++    }
++    panic!("phase machine did not reach the end-step trigger");
++}
++
++fn p1p1_counters(runner: &super::rules::GameRunner, id: ObjectId) -> u32 {
++    runner
++        .state()
++        .objects
++        .get(&id)
++        .expect("object still present")
++        .counters
++        .get(&CounterType::Plus1Plus1)
++        .copied()
++        .unwrap_or(0)
++}
++
++#[test]
++fn lathiel_end_step_distributes_counters_from_lifelink_gain() {
++    let mut scenario = GameScenario::new();
++    scenario.at_phase(Phase::PreCombatMain);
++
++    let lathiel = scenario
++        .add_creature_from_oracle(P0, "Lathiel, the Bounteous Dawn", 2, 2, LATHIEL_ORACLE)
++        .id();
++    let receiver = scenario.add_creature(P0, "Receiver", 1, 1).id();
++    scenario.add_creature(P1, "Blocker", 3, 3);
++
++    let mut runner = scenario.build();
++    let life_before = runner.life(P0);
++
++    run_combat(&mut runner, vec![lathiel], vec![]);
++
++    assert_eq!(runner.life(P0), life_before + 2);
++    assert_eq!(runner.state().players[0].life_gained_this_turn, 2);
++
++    advance_to_end_step_trigger(&mut runner);
++
++    // Choose the receiver as the only distributed target.
++    let mut guard = 0;
++    while matches!(
++        runner.state().waiting_for,
++        WaitingFor::TriggerTargetSelection { .. } | WaitingFor::TargetSelection { .. }
++    ) {
++        guard += 1;
++        assert!(guard < 10, "target selection did not terminate");
++        runner
++            .act(GameAction::ChooseTarget {
++                target: Some(TargetRef::Object(receiver)),
++            })
++            .expect("ChooseTarget should succeed");
++    }
++
++    match &runner.state().waiting_for {
++        WaitingFor::DistributeAmong {
++            total,
++            unit: DistributionUnit::Counters(_),
++            ..
++        } => assert_eq!(*total, 2, "distribution pool must equal life gained"),
++        other => panic!("expected DistributeAmong after targets, got {other:?}"),
++    }
++
++    runner
++        .act(GameAction::DistributeAmong {
++            distribution: vec![(TargetRef::Object(receiver), 2)],
++        })
++        .expect("DistributeAmong should succeed");
++
++    runner.advance_until_stack_empty();
++
++    assert_eq!(
++        p1p1_counters(&runner, receiver),
++        2,
++        "Lathiel must distribute exactly 2 +1/+1 counters (= life gained via lifelink)"
++    );
++}
+diff --git a/crates/engine/tests/integration/main.rs b/crates/engine/tests/integration/main.rs
+index aea8c1d715..12e005a3ff 100644
+--- a/crates/engine/tests/integration/main.rs
++++ b/crates/engine/tests/integration/main.rs
+@@ -65,6 +65,7 @@ mod json_smoke_test;
+ mod kaito_integration;
+ mod kodama_anti_recursion_intervening_if;
+ mod krark_clan_ironworks_castability;
++mod lathiel_end_step_counters_repro;
+ mod leyline_taps_for_mana_repro;
+ mod liliana_waker_cross_scope_decline;
+ mod louisoix_sacrifice_counter;
+diff --git a/crates/mtgish-import/src/convert/action.rs b/crates/mtgish-import/src/convert/action.rs
+index 0efff7b88d..eacc267066 100644
+--- a/crates/mtgish-import/src/convert/action.rs
++++ b/crates/mtgish-import/src/convert/action.rs
+@@ -1362,36 +1362,25 @@ fn distributed_target_to_target_filter(
+         });
+     };
+ 
+-    let fixed_max = |n: &GameNumber, idiom: &'static str| -> ConvResult<usize> {
+-        match quantity::convert(n)? {
+-            QuantityExpr::Fixed { value } if value >= 0 => Ok(value as usize),
+-            other => Err(ConversionGap::EnginePrerequisiteMissing {
+-                engine_type: "MultiTargetSpec",
+-                needed_variant: format!("{idiom} dynamic target count: {other:?}"),
+-            }),
+-        }
++    let dynamic_max = |n: &GameNumber, min: usize| -> ConvResult<MultiTargetSpec> {
++        let max = quantity::convert(n)?;
++        Ok(MultiTargetSpec::bounded(min, max))
+     };
+ 
+     match target {
+-        DistributedTarget::BetweenOneAndNumberAnyTargets(n) => Ok((
+-            TargetFilter::Any,
+-            MultiTargetSpec::fixed(1, fixed_max(n, "BetweenOneAndNumberAnyTargets")?),
+-        )),
+-        DistributedTarget::UptoNumberAnyTargets(n) => Ok((
+-            TargetFilter::Any,
+-            MultiTargetSpec::fixed(0, fixed_max(n, "UptoNumberAnyTargets")?),
+-        )),
++        DistributedTarget::BetweenOneAndNumberAnyTargets(n) => {
++            Ok((TargetFilter::Any, dynamic_max(n, 1)?))
++        }
++        DistributedTarget::UptoNumberAnyTargets(n) => Ok((TargetFilter::Any, dynamic_max(n, 0)?)),
+         DistributedTarget::AnyNumberOfAnyTargets => {
+             Ok((TargetFilter::Any, MultiTargetSpec::unlimited(1)))
+         }
+-        DistributedTarget::BetweenOneAndNumberTargetPermanents(n, permanents) => Ok((
+-            convert_permanents(permanents)?,
+-            MultiTargetSpec::fixed(1, fixed_max(n, "BetweenOneAndNumberTargetPermanents")?),
+-        )),
+-        DistributedTarget::UptoNumberTargetPermanents(n, permanents) => Ok((
+-            convert_permanents(permanents)?,
+-            MultiTargetSpec::fixed(0, fixed_max(n, "UptoNumberTargetPermanents")?),
+-        )),
++        DistributedTarget::BetweenOneAndNumberTargetPermanents(n, permanents) => {
++            Ok((convert_permanents(permanents)?, dynamic_max(n, 1)?))
++        }
++        DistributedTarget::UptoNumberTargetPermanents(n, permanents) => {
++            Ok((convert_permanents(permanents)?, dynamic_max(n, 0)?))
++        }
+         DistributedTarget::AnyNumberOfTargetPermanents(permanents) => Ok((
+             convert_permanents(permanents)?,
+             MultiTargetSpec::unlimited(1),

@@ -1,0 +1,679 @@
+diff --git a/app/src/main/java/dev/touchpilot/app/androidcontrol/AccessibilityBridge.kt b/app/src/main/java/dev/touchpilot/app/androidcontrol/AccessibilityBridge.kt
+index a4ce4d0..c298bc8 100644
+--- a/app/src/main/java/dev/touchpilot/app/androidcontrol/AccessibilityBridge.kt
++++ b/app/src/main/java/dev/touchpilot/app/androidcontrol/AccessibilityBridge.kt
+@@ -59,6 +59,11 @@ object AccessibilityBridge {
+         return service?.scroll(forward = false) ?: false
+     }
+ 
++    fun scrollNode(nodeId: String, forward: Boolean): Boolean {
++        if (nodeId.isBlank()) return false
++        return service?.scrollNode(nodeId, forward) ?: false
++    }
++
+     fun pressBack(): Boolean {
+         return service?.pressBack() ?: false
+     }
+diff --git a/app/src/main/java/dev/touchpilot/app/androidcontrol/TouchPilotAccessibilityService.kt b/app/src/main/java/dev/touchpilot/app/androidcontrol/TouchPilotAccessibilityService.kt
+index b9ae04d..91fe92d 100644
+--- a/app/src/main/java/dev/touchpilot/app/androidcontrol/TouchPilotAccessibilityService.kt
++++ b/app/src/main/java/dev/touchpilot/app/androidcontrol/TouchPilotAccessibilityService.kt
+@@ -93,11 +93,7 @@ class TouchPilotAccessibilityService : AccessibilityService() {
+ 
+     fun scroll(forward: Boolean): Boolean {
+         val root = rootInActiveWindow ?: return false
+-        val action = if (forward) {
+-            AccessibilityNodeInfo.ACTION_SCROLL_FORWARD
+-        } else {
+-            AccessibilityNodeInfo.ACTION_SCROLL_BACKWARD
+-        }
++        val action = scrollAction(forward)
+ 
+         val scrollable = findNode(root) { candidate ->
+             candidate.isScrollable || candidate.actionList.any { it.id == action }
+@@ -106,6 +102,31 @@ class TouchPilotAccessibilityService : AccessibilityService() {
+         return scrollable.performAction(action)
+     }
+ 
++    fun scrollNode(nodeId: String, forward: Boolean): Boolean {
++        val root = rootInActiveWindow ?: return false
++        val target = findNodeById(root, nodeId) ?: return false
++        val action = scrollAction(forward)
++        // Walk up the tree until we find an ancestor that actually accepts the
++        // scroll action. Some apps mark a list item as scrollable through its
++        // parent ListView/RecyclerView rather than on the item itself.
++        var current: AccessibilityNodeInfo? = target
++        while (current != null) {
++            if (current.isScrollable || current.actionList.any { it.id == action }) {
++                return current.performAction(action)
++            }
++            current = current.parent
++        }
++        return false
++    }
++
++    private fun scrollAction(forward: Boolean): Int {
++        return if (forward) {
++            AccessibilityNodeInfo.ACTION_SCROLL_FORWARD
++        } else {
++            AccessibilityNodeInfo.ACTION_SCROLL_BACKWARD
++        }
++    }
++
+     fun pressBack(): Boolean {
+         return performGlobalAction(GLOBAL_ACTION_BACK)
+     }
+diff --git a/app/src/main/java/dev/touchpilot/app/tools/AndroidToolExecutor.kt b/app/src/main/java/dev/touchpilot/app/tools/AndroidToolExecutor.kt
+index ca1914d..f7037da 100644
+--- a/app/src/main/java/dev/touchpilot/app/tools/AndroidToolExecutor.kt
++++ b/app/src/main/java/dev/touchpilot/app/tools/AndroidToolExecutor.kt
+@@ -9,6 +9,9 @@ import dev.touchpilot.app.security.PolicyDecision
+ import dev.touchpilot.app.security.SensitiveTextRedactor
+ import dev.touchpilot.app.security.ToolPolicyRequest
+ import dev.touchpilot.app.security.ToolSource
++import dev.touchpilot.app.tools.targets.ScrollResolution
++import dev.touchpilot.app.tools.targets.ScrollResolver
++import dev.touchpilot.app.tools.targets.ScrollTarget
+ import dev.touchpilot.app.tools.targets.TargetResolutionResult
+ import dev.touchpilot.app.tools.targets.TargetResolver
+ import dev.touchpilot.app.tools.targets.TargetSelector
+@@ -17,7 +20,8 @@ import dev.touchpilot.app.tools.targets.TypeTextTarget
+ class AndroidToolExecutor(
+     private val context: Context,
+     private val policy: DefaultActionPolicy = DefaultActionPolicy(),
+-    private val targetResolver: TargetResolver = TargetResolver()
++    private val targetResolver: TargetResolver = TargetResolver(),
++    private val scrollResolver: ScrollResolver = ScrollResolver(targetResolver)
+ ) {
+     fun execute(
+         name: String,
+@@ -112,14 +116,7 @@ class AndroidToolExecutor(
+                 executeTypeText(args)
+             }
+             "scroll" -> {
+-                val direction = args["direction"].orEmpty()
+-                val ok = if (direction.equals("backward", ignoreCase = true)) {
+-                    AccessibilityBridge.scrollBackward()
+-                } else {
+-                    AccessibilityBridge.scrollForward()
+-                }
+-                record(name, "direction=\"$direction\"", ok, "scroll")
+-                ToolResult(ok, "scroll")
++                executeScroll(args)
+             }
+             "press_back" -> {
+                 val ok = AccessibilityBridge.pressBack()
+@@ -209,6 +206,137 @@ class AndroidToolExecutor(
+         }
+     }
+ 
++    private fun executeScroll(args: Map<String, String>): ToolResult {
++        val direction = args[ScrollTarget.DirectionArg].orEmpty()
++        val backward = ScrollTarget.isBackward(direction)
++        val forward = !backward
++        val hasTarget = ScrollTarget.hasTarget(args)
++        val selector = if (hasTarget) ScrollTarget.selectorFromArgs(args) else null
++
++        val beforeContext = AccessibilityBridge.observeScreenContext()
++        val resolution = scrollResolver.resolve(beforeContext, selector)
++
++        return when (resolution) {
++            is ScrollResolution.Resolved -> {
++                val node = resolution.node
++                val nodeId = node.nodeId
++                if (nodeId.isNullOrBlank()) {
++                    val message = "Resolved scroll target has no stable node id"
++                    record("scroll", scrollLogArgs(direction, "resolved_no_id"), false, message)
++                    return ToolResult(
++                        ok = false,
++                        message = message,
++                        data = mapOf("target" to resolution.selector.toRedactedJson())
++                    )
++                }
++                val attempted = AccessibilityBridge.scrollNode(nodeId, forward)
++                val verification = verifyScreenChanged(beforeContext, attempted)
++                val message = when {
++                    !attempted -> "Unable to perform scroll on resolved container"
++                    !verification.changed -> "Scroll performed but screen did not change"
++                    else -> "scroll"
++                }
++                val ok = attempted && verification.changed
++                record(
++                    "scroll",
++                    scrollLogArgs(direction, "node_id=$nodeId"),
++                    ok,
++                    message
++                )
++                ToolResult(
++                    ok = ok,
++                    message = message,
++                    data = mapOf(
++                        "node_id" to nodeId,
++                        "direction" to if (forward) "forward" else "backward",
++                        "confidence" to resolution.confidence.toString(),
++                        "screen_changed" to verification.changed.toString(),
++                    )
++                )
++            }
++            is ScrollResolution.Ambiguous -> {
++                val message = "Ambiguous scroll target: ${resolution.reason}"
++                record("scroll", scrollLogArgs(direction, "ambiguous"), false, message)
++                ToolResult(
++                    ok = false,
++                    message = message,
++                    data = mapOf("candidate_count" to resolution.candidates.size.toString())
++                )
++            }
++            is ScrollResolution.NotFound -> {
++                val message = "Scroll target not found: ${resolution.reason}"
++                record("scroll", scrollLogArgs(direction, "not_found"), false, message)
++                ToolResult(
++                    ok = false,
++                    message = message,
++                    data = mapOf("debug_context" to resolution.debugContext)
++                )
++            }
++            is ScrollResolution.NoScrollable -> {
++                record("scroll", scrollLogArgs(direction, "no_scrollable"), false, resolution.reason)
++                ToolResult(
++                    ok = false,
++                    message = resolution.reason,
++                    data = mapOf("debug_context" to resolution.debugContext)
++                )
++            }
++            is ScrollResolution.DirectionOnly -> {
++                val attempted = if (backward) {
++                    AccessibilityBridge.scrollBackward()
++                } else {
++                    AccessibilityBridge.scrollForward()
++                }
++                val verification = verifyScreenChanged(beforeContext, attempted)
++                val message = when {
++                    !attempted -> "Unable to perform direction-only scroll"
++                    !verification.changed -> "Scroll performed but screen did not change"
++                    else -> "scroll"
++                }
++                val ok = attempted && verification.changed
++                record(
++                    "scroll",
++                    scrollLogArgs(direction, "direction_only=${resolution.scrollableCount}"),
++                    ok,
++                    message
++                )
++                ToolResult(
++                    ok = ok,
++                    message = message,
++                    data = mapOf(
++                        "direction" to if (forward) "forward" else "backward",
++                        "scrollable_count" to resolution.scrollableCount.toString(),
++                        "screen_changed" to verification.changed.toString(),
++                    )
++                )
++            }
++        }
++    }
++
++    private fun verifyScreenChanged(
++        beforeContext: dev.touchpilot.app.screen.ScreenContext,
++        scrollAttempted: Boolean
++    ): ScrollVerification {
++        if (!scrollAttempted) return ScrollVerification(changed = false)
++        AccessibilityBridge.waitForIdle(ActionIdleTimeoutMs)
++        val after = AccessibilityBridge.observeScreenContext()
++        val changed = !sameSnapshot(beforeContext, after)
++        return ScrollVerification(changed = changed)
++    }
++
++    private fun sameSnapshot(
++        a: dev.touchpilot.app.screen.ScreenContext,
++        b: dev.touchpilot.app.screen.ScreenContext
++    ): Boolean {
++        if (a.nodes.size != b.nodes.size) return false
++        return a.toRedactedJson() == b.toRedactedJson()
++    }
++
++    private fun scrollLogArgs(direction: String, target: String): String {
++        return "direction=\"$direction\", target=$target"
++    }
++
++    private data class ScrollVerification(val changed: Boolean)
++
+     private fun typeTextLogArgs(text: String, selector: TargetSelector): String {
+         val label = selector.text?.displaySafe
+             ?: selector.contentDescription?.displaySafe
+diff --git a/app/src/main/java/dev/touchpilot/app/tools/ToolModels.kt b/app/src/main/java/dev/touchpilot/app/tools/ToolModels.kt
+index b9bac28..8515026 100644
+--- a/app/src/main/java/dev/touchpilot/app/tools/ToolModels.kt
++++ b/app/src/main/java/dev/touchpilot/app/tools/ToolModels.kt
+@@ -1,5 +1,6 @@
+ package dev.touchpilot.app.tools
+ 
++import dev.touchpilot.app.tools.targets.ScrollTarget
+ import dev.touchpilot.app.tools.targets.TypeTextTarget
+ 
+ enum class ToolRisk {
+@@ -64,9 +65,17 @@ object AndroidToolCatalog {
+         ),
+         ToolSpec(
+             name = "scroll",
+-            description = "Scroll the active screen forward or backward.",
++            description = "Scroll a specific container or the active screen forward or backward.",
+             risk = ToolRisk.MEDIUM,
+-            arguments = mapOf("direction" to "forward or backward.")
++            arguments = mapOf(
++                "direction" to "forward or backward.",
++                ScrollTarget.TargetTextArg to "Visible text of the scrollable container to scroll.",
++                ScrollTarget.TargetNodeIdArg to "Container node_id from observe_screen.",
++                ScrollTarget.TargetBoundsArg to "Container bounds from observe_screen as left,top,right,bottom.",
++                ScrollTarget.TargetViewIdArg to "Container viewIdResourceName from observe_screen.",
++                ScrollTarget.TargetContentDescriptionArg to "Container content description.",
++            ),
++            requiredArguments = setOf("direction")
+         ),
+         ToolSpec(
+             name = "press_back",
+@@ -137,6 +146,13 @@ object AndroidToolCatalog {
+             ) {
+                 return "Invalid scroll direction: $direction"
+             }
++            val malformedBounds = args[ScrollTarget.TargetBoundsArg]
++                ?.takeIf { it.isNotBlank() }
++                ?.let { dev.touchpilot.app.tools.targets.TargetBounds.parse(it) == null }
++                ?: false
++            if (malformedBounds) {
++                return "target_bounds must be left,top,right,bottom"
++            }
+         }
+ 
+         val timeout = args["timeout_ms"]
+diff --git a/app/src/main/java/dev/touchpilot/app/tools/targets/ScrollResolver.kt b/app/src/main/java/dev/touchpilot/app/tools/targets/ScrollResolver.kt
+new file mode 100644
+index 0000000..d36bd17
+--- /dev/null
++++ b/app/src/main/java/dev/touchpilot/app/tools/targets/ScrollResolver.kt
+@@ -0,0 +1,103 @@
++package dev.touchpilot.app.tools.targets
++
++import dev.touchpilot.app.screen.ScreenContext
++import dev.touchpilot.app.screen.ScreenNode
++
++/**
++ * Resolves a scroll request against the current [ScreenContext] for issue #80.
++ *
++ * Two flows:
++ *
++ * 1. **Targeted scroll** — when the caller passes a [TargetSelector] the
++ *    resolver narrows the candidate set to scrollable nodes only and reuses
++ *    [TargetResolver] for the existing identity/text/bounds scoring. This
++ *    keeps the scoring consistent with tap/type_text and avoids re-inventing
++ *    ranking rules.
++ *
++ * 2. **Direction-only fallback** — when the selector is empty the resolver
++ *    inspects [ScreenContext.scrollableNodes] only to decide whether the
++ *    existing direction-only behavior can run at all. If no scrollable node
++ *    is visible it returns [ScrollResolution.NoScrollable] so the tool layer
++ *    can surface an explicit failure rather than silently scrolling nothing.
++ */
++class ScrollResolver(
++    private val targetResolver: TargetResolver = TargetResolver(),
++) {
++    fun resolve(context: ScreenContext, selector: TargetSelector?): ScrollResolution {
++        val scrollables = context.scrollableNodes
++
++        if (selector == null || selector.isEmpty) {
++            return if (scrollables.isEmpty()) {
++                ScrollResolution.NoScrollable(
++                    reason = "No scrollable container is visible on the current screen.",
++                    debugContext = directionOnlyDebug(context),
++                )
++            } else {
++                ScrollResolution.DirectionOnly(scrollables.size)
++            }
++        }
++
++        if (scrollables.isEmpty()) {
++            return ScrollResolution.NoScrollable(
++                reason = "No scrollable container is visible on the current screen.",
++                debugContext = directionOnlyDebug(context),
++            )
++        }
++
++        val scrollableContext = context.copy(nodes = scrollables)
++        return when (val resolution = targetResolver.resolve(scrollableContext, selector)) {
++            is TargetResolutionResult.Resolved -> ScrollResolution.Resolved(
++                node = resolution.candidate.node,
++                selector = resolution.candidate.selector,
++                confidence = resolution.candidate.confidence,
++                matchReasons = resolution.candidate.matchReasons,
++            )
++            is TargetResolutionResult.Ambiguous -> ScrollResolution.Ambiguous(
++                reason = resolution.reason,
++                candidates = resolution.candidates,
++            )
++            is TargetResolutionResult.NotFound -> ScrollResolution.NotFound(
++                reason = resolution.reason,
++                debugContext = resolution.debugContext,
++                rejectedCandidates = resolution.rejectedCandidates,
++            )
++        }
++    }
++
++    private fun directionOnlyDebug(context: ScreenContext): String {
++        val screenName = context.appLabel ?: context.windowTitle ?: context.packageName ?: "current screen"
++        return "No scrollable nodes among ${context.nodes.size} node(s) on $screenName."
++    }
++}
++
++sealed class ScrollResolution {
++    /** A specific scrollable node matched the selector and should be used. */
++    data class Resolved(
++        val node: ScreenNode,
++        val selector: TargetSelector,
++        val confidence: Float,
++        val matchReasons: List<String>,
++    ) : ScrollResolution()
++
++    /** Multiple scrollable nodes tied at the same confidence. */
++    data class Ambiguous(
++        val reason: String,
++        val candidates: List<TargetCandidate>,
++    ) : ScrollResolution()
++
++    /** A selector was provided but no scrollable node matched. */
++    data class NotFound(
++        val reason: String,
++        val debugContext: String,
++        val rejectedCandidates: List<TargetCandidate> = emptyList(),
++    ) : ScrollResolution()
++
++    /** No selector provided and at least one scrollable container exists. */
++    data class DirectionOnly(val scrollableCount: Int) : ScrollResolution()
++
++    /** No scrollable node is visible — the tool layer must fail explicitly. */
++    data class NoScrollable(
++        val reason: String,
++        val debugContext: String,
++    ) : ScrollResolution()
++}
+diff --git a/app/src/main/java/dev/touchpilot/app/tools/targets/ScrollTarget.kt b/app/src/main/java/dev/touchpilot/app/tools/targets/ScrollTarget.kt
+new file mode 100644
+index 0000000..a4d0e91
+--- /dev/null
++++ b/app/src/main/java/dev/touchpilot/app/tools/targets/ScrollTarget.kt
+@@ -0,0 +1,48 @@
++package dev.touchpilot.app.tools.targets
++
++/**
++ * Argument-name conventions for the hardened `scroll` tool.
++ *
++ * Mirrors [TypeTextTarget] so callers (intent gate, local model, manual chat
++ * commands) can supply a structured target selector alongside the existing
++ * `direction` argument. When none of the [selectorArgs] are present the tool
++ * falls back to direction-only behavior, preserving the original contract.
++ */
++object ScrollTarget {
++    const val DirectionArg = "direction"
++    const val TargetTextArg = "target_text"
++    const val TargetNodeIdArg = "target_node_id"
++    const val TargetBoundsArg = "target_bounds"
++    const val TargetViewIdArg = "target_view_id"
++    const val TargetContentDescriptionArg = "target_content_description"
++
++    val selectorArgs: List<String> = listOf(
++        TargetTextArg,
++        TargetNodeIdArg,
++        TargetBoundsArg,
++        TargetViewIdArg,
++        TargetContentDescriptionArg,
++    )
++
++    fun hasTarget(args: Map<String, String>): Boolean {
++        return selectorArgs.any { !args[it].isNullOrBlank() }
++    }
++
++    fun selectorFromArgs(args: Map<String, String>): TargetSelector {
++        return TargetSelector(
++            text = args[TargetTextArg]?.takeIf { it.isNotBlank() }?.let { SelectorText.of(it) },
++            contentDescription = args[TargetContentDescriptionArg]
++                ?.takeIf { it.isNotBlank() }
++                ?.let { SelectorText.of(it) },
++            nodeId = args[TargetNodeIdArg]?.takeIf { it.isNotBlank() },
++            bounds = args[TargetBoundsArg]?.takeIf { it.isNotBlank() }?.let { TargetBounds.parse(it) },
++            viewIdResourceName = args[TargetViewIdArg]?.takeIf { it.isNotBlank() },
++            role = TargetRole.SCROLLABLE,
++            source = SelectorSource.AGENT,
++        )
++    }
++
++    fun isBackward(direction: String?): Boolean {
++        return direction.equals("backward", ignoreCase = true)
++    }
++}
+diff --git a/app/src/test/java/dev/touchpilot/app/tools/targets/ScrollResolverTest.kt b/app/src/test/java/dev/touchpilot/app/tools/targets/ScrollResolverTest.kt
+new file mode 100644
+index 0000000..6e8d4c2
+--- /dev/null
++++ b/app/src/test/java/dev/touchpilot/app/tools/targets/ScrollResolverTest.kt
+@@ -0,0 +1,158 @@
++package dev.touchpilot.app.tools.targets
++
++import dev.touchpilot.app.screen.NodeBounds
++import dev.touchpilot.app.screen.NodeRole
++import dev.touchpilot.app.screen.ScreenContext
++import dev.touchpilot.app.screen.ScreenNode
++import dev.touchpilot.app.screen.ScreenText
++import kotlin.test.Test
++import kotlin.test.assertEquals
++import kotlin.test.assertIs
++import kotlin.test.assertTrue
++
++class ScrollResolverTest {
++    private val resolver = ScrollResolver()
++
++    @Test
++    fun directionOnlyWhenSelectorIsNullAndScrollableExists() {
++        val context = screen(scrollable("list-1"))
++        val result = resolver.resolve(context, selector = null)
++        val direction = assertIs<ScrollResolution.DirectionOnly>(result)
++        assertEquals(1, direction.scrollableCount)
++    }
++
++    @Test
++    fun directionOnlyWhenSelectorIsEmpty() {
++        val context = screen(scrollable("list-1"))
++        val result = resolver.resolve(context, selector = TargetSelector())
++        assertIs<ScrollResolution.DirectionOnly>(result)
++    }
++
++    @Test
++    fun noScrollableFailsExplicitlyWhenNoSelectorPresent() {
++        val context = screen(button("btn-1", "Save"))
++        val result = resolver.resolve(context, selector = null)
++        val none = assertIs<ScrollResolution.NoScrollable>(result)
++        assertTrue(none.reason.contains("No scrollable container"))
++        assertTrue(none.debugContext.isNotBlank())
++    }
++
++    @Test
++    fun noScrollableFailsExplicitlyWhenSelectorPresent() {
++        val context = screen(button("btn-1", "Save"))
++        val selector = TargetSelector(text = SelectorText.of("Inbox"), role = TargetRole.SCROLLABLE)
++        val result = resolver.resolve(context, selector)
++        assertIs<ScrollResolution.NoScrollable>(result)
++    }
++
++    @Test
++    fun singleScrollableContainerResolvesByNodeId() {
++        val context = screen(scrollable("list-1"))
++        val selector = TargetSelector(nodeId = "list-1", source = SelectorSource.AGENT)
++        val resolved = assertIs<ScrollResolution.Resolved>(resolver.resolve(context, selector))
++        assertEquals("list-1", resolved.node.nodeId)
++        assertTrue(resolved.confidence >= 0.5f)
++        assertTrue("node_id" in resolved.matchReasons)
++    }
++
++    @Test
++    fun singleScrollableContainerResolvesByText() {
++        val context = screen(scrollable("list-1", text = "Inbox"))
++        val selector = TargetSelector(
++            text = SelectorText.of("Inbox"),
++            role = TargetRole.SCROLLABLE,
++            source = SelectorSource.AGENT,
++        )
++        val resolved = assertIs<ScrollResolution.Resolved>(resolver.resolve(context, selector))
++        assertEquals("list-1", resolved.node.nodeId)
++    }
++
++    @Test
++    fun multipleScrollableContainersAreAmbiguousWhenSelectorIsAmbiguous() {
++        val context = screen(
++            scrollable("list-1", text = "Inbox"),
++            scrollable("list-2", text = "Inbox"),
++        )
++        val selector = TargetSelector(
++            text = SelectorText.of("Inbox"),
++            role = TargetRole.SCROLLABLE,
++            source = SelectorSource.AGENT,
++        )
++        val ambiguous = assertIs<ScrollResolution.Ambiguous>(resolver.resolve(context, selector))
++        assertEquals(2, ambiguous.candidates.size)
++    }
++
++    @Test
++    fun multipleScrollableContainersResolveWhenSelectorPicksOne() {
++        val context = screen(
++            scrollable("list-1", text = "Inbox"),
++            scrollable("list-2", text = "Drafts"),
++        )
++        val selector = TargetSelector(
++            text = SelectorText.of("Drafts"),
++            role = TargetRole.SCROLLABLE,
++            source = SelectorSource.AGENT,
++        )
++        val resolved = assertIs<ScrollResolution.Resolved>(resolver.resolve(context, selector))
++        assertEquals("list-2", resolved.node.nodeId)
++    }
++
++    @Test
++    fun selectorThatDoesNotMatchAnyScrollableIsNotFound() {
++        val context = screen(scrollable("list-1", text = "Inbox"))
++        val selector = TargetSelector(
++            text = SelectorText.of("Nowhere"),
++            role = TargetRole.SCROLLABLE,
++            source = SelectorSource.AGENT,
++        )
++        val notFound = assertIs<ScrollResolution.NotFound>(resolver.resolve(context, selector))
++        assertTrue(notFound.debugContext.isNotBlank())
++    }
++
++    @Test
++    fun nonScrollableNodesAreNeverConsideredEvenIfTheyMatchByText() {
++        // A button labeled "Inbox" exists but only a different scrollable
++        // container is present — the resolver must not pick the button.
++        val context = screen(
++            button("btn-1", "Inbox"),
++            scrollable("list-1", text = "Drafts"),
++        )
++        val selector = TargetSelector(
++            text = SelectorText.of("Inbox"),
++            role = TargetRole.SCROLLABLE,
++            source = SelectorSource.AGENT,
++        )
++        assertIs<ScrollResolution.NotFound>(resolver.resolve(context, selector))
++    }
++
++    private fun screen(vararg nodes: ScreenNode): ScreenContext {
++        return ScreenContext(
++            appLabel = "Test",
++            packageName = "dev.test",
++            nodes = nodes.toList(),
++        )
++    }
++
++    private fun scrollable(
++        id: String,
++        text: String = "",
++        bounds: NodeBounds = NodeBounds(left = 0, top = 0, right = 1000, bottom = 1000),
++    ): ScreenNode {
++        return ScreenNode(
++            nodeId = id,
++            role = NodeRole.SCROLLABLE,
++            text = if (text.isBlank()) ScreenText.Empty else ScreenText.of(text),
++            bounds = bounds,
++            scrollable = true,
++        )
++    }
++
++    private fun button(id: String, text: String): ScreenNode {
++        return ScreenNode(
++            nodeId = id,
++            role = NodeRole.BUTTON,
++            text = ScreenText.of(text),
++            clickable = true,
++        )
++    }
++}
+diff --git a/app/src/test/java/dev/touchpilot/app/tools/targets/ScrollTargetTest.kt b/app/src/test/java/dev/touchpilot/app/tools/targets/ScrollTargetTest.kt
+new file mode 100644
+index 0000000..f6e664c
+--- /dev/null
++++ b/app/src/test/java/dev/touchpilot/app/tools/targets/ScrollTargetTest.kt
+@@ -0,0 +1,58 @@
++package dev.touchpilot.app.tools.targets
++
++import kotlin.test.Test
++import kotlin.test.assertEquals
++import kotlin.test.assertFalse
++import kotlin.test.assertNotNull
++import kotlin.test.assertTrue
++
++class ScrollTargetTest {
++    @Test
++    fun hasTargetIsFalseForDirectionOnlyArgs() {
++        assertFalse(ScrollTarget.hasTarget(mapOf("direction" to "forward")))
++    }
++
++    @Test
++    fun hasTargetIsTrueWhenAnySelectorArgIsPresent() {
++        assertTrue(ScrollTarget.hasTarget(mapOf(ScrollTarget.TargetNodeIdArg to "list-1")))
++        assertTrue(ScrollTarget.hasTarget(mapOf(ScrollTarget.TargetTextArg to "Inbox")))
++        assertTrue(ScrollTarget.hasTarget(mapOf(ScrollTarget.TargetViewIdArg to "com.x:id/list")))
++        assertTrue(ScrollTarget.hasTarget(mapOf(ScrollTarget.TargetBoundsArg to "0,0,100,100")))
++        assertTrue(ScrollTarget.hasTarget(mapOf(ScrollTarget.TargetContentDescriptionArg to "Inbox list")))
++    }
++
++    @Test
++    fun blankSelectorValuesDoNotCountAsTarget() {
++        assertFalse(ScrollTarget.hasTarget(mapOf(ScrollTarget.TargetNodeIdArg to "  ")))
++    }
++
++    @Test
++    fun selectorFromArgsRoutesSelectorRoleAsScrollable() {
++        val selector = ScrollTarget.selectorFromArgs(
++            mapOf(
++                ScrollTarget.TargetTextArg to "Inbox",
++                ScrollTarget.TargetNodeIdArg to "list-1",
++                ScrollTarget.TargetBoundsArg to "0,0,500,1000",
++                ScrollTarget.TargetViewIdArg to "com.x:id/list",
++                ScrollTarget.TargetContentDescriptionArg to "Inbox list",
++            )
++        )
++        assertEquals(TargetRole.SCROLLABLE, selector.role)
++        assertEquals(SelectorSource.AGENT, selector.source)
++        assertEquals("list-1", selector.nodeId)
++        assertEquals("com.x:id/list", selector.viewIdResourceName)
++        assertEquals("Inbox", selector.text?.raw)
++        assertEquals("Inbox list", selector.contentDescription?.raw)
++        assertNotNull(selector.bounds)
++        assertTrue(selector.isValid())
++    }
++
++    @Test
++    fun isBackwardOnlyMatchesBackwardCaseInsensitive() {
++        assertTrue(ScrollTarget.isBackward("backward"))
++        assertTrue(ScrollTarget.isBackward("Backward"))
++        assertFalse(ScrollTarget.isBackward("forward"))
++        assertFalse(ScrollTarget.isBackward(""))
++        assertFalse(ScrollTarget.isBackward(null))
++    }
++}

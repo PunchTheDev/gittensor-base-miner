@@ -1,0 +1,389 @@
+diff --git a/gittensor/cli/issue_commands/helpers.py b/gittensor/cli/issue_commands/helpers.py
+index ab1aa2fb..8630ea6c 100644
+--- a/gittensor/cli/issue_commands/helpers.py
++++ b/gittensor/cli/issue_commands/helpers.py
+@@ -347,12 +347,37 @@ def validate_bounty_amount(bounty: str) -> int:
+     return raw
+ 
+ 
+-def validate_repository(repo: str, verify_exists: bool = True) -> Tuple[str, str]:
++def _raise_github_verification_required(
++    check: str,
++    detail: str,
++    *,
++    param_hint: str,
++) -> None:
++    """Raise BadParameter when a GitHub existence probe could not complete.
++
++    Used by the strict variants of validate_repository and validate_github_issue
++    so mutation commands never fall through to on-chain writes on transient failures.
++    """
++    raise click.BadParameter(
++        f'Could not verify {check} on GitHub ({detail}). Try again when GitHub is reachable.',
++        param_hint=param_hint,
++    )
++
++
++def validate_repository(
++    repo: str,
++    verify_exists: bool = True,
++    *,
++    require_verified_exists: bool = False,
++) -> Tuple[str, str]:
+     """Validate owner/repo format and optionally verify it exists on GitHub.
+ 
+-    Returns (owner, repo_name) on success.
+-    Raises click.BadParameter on failure.
++    Returns (owner, repo_name) on success. Raises click.BadParameter on failure.
++    Pass require_verified_exists=True to abort on transient GitHub errors instead
++    of warning and continuing; requires verify_exists=True.
+     """
++    if require_verified_exists and not verify_exists:
++        raise ValueError('require_verified_exists requires verify_exists=True')
+     repo = repo.strip()
+ 
+     if not REPO_PATTERN.match(repo):
+@@ -377,20 +402,41 @@ def validate_repository(repo: str, verify_exists: bool = True) -> Tuple[str, str
+                     param_hint='--repo',
+                 )
+             if not resp.ok:
++                if require_verified_exists:
++                    _raise_github_verification_required(
++                        f"repository '{owner}/{repo_name}'",
++                        f'status {resp.status_code}',
++                        param_hint='--repo',
++                    )
+                 console.print(
+                     f'[yellow]Warning: GitHub API returned {resp.status_code} — skipping existence check[/yellow]'
+                 )
+-        except requests.RequestException:
++        except requests.RequestException as exc:
++            if require_verified_exists:
++                detail = type(exc).__name__
++                _raise_github_verification_required(
++                    f"repository '{owner}/{repo_name}'",
++                    detail,
++                    param_hint='--repo',
++                )
+             console.print('[yellow]Warning: Could not reach GitHub API — skipping existence check[/yellow]')
+ 
+     return owner, repo_name
+ 
+ 
+-def validate_github_issue(owner: str, repo: str, issue_number: int) -> Optional[Dict[str, Any]]:
++def validate_github_issue(
++    owner: str,
++    repo: str,
++    issue_number: int,
++    *,
++    require_verified_exists: bool = False,
++) -> Optional[Dict[str, Any]]:
+     """Verify a GitHub issue exists, is open, and is not a pull request.
+ 
+     Returns the issue JSON data on success, or None if verification was skipped
+-    due to network issues.  Raises click.BadParameter on validation failure.
++    due to network issues. Raises click.BadParameter on validation failure.
++    Pass require_verified_exists=True to abort on transient errors instead of
++    warning and continuing.
+     """
+     try:
+         resp = requests.get(
+@@ -398,7 +444,14 @@ def validate_github_issue(owner: str, repo: str, issue_number: int) -> Optional[
+             headers={'User-Agent': 'gittensor-cli'},
+             timeout=GITHUB_API_TIMEOUT,
+         )
+-    except requests.RequestException:
++    except requests.RequestException as exc:
++        if require_verified_exists:
++            detail = type(exc).__name__
++            _raise_github_verification_required(
++                f'issue #{issue_number} in {owner}/{repo}',
++                detail,
++                param_hint='--issue',
++            )
+         console.print('[yellow]Warning: Could not reach GitHub API — skipping issue check[/yellow]')
+         return None
+ 
+@@ -408,6 +461,12 @@ def validate_github_issue(owner: str, repo: str, issue_number: int) -> Optional[
+             param_hint='--issue',
+         )
+     if not resp.ok:
++        if require_verified_exists:
++            _raise_github_verification_required(
++                f'issue #{issue_number} in {owner}/{repo}',
++                f'status {resp.status_code}',
++                param_hint='--issue',
++            )
+         console.print(f'[yellow]Warning: GitHub API returned {resp.status_code} — skipping issue check[/yellow]')
+         return None
+ 
+diff --git a/gittensor/cli/issue_commands/mutations.py b/gittensor/cli/issue_commands/mutations.py
+index 6e0df49c..e63e2fb6 100644
+--- a/gittensor/cli/issue_commands/mutations.py
++++ b/gittensor/cli/issue_commands/mutations.py
+@@ -127,16 +127,20 @@ def issue_register(
+     )
+     config = load_config()
+ 
+-    # Validate inputs before showing summary
++    # Validate inputs before showing summary. The register path is owner-only
++    # and spends real ALPHA, so both GitHub probes run in strict mode: any
++    # warn-and-skip branch (network error, 5xx, 403, rate-limit) is promoted
++    # to a click.BadParameter abort so we never submit register_issue on-chain
++    # against a repository or issue we failed to verify.
+     try:
+-        owner, repo_name = validate_repository(repo)
++        owner, repo_name = validate_repository(repo, require_verified_exists=True)
+         bounty_amount = validate_bounty_amount(bounty)
+         if issue_number < 1 or issue_number > MAX_ISSUE_NUMBER:
+             raise click.BadParameter(
+                 f'Issue number must be between 1 and {MAX_ISSUE_NUMBER} (got {issue_number})',
+                 param_hint='--issue',
+             )
+-        validate_github_issue(owner, repo_name, issue_number)
++        validate_github_issue(owner, repo_name, issue_number, require_verified_exists=True)
+     except click.BadParameter as e:
+         raise click.ClickException(str(e))
+ 
+diff --git a/tests/cli/test_cli_helpers.py b/tests/cli/test_cli_helpers.py
+index 4997beab..8790f08f 100644
+--- a/tests/cli/test_cli_helpers.py
++++ b/tests/cli/test_cli_helpers.py
+@@ -11,6 +11,7 @@
+ 
+ import json
+ from decimal import Decimal
++from typing import Any, Dict, Optional
+ from unittest.mock import patch
+ 
+ import click
+@@ -271,6 +272,150 @@ def test_closed_issue_warns_and_returns_data(self):
+         assert 'Issue #42 is already closed' in call_args
+ 
+ 
++# =============================================================================
++# require_verified_exists — strict verification for mutation paths
++# =============================================================================
++
++
++def _fake_response(status_code: int, payload: Optional[Dict[str, Any]] = None):
++    """Build a minimal object that looks like ``requests.Response`` for the helpers."""
++    return type(
++        'Resp',
++        (),
++        {
++            'status_code': status_code,
++            'ok': 200 <= status_code < 300,
++            'json': lambda self: payload or {},
++        },
++    )()
++
++
++class TestRequireVerifiedExistsGitHubIssue:
++    """When register passes ``require_verified_exists=True``, any branch that
++    would otherwise warn-and-skip must raise ``click.BadParameter`` instead,
++    so an outage or 5xx cannot put a bounty on-chain for an unverified issue.
++    """
++
++    def test_503_raises_bad_parameter(self):
++        with patch(
++            'gittensor.cli.issue_commands.helpers.requests.get',
++            return_value=_fake_response(503),
++        ):
++            with pytest.raises(click.BadParameter) as exc_info:
++                validate_github_issue('owner', 'repo', 42, require_verified_exists=True)
++        msg = str(exc_info.value)
++        assert 'Could not verify' in msg
++        assert '#42' in msg
++        assert 'owner/repo' in msg
++        assert '503' in msg
++        assert exc_info.value.param_hint == '--issue'
++
++    def test_403_raises_bad_parameter(self):
++        with patch(
++            'gittensor.cli.issue_commands.helpers.requests.get',
++            return_value=_fake_response(403),
++        ):
++            with pytest.raises(click.BadParameter) as exc_info:
++                validate_github_issue('owner', 'repo', 7, require_verified_exists=True)
++        assert '403' in str(exc_info.value)
++        assert exc_info.value.param_hint == '--issue'
++
++    def test_request_exception_raises_bad_parameter(self):
++        import requests as _requests
++
++        with patch(
++            'gittensor.cli.issue_commands.helpers.requests.get',
++            side_effect=_requests.ConnectionError('boom'),
++        ):
++            with pytest.raises(click.BadParameter) as exc_info:
++                validate_github_issue('owner', 'repo', 99, require_verified_exists=True)
++        msg = str(exc_info.value)
++        assert 'Could not verify' in msg
++        assert 'ConnectionError' in msg
++        assert exc_info.value.param_hint == '--issue'
++
++    def test_503_without_flag_still_returns_none(self):
++        """Back-compat: read-only callers that do not opt in keep warn-and-skip."""
++        with patch(
++            'gittensor.cli.issue_commands.helpers.requests.get',
++            return_value=_fake_response(503),
++        ):
++            with patch('gittensor.cli.issue_commands.helpers.console.print'):
++                result = validate_github_issue('owner', 'repo', 42)
++        assert result is None
++
++    def test_404_still_raises_not_found_even_with_flag(self):
++        """A definitive 404 keeps its dedicated message; the flag only widens
++        the warn-and-skip branches, it does not suppress real rejections."""
++        with patch(
++            'gittensor.cli.issue_commands.helpers.requests.get',
++            return_value=_fake_response(404),
++        ):
++            with pytest.raises(click.BadParameter) as exc_info:
++                validate_github_issue('owner', 'repo', 42, require_verified_exists=True)
++        assert 'not found' in str(exc_info.value)
++
++    def test_happy_path_with_flag_returns_data(self):
++        """The flag must not affect the success path."""
++        payload = {'state': 'open', 'number': 42, 'title': 'Real issue'}
++        with patch(
++            'gittensor.cli.issue_commands.helpers.requests.get',
++            return_value=_fake_response(200, payload),
++        ):
++            data = validate_github_issue('owner', 'repo', 42, require_verified_exists=True)
++        assert data == payload
++
++
++class TestRequireVerifiedExistsRepository:
++    """Same contract for ``validate_repository`` — register's first probe."""
++
++    def test_503_raises_bad_parameter(self):
++        with patch(
++            'gittensor.cli.issue_commands.helpers.requests.get',
++            return_value=_fake_response(503),
++        ):
++            with pytest.raises(click.BadParameter) as exc_info:
++                validate_repository('owner/repo', require_verified_exists=True)
++        msg = str(exc_info.value)
++        assert 'Could not verify' in msg
++        assert "'owner/repo'" in msg
++        assert '503' in msg
++        assert exc_info.value.param_hint == '--repo'
++
++    def test_request_exception_raises_bad_parameter(self):
++        import requests as _requests
++
++        with patch(
++            'gittensor.cli.issue_commands.helpers.requests.get',
++            side_effect=_requests.Timeout('timed out'),
++        ):
++            with pytest.raises(click.BadParameter) as exc_info:
++                validate_repository('owner/repo', require_verified_exists=True)
++        assert 'Could not verify' in str(exc_info.value)
++        assert 'Timeout' in str(exc_info.value)
++        assert exc_info.value.param_hint == '--repo'
++
++    def test_503_without_flag_just_warns(self):
++        with patch(
++            'gittensor.cli.issue_commands.helpers.requests.get',
++            return_value=_fake_response(503),
++        ):
++            with patch('gittensor.cli.issue_commands.helpers.console.print') as mock_print:
++                owner, name = validate_repository('owner/repo')
++        assert owner == 'owner'
++        assert name == 'repo'
++        mock_print.assert_called_once()
++
++    def test_404_still_raises_not_found_even_with_flag(self):
++        with patch(
++            'gittensor.cli.issue_commands.helpers.requests.get',
++            return_value=_fake_response(404),
++        ):
++            with pytest.raises(click.BadParameter) as exc_info:
++                validate_repository('ghost/missing', require_verified_exists=True)
++        assert 'not found' in str(exc_info.value)
++
++
+ # =============================================================================
+ # validate_ss58_address
+ # =============================================================================
+@@ -456,6 +601,78 @@ def test_register_rejects_issue_number_over_max(self, cli_root, runner):
+         assert result.exit_code != 0
+         assert 'between' in result.output or over_max in result.output or 'issue' in result.output.lower()
+ 
++    def test_register_aborts_on_github_503_before_contract_call(self, cli_root, runner):
++        """A 5xx from GitHub during register must abort with a non-zero exit
++        and must NOT reach the contract ``register_issue`` exec path.
++        """
++        import gittensor.cli.issue_commands.mutations as mut
++
++        exec_was_called = {'value': False}
++
++        class _Sentinel:
++            def exec(self, *_args, **_kwargs):
++                exec_was_called['value'] = True
++                raise AssertionError('register_issue must not be submitted on a GitHub skip')
++
++        with (
++            patch(
++                'gittensor.cli.issue_commands.mutations._resolve_contract_and_network',
++                return_value=(
++                    '0x1234567890123456789012345678901234567890',
++                    'wss://entrypoint-finney.opentensor.ai:443',
++                    'finney',
++                ),
++            ),
++            patch(
++                'gittensor.cli.issue_commands.helpers.requests.get',
++                return_value=_fake_response(503),
++            ),
++            patch.object(mut, 'Path'),
++        ):
++            result = runner.invoke(
++                cli_root,
++                ['issues', 'register', '--repo', 'owner/repo', '--issue', '1', '--bounty', '10', '-y'],
++                catch_exceptions=False,
++            )
++
++        assert result.exit_code != 0
++        assert exec_was_called['value'] is False
++        assert 'Could not verify' in result.output
++        assert '503' in result.output
++
++    def test_register_aborts_on_github_network_error_before_contract_call(self, cli_root, runner):
++        """A ``requests.RequestException`` during register must also abort
++        with a non-zero exit before any on-chain write is attempted.
++        """
++        import requests as _requests
++
++        import gittensor.cli.issue_commands.mutations as mut
++
++        with (
++            patch(
++                'gittensor.cli.issue_commands.mutations._resolve_contract_and_network',
++                return_value=(
++                    '0x1234567890123456789012345678901234567890',
++                    'wss://entrypoint-finney.opentensor.ai:443',
++                    'finney',
++                ),
++            ),
++            patch(
++                'gittensor.cli.issue_commands.helpers.requests.get',
++                side_effect=_requests.ConnectionError('no route to host'),
++            ),
++            patch.object(mut, 'Path'),
++        ):
++            result = runner.invoke(
++                cli_root,
++                ['issues', 'register', '--repo', 'owner/repo', '--issue', '1', '--bounty', '10', '-y'],
++                catch_exceptions=False,
++            )
++
++        assert result.exit_code != 0
++        assert 'Could not verify' in result.output
++        assert 'ConnectionError' in result.output
++
+ 
+ class TestCliVoteValidation:
+     """Ensure vote solution rejects invalid issue_id / PR (validators wired)."""

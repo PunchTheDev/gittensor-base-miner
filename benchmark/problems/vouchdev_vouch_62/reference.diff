@@ -1,0 +1,125 @@
+diff --git a/src/vouch/cli.py b/src/vouch/cli.py
+index c00877d..6bba021 100644
+--- a/src/vouch/cli.py
++++ b/src/vouch/cli.py
+@@ -457,6 +457,22 @@ def crystallize(session_id: str, no_page: bool) -> None:
+             store, session_id, approver=_whoami(), write_summary_page=not no_page,
+         )
+     _emit_json(result)
++    n_approved = len(result["approved"])
++    n_failed = len(result["failures"])
++    total = n_approved + n_failed
++    if total > 0 and n_failed == total:
++        click.echo(
++            f"error: all {total} proposal(s) failed to approve — "
++            f"crystallize aborted",
++            err=True,
++        )
++        raise SystemExit(1)
++    if n_failed > 0:
++        click.echo(
++            f"warning: {n_failed}/{total} proposal(s) failed to approve "
++            f"(see failures in JSON above)",
++            err=True,
++        )
+ 
+ 
+ # --- retrieval ------------------------------------------------------------
+diff --git a/tests/test_cli.py b/tests/test_cli.py
+index 0fde74f..ac904c7 100644
+--- a/tests/test_cli.py
++++ b/tests/test_cli.py
+@@ -11,10 +11,12 @@
+ from __future__ import annotations
+ 
+ from pathlib import Path
++from unittest.mock import patch
+ 
+ import pytest
+ from click.testing import CliRunner
+ 
++from vouch import sessions as sess_mod
+ from vouch.cli import cli
+ from vouch.proposals import propose_claim
+ from vouch.storage import KBStore
+@@ -119,3 +121,47 @@ def test_search_substring_backend_label(
+     result = runner.invoke(cli, ["search", "findable"])
+     assert result.exit_code == 0, result.output
+     assert "(substring)" in result.output
++
++
++def test_crystallize_cli_all_failures_exits_1(store: KBStore) -> None:
++    with patch.object(KBStore, "_embed_and_store"):
++        src = store.put_source(b"e")
++    sess = sess_mod.session_start(store, agent="a", task="t")
++    propose_claim(store, text="t1", evidence=[src.id], proposed_by="a", session_id=sess.id)
++    propose_claim(store, text="t2", evidence=[src.id], proposed_by="a", session_id=sess.id)
++    sess_mod.session_end(store, sess.id)
++
++    with patch("vouch.sessions.approve", side_effect=ValueError("storage full")):
++        result = CliRunner().invoke(cli, ["crystallize", sess.id])
++
++    assert result.exit_code == 1
++    assert "error:" in result.stderr
++    assert "all 2 proposal(s) failed" in result.stderr
++
++
++def test_crystallize_cli_partial_failures_shows_warning(store: KBStore) -> None:
++    from vouch.proposals import approve as real_approve
++
++    with patch.object(KBStore, "_embed_and_store"):
++        src = store.put_source(b"e")
++    sess = sess_mod.session_start(store, agent="a", task="t")
++    propose_claim(store, text="t1", evidence=[src.id], proposed_by="a", session_id=sess.id)
++    propose_claim(store, text="t2", evidence=[src.id], proposed_by="a", session_id=sess.id)
++    sess_mod.session_end(store, sess.id)
++
++    call_count = 0
++
++    def _side_effect(store, proposal_id, **kwargs):
++        nonlocal call_count
++        call_count += 1
++        if call_count == 1:
++            raise ValueError("storage full")
++        return real_approve(store, proposal_id, **kwargs)
++
++    with patch("vouch.sessions.approve", side_effect=_side_effect), \
++         patch.object(KBStore, "_embed_and_store"):
++        result = CliRunner().invoke(cli, ["crystallize", sess.id])
++
++    assert result.exit_code == 0
++    assert "warning:" in result.stderr
++    assert "1/2 proposal(s) failed" in result.stderr
+diff --git a/tests/test_sessions.py b/tests/test_sessions.py
+index 56d4a6c..37f655f 100644
+--- a/tests/test_sessions.py
++++ b/tests/test_sessions.py
+@@ -3,6 +3,7 @@
+ from __future__ import annotations
+ 
+ from pathlib import Path
++from unittest.mock import patch
+ 
+ import pytest
+ 
+@@ -43,3 +44,20 @@ def test_crystallize_skips_already_approved(store: KBStore) -> None:
+     sess_mod.session_end(store, sess.id)
+     result = sess_mod.crystallize(store, sess.id, approver="u")
+     assert result["approved"] == []  # already handled
++
++
++def test_crystallize_collects_approval_failures(store: KBStore) -> None:
++    src = store.put_source(b"e")
++    sess = sess_mod.session_start(store, agent="a", task="t")
++    propose_claim(store, text="t", evidence=[src.id], proposed_by="a", session_id=sess.id)
++    propose_claim(store, text="u", evidence=[src.id], proposed_by="a", session_id=sess.id)
++    sess_mod.session_end(store, sess.id)
++
++    with patch("vouch.sessions.approve", side_effect=ValueError("storage full")):
++        result = sess_mod.crystallize(store, sess.id, approver="u")
++
++    assert result["approved"] == []
++    assert len(result["failures"]) == 2
++    for f in result["failures"]:
++        assert f["error"] == "storage full"
++        assert f["error_type"] == "ValueError"

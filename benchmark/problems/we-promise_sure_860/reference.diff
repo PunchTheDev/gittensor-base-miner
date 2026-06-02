@@ -1,0 +1,1509 @@
+diff --git a/app/controllers/api/v1/auth_controller.rb b/app/controllers/api/v1/auth_controller.rb
+index a12e290ad8..590b332eee 100644
+--- a/app/controllers/api/v1/auth_controller.rb
++++ b/app/controllers/api/v1/auth_controller.rb
+@@ -46,8 +46,13 @@ def signup
+           InviteCode.claim!(params[:invite_code]) if params[:invite_code].present?
+ 
+           # Create device and OAuth token
+-          device = create_or_update_device(user)
+-          token_response = create_oauth_token_for_device(user, device)
++          begin
++            device = MobileDevice.upsert_device!(user, device_params)
++            token_response = device.issue_token!
++          rescue ActiveRecord::RecordInvalid => e
++            render json: { error: "Failed to register device: #{e.message}" }, status: :unprocessable_entity
++            return
++          end
+ 
+           render json: token_response.merge(
+             user: {
+@@ -84,8 +89,13 @@ def login
+           end
+ 
+           # Create device and OAuth token
+-          device = create_or_update_device(user)
+-          token_response = create_oauth_token_for_device(user, device)
++          begin
++            device = MobileDevice.upsert_device!(user, device_params)
++            token_response = device.issue_token!
++          rescue ActiveRecord::RecordInvalid => e
++            render json: { error: "Failed to register device: #{e.message}" }, status: :unprocessable_entity
++            return
++          end
+ 
+           render json: token_response.merge(
+             user: {
+@@ -100,6 +110,44 @@ def login
+         end
+       end
+ 
++      def sso_exchange
++        code = sso_exchange_params
++
++        if code.blank?
++          render json: { error: "invalid_or_expired_code", message: "Authorization code is required" }, status: :unauthorized
++          return
++        end
++
++        cache_key = "mobile_sso:#{code}"
++        cached = Rails.cache.read(cache_key)
++
++        unless cached.present?
++          render json: { error: "invalid_or_expired_code", message: "Authorization code is invalid or expired" }, status: :unauthorized
++          return
++        end
++
++        # Atomic delete — only the request that successfully deletes the key may proceed.
++        # This prevents a race where two concurrent requests both read the same code.
++        unless Rails.cache.delete(cache_key)
++          render json: { error: "invalid_or_expired_code", message: "Authorization code is invalid or expired" }, status: :unauthorized
++          return
++        end
++
++        render json: {
++          access_token: cached[:access_token],
++          refresh_token: cached[:refresh_token],
++          token_type: cached[:token_type],
++          expires_in: cached[:expires_in],
++          created_at: cached[:created_at],
++          user: {
++            id: cached[:user_id],
++            email: cached[:user_email],
++            first_name: cached[:user_first_name],
++            last_name: cached[:user_last_name]
++          }
++        }
++      end
++
+       def refresh
+         # Find the refresh token
+         refresh_token = params[:refresh_token]
+@@ -121,6 +169,7 @@ def refresh
+         new_token = Doorkeeper::AccessToken.create!(
+           application: access_token.application,
+           resource_owner_id: access_token.resource_owner_id,
++          mobile_device_id: access_token.mobile_device_id,
+           expires_in: 30.days.to_i,
+           scopes: access_token.scopes,
+           use_refresh_token: true
+@@ -173,38 +222,12 @@ def valid_device_info?
+           required_fields.all? { |field| device[field].present? }
+         end
+ 
+-        def create_or_update_device(user)
+-          # Handle both string and symbol keys
+-          device_data = params[:device].permit(:device_id, :device_name, :device_type, :os_version, :app_version)
+-
+-          device = user.mobile_devices.find_or_initialize_by(device_id: device_data[:device_id])
+-          device.update!(device_data.merge(last_seen_at: Time.current))
+-          device
++        def device_params
++          params.require(:device).permit(:device_id, :device_name, :device_type, :os_version, :app_version)
+         end
+ 
+-        def create_oauth_token_for_device(user, device)
+-          # Create OAuth application for this device if needed
+-          oauth_app = device.create_oauth_application!
+-
+-          # Revoke any existing tokens for this device
+-          device.revoke_all_tokens!
+-
+-          # Create new access token with 30-day expiration
+-          access_token = Doorkeeper::AccessToken.create!(
+-            application: oauth_app,
+-            resource_owner_id: user.id,
+-            expires_in: 30.days.to_i,
+-            scopes: "read_write",
+-            use_refresh_token: true
+-          )
+-
+-          {
+-            access_token: access_token.plaintext_token,
+-            refresh_token: access_token.plaintext_refresh_token,
+-            token_type: "Bearer",
+-            expires_in: access_token.expires_in,
+-            created_at: access_token.created_at.to_i
+-          }
++        def sso_exchange_params
++          params.require(:code)
+         end
+     end
+   end
+diff --git a/app/controllers/sessions_controller.rb b/app/controllers/sessions_controller.rb
+index 2d9007668e..30703f5159 100644
+--- a/app/controllers/sessions_controller.rb
++++ b/app/controllers/sessions_controller.rb
+@@ -1,6 +1,6 @@
+ class SessionsController < ApplicationController
+   before_action :set_session, only: :destroy
+-  skip_authentication only: %i[index new create openid_connect failure post_logout]
++  skip_authentication only: %i[index new create openid_connect failure post_logout mobile_sso_start]
+ 
+   layout "auth"
+ 
+@@ -10,6 +10,9 @@ def index
+   end
+ 
+   def new
++    # Clear any stale mobile SSO session flag from an abandoned mobile flow
++    session.delete(:mobile_sso)
++
+     begin
+       demo = Rails.application.config_for(:demo)
+       @prefill_demo_credentials = demo_host_match?(demo)
+@@ -29,6 +32,9 @@ def new
+   end
+ 
+   def create
++    # Clear any stale mobile SSO session flag from an abandoned mobile flow
++    session.delete(:mobile_sso)
++
+     user = nil
+ 
+     if AuthConfig.local_login_enabled?
+@@ -104,6 +110,34 @@ def post_logout
+     redirect_to new_session_path, notice: t(".logout_successful")
+   end
+ 
++  def mobile_sso_start
++    provider = params[:provider].to_s
++    configured_providers = Rails.configuration.x.auth.sso_providers.map { |p| p[:name].to_s }
++
++    unless configured_providers.include?(provider)
++      mobile_sso_redirect(error: "invalid_provider", message: "SSO provider not configured")
++      return
++    end
++
++    device_params = params.permit(:device_id, :device_name, :device_type, :os_version, :app_version)
++    unless device_params[:device_id].present? && device_params[:device_name].present? && device_params[:device_type].present?
++      mobile_sso_redirect(error: "missing_device_info", message: "Device information is required")
++      return
++    end
++
++    session[:mobile_sso] = {
++      device_id: device_params[:device_id],
++      device_name: device_params[:device_name],
++      device_type: device_params[:device_type],
++      os_version: device_params[:os_version],
++      app_version: device_params[:app_version]
++    }
++
++    # Render auto-submitting form to POST to OmniAuth (required by omniauth-rails_csrf_protection)
++    @provider = provider
++    render layout: false
++  end
++
+   def openid_connect
+     auth = request.env["omniauth.auth"]
+ 
+@@ -122,13 +156,24 @@ def openid_connect
+       oidc_identity.record_authentication!
+       oidc_identity.sync_user_attributes!(auth)
+ 
++      # Log successful SSO login
++      SsoAuditLog.log_login!(user: user, provider: auth.provider, request: request)
++
++      # Mobile SSO: issue Doorkeeper tokens and redirect to app
++      if session[:mobile_sso].present?
++        if user.otp_required?
++          session.delete(:mobile_sso)
++          mobile_sso_redirect(error: "mfa_not_supported", message: "MFA users should sign in with email and password")
++        else
++          handle_mobile_sso_callback(user)
++        end
++        return
++      end
++
+       # Store id_token and provider for RP-initiated logout
+       session[:id_token_hint] = auth.credentials&.id_token if auth.credentials&.id_token
+       session[:sso_login_provider] = auth.provider
+ 
+-      # Log successful SSO login
+-      SsoAuditLog.log_login!(user: user, provider: auth.provider, request: request)
+-
+       # MFA check: If user has MFA enabled, require verification
+       if user.otp_required?
+         session[:mfa_user_id] = user.id
+@@ -138,6 +183,13 @@ def openid_connect
+         redirect_to root_path
+       end
+     else
++      # Mobile SSO with no linked identity - redirect back with error
++      if session[:mobile_sso].present?
++        session.delete(:mobile_sso)
++        mobile_sso_redirect(error: "account_not_linked", message: "Please link your Google account from the web app first")
++        return
++      end
++
+       # No existing OIDC identity - need to link to account
+       # Store auth data in session and redirect to linking page
+       session[:pending_oidc_auth] = {
+@@ -164,6 +216,13 @@ def failure
+       reason: sanitized_reason
+     )
+ 
++    # Mobile SSO: redirect back to the app with error instead of web login page
++    if session[:mobile_sso].present?
++      session.delete(:mobile_sso)
++      mobile_sso_redirect(error: sanitized_reason, message: "SSO authentication failed")
++      return
++    end
++
+     message = case sanitized_reason
+     when "sso_provider_unavailable"
+       t("sessions.failure.sso_provider_unavailable")
+@@ -177,6 +236,40 @@ def failure
+   end
+ 
+   private
++    def handle_mobile_sso_callback(user)
++      device_info = session.delete(:mobile_sso)
++
++      unless device_info.present?
++        mobile_sso_redirect(error: "missing_session", message: "Mobile SSO session expired")
++        return
++      end
++
++      device = MobileDevice.upsert_device!(user, device_info.symbolize_keys)
++      token_response = device.issue_token!
++
++      # Store tokens behind a one-time authorization code instead of passing in URL
++      authorization_code = SecureRandom.urlsafe_base64(32)
++      Rails.cache.write(
++        "mobile_sso:#{authorization_code}",
++        token_response.merge(
++          user_id: user.id,
++          user_email: user.email,
++          user_first_name: user.first_name,
++          user_last_name: user.last_name
++        ),
++        expires_in: 5.minutes
++      )
++
++      mobile_sso_redirect(code: authorization_code)
++    rescue ActiveRecord::RecordInvalid => e
++      Rails.logger.warn("[Mobile SSO] Device save failed: #{e.record.errors.full_messages.join(', ')}")
++      mobile_sso_redirect(error: "device_error", message: "Unable to register device")
++    end
++
++    def mobile_sso_redirect(params = {})
++      redirect_to "sureapp://oauth/callback?#{params.to_query}", allow_other_host: true
++    end
++
+     def set_session
+       @session = Current.user.sessions.find(params[:id])
+     end
+diff --git a/app/models/mobile_device.rb b/app/models/mobile_device.rb
+index 07dffcbe48..18f0c93a3b 100644
+--- a/app/models/mobile_device.rb
++++ b/app/models/mobile_device.rb
+@@ -7,7 +7,6 @@ class MobileDevice < ApplicationRecord
+   end
+ 
+   belongs_to :user
+-  belongs_to :oauth_application, class_name: "Doorkeeper::Application", optional: true
+ 
+   validates :device_id, presence: true, uniqueness: { scope: :user_id }
+   validates :device_name, presence: true
+@@ -15,8 +14,27 @@ class MobileDevice < ApplicationRecord
+ 
+   before_validation :set_last_seen_at, on: :create
+ 
++  CALLBACK_URL = "sureapp://oauth/callback"
++
+   scope :active, -> { where("last_seen_at > ?", 90.days.ago) }
+ 
++  def self.shared_oauth_application
++    @shared_oauth_application ||= Doorkeeper::Application.find_by!(name: "Sure Mobile")
++  end
++
++  def self.upsert_device!(user, attrs)
++    device = user.mobile_devices.find_or_initialize_by(device_id: attrs[:device_id])
++    device.assign_attributes(
++      device_name: attrs[:device_name],
++      device_type: attrs[:device_type],
++      os_version: attrs[:os_version],
++      app_version: attrs[:app_version],
++      last_seen_at: Time.current
++    )
++    device.save!
++    device
++  end
++
+   def active?
+     last_seen_at > 90.days.ago
+   end
+@@ -25,26 +43,9 @@ def update_last_seen!
+     update_column(:last_seen_at, Time.current)
+   end
+ 
+-  def create_oauth_application!
+-    return oauth_application if oauth_application.present?
+-
+-    app = Doorkeeper::Application.create!(
+-      name: "Mobile App - #{device_id}",
+-      redirect_uri: "sureapp://oauth/callback", # Custom scheme for mobile
+-      scopes: "read_write", # Use the configured scope
+-      confidential: false # Public client for mobile
+-    )
+-
+-    # Store the association
+-    update!(oauth_application: app)
+-    app
+-  end
+-
+   def active_tokens
+-    return Doorkeeper::AccessToken.none unless oauth_application
+-
+     Doorkeeper::AccessToken
+-      .where(application: oauth_application)
++      .where(mobile_device_id: id)
+       .where(resource_owner_id: user_id)
+       .where(revoked_at: nil)
+       .where("expires_in IS NULL OR created_at + expires_in * interval '1 second' > ?", Time.current)
+@@ -54,6 +55,30 @@ def revoke_all_tokens!
+     active_tokens.update_all(revoked_at: Time.current)
+   end
+ 
++  # Issues a fresh Doorkeeper access token for this device, revoking any
++  # previous tokens. Returns a hash with token details ready for an API
++  # response or deep-link callback.
++  def issue_token!
++    revoke_all_tokens!
++
++    access_token = Doorkeeper::AccessToken.create!(
++      application: self.class.shared_oauth_application,
++      resource_owner_id: user_id,
++      mobile_device_id: id,
++      expires_in: 30.days.to_i,
++      scopes: "read_write",
++      use_refresh_token: true
++    )
++
++    {
++      access_token: access_token.plaintext_token,
++      refresh_token: access_token.plaintext_refresh_token,
++      token_type: "Bearer",
++      expires_in: access_token.expires_in,
++      created_at: access_token.created_at.to_i
++    }
++  end
++
+   private
+ 
+     def set_last_seen_at
+diff --git a/app/views/sessions/mobile_sso_start.html.erb b/app/views/sessions/mobile_sso_start.html.erb
+new file mode 100644
+index 0000000000..74fa9ebfda
+--- /dev/null
++++ b/app/views/sessions/mobile_sso_start.html.erb
+@@ -0,0 +1,8 @@
++<!DOCTYPE html>
++<html><body>
++  <form id="sso_form" action="/auth/<%= ERB::Util.html_escape(@provider) %>" method="post">
++    <input type="hidden" name="authenticity_token" value="<%= form_authenticity_token %>">
++  </form>
++  <script>document.getElementById('sso_form').submit();</script>
++  <noscript><p>Redirecting to sign in... <a href="/auth/<%= ERB::Util.html_escape(@provider) %>">Click here</a> if not redirected.</p></noscript>
++</body></html>
+diff --git a/config/routes.rb b/config/routes.rb
+index 632b5ca201..d5363cb352 100644
+--- a/config/routes.rb
++++ b/config/routes.rb
+@@ -118,6 +118,7 @@
+ 
+   resource :registration, only: %i[new create]
+   resources :sessions, only: %i[index new create destroy]
++  get "/auth/mobile/:provider", to: "sessions#mobile_sso_start"
+   match "/auth/:provider/callback", to: "sessions#openid_connect", via: %i[get post]
+   match "/auth/failure", to: "sessions#failure", via: %i[get post]
+   get "/auth/logout/callback", to: "sessions#post_logout"
+@@ -355,6 +356,7 @@
+       post "auth/signup", to: "auth#signup"
+       post "auth/login", to: "auth#login"
+       post "auth/refresh", to: "auth#refresh"
++      post "auth/sso_exchange", to: "auth#sso_exchange"
+ 
+       # Production API endpoints
+       resources :accounts, only: [ :index, :show ]
+diff --git a/db/migrate/20260203204605_refactor_mobile_device_oauth.rb b/db/migrate/20260203204605_refactor_mobile_device_oauth.rb
+new file mode 100644
+index 0000000000..45c7c9c037
+--- /dev/null
++++ b/db/migrate/20260203204605_refactor_mobile_device_oauth.rb
+@@ -0,0 +1,7 @@
++class RefactorMobileDeviceOauth < ActiveRecord::Migration[7.2]
++  def change
++    add_column :oauth_access_tokens, :mobile_device_id, :uuid
++    add_index :oauth_access_tokens, :mobile_device_id
++    remove_column :mobile_devices, :oauth_application_id, :integer
++  end
++end
+diff --git a/db/schema.rb b/db/schema.rb
+index 3277c7385f..397048d7e6 100644
+--- a/db/schema.rb
++++ b/db/schema.rb
+@@ -10,7 +10,7 @@
+ #
+ # It's strongly recommended that you check this file into your version control system.
+ 
+-ActiveRecord::Schema[7.2].define(version: 2026_01_29_200129) do
++ActiveRecord::Schema[7.2].define(version: 2026_02_03_204605) do
+   # These are extensions that must be enabled in order to support this database
+   enable_extension "pgcrypto"
+   enable_extension "plpgsql"
+@@ -853,8 +853,6 @@
+     t.datetime "last_seen_at"
+     t.datetime "created_at", null: false
+     t.datetime "updated_at", null: false
+-    t.integer "oauth_application_id"
+-    t.index ["oauth_application_id"], name: "index_mobile_devices_on_oauth_application_id"
+     t.index ["user_id", "device_id"], name: "index_mobile_devices_on_user_id_and_device_id", unique: true
+     t.index ["user_id"], name: "index_mobile_devices_on_user_id"
+   end
+@@ -883,7 +881,9 @@
+     t.datetime "created_at", null: false
+     t.datetime "revoked_at"
+     t.string "previous_refresh_token", default: "", null: false
++    t.uuid "mobile_device_id"
+     t.index ["application_id"], name: "index_oauth_access_tokens_on_application_id"
++    t.index ["mobile_device_id"], name: "index_oauth_access_tokens_on_mobile_device_id"
+     t.index ["refresh_token"], name: "index_oauth_access_tokens_on_refresh_token", unique: true
+     t.index ["resource_owner_id"], name: "index_oauth_access_tokens_on_resource_owner_id"
+     t.index ["token"], name: "index_oauth_access_tokens_on_token", unique: true
+diff --git a/db/seeds/oauth_applications.rb b/db/seeds/oauth_applications.rb
+index 1e82b70d6f..40d1d187e0 100644
+--- a/db/seeds/oauth_applications.rb
++++ b/db/seeds/oauth_applications.rb
+@@ -1,14 +1,14 @@
+ # Create OAuth applications for Sure's first-party apps
+ # These are the only OAuth apps that will exist - external developers use API keys
+ 
+-# Sure iOS App
+-ios_app = Doorkeeper::Application.find_or_create_by(name: "Sure iOS") do |app|
++# Sure Mobile App (shared across iOS and Android)
++mobile_app = Doorkeeper::Application.find_or_create_by(name: "Sure Mobile") do |app|
+   app.redirect_uri = "sureapp://oauth/callback"
+-  app.scopes = "read_accounts read_transactions read_balances"
++  app.scopes = "read_write"
+   app.confidential = false # Public client (mobile app)
+ end
+ 
+ puts "Created OAuth applications:"
+-puts "iOS App - Client ID: #{ios_app.uid}"
++puts "Mobile App - Client ID: #{mobile_app.uid}"
+ puts ""
+ puts "External developers should use API keys instead of OAuth."
+diff --git a/mobile/lib/main.dart b/mobile/lib/main.dart
+index d9ef30c70b..4c7489b3b9 100644
+--- a/mobile/lib/main.dart
++++ b/mobile/lib/main.dart
+@@ -1,3 +1,5 @@
++import 'dart:async';
++import 'package:app_links/app_links.dart';
+ import 'package:flutter/material.dart';
+ import 'package:provider/provider.dart';
+ import 'providers/auth_provider.dart';
+@@ -146,11 +148,46 @@ class AppWrapper extends StatefulWidget {
+ class _AppWrapperState extends State<AppWrapper> {
+   bool _isCheckingConfig = true;
+   bool _hasBackendUrl = false;
++  late final AppLinks _appLinks;
++  StreamSubscription<Uri>? _linkSubscription;
+ 
+   @override
+   void initState() {
+     super.initState();
+     _checkBackendConfig();
++    _initDeepLinks();
++  }
++
++  @override
++  void dispose() {
++    _linkSubscription?.cancel();
++    super.dispose();
++  }
++
++  void _initDeepLinks() {
++    _appLinks = AppLinks();
++
++    // Handle deep link that launched the app (cold start)
++    _appLinks.getInitialLink().then((uri) {
++      if (uri != null) _handleDeepLink(uri);
++    }).catchError((e, stackTrace) {
++      LogService.instance.error('DeepLinks', 'Initial link error: $e\n$stackTrace');
++    });
++
++    // Listen for deep links while app is running
++    _linkSubscription = _appLinks.uriLinkStream.listen(
++      (uri) => _handleDeepLink(uri),
++      onError: (e, stackTrace) {
++        LogService.instance.error('DeepLinks', 'Link stream error: $e\n$stackTrace');
++      },
++    );
++  }
++
++  void _handleDeepLink(Uri uri) {
++    if (uri.scheme == 'sureapp' && uri.host == 'oauth') {
++      final authProvider = Provider.of<AuthProvider>(context, listen: false);
++      authProvider.handleSsoCallback(uri);
++    }
+   }
+ 
+   Future<void> _checkBackendConfig() async {
+diff --git a/mobile/lib/providers/auth_provider.dart b/mobile/lib/providers/auth_provider.dart
+index bfc24670f8..0fa47fd63b 100644
+--- a/mobile/lib/providers/auth_provider.dart
++++ b/mobile/lib/providers/auth_provider.dart
+@@ -1,4 +1,5 @@
+ import 'package:flutter/foundation.dart';
++import 'package:url_launcher/url_launcher.dart';
+ import '../models/user.dart';
+ import '../models/auth_tokens.dart';
+ import '../services/auth_service.dart';
+@@ -215,6 +216,60 @@ class AuthProvider with ChangeNotifier {
+     }
+   }
+ 
++  Future<void> startSsoLogin(String provider) async {
++    _errorMessage = null;
++    _isLoading = true;
++    notifyListeners();
++
++    try {
++      final deviceInfo = await _deviceService.getDeviceInfo();
++      final ssoUrl = _authService.buildSsoUrl(
++        provider: provider,
++        deviceInfo: deviceInfo,
++      );
++
++      final launched = await launchUrl(Uri.parse(ssoUrl), mode: LaunchMode.externalApplication);
++      if (!launched) {
++        _errorMessage = 'Unable to open browser for sign-in.';
++      }
++    } catch (e, stackTrace) {
++      LogService.instance.error('AuthProvider', 'SSO launch error: $e\n$stackTrace');
++      _errorMessage = 'Unable to start sign-in. Please try again.';
++    } finally {
++      _isLoading = false;
++      notifyListeners();
++    }
++  }
++
++  Future<bool> handleSsoCallback(Uri uri) async {
++    _errorMessage = null;
++    _isLoading = true;
++    notifyListeners();
++
++    try {
++      final result = await _authService.handleSsoCallback(uri);
++
++      if (result['success'] == true) {
++        _tokens = result['tokens'] as AuthTokens?;
++        _user = result['user'] as User?;
++        _isLoading = false;
++        notifyListeners();
++        return true;
++      } else {
++        _errorMessage = result['error'] as String?;
++        _isLoading = false;
++        notifyListeners();
++        return false;
++      }
++    } catch (e, stackTrace) {
++      LogService.instance.error('AuthProvider', 'SSO callback error: $e\n$stackTrace');
++      _errorMessage = 'Sign-in failed. Please try again.';
++      _isLoading = false;
++      notifyListeners();
++      return false;
++    }
++  }
++
+   Future<void> logout() async {
+     await _authService.logout();
+     _tokens = null;
+diff --git a/mobile/lib/screens/login_screen.dart b/mobile/lib/screens/login_screen.dart
+index e4c8fc6dee..f3089293ab 100644
+--- a/mobile/lib/screens/login_screen.dart
++++ b/mobile/lib/screens/login_screen.dart
+@@ -371,6 +371,44 @@ class _LoginScreenState extends State<LoginScreen> {
+ 
+                 const SizedBox(height: 16),
+ 
++                // Divider with "or"
++                Row(
++                  children: [
++                    Expanded(child: Divider(color: colorScheme.outlineVariant)),
++                    Padding(
++                      padding: const EdgeInsets.symmetric(horizontal: 16),
++                      child: Text(
++                        'or',
++                        style: TextStyle(color: colorScheme.onSurfaceVariant),
++                      ),
++                    ),
++                    Expanded(child: Divider(color: colorScheme.outlineVariant)),
++                  ],
++                ),
++
++                const SizedBox(height: 16),
++
++                // Google Sign-In button
++                Consumer<AuthProvider>(
++                  builder: (context, authProvider, _) {
++                    return OutlinedButton.icon(
++                      onPressed: authProvider.isLoading
++                          ? null
++                          : () => authProvider.startSsoLogin('google_oauth2'),
++                      icon: const Icon(Icons.g_mobiledata, size: 24),
++                      label: const Text('Sign in with Google'),
++                      style: OutlinedButton.styleFrom(
++                        minimumSize: const Size(double.infinity, 50),
++                        shape: RoundedRectangleBorder(
++                          borderRadius: BorderRadius.circular(12),
++                        ),
++                      ),
++                    );
++                  },
++                ),
++
++                const SizedBox(height: 24),
++
+                 // Backend URL info
+                 Container(
+                   padding: const EdgeInsets.all(12),
+diff --git a/mobile/lib/services/auth_service.dart b/mobile/lib/services/auth_service.dart
+index 5c28ff28d4..c6b6c88598 100644
+--- a/mobile/lib/services/auth_service.dart
++++ b/mobile/lib/services/auth_service.dart
+@@ -341,6 +341,100 @@ class AuthService {
+     }
+   }
+ 
++  String buildSsoUrl({
++    required String provider,
++    required Map<String, String> deviceInfo,
++  }) {
++    final params = {
++      'device_id': deviceInfo['device_id']!,
++      'device_name': deviceInfo['device_name']!,
++      'device_type': deviceInfo['device_type']!,
++      'os_version': deviceInfo['os_version']!,
++      'app_version': deviceInfo['app_version']!,
++    };
++    final uri = Uri.parse('${ApiConfig.baseUrl}/auth/mobile/$provider')
++        .replace(queryParameters: params);
++    return uri.toString();
++  }
++
++  Future<Map<String, dynamic>> handleSsoCallback(Uri uri) async {
++    final params = uri.queryParameters;
++
++    if (params.containsKey('error')) {
++      return {
++        'success': false,
++        'error': params['message'] ?? params['error'] ?? 'SSO login failed',
++      };
++    }
++
++    final code = params['code'];
++    if (code == null || code.isEmpty) {
++      return {
++        'success': false,
++        'error': 'Invalid SSO callback response',
++      };
++    }
++
++    // Exchange authorization code for tokens via secure POST
++    try {
++      final url = Uri.parse('${ApiConfig.baseUrl}/api/v1/auth/sso_exchange');
++      final response = await http.post(
++        url,
++        headers: {
++          'Content-Type': 'application/json',
++          'Accept': 'application/json',
++        },
++        body: jsonEncode({'code': code}),
++      ).timeout(const Duration(seconds: 30));
++
++      if (response.statusCode != 200) {
++        final errorData = jsonDecode(response.body);
++        return {
++          'success': false,
++          'error': errorData['message'] ?? 'Token exchange failed',
++        };
++      }
++
++      final data = jsonDecode(response.body);
++
++      final tokens = AuthTokens.fromJson({
++        'access_token': data['access_token'],
++        'refresh_token': data['refresh_token'],
++        'token_type': data['token_type'] ?? 'Bearer',
++        'expires_in': data['expires_in'] ?? 0,
++        'created_at': data['created_at'] ?? 0,
++      });
++      await _saveTokens(tokens);
++
++      final user = User.fromJson(data['user']);
++      await _saveUser(user);
++
++      return {
++        'success': true,
++        'tokens': tokens,
++        'user': user,
++      };
++    } on SocketException catch (e, stackTrace) {
++      LogService.instance.error('AuthService', 'SSO exchange SocketException: $e\n$stackTrace');
++      return {
++        'success': false,
++        'error': 'Network unavailable',
++      };
++    } on TimeoutException catch (e, stackTrace) {
++      LogService.instance.error('AuthService', 'SSO exchange TimeoutException: $e\n$stackTrace');
++      return {
++        'success': false,
++        'error': 'Request timed out',
++      };
++    } catch (e, stackTrace) {
++      LogService.instance.error('AuthService', 'SSO exchange unexpected error: $e\n$stackTrace');
++      return {
++        'success': false,
++        'error': 'Failed to exchange authorization code',
++      };
++    }
++  }
++
+   Future<void> logout() async {
+     await _storage.delete(key: _tokenKey);
+     await _storage.delete(key: _userKey);
+diff --git a/mobile/pubspec.yaml b/mobile/pubspec.yaml
+index 2c8876e504..1720033ce3 100644
+--- a/mobile/pubspec.yaml
++++ b/mobile/pubspec.yaml
+@@ -20,6 +20,8 @@ dependencies:
+   path: ^1.9.1
+   connectivity_plus: ^7.0.0
+   uuid: ^4.5.2
++  app_links: ^6.4.0
++  url_launcher: ^6.2.5
+ 
+ dev_dependencies:
+   flutter_test:
+diff --git a/spec/requests/api/v1/auth_spec.rb b/spec/requests/api/v1/auth_spec.rb
+new file mode 100644
+index 0000000000..38f797bd16
+--- /dev/null
++++ b/spec/requests/api/v1/auth_spec.rb
+@@ -0,0 +1,212 @@
++# frozen_string_literal: true
++
++require 'swagger_helper'
++
++RSpec.describe 'API V1 Auth', type: :request do
++  path '/api/v1/auth/signup' do
++    post 'Sign up a new user' do
++      tags 'Auth'
++      consumes 'application/json'
++      produces 'application/json'
++      parameter name: :body, in: :body, required: true, schema: {
++        type: :object,
++        properties: {
++          user: {
++            type: :object,
++            properties: {
++              email: { type: :string, format: :email, description: 'User email address' },
++              password: { type: :string, description: 'Password (min 8 chars, mixed case, number, special char)' },
++              first_name: { type: :string },
++              last_name: { type: :string }
++            },
++            required: %w[email password]
++          },
++          device: {
++            type: :object,
++            properties: {
++              device_id: { type: :string, description: 'Unique device identifier' },
++              device_name: { type: :string, description: 'Human-readable device name' },
++              device_type: { type: :string, description: 'Device type (e.g. ios, android)' },
++              os_version: { type: :string },
++              app_version: { type: :string }
++            },
++            required: %w[device_id device_name device_type os_version app_version]
++          },
++          invite_code: { type: :string, nullable: true, description: 'Invite code (required when invites are enforced)' }
++        },
++        required: %w[user device]
++      }
++
++      response '201', 'user created' do
++        schema type: :object,
++               properties: {
++                 access_token: { type: :string },
++                 refresh_token: { type: :string },
++                 token_type: { type: :string },
++                 expires_in: { type: :integer },
++                 created_at: { type: :integer },
++                 user: {
++                   type: :object,
++                   properties: {
++                     id: { type: :string, format: :uuid },
++                     email: { type: :string },
++                     first_name: { type: :string },
++                     last_name: { type: :string }
++                   }
++                 }
++               }
++        run_test!
++      end
++
++      response '422', 'validation error' do
++        schema '$ref' => '#/components/schemas/ErrorResponse'
++        run_test!
++      end
++
++      response '403', 'invite code required or invalid' do
++        schema '$ref' => '#/components/schemas/ErrorResponse'
++        run_test!
++      end
++    end
++  end
++
++  path '/api/v1/auth/login' do
++    post 'Log in with email and password' do
++      tags 'Auth'
++      consumes 'application/json'
++      produces 'application/json'
++      parameter name: :body, in: :body, required: true, schema: {
++        type: :object,
++        properties: {
++          email: { type: :string, format: :email },
++          password: { type: :string },
++          otp_code: { type: :string, nullable: true, description: 'TOTP code if MFA is enabled' },
++          device: {
++            type: :object,
++            properties: {
++              device_id: { type: :string },
++              device_name: { type: :string },
++              device_type: { type: :string },
++              os_version: { type: :string },
++              app_version: { type: :string }
++            },
++            required: %w[device_id device_name device_type os_version app_version]
++          }
++        },
++        required: %w[email password device]
++      }
++
++      response '200', 'login successful' do
++        schema type: :object,
++               properties: {
++                 access_token: { type: :string },
++                 refresh_token: { type: :string },
++                 token_type: { type: :string },
++                 expires_in: { type: :integer },
++                 created_at: { type: :integer },
++                 user: {
++                   type: :object,
++                   properties: {
++                     id: { type: :string, format: :uuid },
++                     email: { type: :string },
++                     first_name: { type: :string },
++                     last_name: { type: :string }
++                   }
++                 }
++               }
++        run_test!
++      end
++
++      response '401', 'invalid credentials or MFA required' do
++        schema '$ref' => '#/components/schemas/ErrorResponse'
++        run_test!
++      end
++    end
++  end
++
++  path '/api/v1/auth/sso_exchange' do
++    post 'Exchange mobile SSO authorization code for tokens' do
++      tags 'Auth'
++      consumes 'application/json'
++      produces 'application/json'
++      description 'Exchanges a one-time authorization code (received via deep link after mobile SSO) for OAuth tokens. The code is single-use and expires after 5 minutes.'
++      parameter name: :body, in: :body, required: true, schema: {
++        type: :object,
++        properties: {
++          code: { type: :string, description: 'One-time authorization code from mobile SSO callback' }
++        },
++        required: %w[code]
++      }
++
++      response '200', 'tokens issued' do
++        schema type: :object,
++               properties: {
++                 access_token: { type: :string },
++                 refresh_token: { type: :string },
++                 token_type: { type: :string },
++                 expires_in: { type: :integer },
++                 created_at: { type: :integer },
++                 user: {
++                   type: :object,
++                   properties: {
++                     id: { type: :string, format: :uuid },
++                     email: { type: :string },
++                     first_name: { type: :string },
++                     last_name: { type: :string }
++                   }
++                 }
++               }
++        run_test!
++      end
++
++      response '401', 'invalid or expired code' do
++        schema '$ref' => '#/components/schemas/ErrorResponse'
++        run_test!
++      end
++    end
++  end
++
++  path '/api/v1/auth/refresh' do
++    post 'Refresh an access token' do
++      tags 'Auth'
++      consumes 'application/json'
++      produces 'application/json'
++      parameter name: :body, in: :body, required: true, schema: {
++        type: :object,
++        properties: {
++          refresh_token: { type: :string, description: 'The refresh token from a previous login or refresh' },
++          device: {
++            type: :object,
++            properties: {
++              device_id: { type: :string }
++            },
++            required: %w[device_id]
++          }
++        },
++        required: %w[refresh_token device]
++      }
++
++      response '200', 'token refreshed' do
++        schema type: :object,
++               properties: {
++                 access_token: { type: :string },
++                 refresh_token: { type: :string },
++                 token_type: { type: :string },
++                 expires_in: { type: :integer },
++                 created_at: { type: :integer }
++               }
++        run_test!
++      end
++
++      response '401', 'invalid refresh token' do
++        schema '$ref' => '#/components/schemas/ErrorResponse'
++        run_test!
++      end
++
++      response '400', 'missing refresh token' do
++        schema '$ref' => '#/components/schemas/ErrorResponse'
++        run_test!
++      end
++    end
++  end
++end
+diff --git a/test/controllers/api/v1/auth_controller_test.rb b/test/controllers/api/v1/auth_controller_test.rb
+index 959de1086b..272534f538 100644
+--- a/test/controllers/api/v1/auth_controller_test.rb
++++ b/test/controllers/api/v1/auth_controller_test.rb
+@@ -11,12 +11,22 @@ class Api::V1::AuthControllerTest < ActionDispatch::IntegrationTest
+       os_version: "17.0",
+       app_version: "1.0.0"
+     }
++
++    # Ensure the shared OAuth application exists
++    @shared_app = Doorkeeper::Application.find_or_create_by!(name: "Sure Mobile") do |app|
++      app.redirect_uri = "sureapp://oauth/callback"
++      app.scopes = "read_write"
++      app.confidential = false
++    end
++
++    # Clear the memoized class variable so it picks up the test record
++    MobileDevice.instance_variable_set(:@shared_oauth_application, nil)
+   end
+ 
+   test "should signup new user and return OAuth tokens" do
+     assert_difference("User.count", 1) do
+       assert_difference("MobileDevice.count", 1) do
+-        assert_difference("Doorkeeper::Application.count", 1) do
++        assert_no_difference("Doorkeeper::Application.count") do
+           assert_difference("Doorkeeper::AccessToken.count", 1) do
+             post "/api/v1/auth/signup", params: {
+               user: {
+@@ -279,10 +289,10 @@ class Api::V1::AuthControllerTest < ActionDispatch::IntegrationTest
+ 
+     # Create an existing device and token
+     device = user.mobile_devices.create!(@device_info)
+-    oauth_app = device.create_oauth_application!
+     existing_token = Doorkeeper::AccessToken.create!(
+-      application: oauth_app,
++      application: @shared_app,
+       resource_owner_id: user.id,
++      mobile_device_id: device.id,
+       expires_in: 30.days.to_i,
+       scopes: "read_write"
+     )
+@@ -350,12 +360,12 @@ class Api::V1::AuthControllerTest < ActionDispatch::IntegrationTest
+   test "should refresh access token with valid refresh token" do
+     user = users(:family_admin)
+     device = user.mobile_devices.create!(@device_info)
+-    oauth_app = device.create_oauth_application!
+ 
+     # Create initial token
+     initial_token = Doorkeeper::AccessToken.create!(
+-      application: oauth_app,
++      application: @shared_app,
+       resource_owner_id: user.id,
++      mobile_device_id: device.id,
+       expires_in: 30.days.to_i,
+       scopes: "read_write",
+       use_refresh_token: true
+diff --git a/test/controllers/sessions_controller_test.rb b/test/controllers/sessions_controller_test.rb
+index 3f2da73518..8bdad7bf07 100644
+--- a/test/controllers/sessions_controller_test.rb
++++ b/test/controllers/sessions_controller_test.rb
+@@ -3,6 +3,16 @@
+ class SessionsControllerTest < ActionDispatch::IntegrationTest
+   setup do
+     @user = users(:family_admin)
++
++    # Ensure the shared OAuth application exists
++    Doorkeeper::Application.find_or_create_by!(name: "Sure Mobile") do |app|
++      app.redirect_uri = "sureapp://oauth/callback"
++      app.scopes = "read_write"
++      app.confidential = false
++    end
++
++    # Clear the memoized class variable so it picks up the test record
++    MobileDevice.instance_variable_set(:@shared_oauth_application, nil)
+   end
+ 
+   teardown do
+@@ -210,6 +220,421 @@ def setup_omniauth_mock(provider:, uid:, email:, name:, first_name: nil, last_na
+     assert_equal "Could not authenticate via OpenID Connect.", flash[:alert]
+   end
+ 
++  # ── Mobile SSO: mobile_sso_start ──
++
++  test "mobile_sso_start renders auto-submit form for valid provider" do
++    Rails.configuration.x.auth.stubs(:sso_providers).returns([
++      { name: "google_oauth2", strategy: "google_oauth2", label: "Google" }
++    ])
++
++    get "/auth/mobile/google_oauth2", params: {
++      device_id: "test-device-123",
++      device_name: "Pixel 8",
++      device_type: "android",
++      os_version: "14",
++      app_version: "1.0.0"
++    }
++
++    assert_response :success
++    assert_match %r{action="/auth/google_oauth2"}, @response.body
++    assert_match %r{method="post"}, @response.body
++    assert_match /authenticity_token/, @response.body
++  end
++
++  test "mobile_sso_start stores device info in session" do
++    Rails.configuration.x.auth.stubs(:sso_providers).returns([
++      { name: "google_oauth2", strategy: "google_oauth2", label: "Google" }
++    ])
++
++    get "/auth/mobile/google_oauth2", params: {
++      device_id: "test-device-123",
++      device_name: "Pixel 8",
++      device_type: "android",
++      os_version: "14",
++      app_version: "1.0.0"
++    }
++
++    assert_equal "test-device-123", session[:mobile_sso][:device_id]
++    assert_equal "Pixel 8", session[:mobile_sso][:device_name]
++    assert_equal "android", session[:mobile_sso][:device_type]
++    assert_equal "14", session[:mobile_sso][:os_version]
++    assert_equal "1.0.0", session[:mobile_sso][:app_version]
++  end
++
++  test "mobile_sso_start redirects with error for invalid provider" do
++    Rails.configuration.x.auth.stubs(:sso_providers).returns([
++      { name: "google_oauth2", strategy: "google_oauth2", label: "Google" }
++    ])
++
++    get "/auth/mobile/unknown_provider", params: {
++      device_id: "test-device-123",
++      device_name: "Pixel 8",
++      device_type: "android"
++    }
++
++    assert_redirected_to %r{\Asureapp://oauth/callback\?error=invalid_provider}
++  end
++
++  test "mobile_sso_start redirects with error when device_id is missing" do
++    Rails.configuration.x.auth.stubs(:sso_providers).returns([
++      { name: "google_oauth2", strategy: "google_oauth2", label: "Google" }
++    ])
++
++    get "/auth/mobile/google_oauth2", params: {
++      device_name: "Pixel 8",
++      device_type: "android"
++    }
++
++    assert_redirected_to %r{\Asureapp://oauth/callback\?error=missing_device_info}
++  end
++
++  test "mobile_sso_start redirects with error when device_name is missing" do
++    Rails.configuration.x.auth.stubs(:sso_providers).returns([
++      { name: "google_oauth2", strategy: "google_oauth2", label: "Google" }
++    ])
++
++    get "/auth/mobile/google_oauth2", params: {
++      device_id: "test-device-123",
++      device_type: "android"
++    }
++
++    assert_redirected_to %r{\Asureapp://oauth/callback\?error=missing_device_info}
++  end
++
++  test "mobile_sso_start redirects with error when device_type is missing" do
++    Rails.configuration.x.auth.stubs(:sso_providers).returns([
++      { name: "google_oauth2", strategy: "google_oauth2", label: "Google" }
++    ])
++
++    get "/auth/mobile/google_oauth2", params: {
++      device_id: "test-device-123",
++      device_name: "Pixel 8"
++    }
++
++    assert_redirected_to %r{\Asureapp://oauth/callback\?error=missing_device_info}
++  end
++
++  # ── Mobile SSO: openid_connect callback with mobile_sso session ──
++
++  test "mobile SSO issues Doorkeeper tokens for linked user" do
++    # Test environment uses null_store; swap in a memory store so the
++    # authorization code round-trip (write in controller, read in sso_exchange) works.
++    original_cache = Rails.cache
++    Rails.cache = ActiveSupport::Cache::MemoryStore.new
++
++    oidc_identity = oidc_identities(:bob_google)
++
++    setup_omniauth_mock(
++      provider: oidc_identity.provider,
++      uid: oidc_identity.uid,
++      email: @user.email,
++      name: "Bob Dylan",
++      first_name: "Bob",
++      last_name: "Dylan"
++    )
++
++    # Simulate mobile_sso session data (would be set by mobile_sso_start)
++    post sessions_path, params: { email: @user.email, password: user_password_test }
++    delete session_url(@user.sessions.last)
++
++    # We need to set the session directly via a custom approach:
++    # Hit mobile_sso_start first, then trigger the OIDC callback
++    Rails.configuration.x.auth.stubs(:sso_providers).returns([
++      { name: "openid_connect", strategy: "openid_connect", label: "Google" }
++    ])
++
++    get "/auth/mobile/openid_connect", params: {
++      device_id: "flutter-device-001",
++      device_name: "Pixel 8",
++      device_type: "android",
++      os_version: "14",
++      app_version: "1.0.0"
++    }
++
++    assert_response :success
++
++    # Now trigger the OIDC callback — session[:mobile_sso] is set from the previous request
++    get "/auth/openid_connect/callback"
++
++    assert_response :redirect
++    redirect_url = @response.redirect_url
++
++    assert redirect_url.start_with?("sureapp://oauth/callback?"), "Expected redirect to sureapp:// but got #{redirect_url}"
++
++    uri = URI.parse(redirect_url)
++    callback_params = Rack::Utils.parse_query(uri.query)
++
++    assert callback_params["code"].present?, "Expected authorization code in callback"
++
++    # Exchange the authorization code for tokens via the API (as the mobile app would)
++    post "/api/v1/auth/sso_exchange", params: { code: callback_params["code"] }, as: :json
++
++    assert_response :success
++    token_data = JSON.parse(@response.body)
++
++    assert token_data["access_token"].present?, "Expected access_token in response"
++    assert token_data["refresh_token"].present?, "Expected refresh_token in response"
++    assert_equal "Bearer", token_data["token_type"]
++    assert_equal 30.days.to_i, token_data["expires_in"]
++    assert_equal @user.id, token_data["user"]["id"]
++    assert_equal @user.email, token_data["user"]["email"]
++    assert_equal @user.first_name, token_data["user"]["first_name"]
++    assert_equal @user.last_name, token_data["user"]["last_name"]
++  ensure
++    Rails.cache = original_cache
++  end
++
++  test "mobile SSO creates a MobileDevice record" do
++    oidc_identity = oidc_identities(:bob_google)
++
++    setup_omniauth_mock(
++      provider: oidc_identity.provider,
++      uid: oidc_identity.uid,
++      email: @user.email,
++      name: "Bob Dylan"
++    )
++
++    Rails.configuration.x.auth.stubs(:sso_providers).returns([
++      { name: "openid_connect", strategy: "openid_connect", label: "Google" }
++    ])
++
++    get "/auth/mobile/openid_connect", params: {
++      device_id: "flutter-device-002",
++      device_name: "iPhone 15",
++      device_type: "ios",
++      os_version: "17.2",
++      app_version: "1.0.0"
++    }
++
++    assert_difference "MobileDevice.count", 1 do
++      get "/auth/openid_connect/callback"
++    end
++
++    device = @user.mobile_devices.find_by(device_id: "flutter-device-002")
++    assert device.present?, "Expected MobileDevice to be created"
++    assert_equal "iPhone 15", device.device_name
++    assert_equal "ios", device.device_type
++    assert_equal "17.2", device.os_version
++    assert_equal "1.0.0", device.app_version
++  end
++
++  test "mobile SSO uses the shared OAuth application" do
++    oidc_identity = oidc_identities(:bob_google)
++
++    setup_omniauth_mock(
++      provider: oidc_identity.provider,
++      uid: oidc_identity.uid,
++      email: @user.email,
++      name: "Bob Dylan"
++    )
++
++    Rails.configuration.x.auth.stubs(:sso_providers).returns([
++      { name: "openid_connect", strategy: "openid_connect", label: "Google" }
++    ])
++
++    get "/auth/mobile/openid_connect", params: {
++      device_id: "flutter-device-003",
++      device_name: "Pixel 8",
++      device_type: "android"
++    }
++
++    assert_no_difference "Doorkeeper::Application.count" do
++      get "/auth/openid_connect/callback"
++    end
++
++    device = @user.mobile_devices.find_by(device_id: "flutter-device-003")
++    assert device.active_tokens.any?, "Expected device to have active tokens via shared app"
++  end
++
++  test "mobile SSO revokes previous tokens for existing device" do
++    oidc_identity = oidc_identities(:bob_google)
++
++    setup_omniauth_mock(
++      provider: oidc_identity.provider,
++      uid: oidc_identity.uid,
++      email: @user.email,
++      name: "Bob Dylan"
++    )
++
++    Rails.configuration.x.auth.stubs(:sso_providers).returns([
++      { name: "openid_connect", strategy: "openid_connect", label: "Google" }
++    ])
++
++    # First login — creates device and token
++    get "/auth/mobile/openid_connect", params: {
++      device_id: "flutter-device-004",
++      device_name: "Pixel 8",
++      device_type: "android"
++    }
++    get "/auth/openid_connect/callback"
++
++    device = @user.mobile_devices.find_by(device_id: "flutter-device-004")
++    first_token = Doorkeeper::AccessToken.where(
++      mobile_device_id: device.id,
++      resource_owner_id: @user.id,
++      revoked_at: nil
++    ).last
++
++    assert first_token.present?, "Expected first access token"
++
++    # Second login with same device — should revoke old token
++    setup_omniauth_mock(
++      provider: oidc_identity.provider,
++      uid: oidc_identity.uid,
++      email: @user.email,
++      name: "Bob Dylan"
++    )
++
++    get "/auth/mobile/openid_connect", params: {
++      device_id: "flutter-device-004",
++      device_name: "Pixel 8",
++      device_type: "android"
++    }
++    get "/auth/openid_connect/callback"
++
++    first_token.reload
++    assert first_token.revoked_at.present?, "Expected first token to be revoked"
++  end
++
++  test "mobile SSO redirects MFA user with error" do
++    @user.setup_mfa!
++    @user.enable_mfa!
++
++    oidc_identity = oidc_identities(:bob_google)
++
++    setup_omniauth_mock(
++      provider: oidc_identity.provider,
++      uid: oidc_identity.uid,
++      email: @user.email,
++      name: "Bob Dylan"
++    )
++
++    Rails.configuration.x.auth.stubs(:sso_providers).returns([
++      { name: "openid_connect", strategy: "openid_connect", label: "Google" }
++    ])
++
++    get "/auth/mobile/openid_connect", params: {
++      device_id: "flutter-device-005",
++      device_name: "Pixel 8",
++      device_type: "android"
++    }
++    get "/auth/openid_connect/callback"
++
++    assert_response :redirect
++    redirect_url = @response.redirect_url
++
++    assert redirect_url.start_with?("sureapp://oauth/callback?"), "Expected redirect to sureapp://"
++    params = Rack::Utils.parse_query(URI.parse(redirect_url).query)
++    assert_equal "mfa_not_supported", params["error"]
++    assert_nil session[:mobile_sso], "Expected mobile_sso session to be cleared"
++  end
++
++  test "mobile SSO redirects with error when OIDC identity not linked" do
++    user_without_oidc = users(:new_email)
++
++    setup_omniauth_mock(
++      provider: "openid_connect",
++      uid: "unlinked-uid-99999",
++      email: user_without_oidc.email,
++      name: "New User"
++    )
++
++    Rails.configuration.x.auth.stubs(:sso_providers).returns([
++      { name: "openid_connect", strategy: "openid_connect", label: "Google" }
++    ])
++
++    get "/auth/mobile/openid_connect", params: {
++      device_id: "flutter-device-006",
++      device_name: "Pixel 8",
++      device_type: "android"
++    }
++    get "/auth/openid_connect/callback"
++
++    assert_response :redirect
++    redirect_url = @response.redirect_url
++
++    assert redirect_url.start_with?("sureapp://oauth/callback?"), "Expected redirect to sureapp://"
++    params = Rack::Utils.parse_query(URI.parse(redirect_url).query)
++    assert_equal "account_not_linked", params["error"]
++    assert_nil session[:mobile_sso], "Expected mobile_sso session to be cleared"
++  end
++
++  test "mobile SSO does not create a web session" do
++    oidc_identity = oidc_identities(:bob_google)
++
++    setup_omniauth_mock(
++      provider: oidc_identity.provider,
++      uid: oidc_identity.uid,
++      email: @user.email,
++      name: "Bob Dylan"
++    )
++
++    Rails.configuration.x.auth.stubs(:sso_providers).returns([
++      { name: "openid_connect", strategy: "openid_connect", label: "Google" }
++    ])
++
++    @user.sessions.destroy_all
++
++    get "/auth/mobile/openid_connect", params: {
++      device_id: "flutter-device-007",
++      device_name: "Pixel 8",
++      device_type: "android"
++    }
++
++    assert_no_difference "Session.count" do
++      get "/auth/openid_connect/callback"
++    end
++  end
++
++  # ── Mobile SSO: failure action ──
++
++  test "failure redirects mobile SSO to app with error" do
++    # Simulate mobile_sso session being set
++    Rails.configuration.x.auth.stubs(:sso_providers).returns([
++      { name: "google_oauth2", strategy: "google_oauth2", label: "Google" }
++    ])
++
++    get "/auth/mobile/google_oauth2", params: {
++      device_id: "flutter-device-008",
++      device_name: "Pixel 8",
++      device_type: "android"
++    }
++
++    # Now simulate a failure callback
++    get "/auth/failure", params: { message: "sso_failed", strategy: "google_oauth2" }
++
++    assert_response :redirect
++    redirect_url = @response.redirect_url
++    assert redirect_url.start_with?("sureapp://oauth/callback?"), "Expected redirect to sureapp://"
++    params = Rack::Utils.parse_query(URI.parse(redirect_url).query)
++    assert_equal "sso_failed", params["error"]
++    assert_nil session[:mobile_sso], "Expected mobile_sso session to be cleared"
++  end
++
++  test "failure without mobile SSO session redirects to web login" do
++    get "/auth/failure", params: { message: "sso_failed", strategy: "google_oauth2" }
++
++    assert_redirected_to new_session_path
++  end
++
++  test "failure sanitizes unknown error reasons" do
++    Rails.configuration.x.auth.stubs(:sso_providers).returns([
++      { name: "google_oauth2", strategy: "google_oauth2", label: "Google" }
++    ])
++
++    get "/auth/mobile/google_oauth2", params: {
++      device_id: "flutter-device-009",
++      device_name: "Pixel 8",
++      device_type: "android"
++    }
++
++    get "/auth/failure", params: { message: "xss_attempt<script>", strategy: "google_oauth2" }
++
++    redirect_url = @response.redirect_url
++    params = Rack::Utils.parse_query(URI.parse(redirect_url).query)
++    assert_equal "sso_failed", params["error"], "Unknown reason should be sanitized to sso_failed"
++  end
++
+   test "prevents account takeover via email matching" do
+     # Clean up any existing sessions
+     @user.sessions.destroy_all

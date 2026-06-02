@@ -1,0 +1,371 @@
+diff --git a/app/controllers/settings/hostings_controller.rb b/app/controllers/settings/hostings_controller.rb
+index 02e61350e8..22936cfb44 100644
+--- a/app/controllers/settings/hostings_controller.rb
++++ b/app/controllers/settings/hostings_controller.rb
+@@ -25,6 +25,7 @@ def show
+     if @show_twelve_data_settings
+       twelve_data_provider = Provider::Registry.get_provider(:twelve_data)
+       @twelve_data_usage = twelve_data_provider&.usage
++      @plan_restricted_securities = Current.family.securities_with_plan_restrictions(provider: "TwelveData")
+     end
+ 
+     if @show_yahoo_finance_settings
+diff --git a/app/models/family.rb b/app/models/family.rb
+index a69e9629b1..af9f0aa985 100644
+--- a/app/models/family.rb
++++ b/app/models/family.rb
+@@ -141,6 +141,27 @@ def missing_data_provider?
+     (requires_exchange_rates_data_provider? && ExchangeRate.provider.nil?)
+   end
+ 
++  # Returns securities with plan restrictions for a specific provider
++  # @param provider [String] The provider name (e.g., "TwelveData")
++  # @return [Array<Hash>] Array of hashes with ticker, name, required_plan, provider
++  def securities_with_plan_restrictions(provider:)
++    security_ids = trades.joins(:security).pluck("securities.id").uniq
++    return [] if security_ids.empty?
++
++    restrictions = Security.plan_restrictions_for(security_ids, provider: provider)
++    return [] if restrictions.empty?
++
++    Security.where(id: restrictions.keys).map do |security|
++      restriction = restrictions[security.id]
++      {
++        ticker: security.ticker,
++        name: security.name,
++        required_plan: restriction[:required_plan],
++        provider: restriction[:provider]
++      }
++    end
++  end
++
+   def oldest_entry_date
+     entries.order(:date).first&.date || Date.current
+   end
+diff --git a/app/models/provider/twelve_data.rb b/app/models/provider/twelve_data.rb
+index 8f9d81a42f..fef92e1bcf 100644
+--- a/app/models/provider/twelve_data.rb
++++ b/app/models/provider/twelve_data.rb
+@@ -6,6 +6,22 @@ class Provider::TwelveData < Provider
+   InvalidExchangeRateError = Class.new(Error)
+   InvalidSecurityPriceError = Class.new(Error)
+ 
++  # Pattern to detect plan upgrade errors in API responses
++  PLAN_UPGRADE_PATTERN = /available starting with (\w+)/i
++
++  # Returns true if the error message indicates a plan upgrade is required
++  def self.plan_upgrade_required?(error_message)
++    return false if error_message.blank?
++    PLAN_UPGRADE_PATTERN.match?(error_message)
++  end
++
++  # Extracts the required plan name from an error message, or nil if not found
++  def self.extract_required_plan(error_message)
++    return nil if error_message.blank?
++    match = error_message.match(PLAN_UPGRADE_PATTERN)
++    match ? match[1] : nil
++  end
++
+   def initialize(api_key)
+     @api_key = api_key
+   end
+diff --git a/app/models/security.rb b/app/models/security.rb
+index 35c2a38760..fb26d4d3e0 100644
+--- a/app/models/security.rb
++++ b/app/models/security.rb
+@@ -1,5 +1,5 @@
+ class Security < ApplicationRecord
+-  include Provided
++  include Provided, PlanRestrictionTracker
+ 
+   # ISO 10383 MIC codes mapped to user-friendly exchange names
+   # Source: https://www.iso20022.org/market-identifier-codes
+diff --git a/app/models/security/plan_restriction_tracker.rb b/app/models/security/plan_restriction_tracker.rb
+new file mode 100644
+index 0000000000..1783f8e5d9
+--- /dev/null
++++ b/app/models/security/plan_restriction_tracker.rb
+@@ -0,0 +1,82 @@
++# Tracks securities that require a higher plan to fetch prices from data providers.
++# Uses Rails cache to store restriction info, keyed by provider and security ID.
++# This allows the settings page to warn users about tickers that need a paid plan.
++#
++# Note: Currently API keys are configured at the instance level (not per-family),
++# so restrictions are shared across all families using the same provider.
++module Security::PlanRestrictionTracker
++  extend ActiveSupport::Concern
++
++  CACHE_KEY_PREFIX = "security_plan_restriction"
++  CACHE_EXPIRY = 7.days
++
++  # Map provider names to their classes for plan detection
++  PROVIDER_CLASSES = {
++    "TwelveData" => Provider::TwelveData
++  }.freeze
++
++  class_methods do
++    # Records that a security requires a higher plan to fetch data
++    # @param security_id [Integer] The security ID
++    # @param error_message [String] The error message from the provider
++    # @param provider [String] The provider name (e.g., "TwelveData")
++    def record_plan_restriction(security_id:, error_message:, provider:)
++      provider_class = PROVIDER_CLASSES[provider]
++      return unless provider_class&.respond_to?(:extract_required_plan)
++
++      required_plan = provider_class.extract_required_plan(error_message)
++      return unless required_plan
++
++      cache_key = plan_restriction_cache_key(provider, security_id)
++      Rails.cache.write(cache_key, {
++        required_plan: required_plan,
++        provider: provider,
++        recorded_at: Time.current.iso8601
++      }, expires_in: CACHE_EXPIRY)
++    end
++
++    # Clears the plan restriction for a security (e.g., if user upgrades their plan)
++    # @param security_id [Integer] The security ID
++    # @param provider [String] The provider name
++    def clear_plan_restriction(security_id, provider:)
++      Rails.cache.delete(plan_restriction_cache_key(provider, security_id))
++    end
++
++    # Returns the plan restriction info for a security, or nil if none
++    # @param security_id [Integer] The security ID
++    # @param provider [String] The provider name
++    def plan_restriction_for(security_id, provider:)
++      Rails.cache.read(plan_restriction_cache_key(provider, security_id))
++    end
++
++    # Returns all plan-restricted securities from a collection of security IDs for a provider
++    # @param security_ids [Array<Integer>] Security IDs to check
++    # @param provider [String] The provider name
++    # @return [Hash] security_id => restriction_info
++    def plan_restrictions_for(security_ids, provider:)
++      return {} if security_ids.blank?
++
++      restrictions = {}
++      security_ids.each do |id|
++        restriction = plan_restriction_for(id, provider: provider)
++        restrictions[id] = restriction if restriction.present?
++      end
++      restrictions
++    end
++
++    # Checks if an error message indicates a plan upgrade is required for a provider
++    # @param error_message [String] The error message
++    # @param provider [String] The provider name
++    def plan_upgrade_required?(error_message, provider:)
++      provider_class = PROVIDER_CLASSES[provider]
++      return false unless provider_class&.respond_to?(:plan_upgrade_required?)
++      provider_class.plan_upgrade_required?(error_message)
++    end
++
++    private
++
++      def plan_restriction_cache_key(provider, security_id)
++        "#{CACHE_KEY_PREFIX}/#{provider.downcase}/#{security_id}"
++      end
++  end
++end
+diff --git a/app/models/security/price/importer.rb b/app/models/security/price/importer.rb
+index def62fc03e..bc5840c0cf 100644
+--- a/app/models/security/price/importer.rb
++++ b/app/models/security/price/importer.rb
+@@ -111,9 +111,20 @@ def provider_prices
+         )
+ 
+         if response.success?
++          Security.clear_plan_restriction(security.id, provider: security_provider.class.name.demodulize)
+           response.data.index_by(&:date)
+         else
+-          Rails.logger.warn("#{security_provider.class.name} could not fetch prices for #{security.ticker} between #{provider_fetch_start_date} and #{end_date}. Provider error: #{response.error.message}")
++          error_message = response.error.message
++          Rails.logger.warn("#{security_provider.class.name} could not fetch prices for #{security.ticker} between #{provider_fetch_start_date} and #{end_date}. Provider error: #{error_message}")
++
++          if Security.plan_upgrade_required?(error_message, provider: security_provider.class.name.demodulize)
++            Security.record_plan_restriction(
++              security_id: security.id,
++              error_message: error_message,
++              provider: security_provider.class.name.demodulize
++            )
++          end
++
+           Sentry.capture_exception(MissingSecurityPriceError.new("Could not fetch prices for ticker"), level: :warning) do |scope|
+             scope.set_tags(security_id: security.id)
+             scope.set_context("security", { id: security.id, start_date: start_date, end_date: end_date })
+diff --git a/app/views/settings/hostings/_twelve_data_settings.html.erb b/app/views/settings/hostings/_twelve_data_settings.html.erb
+index 90b524f2f9..b6275491aa 100644
+--- a/app/views/settings/hostings/_twelve_data_settings.html.erb
++++ b/app/views/settings/hostings/_twelve_data_settings.html.erb
+@@ -60,6 +60,34 @@
+           <%= t(".plan", plan: @twelve_data_usage.data.plan) %>
+         </p>
+       </div>
++
++      <% if @plan_restricted_securities.present? %>
++        <div class="bg-amber-50 border border-amber-200 rounded-lg p-3 mt-4">
++          <div class="flex items-start gap-2">
++            <%= icon("alert-triangle", size: "sm", class: "text-amber-600 mt-0.5") %>
++            <div class="text-sm">
++              <p class="font-medium text-amber-800"><%= t(".plan_upgrade_warning_title") %></p>
++              <p class="text-amber-700 mt-1"><%= t(".plan_upgrade_warning_description") %></p>
++              <ul class="mt-2 space-y-1">
++                <% @plan_restricted_securities.each do |security| %>
++                  <li class="text-amber-700">
++                    <span class="font-medium"><%= security[:ticker] %></span>
++                    <% if security[:name].present? %>
++                      <span class="text-amber-600">(<%= security[:name] %>)</span>
++                    <% end %>
++                    <span class="text-amber-600">— <%= t(".requires_plan", plan: security[:required_plan]) %></span>
++                  </li>
++                <% end %>
++              </ul>
++              <p class="mt-2">
++                <a href="https://twelvedata.com/pricing" target="_blank" rel="noopener noreferrer" class="text-amber-800 underline font-medium">
++                  <%= t(".view_pricing") %>
++                </a>
++              </p>
++            </div>
++          </div>
++        </div>
++      <% end %>
+     </div>
+   <% end %>
+ </div>
+diff --git a/config/locales/views/settings/hostings/en.yml b/config/locales/views/settings/hostings/en.yml
+index d70260ba3b..8f3fcec325 100644
+--- a/config/locales/views/settings/hostings/en.yml
++++ b/config/locales/views/settings/hostings/en.yml
+@@ -72,6 +72,10 @@ en:
+         label: API Key
+         placeholder: Enter your API key here
+         plan: "%{plan} plan"
++        plan_upgrade_warning_title: Some tickers require a paid plan
++        plan_upgrade_warning_description: The following tickers in your portfolio cannot sync prices with your current Twelve Data plan.
++        requires_plan: requires %{plan} plan
++        view_pricing: View Twelve Data pricing
+         title: Twelve Data
+       update:
+         failure: Invalid setting value
+diff --git a/test/models/security/plan_restriction_tracker_test.rb b/test/models/security/plan_restriction_tracker_test.rb
+new file mode 100644
+index 0000000000..2649579809
+--- /dev/null
++++ b/test/models/security/plan_restriction_tracker_test.rb
+@@ -0,0 +1,115 @@
++require "test_helper"
++
++class Security::PlanRestrictionTrackerTest < ActiveSupport::TestCase
++  setup do
++    # Use memory store for testing
++    @original_cache = Rails.cache
++    Rails.cache = ActiveSupport::Cache::MemoryStore.new
++  end
++
++  teardown do
++    Rails.cache = @original_cache
++  end
++
++  test "plan_upgrade_required? detects Grow plan message" do
++    message = "This endpoint is available starting with Grow subscription."
++    assert Security.plan_upgrade_required?(message, provider: "TwelveData")
++  end
++
++  test "plan_upgrade_required? detects Pro plan message" do
++    message = "API error (code: 400): available starting with Pro plan"
++    assert Security.plan_upgrade_required?(message, provider: "TwelveData")
++  end
++
++  test "plan_upgrade_required? returns false for other errors" do
++    message = "Some other error message"
++    assert_not Security.plan_upgrade_required?(message, provider: "TwelveData")
++  end
++
++  test "plan_upgrade_required? returns false for nil" do
++    assert_not Security.plan_upgrade_required?(nil, provider: "TwelveData")
++  end
++
++  test "plan_upgrade_required? returns false for unknown provider" do
++    message = "This endpoint is available starting with Grow subscription."
++    assert_not Security.plan_upgrade_required?(message, provider: "UnknownProvider")
++  end
++
++  test "record_plan_restriction stores restriction in cache" do
++    Security.record_plan_restriction(
++      security_id: 999,
++      error_message: "This endpoint is available starting with Grow subscription.",
++      provider: "TwelveData"
++    )
++
++    restriction = Security.plan_restriction_for(999, provider: "TwelveData")
++    assert_not_nil restriction
++    assert_equal "Grow", restriction[:required_plan]
++    assert_equal "TwelveData", restriction[:provider]
++  end
++
++  test "clear_plan_restriction removes restriction from cache" do
++    Security.record_plan_restriction(
++      security_id: 999,
++      error_message: "available starting with Pro",
++      provider: "TwelveData"
++    )
++
++    Security.clear_plan_restriction(999, provider: "TwelveData")
++    assert_nil Security.plan_restriction_for(999, provider: "TwelveData")
++  end
++
++  test "plan_restrictions_for returns multiple restrictions" do
++    Security.record_plan_restriction(security_id: 1001, error_message: "available starting with Grow", provider: "TwelveData")
++    Security.record_plan_restriction(security_id: 1002, error_message: "available starting with Pro", provider: "TwelveData")
++
++    restrictions = Security.plan_restrictions_for([ 1001, 1002, 9999 ], provider: "TwelveData")
++
++    assert_equal 2, restrictions.keys.count
++    assert_equal "Grow", restrictions[1001][:required_plan]
++    assert_equal "Pro", restrictions[1002][:required_plan]
++    assert_nil restrictions[9999]
++  end
++
++  test "plan_restrictions_for returns empty hash for empty input" do
++    assert_equal({}, Security.plan_restrictions_for([], provider: "TwelveData"))
++    assert_equal({}, Security.plan_restrictions_for(nil, provider: "TwelveData"))
++  end
++
++  test "record_plan_restriction does nothing for non-plan errors" do
++    Security.record_plan_restriction(
++      security_id: 999,
++      error_message: "Some other error",
++      provider: "TwelveData"
++    )
++
++    assert_nil Security.plan_restriction_for(999, provider: "TwelveData")
++  end
++
++  test "restrictions are scoped by provider" do
++    # Record restriction for TwelveData
++    Security.record_plan_restriction(security_id: 999, error_message: "available starting with Grow", provider: "TwelveData")
++
++    # Simulate a different provider by directly writing to cache (tests cache key scoping)
++    Rails.cache.write("security_plan_restriction/otherprovider/999", { required_plan: "Pro", provider: "OtherProvider" }, expires_in: 7.days)
++
++    twelve_data_restriction = Security.plan_restriction_for(999, provider: "TwelveData")
++    other_restriction = Security.plan_restriction_for(999, provider: "OtherProvider")
++
++    assert_equal "Grow", twelve_data_restriction[:required_plan]
++    assert_equal "Pro", other_restriction[:required_plan]
++  end
++
++  test "clearing restriction for one provider does not affect another" do
++    # Record restriction for TwelveData
++    Security.record_plan_restriction(security_id: 999, error_message: "available starting with Grow", provider: "TwelveData")
++
++    # Simulate another provider by directly writing to cache
++    Rails.cache.write("security_plan_restriction/otherprovider/999", { required_plan: "Pro", provider: "OtherProvider" }, expires_in: 7.days)
++
++    Security.clear_plan_restriction(999, provider: "TwelveData")
++
++    assert_nil Security.plan_restriction_for(999, provider: "TwelveData")
++    assert_not_nil Security.plan_restriction_for(999, provider: "OtherProvider")
++  end
++end

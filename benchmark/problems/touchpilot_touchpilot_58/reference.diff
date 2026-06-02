@@ -1,0 +1,744 @@
+diff --git a/app/src/main/java/dev/touchpilot/app/MainActivity.kt b/app/src/main/java/dev/touchpilot/app/MainActivity.kt
+index 8e6e531..9567076 100644
+--- a/app/src/main/java/dev/touchpilot/app/MainActivity.kt
++++ b/app/src/main/java/dev/touchpilot/app/MainActivity.kt
+@@ -83,7 +83,8 @@ class MainActivity : Activity() {
+                 localModelRuntime = localModelRuntime
+             ),
+             sessionContext = { currentReasoningContext() },
+-            availableSkills = { skills }
++            availableSkills = { skills },
++            screenContextProvider = { AccessibilityBridge.observeScreenContext() }
+         )
+ 
+         if (conversation.isEmpty()) {
+diff --git a/app/src/main/java/dev/touchpilot/app/agent/IntentGate.kt b/app/src/main/java/dev/touchpilot/app/agent/IntentGate.kt
+index 920d63d..9e68b39 100644
+--- a/app/src/main/java/dev/touchpilot/app/agent/IntentGate.kt
++++ b/app/src/main/java/dev/touchpilot/app/agent/IntentGate.kt
+@@ -49,6 +49,16 @@ sealed class IntentDecision {
+         val clarification: String
+     ) : IntentDecision()
+ 
++    /**
++     * User is asking about the current Android screen ("what screen am I on",
++     * "what can you do here", "suggest actions for this screen"). The
++     * reasoning core answers from a local [dev.touchpilot.app.screen.ScreenContext]
++     * summary instead of invoking the agent runner.
++     */
++    data class ScreenInquiry(
++        override val reason: String
++    ) : IntentDecision()
++
+     /**
+      * No deterministic path matched — defer to the configured local model path
+      * for reasoning.
+@@ -75,6 +85,7 @@ class IntentGate : IntentClassifier {
+         }
+ 
+         detectUnsafe(normalized)?.let { return it }
++        detectScreenInquiry(normalized)?.let { return it }
+         detectExactCommand(normalized)?.let { return it }
+         detectKnownSkill(normalized, skills)?.let { return it }
+         detectAmbiguousReference(normalized)?.let { return it }
+@@ -82,6 +93,12 @@ class IntentGate : IntentClassifier {
+         return IntentDecision.LocalModelNeeded(reason = "no deterministic route matched")
+     }
+ 
++    private fun detectScreenInquiry(normalized: String): IntentDecision.ScreenInquiry? {
++        val match = ScreenInquiryPatterns.firstOrNull { pattern -> pattern.containsMatchIn(normalized) }
++            ?: return null
++        return IntentDecision.ScreenInquiry(reason = "screen inquiry phrase '${match.pattern}'")
++    }
++
+     private fun detectUnsafe(normalized: String): IntentDecision.UnsafeRequest? {
+         val match = UnsafePatterns.firstOrNull { (needle, _) -> needle in normalized }
+             ?: return null
+@@ -180,6 +197,17 @@ class IntentGate : IntentClassifier {
+             "transfer money" to "banking or financial actions are blocked"
+         )
+ 
++        val ScreenInquiryPatterns: List<Regex> = listOf(
++            Regex("\\bwhat\\s+screen\\s+am\\s+i\\s+on\\b"),
++            Regex("\\bwhat\\s+can\\s+you\\s+do\\s+here\\b"),
++            Regex("\\bwhat\\s+can\\s+i\\s+do\\s+here\\b"),
++            Regex("\\bwhat\\s+(actions|buttons|controls)\\s+(are|can\\s+i)\\s+\\w+"),
++            Regex("\\bwhat\\s+(is|are)\\s+on\\s+(this|the)\\s+screen\\b"),
++            Regex("\\b(summari[sz]e|describe)\\b[\\w\\s-]{0,40}?\\bscreen\\b"),
++            Regex("\\bsuggest\\s+actions?\\s+(for|on)\\s+(this|the)\\s+screen\\b"),
++            Regex("\\bwhat\\s+actions?\\s+can\\s+i\\s+take\\s+here\\b")
++        )
++
+         val AmbiguousPhrases: List<String> = listOf(
+             "do the thing",
+             "the usual",
+diff --git a/app/src/main/java/dev/touchpilot/app/agent/LocalReasoningCore.kt b/app/src/main/java/dev/touchpilot/app/agent/LocalReasoningCore.kt
+index 4555712..c203868 100644
+--- a/app/src/main/java/dev/touchpilot/app/agent/LocalReasoningCore.kt
++++ b/app/src/main/java/dev/touchpilot/app/agent/LocalReasoningCore.kt
+@@ -3,6 +3,9 @@ package dev.touchpilot.app.agent
+ import dev.touchpilot.app.localinference.LocalCommandModelRuntime
+ import dev.touchpilot.app.localinference.LocalModelCommandProvider
+ import dev.touchpilot.app.memory.Skill
++import dev.touchpilot.app.screen.ScreenContext
++import dev.touchpilot.app.screen.ScreenContextSummarizer
++import dev.touchpilot.app.screen.ScreenSummary
+ import dev.touchpilot.app.security.ActionPolicy
+ import dev.touchpilot.app.security.DefaultActionPolicy
+ import dev.touchpilot.app.security.ToolApprovalProvider
+@@ -50,7 +53,9 @@ class DefaultLocalReasoningCore(
+     private val sessionContext: () -> LocalReasoningContext,
+     private val intents: ConversationalIntents = ConversationalGate,
+     private val intentClassifier: IntentClassifier = IntentGate(),
+-    private val availableSkills: () -> List<Skill> = { emptyList() }
++    private val availableSkills: () -> List<Skill> = { emptyList() },
++    private val screenContextProvider: () -> ScreenContext = { ScreenContext.Empty },
++    private val screenSummarizer: ScreenContextSummarizer = ScreenContextSummarizer()
+ ) : LocalReasoningCore {
+ 
+     override fun run(task: String, listener: AgentEventListener): AgentRunResult {
+@@ -73,6 +78,7 @@ class DefaultLocalReasoningCore(
+         when (intent) {
+             is IntentDecision.UnsafeRequest -> return blockUnsafe(task, intent, listener)
+             is IntentDecision.ClarificationNeeded -> return askForClarification(task, intent, listener)
++            is IntentDecision.ScreenInquiry -> return answerScreenInquiry(task, intent, listener)
+             is IntentDecision.ExactCommand,
+             is IntentDecision.KnownSkill,
+             is IntentDecision.LocalModelNeeded -> Unit
+@@ -110,7 +116,8 @@ class DefaultLocalReasoningCore(
+             }
+             is IntentDecision.LocalModelNeeded -> baseCtx
+             is IntentDecision.UnsafeRequest,
+-            is IntentDecision.ClarificationNeeded -> error("handled above")
++            is IntentDecision.ClarificationNeeded,
++            is IntentDecision.ScreenInquiry -> error("handled above")
+         }
+ 
+         val result = invocation.invoke(task, effectiveCtx)
+@@ -158,6 +165,48 @@ class DefaultLocalReasoningCore(
+             events = listOf(userEvent, assistant)
+         )
+     }
++
++    private fun answerScreenInquiry(
++        task: String,
++        intent: IntentDecision.ScreenInquiry,
++        listener: AgentEventListener
++    ): AgentRunResult {
++        val context = screenContextProvider()
++        val summary = screenSummarizer.summarize(context)
++        val userEvent = AgentEvent.UserMessage(task)
++        val suggestionBlock = renderSuggestions(summary)
++        val assistant = AgentEvent.AssistantMessage(
++            text = summary.sentence,
++            detail = suggestionBlock
++        )
++        val finalEvent = AgentEvent.FinalAnswer(summary.sentence)
++        listener.onEvent(userEvent)
++        listener.onEvent(assistant)
++        listener.onEvent(finalEvent)
++        val transcript = if (suggestionBlock.isBlank()) {
++            summary.sentence
++        } else {
++            summary.sentence + "\n\n" + suggestionBlock
++        }
++        return AgentRunResult(
++            transcript = transcript,
++            finalAnswer = summary.sentence,
++            events = listOf(userEvent, assistant, finalEvent)
++        )
++    }
++
++    private fun renderSuggestions(summary: ScreenSummary): String {
++        if (summary.suggestedActions.isEmpty()) return ""
++        return buildString {
++            appendLine("Suggested actions:")
++            summary.suggestedActions.forEachIndexed { index, action ->
++                append(index + 1)
++                append(". ")
++                append(action.label)
++                if (index < summary.suggestedActions.lastIndex) appendLine()
++            }
++        }
++    }
+ }
+ 
+ /**
+diff --git a/app/src/main/java/dev/touchpilot/app/screen/ScreenContextSummarizer.kt b/app/src/main/java/dev/touchpilot/app/screen/ScreenContextSummarizer.kt
+new file mode 100644
+index 0000000..96f04d9
+--- /dev/null
++++ b/app/src/main/java/dev/touchpilot/app/screen/ScreenContextSummarizer.kt
+@@ -0,0 +1,161 @@
++package dev.touchpilot.app.screen
++
++/**
++ * Produces a deterministic local [ScreenSummary] from a [ScreenContext].
++ *
++ * Rules (in order):
++ *
++ * - If the context has no nodes at all, return a "weak screen" message.
++ * - Otherwise build a one-sentence summary using the app label / package /
++ *   window title when available, plus the first few visible clickable items.
++ * - Emit suggested actions from the visible controls, capped at
++ *   [maxSuggestions]. Sensitive nodes (e.g. password fields) are filtered out
++ *   of suggestions and never mentioned by raw text in the summary.
++ * - Always include the universal back/home pair if the screen has any
++ *   content, since those are always-safe navigation aids.
++ *
++ * The summarizer never executes a tool, calls a network, or touches an
++ * approval; it is a pure function of the context.
++ */
++class ScreenContextSummarizer(
++    private val maxNamedItems: Int = 5,
++    private val maxSuggestions: Int = 6
++) {
++    fun summarize(context: ScreenContext): ScreenSummary {
++        if (context.nodes.isEmpty()) {
++            return ScreenSummary(
++                sentence = WeakScreenMessage,
++                suggestedActions = emptyList()
++            )
++        }
++
++        val visibleClickables = context.clickableNodes.filter { it.isSafeToSurface }
++
++        val sentence = buildSentence(context, visibleClickables)
++        val suggestions = buildSuggestions(context, visibleClickables)
++
++        return ScreenSummary(sentence = sentence, suggestedActions = suggestions)
++    }
++
++    private fun buildSentence(
++        context: ScreenContext,
++        visibleClickables: List<ScreenNode>
++    ): String {
++        val screenName = context.appLabel?.takeIf { it.isNotBlank() }
++            ?: context.windowTitle?.takeIf { it.isNotBlank() }
++            ?: context.packageName?.takeIf { it.isNotBlank() }
++
++        val opener = if (screenName != null) {
++            "I see the $screenName screen."
++        } else {
++            "I can see the current screen."
++        }
++
++        val namedLabels = visibleClickables
++            .take(maxNamedItems)
++            .map { it.text.displaySafe }
++            .filter { it.isNotBlank() }
++
++        val visibleClause = when {
++            namedLabels.isEmpty() && context.inputFields.isNotEmpty() ->
++                " It has an input field."
++            namedLabels.isEmpty() -> ""
++            namedLabels.size == 1 -> " Visible actions include ${namedLabels[0]}."
++            else -> " Visible actions include ${joinHumanReadable(namedLabels)}."
++        }
++
++        val tail = buildTail(context)
++        return opener + visibleClause + tail
++    }
++
++    private fun buildTail(context: ScreenContext): String {
++        val parts = mutableListOf<String>()
++        if (context.scrollableNodes.isNotEmpty()) parts += "scroll"
++        parts += "go back or home"
++        return " I can " + joinHumanReadable(parts) + "."
++    }
++
++    private fun buildSuggestions(
++        context: ScreenContext,
++        visibleClickables: List<ScreenNode>
++    ): List<SuggestedAction> {
++        val suggestions = mutableListOf<SuggestedAction>()
++
++        visibleClickables.take(maxSuggestions - SafeNavigationSlots).forEach { node ->
++            suggestions += SuggestedAction(
++                tool = "tap",
++                args = mapOf("text" to node.text.raw),
++                label = "Tap ${node.text.displaySafe}",
++                reason = "visible clickable text"
++            )
++        }
++
++        val firstInput = context.inputFields.firstOrNull { it.isSafeToSurface || it.text.raw.isBlank() }
++            ?.takeUnless { it.sensitive || it.text.isSensitive }
++        if (firstInput != null) {
++            val descriptor = firstInput.text.displaySafe.ifBlank { "input field" }
++            suggestions += SuggestedAction(
++                tool = "type_text",
++                args = emptyMap(),
++                label = "Type into the $descriptor",
++                reason = "visible input field"
++            )
++        }
++
++        if (context.scrollableNodes.isNotEmpty()) {
++            suggestions += SuggestedAction(
++                tool = "scroll",
++                args = mapOf("direction" to "forward"),
++                label = "Scroll down",
++                reason = "scrollable container present"
++            )
++        }
++
++        // Safe navigation slots are always included while content exists, so
++        // the user always has a documented way to back out without re-reading
++        // the visible UI.
++        suggestions += SuggestedAction(
++            tool = "press_back",
++            args = emptyMap(),
++            label = "Go back",
++            reason = "always-safe navigation"
++        )
++        suggestions += SuggestedAction(
++            tool = "press_home",
++            args = emptyMap(),
++            label = "Go home",
++            reason = "always-safe navigation"
++        )
++
++        return suggestions.take(maxSuggestions)
++    }
++
++    private fun joinHumanReadable(items: List<String>): String {
++        return when (items.size) {
++            0 -> ""
++            1 -> items[0]
++            2 -> "${items[0]} and ${items[1]}"
++            else -> items.dropLast(1).joinToString(", ") + ", and " + items.last()
++        }
++    }
++
++    /**
++     * A node is safe to mention by name only when neither the explicit
++     * password/secret flag is set *and* the redactor has not classified its
++     * text as sensitive. The combined check matches
++     * [ScreenContext.containsSensitiveContent], so a node that contributes to
++     * "this screen has sensitive content" never appears verbatim in the
++     * sentence or the suggestion list.
++     */
++    private val ScreenNode.isSafeToSurface: Boolean
++        get() = !sensitive && !text.isSensitive && text.raw.isNotBlank()
++
++    companion object {
++        const val WeakScreenMessage: String =
++            "I can see this screen, but the app exposes limited readable UI data right now. " +
++                "I can still go back or home, or you can switch apps first."
++
++        // press_back + press_home reservations in the suggestion cap.
++        private const val SafeNavigationSlots: Int = 2
++    }
++}
+diff --git a/app/src/main/java/dev/touchpilot/app/screen/ScreenSummary.kt b/app/src/main/java/dev/touchpilot/app/screen/ScreenSummary.kt
+new file mode 100644
+index 0000000..660f596
+--- /dev/null
++++ b/app/src/main/java/dev/touchpilot/app/screen/ScreenSummary.kt
+@@ -0,0 +1,37 @@
++package dev.touchpilot.app.screen
++
++/**
++ * Deterministic local summary of a [ScreenContext] plus a small list of
++ * suggested actions the user could ask TouchPilot to run next.
++ *
++ * The summary is *descriptive* only — generating it never invokes a tool, an
++ * approval, or a network call. Each [SuggestedAction] references an existing
++ * tool concept (tap / scroll / press_back / press_home / type_text) so the
++ * agent runner can execute it through the normal validation, skill
++ * allowlist, policy, approval, and logging path if the user later asks for
++ * it.
++ */
++data class ScreenSummary(
++    val sentence: String,
++    val suggestedActions: List<SuggestedAction>
++)
++
++/**
++ * A safe action the agent could perform next on the current screen.
++ *
++ * - [tool] is one of the tool names known to `AndroidToolCatalog`.
++ * - [args] is a JSON-shaped argument map ready for the agent runner.
++ * - [label] is the user-facing description (e.g. "Tap Wi-Fi").
++ * - [reason] explains the heuristic that produced the suggestion ("visible
++ *   clickable text", "scrollable container present", etc.).
++ *
++ * The intent gate / reasoning core surfaces these as text only. Nothing
++ * executes until the user issues an explicit request that the runner
++ * validates as usual.
++ */
++data class SuggestedAction(
++    val tool: String,
++    val args: Map<String, String>,
++    val label: String,
++    val reason: String
++)
+diff --git a/app/src/test/java/dev/touchpilot/app/agent/IntentGateTest.kt b/app/src/test/java/dev/touchpilot/app/agent/IntentGateTest.kt
+index 30a0d6d..0127279 100644
+--- a/app/src/test/java/dev/touchpilot/app/agent/IntentGateTest.kt
++++ b/app/src/test/java/dev/touchpilot/app/agent/IntentGateTest.kt
+@@ -130,4 +130,46 @@ class IntentGateTest {
+         val decision = gate.classify("Go back", skills = listOf(skill))
+         assertIs<IntentDecision.ExactCommand>(decision)
+     }
++
++    @Test
++    fun classifiesWhatScreenAmIOnAsScreenInquiry() {
++        assertIs<IntentDecision.ScreenInquiry>(gate.classify("What screen am I on?"))
++    }
++
++    @Test
++    fun classifiesWhatCanYouDoHereAsScreenInquiry() {
++        assertIs<IntentDecision.ScreenInquiry>(gate.classify("what can you do here"))
++    }
++
++    @Test
++    fun classifiesWhatButtonsAreVisibleAsScreenInquiry() {
++        assertIs<IntentDecision.ScreenInquiry>(gate.classify("What buttons are visible?"))
++    }
++
++    @Test
++    fun classifiesSummarizeThisScreenAsScreenInquiry() {
++        assertIs<IntentDecision.ScreenInquiry>(gate.classify("Summarize this screen"))
++        assertIs<IntentDecision.ScreenInquiry>(gate.classify("summarise the screen"))
++    }
++
++    @Test
++    fun classifiesSuggestActionsForThisScreenAsScreenInquiry() {
++        assertIs<IntentDecision.ScreenInquiry>(gate.classify("Suggest actions for this screen"))
++    }
++
++    @Test
++    fun whatCanYouDoWithoutHereStaysOutOfScreenInquiry() {
++        // "what can you do" (without "here") is handled by ConversationalGate
++        // as the generic help reply; IntentGate should not claim it.
++        val decision = gate.classify("what can you do")
++        assertIs<IntentDecision.LocalModelNeeded>(decision)
++    }
++
++    @Test
++    fun screenInquiryWinsOverExactCommandWhenBothCouldMatch() {
++        // "what can i do here" has no exact command, but a phrasing like
++        // "summarize the home screen" contains "home" which would otherwise
++        // trip the press_home exact command. Screen inquiry runs first.
++        assertIs<IntentDecision.ScreenInquiry>(gate.classify("summarize the home screen"))
++    }
+ }
+diff --git a/app/src/test/java/dev/touchpilot/app/agent/LocalReasoningCoreTest.kt b/app/src/test/java/dev/touchpilot/app/agent/LocalReasoningCoreTest.kt
+index 8b14727..49478b6 100644
+--- a/app/src/test/java/dev/touchpilot/app/agent/LocalReasoningCoreTest.kt
++++ b/app/src/test/java/dev/touchpilot/app/agent/LocalReasoningCoreTest.kt
+@@ -371,6 +371,79 @@ class LocalReasoningCoreTest {
+         assertEquals(assistant.text, result.finalAnswer)
+     }
+ 
++    @Test
++    fun screenInquiryIntentQueriesProviderAndShortCircuitsBeforeInvocation() {
++        var invoked = false
++        val providerCalls = AtomicInt()
++        val collected = mutableListOf<AgentEvent>()
++        val screen = dev.touchpilot.app.screen.ScreenContext(
++            appLabel = "Settings",
++            nodes = listOf(
++                dev.touchpilot.app.screen.ScreenNode(
++                    nodeId = "0.0",
++                    role = dev.touchpilot.app.screen.NodeRole.BUTTON,
++                    text = dev.touchpilot.app.screen.ScreenText.of("Network & internet"),
++                    clickable = true
++                )
++            )
++        )
++        val core = DefaultLocalReasoningCore(
++            invocation = { _, _ ->
++                invoked = true
++                error("screen inquiry must not invoke the runner")
++            },
++            sessionContext = { defaultContext },
++            screenContextProvider = {
++                providerCalls.value += 1
++                screen
++            }
++        )
++
++        val result = core.run("What screen am I on?") { collected += it }
++
++        assertFalse(invoked)
++        assertEquals(1, providerCalls.value)
++        assertEquals(3, collected.size)
++        assertIs<AgentEvent.UserMessage>(collected[0])
++        val assistant = assertIs<AgentEvent.AssistantMessage>(collected[1])
++        assertTrue(assistant.text.startsWith("I see the Settings screen."))
++        assertTrue(assistant.detail.contains("Suggested actions:"))
++        val finalEvent = assertIs<AgentEvent.FinalAnswer>(collected[2])
++        assertEquals(assistant.text, finalEvent.text)
++        assertEquals(assistant.text, result.finalAnswer)
++        // Transcript surfaces the summary plus the suggestion block so the
++        // chat timeline shows the actual answer rather than a diagnostic.
++        assertTrue(result.transcript.startsWith("I see the Settings screen."))
++        assertTrue(result.transcript.contains("Suggested actions:"))
++    }
++
++    @Test
++    fun screenInquiryWithoutProviderFallsBackToWeakScreenMessage() {
++        var invoked = false
++        val collected = mutableListOf<AgentEvent>()
++        val core = DefaultLocalReasoningCore(
++            invocation = { _, _ ->
++                invoked = true
++                error("screen inquiry must not invoke the runner")
++            },
++            sessionContext = { defaultContext }
++            // screenContextProvider intentionally left at default (Empty).
++        )
++
++        val result = core.run("what can you do here") { collected += it }
++
++        assertFalse(invoked)
++        assertEquals(3, collected.size)
++        val assistant = assertIs<AgentEvent.AssistantMessage>(collected[1])
++        assertTrue(
++            assistant.text.startsWith("I can see this screen, but the app exposes limited"),
++            "expected weak-screen fallback, got: ${assistant.text}"
++        )
++        assertEquals(assistant.text, result.finalAnswer)
++    }
++
++    private class AtomicInt(var value: Int = 0)
++
+     private class StubRuntime(private val output: String) : LocalCommandModelRuntime {
+         override fun status(): LocalModelStatus = LocalModelStatus(
+             available = true,
+diff --git a/app/src/test/java/dev/touchpilot/app/screen/ScreenContextSummarizerTest.kt b/app/src/test/java/dev/touchpilot/app/screen/ScreenContextSummarizerTest.kt
+new file mode 100644
+index 0000000..0d470dc
+--- /dev/null
++++ b/app/src/test/java/dev/touchpilot/app/screen/ScreenContextSummarizerTest.kt
+@@ -0,0 +1,227 @@
++package dev.touchpilot.app.screen
++
++import kotlin.test.Test
++import kotlin.test.assertEquals
++import kotlin.test.assertFalse
++import kotlin.test.assertTrue
++
++class ScreenContextSummarizerTest {
++    private val summarizer = ScreenContextSummarizer()
++
++    @Test
++    fun settingsLikeScreenSummariesAppLabelAndTopActions() {
++        val context = ScreenContext(
++            appLabel = "Settings",
++            packageName = "com.android.settings",
++            nodes = listOf(
++                clickable("0.0", "Network & internet"),
++                clickable("0.1", "Connected devices"),
++                clickable("0.2", "Apps"),
++                clickable("0.3", "Notifications"),
++                clickable("0.4", "Battery")
++            )
++        )
++
++        val summary = summarizer.summarize(context)
++        assertTrue(summary.sentence.startsWith("I see the Settings screen."))
++        assertTrue(summary.sentence.contains("Network & internet"))
++        assertTrue(summary.sentence.contains("Battery"))
++        assertTrue(summary.sentence.contains("go back or home"))
++
++        val tapLabels = summary.suggestedActions.filter { it.tool == "tap" }.map { it.label }
++        assertTrue("Tap Network & internet" in tapLabels)
++        // 5 clickables would exceed the default suggestion cap once back/home
++        // are reserved; the first few entries are kept in order.
++        assertTrue(tapLabels.size in 3..5)
++        // Always-safe navigation is always included.
++        assertTrue(summary.suggestedActions.any { it.tool == "press_back" })
++        assertTrue(summary.suggestedActions.any { it.tool == "press_home" })
++        assertTrue(summary.suggestedActions.size <= 6)
++    }
++
++    @Test
++    fun launcherLikeScreenWithManyItemsTruncatesToTopFew() {
++        val nodes = (1..10).map { i -> clickable("0.$i", "App $i") }
++        val context = ScreenContext(appLabel = "Pixel Launcher", nodes = nodes)
++        val summary = summarizer.summarize(context)
++
++        // Sentence mentions at most maxNamedItems (default 5).
++        val mentioned = (1..10).count { i -> "App $i" in summary.sentence }
++        assertEquals(5, mentioned)
++
++        // Top-of-list app should appear.
++        assertTrue(summary.sentence.contains("App 1"))
++    }
++
++    @Test
++    fun inputFieldScreenSurfacesTypeAction() {
++        val emailInput = ScreenNode(
++            nodeId = "0.0",
++            role = NodeRole.INPUT,
++            text = ScreenText.of("Email"),
++            isInputField = true
++        )
++        val signIn = ScreenNode(
++            nodeId = "0.1",
++            role = NodeRole.BUTTON,
++            text = ScreenText.of("Sign in"),
++            clickable = true
++        )
++        val context = ScreenContext(
++            appLabel = "Mail",
++            nodes = listOf(emailInput, signIn)
++        )
++        val summary = summarizer.summarize(context)
++
++        assertTrue(summary.suggestedActions.any { it.tool == "tap" && it.label == "Tap Sign in" })
++        val type = summary.suggestedActions.firstOrNull { it.tool == "type_text" }
++        assertTrue(type != null, "expected a type_text suggestion")
++        assertTrue(type!!.label.startsWith("Type into"))
++    }
++
++    @Test
++    fun passwordFieldIsNeverSurfacedInSuggestions() {
++        val passwordInput = ScreenNode(
++            nodeId = "0.0",
++            role = NodeRole.INPUT,
++            text = ScreenText.of("Password"),
++            isInputField = true,
++            sensitive = true
++        )
++        val visibleButton = ScreenNode(
++            nodeId = "0.1",
++            role = NodeRole.BUTTON,
++            text = ScreenText.of("Continue"),
++            clickable = true
++        )
++        val context = ScreenContext(
++            appLabel = "Login",
++            nodes = listOf(passwordInput, visibleButton)
++        )
++        val summary = summarizer.summarize(context)
++
++        // Password field must not appear as a type_text suggestion.
++        assertFalse(summary.suggestedActions.any { it.tool == "type_text" })
++        // And the literal "Password" label must not leak into the sentence.
++        assertFalse(summary.sentence.contains("Password"))
++        // Continue button is still actionable.
++        assertTrue(summary.suggestedActions.any { it.label == "Tap Continue" })
++    }
++
++    @Test
++    fun sensitiveClickableLabelIsFilteredFromSuggestions() {
++        val emailItem = ScreenNode(
++            nodeId = "0.0",
++            role = NodeRole.BUTTON,
++            text = ScreenText.of("user@example.com"),
++            clickable = true,
++            sensitive = true
++        )
++        val benignItem = ScreenNode(
++            nodeId = "0.1",
++            role = NodeRole.BUTTON,
++            text = ScreenText.of("Sign out"),
++            clickable = true
++        )
++        val summary = summarizer.summarize(
++            ScreenContext(appLabel = "Account", nodes = listOf(emailItem, benignItem))
++        )
++
++        assertFalse(summary.suggestedActions.any { it.label.contains("@example.com") })
++        assertTrue(summary.suggestedActions.any { it.label == "Tap Sign out" })
++    }
++
++    @Test
++    fun textSensitiveNodesAreFilteredEvenWithoutNodeSensitiveFlag() {
++        val emailInput = ScreenNode(
++            nodeId = "0.0",
++            role = NodeRole.INPUT,
++            text = ScreenText.of("user@example.com"),
++            isInputField = true
++        )
++        val emailClickable = ScreenNode(
++            nodeId = "0.1",
++            role = NodeRole.BUTTON,
++            text = ScreenText.of("user@example.com"),
++            clickable = true
++        )
++        val continueButton = ScreenNode(
++            nodeId = "0.2",
++            role = NodeRole.BUTTON,
++            text = ScreenText.of("Continue"),
++            clickable = true
++        )
++
++        val summary = summarizer.summarize(
++            ScreenContext(appLabel = "Account", nodes = listOf(emailInput, emailClickable, continueButton))
++        )
++
++        assertFalse(summary.sentence.contains("@example.com"))
++        assertFalse(summary.suggestedActions.any { it.tool == "type_text" })
++        assertFalse(summary.suggestedActions.any { it.label.contains("@example.com") })
++        assertTrue(summary.suggestedActions.any { it.label == "Tap Continue" })
++    }
++
++    @Test
++    fun emptyContextReturnsWeakScreenMessageAndNoSuggestions() {
++        val summary = summarizer.summarize(ScreenContext.Empty)
++        assertEquals(ScreenContextSummarizer.WeakScreenMessage, summary.sentence)
++        assertTrue(summary.suggestedActions.isEmpty())
++    }
++
++    @Test
++    fun scrollableContainerAddsScrollSuggestion() {
++        val list = ScreenNode(
++            nodeId = "0.0",
++            role = NodeRole.SCROLLABLE,
++            scrollable = true
++        )
++        val item = clickable("0.1", "Item one")
++        val summary = summarizer.summarize(
++            ScreenContext(appLabel = "Feed", nodes = listOf(list, item))
++        )
++        assertTrue(summary.suggestedActions.any { it.tool == "scroll" })
++        assertTrue(summary.sentence.contains("scroll"))
++    }
++
++    @Test
++    fun windowTitleFallbackUsedWhenAppLabelMissing() {
++        val summary = summarizer.summarize(
++            ScreenContext(
++                windowTitle = "Wi-Fi",
++                nodes = listOf(clickable("0.0", "Add network"))
++            )
++        )
++        assertTrue(summary.sentence.startsWith("I see the Wi-Fi screen."))
++    }
++
++    @Test
++    fun packageNameFallbackUsedWhenLabelAndTitleMissing() {
++        val summary = summarizer.summarize(
++            ScreenContext(
++                packageName = "com.example.app",
++                nodes = listOf(clickable("0.0", "Continue"))
++            )
++        )
++        assertTrue(summary.sentence.startsWith("I see the com.example.app screen."))
++    }
++
++    @Test
++    fun maxSuggestionsCapEnforced() {
++        val many = (1..20).map { clickable("0.$it", "Action $it") }
++        val summary = summarizer.summarize(ScreenContext(appLabel = "Many", nodes = many))
++        assertEquals(6, summary.suggestedActions.size)
++        // press_back and press_home are always retained.
++        assertTrue(summary.suggestedActions.any { it.tool == "press_back" })
++        assertTrue(summary.suggestedActions.any { it.tool == "press_home" })
++    }
++
++    private fun clickable(id: String, label: String): ScreenNode {
++        return ScreenNode(
++            nodeId = id,
++            role = NodeRole.BUTTON,
++            text = ScreenText.of(label),
++            clickable = true
++        )
++    }
++}

@@ -1,0 +1,491 @@
+diff --git a/src/vouch/cli.py b/src/vouch/cli.py
+index a3d1559..1d38caf 100644
+--- a/src/vouch/cli.py
++++ b/src/vouch/cli.py
+@@ -11,6 +11,8 @@
+ import json
+ import os
+ import sys
++from collections.abc import Iterator
++from contextlib import contextmanager
+ from pathlib import Path
+ 
+ import click
+@@ -23,16 +25,18 @@
+ from . import verify as verify_mod
+ from .capabilities import capabilities as build_caps
+ from .context import build_context_pack
++from .lifecycle import LifecycleError
+ from .models import ProposalStatus
+ from .proposals import (
+-    approve as do_approve,
+-)
+-from .proposals import (
++    ProposalError,
+     propose_claim,
+     propose_entity,
+     propose_page,
+     propose_relation,
+ )
++from .proposals import (
++    approve as do_approve,
++)
+ from .proposals import (
+     reject as do_reject,
+ )
+@@ -44,6 +48,20 @@
+ )
+ 
+ 
++@contextmanager
++def _cli_errors() -> Iterator[None]:
++    # Translate domain errors into click.ClickException so users see a
++    # one-line `Error: ...` instead of a Python traceback. Without this,
++    # ProposalError / LifecycleError (both RuntimeError subclasses) escape
++    # the narrower `(ArtifactNotFoundError, ValueError)` tuples previously
++    # used per-command. The MCP and JSONL servers do the equivalent in
++    # their own request envelopes.
++    try:
++        yield
++    except (ArtifactNotFoundError, ValueError, ProposalError, LifecycleError) as e:
++        raise click.ClickException(str(e)) from e
++
++
+ def _load_store(start: Path | None = None) -> KBStore:
+     try:
+         return KBStore(discover_root(start))
+@@ -176,10 +194,8 @@ def pending() -> None:
+ def show(proposal_id: str) -> None:
+     """Show full details of a proposal."""
+     store = _load_store()
+-    try:
++    with _cli_errors():
+         pr = store.get_proposal(proposal_id)
+-    except ArtifactNotFoundError as e:
+-        raise click.ClickException(str(e)) from e
+     click.echo(yaml.safe_dump(pr.model_dump(mode="json"), sort_keys=False))
+ 
+ 
+@@ -189,10 +205,8 @@ def show(proposal_id: str) -> None:
+ def approve(proposal_id: str, reason: str | None) -> None:
+     """Approve a proposal — converts it into a durable artifact."""
+     store = _load_store()
+-    try:
++    with _cli_errors():
+         artifact = do_approve(store, proposal_id, approved_by=_whoami(), reason=reason)
+-    except (ArtifactNotFoundError, ValueError) as e:
+-        raise click.ClickException(str(e)) from e
+     click.echo(f"Approved → {type(artifact).__name__.lower()}/{artifact.id}")
+ 
+ 
+@@ -202,10 +216,8 @@ def approve(proposal_id: str, reason: str | None) -> None:
+ def reject(proposal_id: str, reason: str) -> None:
+     """Reject a proposal — recorded for audit and future agent context."""
+     store = _load_store()
+-    try:
++    with _cli_errors():
+         do_reject(store, proposal_id, rejected_by=_whoami(), reason=reason)
+-    except (ArtifactNotFoundError, ValueError) as e:
+-        raise click.ClickException(str(e)) from e
+     click.echo(f"Rejected {proposal_id}")
+ 
+ 
+@@ -224,11 +236,12 @@ def propose_claim_cmd(text: str, sources: tuple[str, ...], claim_type: str,
+                       confidence: float, rationale: str | None,
+                       tags: tuple[str, ...]) -> None:
+     store = _load_store()
+-    pr = propose_claim(
+-        store, text=text, evidence=list(sources),
+-        proposed_by=_whoami(), claim_type=claim_type,
+-        confidence=confidence, tags=list(tags), rationale=rationale,
+-    )
++    with _cli_errors():
++        pr = propose_claim(
++            store, text=text, evidence=list(sources),
++            proposed_by=_whoami(), claim_type=claim_type,
++            confidence=confidence, tags=list(tags), rationale=rationale,
++        )
+     click.echo(pr.id)
+ 
+ 
+@@ -243,11 +256,12 @@ def propose_page_cmd(title: str, body: str, page_type: str,
+     store = _load_store()
+     if body == "-":
+         body = sys.stdin.read()
+-    pr = propose_page(
+-        store, title=title, body=body, page_type=page_type,
+-        claim_ids=list(claims), entity_ids=list(entities),
+-        proposed_by=_whoami(),
+-    )
++    with _cli_errors():
++        pr = propose_page(
++            store, title=title, body=body, page_type=page_type,
++            claim_ids=list(claims), entity_ids=list(entities),
++            proposed_by=_whoami(),
++        )
+     click.echo(pr.id)
+ 
+ 
+@@ -259,10 +273,11 @@ def propose_page_cmd(title: str, body: str, page_type: str,
+ def propose_entity_cmd(name: str, entity_type: str, aliases: tuple[str, ...],
+                        description: str | None) -> None:
+     store = _load_store()
+-    pr = propose_entity(
+-        store, name=name, entity_type=entity_type,
+-        aliases=list(aliases), description=description, proposed_by=_whoami(),
+-    )
++    with _cli_errors():
++        pr = propose_entity(
++            store, name=name, entity_type=entity_type,
++            aliases=list(aliases), description=description, proposed_by=_whoami(),
++        )
+     click.echo(pr.id)
+ 
+ 
+@@ -273,10 +288,11 @@ def propose_entity_cmd(name: str, entity_type: str, aliases: tuple[str, ...],
+ @click.option("--confidence", default=0.7, show_default=True, type=float)
+ def propose_relation_cmd(src: str, relation: str, target: str, confidence: float) -> None:
+     store = _load_store()
+-    pr = propose_relation(
+-        store, src=src, relation=relation, target=target,
+-        confidence=confidence, proposed_by=_whoami(),
+-    )
++    with _cli_errors():
++        pr = propose_relation(
++            store, src=src, relation=relation, target=target,
++            confidence=confidence, proposed_by=_whoami(),
++        )
+     click.echo(pr.id)
+ 
+ 
+@@ -298,13 +314,14 @@ def source_add(path: str, title: str | None, url: str | None,
+     """Register a file as a Source; prints its sha256 id."""
+     store = _load_store()
+     data = Path(path).read_bytes()
+-    src = store.put_source(
+-        data,
+-        title=title or Path(path).name,
+-        url=url,
+-        locator=str(Path(path).resolve()),
+-        source_type=source_type,
+-    )
++    with _cli_errors():
++        src = store.put_source(
++            data,
++            title=title or Path(path).name,
++            url=url,
++            locator=str(Path(path).resolve()),
++            source_type=source_type,
++        )
+     audit_mod.log_event(
+         store.kb_dir, event="source.add", actor=_whoami(), object_ids=[src.id],
+     )
+@@ -338,8 +355,9 @@ def source_verify(fail_on_issue: bool) -> None:
+ def supersede(old_claim_id: str, new_claim_id: str) -> None:
+     """Mark OLD as superseded by NEW."""
+     store = _load_store()
+-    life.supersede(store, old_claim_id=old_claim_id,
+-                   new_claim_id=new_claim_id, actor=_whoami())
++    with _cli_errors():
++        life.supersede(store, old_claim_id=old_claim_id,
++                       new_claim_id=new_claim_id, actor=_whoami())
+     click.echo(f"superseded {old_claim_id} -> {new_claim_id}")
+ 
+ 
+@@ -349,7 +367,8 @@ def supersede(old_claim_id: str, new_claim_id: str) -> None:
+ def contradict(claim_a: str, claim_b: str) -> None:
+     """Record that two claims contradict each other."""
+     store = _load_store()
+-    life.contradict(store, claim_a=claim_a, claim_b=claim_b, actor=_whoami())
++    with _cli_errors():
++        life.contradict(store, claim_a=claim_a, claim_b=claim_b, actor=_whoami())
+     click.echo(f"contradiction recorded: {claim_a} <-> {claim_b}")
+ 
+ 
+@@ -358,7 +377,8 @@ def contradict(claim_a: str, claim_b: str) -> None:
+ def archive(claim_id: str) -> None:
+     """Archive a claim (kept for history, omitted from default retrieval)."""
+     store = _load_store()
+-    life.archive(store, claim_id=claim_id, actor=_whoami())
++    with _cli_errors():
++        life.archive(store, claim_id=claim_id, actor=_whoami())
+     click.echo(f"archived {claim_id}")
+ 
+ 
+@@ -367,7 +387,8 @@ def archive(claim_id: str) -> None:
+ def confirm(claim_id: str) -> None:
+     """Re-confirm a claim — bumps last_confirmed_at."""
+     store = _load_store()
+-    life.confirm(store, claim_id=claim_id, actor=_whoami())
++    with _cli_errors():
++        life.confirm(store, claim_id=claim_id, actor=_whoami())
+     click.echo(f"confirmed {claim_id}")
+ 
+ 
+@@ -377,8 +398,9 @@ def cite(claim_id: str) -> None:
+     """Resolve and print all citations backing a claim."""
+     store = _load_store()
+     out = []
+-    for c in life.cite(store, claim_id):
+-        out.append(c.model_dump(mode="json") if hasattr(c, "model_dump") else c)
++    with _cli_errors():
++        for c in life.cite(store, claim_id):
++            out.append(c.model_dump(mode="json") if hasattr(c, "model_dump") else c)
+     _emit_json(out)
+ 
+ 
+@@ -411,7 +433,8 @@ def session_start_cmd(agent: str | None, task: str | None, note: str | None) ->
+ @click.option("--note", default=None)
+ def session_end_cmd(session_id: str, note: str | None) -> None:
+     store = _load_store()
+-    sess = sess_mod.session_end(store, session_id, note=note)
++    with _cli_errors():
++        sess = sess_mod.session_end(store, session_id, note=note)
+     _emit_json({"session": sess.id, "proposals": sess.proposal_ids})
+ 
+ 
+@@ -421,9 +444,10 @@ def session_end_cmd(session_id: str, note: str | None) -> None:
+ def crystallize(session_id: str, no_page: bool) -> None:
+     """Approve every pending proposal in a session (and write a summary page)."""
+     store = _load_store()
+-    result = sess_mod.crystallize(
+-        store, session_id, approver=_whoami(), write_summary_page=not no_page,
+-    )
++    with _cli_errors():
++        result = sess_mod.crystallize(
++            store, session_id, approver=_whoami(), write_summary_page=not no_page,
++        )
+     _emit_json(result)
+ 
+ 
+diff --git a/src/vouch/context.py b/src/vouch/context.py
+index 511517b..532e727 100644
+--- a/src/vouch/context.py
++++ b/src/vouch/context.py
+@@ -13,10 +13,14 @@
+ 
+ from __future__ import annotations
+ 
++from typing import Literal, cast
++
+ from . import index_db
+ from .models import ContextItem, ContextPack, ContextQuality
+ from .storage import KBStore
+ 
++ContextItemKind = Literal["claim", "page", "entity", "relation", "source"]
++
+ 
+ def _retrieve(store: KBStore, query: str, limit: int
+               ) -> list[tuple[str, str, str, float, str]]:
+@@ -61,7 +65,7 @@ def build_context_pack(
+             cites = _citations_for_claim(store, hid)
+         items.append(
+             ContextItem(
+-                id=hid, type=kind, summary=summary, score=score,
++                id=hid, type=cast(ContextItemKind, kind), summary=summary, score=score,
+                 backend=backend, citations=cites,
+                 freshness="unknown",
+             )
+diff --git a/src/vouch/sessions.py b/src/vouch/sessions.py
+index 3e847c8..5a93134 100644
+--- a/src/vouch/sessions.py
++++ b/src/vouch/sessions.py
+@@ -44,7 +44,7 @@ def session_end(store: KBStore, session_id: str, *, note: str | None = None) ->
+     sess.proposal_ids = sorted({
+         p.id for p in store.list_proposals() if p.session_id == sess.id
+     })
+-    store.put_session(sess)
++    store.update_session(sess)
+     audit.log_event(
+         store.kb_dir, event="session.end", actor=sess.agent,
+         object_ids=[sess.id], data={"proposals": len(sess.proposal_ids)},
+diff --git a/src/vouch/storage.py b/src/vouch/storage.py
+index 8249ea0..accd233 100644
+--- a/src/vouch/storage.py
++++ b/src/vouch/storage.py
+@@ -246,10 +246,10 @@ def put_claim(self, claim: Claim) -> Claim:
+         try:
+             with self._claim_path(claim.id).open("x") as f:
+                 f.write(_yaml_dump(claim.model_dump(mode="json")))
+-        except FileExistsError:
++        except FileExistsError as e:
+             raise ValueError(
+                 f"claim {claim.id} already exists -- use update_claim()"
+-            )
++            ) from e
+         return claim
+ 
+     def get_claim(self, claim_id: str) -> Claim:
+@@ -282,10 +282,10 @@ def put_page(self, page: Page) -> Page:
+         try:
+             with self._page_path(page.id).open("x") as f:
+                 f.write(_serialize_page(page))
+-        except FileExistsError:
++        except FileExistsError as e:
+             raise ValueError(
+                 f"page {page.id} already exists -- choose a different slug"
+-            )
++            ) from e
+         return page
+ 
+     def get_page(self, page_id: str) -> Page:
+@@ -306,10 +306,10 @@ def put_entity(self, entity: Entity) -> Entity:
+         try:
+             with self._entity_path(entity.id).open("x") as f:
+                 f.write(_yaml_dump(entity.model_dump(mode="json")))
+-        except FileExistsError:
++        except FileExistsError as e:
+             raise ValueError(
+                 f"entity {entity.id} already exists -- choose a different slug"
+-            )
++            ) from e
+         return entity
+ 
+     def get_entity(self, eid: str) -> Entity:
+@@ -331,10 +331,10 @@ def put_relation(self, rel: Relation) -> Relation:
+         try:
+             with self._relation_path(rel.id).open("x") as f:
+                 f.write(_yaml_dump(rel.model_dump(mode="json")))
+-        except FileExistsError:
++        except FileExistsError as e:
+             raise ValueError(
+                 f"relation {rel.id} already exists -- choose a different slug"
+-            )
++            ) from e
+         return rel
+ 
+     def get_relation(self, rid: str) -> Relation:
+@@ -364,10 +364,10 @@ def put_evidence(self, ev: Evidence) -> Evidence:
+         try:
+             with self._evidence_path(ev.id).open("x") as f:
+                 f.write(_yaml_dump(ev.model_dump(mode="json")))
+-        except FileExistsError:
++        except FileExistsError as e:
+             raise ValueError(
+                 f"evidence {ev.id} already exists -- choose a different slug"
+-            )
++            ) from e
+         return ev
+ 
+     def get_evidence(self, eid: str) -> Evidence:
+@@ -389,10 +389,19 @@ def put_session(self, sess: Session) -> Session:
+         try:
+             with self._session_path(sess.id).open("x") as f:
+                 f.write(_yaml_dump(sess.model_dump(mode="json")))
+-        except FileExistsError:
++        except FileExistsError as e:
+             raise ValueError(
+                 f"session {sess.id} already exists -- choose a different id"
+-            )
++            ) from e
++        return sess
++
++    def update_session(self, sess: Session) -> Session:
++        # session_end() mutates an already-on-disk session (sets ended_at /
++        # backfills proposal_ids). put_session() uses exclusive create as a
++        # guard against duplicate ids, so updates need a separate path.
++        if not self._session_path(sess.id).exists():
++            raise ArtifactNotFoundError(f"session {sess.id}")
++        self._session_path(sess.id).write_text(_yaml_dump(sess.model_dump(mode="json")))
+         return sess
+ 
+     def get_session(self, sid: str) -> Session:
+@@ -414,10 +423,10 @@ def put_proposal(self, proposal: Proposal) -> Proposal:
+         try:
+             with self._proposal_path(proposal.id).open("x") as f:
+                 f.write(_yaml_dump(proposal.model_dump(mode="json")))
+-        except FileExistsError:
++        except FileExistsError as e:
+             raise ValueError(
+                 f"proposal {proposal.id} already exists -- choose a different id"
+-            )
++            ) from e
+         return proposal
+ 
+     def get_proposal(self, proposal_id: str) -> Proposal:
+diff --git a/tests/test_cli.py b/tests/test_cli.py
+new file mode 100644
+index 0000000..6fa1034
+--- /dev/null
++++ b/tests/test_cli.py
+@@ -0,0 +1,80 @@
++"""CLI surface — every command must turn domain errors into a clean
++`Error: ...` line via click.ClickException, never a raw Python traceback.
++
++These regressions cover the bug class where CLI handlers caught
++``(ArtifactNotFoundError, ValueError)`` but ``proposals.approve()`` /
++``proposals.reject()`` (and the ``propose_*`` helpers) raise
++``ProposalError`` (a ``RuntimeError`` subclass) for validation failures —
++which slipped past the except and surfaced as a traceback.
++"""
++
++from __future__ import annotations
++
++from pathlib import Path
++
++import pytest
++from click.testing import CliRunner
++
++from vouch.cli import cli
++from vouch.proposals import propose_claim
++from vouch.storage import KBStore
++
++
++@pytest.fixture
++def store(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> KBStore:
++    s = KBStore.init(tmp_path)
++    monkeypatch.chdir(s.root)
++    return s
++
++
++def _assert_clean_error(result, needle: str) -> None:
++    assert result.exit_code != 0, result.output
++    # click.ClickException renders as ``Error: <msg>``; a raw traceback would
++    # include the Python frame marker ``Traceback (most recent call last)``.
++    assert "Traceback" not in result.output, result.output
++    assert "Error:" in result.output, result.output
++    assert needle in result.output, result.output
++
++
++def test_approve_already_decided_proposal_shows_clean_error(store: KBStore) -> None:
++    src = store.put_source(b"e")
++    pr = propose_claim(store, text="x", evidence=[src.id], proposed_by="agent")
++    runner = CliRunner()
++    first = runner.invoke(cli, ["approve", pr.id])
++    assert first.exit_code == 0, first.output
++    second = runner.invoke(cli, ["approve", pr.id])
++    _assert_clean_error(second, "not pending")
++
++
++def test_reject_empty_reason_shows_clean_error(store: KBStore) -> None:
++    src = store.put_source(b"e")
++    pr = propose_claim(store, text="x", evidence=[src.id], proposed_by="agent")
++    result = CliRunner().invoke(cli, ["reject", pr.id, "--reason", "   "])
++    _assert_clean_error(result, "reason")
++
++
++def test_propose_claim_empty_text_shows_clean_error(store: KBStore) -> None:
++    src = store.put_source(b"e")
++    result = CliRunner().invoke(
++        cli, ["propose-claim", "--text", "   ", "--source", src.id]
++    )
++    _assert_clean_error(result, "claim text")
++
++
++def test_propose_claim_unknown_source_shows_clean_error(store: KBStore) -> None:
++    result = CliRunner().invoke(
++        cli, ["propose-claim", "--text", "ok", "--source", "deadbeef"]
++    )
++    _assert_clean_error(result, "unknown source")
++
++
++def test_propose_entity_empty_name_shows_clean_error(store: KBStore) -> None:
++    result = CliRunner().invoke(
++        cli, ["propose-entity", "--name", "   ", "--type", "project"]
++    )
++    _assert_clean_error(result, "entity name")
++
++
++def test_show_missing_proposal_shows_clean_error(store: KBStore) -> None:
++    result = CliRunner().invoke(cli, ["show", "no-such-proposal"])
++    _assert_clean_error(result, "proposal no-such-proposal")

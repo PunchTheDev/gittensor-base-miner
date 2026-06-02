@@ -1,0 +1,566 @@
+diff --git a/app/models/enable_banking_item/importer.rb b/app/models/enable_banking_item/importer.rb
+index 178d146f29..5e7617a628 100644
+--- a/app/models/enable_banking_item/importer.rb
++++ b/app/models/enable_banking_item/importer.rb
+@@ -203,6 +203,11 @@ def fetch_and_store_transactions(enable_banking_account)
+         break if continuation_key.blank?
+       end
+ 
++      # Deduplicate API response: Enable Banking sometimes returns the same logical
++      # transaction with different entry_reference IDs in the same response.
++      # Remove content-level duplicates before storing. (Issue #954)
++      all_transactions = deduplicate_api_transactions(all_transactions)
++
+       transactions_count = all_transactions.count
+ 
+       if all_transactions.any?
+@@ -232,6 +237,71 @@ def fetch_and_store_transactions(enable_banking_account)
+       { success: false, transactions_count: 0, error: e.message }
+     end
+ 
++    # Deduplicate transactions from the Enable Banking API response.
++    # Some banks return the same logical transaction multiple times with different
++    # entry_reference IDs. We build a composite content key that includes
++    # transaction_id (when present) alongside date, amount, currency, creditor,
++    # debtor, remittance_information, and status. Per the Enable Banking API docs
++    # transaction_id is not guaranteed to be unique, so it cannot be used as
++    # the sole dedup criterion. Including it in the composite key preserves
++    # legitimately distinct transactions with identical content but different
++    # transaction_ids (e.g. two laundromat payments on the same day). (Issue #954)
++    def deduplicate_api_transactions(transactions)
++      seen = {}
++      duplicates_removed = 0
++
++      result = transactions.select do |tx|
++        tx = tx.with_indifferent_access
++        key = build_transaction_content_key(tx)
++
++        if seen[key]
++          duplicates_removed += 1
++          false
++        else
++          seen[key] = true
++          true
++        end
++      end
++
++      if duplicates_removed > 0
++        Rails.logger.info(
++          "EnableBankingItem::Importer - Removed #{duplicates_removed} content-level " \
++          "duplicate(s) from API response (#{transactions.count} → #{result.count} transactions)"
++        )
++      end
++
++      result
++    end
++
++    # Build a composite key for deduplication. Two transactions with different
++    # entry_reference values but identical content fields (including
++    # transaction_id and credit_debit_indicator) are considered duplicates.
++    # transaction_id is included as one component — not a standalone key —
++    # because the Enable Banking API docs state it is not guaranteed to be
++    # unique. credit_debit_indicator (CRDT/DBIT) is included because
++    # transaction_amount.amount is always positive — without it, a payment
++    # and a same-day refund of the same amount would produce identical keys.
++    # Known limitation: when transaction_id is nil for both, pure content
++    # comparison applies. This means two genuinely distinct transactions
++    # with identical content (same date, amount, direction, creditor, etc.)
++    # and no transaction_id would collapse to one. In practice, banks that
++    # omit transaction_id rarely produce such exact duplicates in the same
++    # API response; timestamps or remittance info usually differ. (Issue #954)
++    def build_transaction_content_key(tx)
++      date = tx[:booking_date].presence || tx[:value_date]
++      amount = tx.dig(:transaction_amount, :amount).presence || tx[:amount]
++      currency = tx.dig(:transaction_amount, :currency).presence || tx[:currency]
++      creditor = tx.dig(:creditor, :name).presence || tx[:creditor_name]
++      debtor = tx.dig(:debtor, :name).presence || tx[:debtor_name]
++      remittance = tx[:remittance_information]
++      remittance_key = remittance.is_a?(Array) ? remittance.compact.map(&:to_s).sort.join("|") : remittance.to_s
++      status = tx[:status]
++      tid = tx[:transaction_id]
++      direction = tx[:credit_debit_indicator]
++
++      [ date, amount, currency, creditor, debtor, remittance_key, status, tid, direction ].map(&:to_s).join("\x1F")
++    end
++
+     def determine_sync_start_date(enable_banking_account)
+       has_stored_transactions = enable_banking_account.raw_transactions_payload.to_a.any?
+ 
+diff --git a/test/models/enable_banking_entry/processor_test.rb b/test/models/enable_banking_entry/processor_test.rb
+new file mode 100644
+index 0000000000..33e55f46eb
+--- /dev/null
++++ b/test/models/enable_banking_entry/processor_test.rb
+@@ -0,0 +1,120 @@
++require "test_helper"
++
++class EnableBankingEntry::ProcessorTest < ActiveSupport::TestCase
++  setup do
++    @family = families(:dylan_family)
++    @account = accounts(:depository)
++    @enable_banking_item = EnableBankingItem.create!(
++      family: @family,
++      name: "Test Enable Banking",
++      country_code: "DE",
++      application_id: "test_app_id",
++      client_certificate: "test_cert"
++    )
++    @enable_banking_account = EnableBankingAccount.create!(
++      enable_banking_item: @enable_banking_item,
++      name: "N26 Hauptkonto",
++      uid: "eb_uid_1",
++      currency: "EUR"
++    )
++    AccountProvider.create!(
++      account: @account,
++      provider: @enable_banking_account
++    )
++  end
++
++  test "uses entry_reference as external_id when transaction_id is nil" do
++    tx = {
++      entry_reference: "31e13269-03fc-11f1-89d2-cd465703551c",
++      transaction_id: nil,
++      booking_date: Date.current.to_s,
++      transaction_amount: { amount: "11.65", currency: "EUR" },
++      creditor: { name: "Spar Dankt 3418" },
++      credit_debit_indicator: "DBIT",
++      status: "BOOK"
++    }
++
++    assert_difference "@account.entries.count", 1 do
++      EnableBankingEntry::Processor.new(tx, enable_banking_account: @enable_banking_account).process
++    end
++
++    entry = @account.entries.find_by!(
++      external_id: "enable_banking_31e13269-03fc-11f1-89d2-cd465703551c",
++      source: "enable_banking"
++    )
++    assert_equal 11.65, entry.amount.to_f
++    assert_equal "EUR", entry.currency
++  end
++
++  test "uses transaction_id as external_id when present" do
++    tx = {
++      entry_reference: "ref_123",
++      transaction_id: "txn_456",
++      booking_date: Date.current.to_s,
++      transaction_amount: { amount: "25.00", currency: "EUR" },
++      creditor: { name: "Amazon" },
++      credit_debit_indicator: "DBIT",
++      status: "BOOK"
++    }
++
++    EnableBankingEntry::Processor.new(tx, enable_banking_account: @enable_banking_account).process
++
++    entry = @account.entries.find_by!(external_id: "enable_banking_txn_456", source: "enable_banking")
++    assert_equal 25.0, entry.amount.to_f
++  end
++
++  test "does not create duplicate when same entry_reference is processed twice" do
++    tx = {
++      entry_reference: "unique_ref_abc",
++      transaction_id: nil,
++      booking_date: Date.current.to_s,
++      transaction_amount: { amount: "50.00", currency: "EUR" },
++      creditor: { name: "Rewe" },
++      credit_debit_indicator: "DBIT",
++      status: "BOOK"
++    }
++
++    assert_difference "@account.entries.count", 1 do
++      EnableBankingEntry::Processor.new(tx, enable_banking_account: @enable_banking_account).process
++    end
++
++    assert_no_difference "@account.entries.count" do
++      EnableBankingEntry::Processor.new(tx, enable_banking_account: @enable_banking_account).process
++    end
++  end
++
++  test "raises ArgumentError when both transaction_id and entry_reference are nil" do
++    tx = {
++      transaction_id: nil,
++      entry_reference: nil,
++      booking_date: Date.current.to_s,
++      transaction_amount: { amount: "10.00", currency: "EUR" },
++      creditor: { name: "Test" },
++      credit_debit_indicator: "DBIT",
++      status: "BOOK"
++    }
++
++    assert_raises(ArgumentError) do
++      EnableBankingEntry::Processor.new(tx, enable_banking_account: @enable_banking_account).process
++    end
++  end
++
++  test "handles string keys in transaction data" do
++    tx = {
++      "entry_reference" => "string_key_ref",
++      "transaction_id" => nil,
++      "booking_date" => Date.current.to_s,
++      "transaction_amount" => { "amount" => "15.00", "currency" => "EUR" },
++      "creditor" => { "name" => "Lidl" },
++      "credit_debit_indicator" => "DBIT",
++      "status" => "BOOK"
++    }
++
++    assert_difference "@account.entries.count", 1 do
++      EnableBankingEntry::Processor.new(tx, enable_banking_account: @enable_banking_account).process
++    end
++
++    entry = @account.entries.find_by!(external_id: "enable_banking_string_key_ref", source: "enable_banking")
++    assert_equal 15.0, entry.amount.to_f
++  end
++end
+diff --git a/test/models/enable_banking_item/importer_dedup_test.rb b/test/models/enable_banking_item/importer_dedup_test.rb
+new file mode 100644
+index 0000000000..af6737a1ac
+--- /dev/null
++++ b/test/models/enable_banking_item/importer_dedup_test.rb
+@@ -0,0 +1,346 @@
++require "test_helper"
++
++class EnableBankingItem::ImporterDedupTest < ActiveSupport::TestCase
++  setup do
++    @family = families(:dylan_family)
++    @enable_banking_item = EnableBankingItem.create!(
++      family: @family,
++      name: "Test Enable Banking",
++      country_code: "AT",
++      application_id: "test_app_id",
++      client_certificate: "test_cert",
++      session_id: "test_session",
++      session_expires_at: 1.day.from_now
++    )
++
++    mock_provider = mock()
++    @importer = EnableBankingItem::Importer.new(@enable_banking_item, enable_banking_provider: mock_provider)
++  end
++
++  test "removes content-level duplicates with different entry_reference IDs" do
++    transactions = [
++      {
++        entry_reference: "ref_aaa",
++        transaction_id: nil,
++        booking_date: "2026-02-07",
++        transaction_amount: { amount: "11.65", currency: "EUR" },
++        creditor: { name: "Spar Dankt 3418" },
++        credit_debit_indicator: "DBIT",
++        status: "BOOK"
++      },
++      {
++        entry_reference: "ref_bbb",
++        transaction_id: nil,
++        booking_date: "2026-02-07",
++        transaction_amount: { amount: "11.65", currency: "EUR" },
++        creditor: { name: "Spar Dankt 3418" },
++        credit_debit_indicator: "DBIT",
++        status: "BOOK"
++      }
++    ]
++
++    result = @importer.send(:deduplicate_api_transactions, transactions)
++
++    assert_equal 1, result.count
++    assert_equal "ref_aaa", result.first[:entry_reference]
++  end
++
++  test "keeps transactions with different amounts" do
++    transactions = [
++      {
++        entry_reference: "ref_1",
++        booking_date: "2026-02-07",
++        transaction_amount: { amount: "11.65", currency: "EUR" },
++        creditor: { name: "Spar" },
++        status: "BOOK"
++      },
++      {
++        entry_reference: "ref_2",
++        booking_date: "2026-02-07",
++        transaction_amount: { amount: "23.30", currency: "EUR" },
++        creditor: { name: "Spar" },
++        status: "BOOK"
++      }
++    ]
++
++    result = @importer.send(:deduplicate_api_transactions, transactions)
++
++    assert_equal 2, result.count
++  end
++
++  test "keeps transactions with different dates" do
++    transactions = [
++      {
++        entry_reference: "ref_1",
++        booking_date: "2026-02-07",
++        transaction_amount: { amount: "11.65", currency: "EUR" },
++        creditor: { name: "Spar" },
++        status: "BOOK"
++      },
++      {
++        entry_reference: "ref_2",
++        booking_date: "2026-02-08",
++        transaction_amount: { amount: "11.65", currency: "EUR" },
++        creditor: { name: "Spar" },
++        status: "BOOK"
++      }
++    ]
++
++    result = @importer.send(:deduplicate_api_transactions, transactions)
++
++    assert_equal 2, result.count
++  end
++
++  test "keeps transactions with different creditors" do
++    transactions = [
++      {
++        entry_reference: "ref_1",
++        booking_date: "2026-02-07",
++        transaction_amount: { amount: "11.65", currency: "EUR" },
++        creditor: { name: "Spar" },
++        status: "BOOK"
++      },
++      {
++        entry_reference: "ref_2",
++        booking_date: "2026-02-07",
++        transaction_amount: { amount: "11.65", currency: "EUR" },
++        creditor: { name: "Lidl" },
++        status: "BOOK"
++      }
++    ]
++
++    result = @importer.send(:deduplicate_api_transactions, transactions)
++
++    assert_equal 2, result.count
++  end
++
++  test "removes multiple duplicates from same response" do
++    base = {
++      booking_date: "2026-02-07",
++      transaction_amount: { amount: "3.00", currency: "EUR" },
++      creditor: { name: "Bakery" },
++      status: "BOOK"
++    }
++
++    transactions = [
++      base.merge(entry_reference: "ref_1"),
++      base.merge(entry_reference: "ref_2"),
++      base.merge(entry_reference: "ref_3")
++    ]
++
++    result = @importer.send(:deduplicate_api_transactions, transactions)
++
++    assert_equal 1, result.count
++    assert_equal "ref_1", result.first[:entry_reference]
++  end
++
++  test "handles string keys in transaction data" do
++    transactions = [
++      {
++        "entry_reference" => "ref_aaa",
++        "booking_date" => "2026-02-07",
++        "transaction_amount" => { "amount" => "11.65", "currency" => "EUR" },
++        "creditor" => { "name" => "Spar" },
++        "status" => "BOOK"
++      },
++      {
++        "entry_reference" => "ref_bbb",
++        "booking_date" => "2026-02-07",
++        "transaction_amount" => { "amount" => "11.65", "currency" => "EUR" },
++        "creditor" => { "name" => "Spar" },
++        "status" => "BOOK"
++      }
++    ]
++
++    result = @importer.send(:deduplicate_api_transactions, transactions)
++
++    assert_equal 1, result.count
++  end
++
++  test "differentiates by remittance_information" do
++    transactions = [
++      {
++        entry_reference: "ref_1",
++        booking_date: "2026-02-07",
++        transaction_amount: { amount: "100.00", currency: "EUR" },
++        creditor: { name: "Landlord" },
++        remittance_information: [ "Rent January" ],
++        status: "BOOK"
++      },
++      {
++        entry_reference: "ref_2",
++        booking_date: "2026-02-07",
++        transaction_amount: { amount: "100.00", currency: "EUR" },
++        creditor: { name: "Landlord" },
++        remittance_information: [ "Rent February" ],
++        status: "BOOK"
++      }
++    ]
++
++    result = @importer.send(:deduplicate_api_transactions, transactions)
++
++    assert_equal 2, result.count
++  end
++
++  test "handles nil values in remittance_information array" do
++    transactions = [
++      {
++        entry_reference: "ref_aaa",
++        booking_date: "2026-02-07",
++        transaction_amount: { amount: "11.65", currency: "EUR" },
++        creditor: { name: "Spar" },
++        remittance_information: [ nil, "Payment ref 123", nil ],
++        status: "BOOK"
++      },
++      {
++        entry_reference: "ref_bbb",
++        booking_date: "2026-02-07",
++        transaction_amount: { amount: "11.65", currency: "EUR" },
++        creditor: { name: "Spar" },
++        remittance_information: [ "Payment ref 123", nil ],
++        status: "BOOK"
++      }
++    ]
++
++    result = @importer.send(:deduplicate_api_transactions, transactions)
++
++    assert_equal 1, result.count
++    assert_equal "ref_aaa", result.first[:entry_reference]
++  end
++
++  test "preserves distinct transactions with same content but different transaction_ids" do
++    transactions = [
++      {
++        entry_reference: "ref_1",
++        transaction_id: "txn_001",
++        booking_date: "2026-02-09",
++        transaction_amount: { amount: "1.50", currency: "EUR" },
++        creditor: { name: "Waschsalon" },
++        status: "BOOK"
++      },
++      {
++        entry_reference: "ref_2",
++        transaction_id: "txn_002",
++        booking_date: "2026-02-09",
++        transaction_amount: { amount: "1.50", currency: "EUR" },
++        creditor: { name: "Waschsalon" },
++        status: "BOOK"
++      }
++    ]
++
++    result = @importer.send(:deduplicate_api_transactions, transactions)
++
++    assert_equal 2, result.count
++  end
++
++  test "deduplicates same transaction_id even with different entry_references" do
++    transactions = [
++      {
++        entry_reference: "ref_aaa",
++        transaction_id: "txn_same",
++        booking_date: "2026-02-09",
++        transaction_amount: { amount: "25.00", currency: "EUR" },
++        creditor: { name: "Amazon" },
++        status: "BOOK"
++      },
++      {
++        entry_reference: "ref_bbb",
++        transaction_id: "txn_same",
++        booking_date: "2026-02-09",
++        transaction_amount: { amount: "25.00", currency: "EUR" },
++        creditor: { name: "Amazon" },
++        status: "BOOK"
++      }
++    ]
++
++    result = @importer.send(:deduplicate_api_transactions, transactions)
++
++    assert_equal 1, result.count
++    assert_equal "ref_aaa", result.first[:entry_reference]
++  end
++
++  test "preserves transactions with same non-unique transaction_id but different content" do
++    # Per Enable Banking API docs, transaction_id is not guaranteed to be unique.
++    # Two transactions sharing a transaction_id but differing in content must both be kept.
++    transactions = [
++      {
++        entry_reference: "ref_1",
++        transaction_id: "shared_tid",
++        booking_date: "2026-02-09",
++        transaction_amount: { amount: "25.00", currency: "EUR" },
++        creditor: { name: "Amazon" },
++        status: "BOOK"
++      },
++      {
++        entry_reference: "ref_2",
++        transaction_id: "shared_tid",
++        booking_date: "2026-02-09",
++        transaction_amount: { amount: "42.00", currency: "EUR" },
++        creditor: { name: "Amazon" },
++        status: "BOOK"
++      }
++    ]
++
++    result = @importer.send(:deduplicate_api_transactions, transactions)
++
++    assert_equal 2, result.count
++  end
++
++  test "deduplicates using value_date when booking_date is absent" do
++    transactions = [
++      {
++        entry_reference: "ref_1",
++        transaction_id: nil,
++        value_date: "2026-02-10",
++        transaction_amount: { amount: "1.50", currency: "EUR" },
++        creditor: { name: "Waschsalon" },
++        status: "BOOK"
++      },
++      {
++        entry_reference: "ref_2",
++        transaction_id: nil,
++        value_date: "2026-02-10",
++        transaction_amount: { amount: "1.50", currency: "EUR" },
++        creditor: { name: "Waschsalon" },
++        status: "BOOK"
++      }
++    ]
++
++    result = @importer.send(:deduplicate_api_transactions, transactions)
++
++    assert_equal 1, result.count
++    assert_equal "ref_1", result.first[:entry_reference]
++  end
++
++  test "keeps payment and same-day refund with same amount as separate transactions" do
++    transactions = [
++      {
++        entry_reference: "ref_payment",
++        transaction_id: nil,
++        booking_date: "2026-02-09",
++        transaction_amount: { amount: "25.00", currency: "EUR" },
++        creditor: { name: "Amazon" },
++        credit_debit_indicator: "DBIT",
++        status: "BOOK"
++      },
++      {
++        entry_reference: "ref_refund",
++        transaction_id: nil,
++        booking_date: "2026-02-09",
++        transaction_amount: { amount: "25.00", currency: "EUR" },
++        creditor: { name: "Amazon" },
++        credit_debit_indicator: "CRDT",
++        status: "BOOK"
++      }
++    ]
++
++    result = @importer.send(:deduplicate_api_transactions, transactions)
++
++    assert_equal 2, result.count
++  end
++
++  test "returns empty array for empty input" do
++    result = @importer.send(:deduplicate_api_transactions, [])
++    assert_equal [], result
++  end
++end

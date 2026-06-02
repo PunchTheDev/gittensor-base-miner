@@ -1,0 +1,249 @@
+diff --git a/src/vouch/context.py b/src/vouch/context.py
+index 511517b..532e727 100644
+--- a/src/vouch/context.py
++++ b/src/vouch/context.py
+@@ -13,10 +13,14 @@
+ 
+ from __future__ import annotations
+ 
++from typing import Literal, cast
++
+ from . import index_db
+ from .models import ContextItem, ContextPack, ContextQuality
+ from .storage import KBStore
+ 
++ContextItemKind = Literal["claim", "page", "entity", "relation", "source"]
++
+ 
+ def _retrieve(store: KBStore, query: str, limit: int
+               ) -> list[tuple[str, str, str, float, str]]:
+@@ -61,7 +65,7 @@ def build_context_pack(
+             cites = _citations_for_claim(store, hid)
+         items.append(
+             ContextItem(
+-                id=hid, type=kind, summary=summary, score=score,
++                id=hid, type=cast(ContextItemKind, kind), summary=summary, score=score,
+                 backend=backend, citations=cites,
+                 freshness="unknown",
+             )
+diff --git a/src/vouch/sessions.py b/src/vouch/sessions.py
+index 3e847c8..5a93134 100644
+--- a/src/vouch/sessions.py
++++ b/src/vouch/sessions.py
+@@ -44,7 +44,7 @@ def session_end(store: KBStore, session_id: str, *, note: str | None = None) ->
+     sess.proposal_ids = sorted({
+         p.id for p in store.list_proposals() if p.session_id == sess.id
+     })
+-    store.put_session(sess)
++    store.update_session(sess)
+     audit.log_event(
+         store.kb_dir, event="session.end", actor=sess.agent,
+         object_ids=[sess.id], data={"proposals": len(sess.proposal_ids)},
+diff --git a/src/vouch/storage.py b/src/vouch/storage.py
+index 8249ea0..accd233 100644
+--- a/src/vouch/storage.py
++++ b/src/vouch/storage.py
+@@ -246,10 +246,10 @@ def put_claim(self, claim: Claim) -> Claim:
+         try:
+             with self._claim_path(claim.id).open("x") as f:
+                 f.write(_yaml_dump(claim.model_dump(mode="json")))
+-        except FileExistsError:
++        except FileExistsError as e:
+             raise ValueError(
+                 f"claim {claim.id} already exists -- use update_claim()"
+-            )
++            ) from e
+         return claim
+ 
+     def get_claim(self, claim_id: str) -> Claim:
+@@ -282,10 +282,10 @@ def put_page(self, page: Page) -> Page:
+         try:
+             with self._page_path(page.id).open("x") as f:
+                 f.write(_serialize_page(page))
+-        except FileExistsError:
++        except FileExistsError as e:
+             raise ValueError(
+                 f"page {page.id} already exists -- choose a different slug"
+-            )
++            ) from e
+         return page
+ 
+     def get_page(self, page_id: str) -> Page:
+@@ -306,10 +306,10 @@ def put_entity(self, entity: Entity) -> Entity:
+         try:
+             with self._entity_path(entity.id).open("x") as f:
+                 f.write(_yaml_dump(entity.model_dump(mode="json")))
+-        except FileExistsError:
++        except FileExistsError as e:
+             raise ValueError(
+                 f"entity {entity.id} already exists -- choose a different slug"
+-            )
++            ) from e
+         return entity
+ 
+     def get_entity(self, eid: str) -> Entity:
+@@ -331,10 +331,10 @@ def put_relation(self, rel: Relation) -> Relation:
+         try:
+             with self._relation_path(rel.id).open("x") as f:
+                 f.write(_yaml_dump(rel.model_dump(mode="json")))
+-        except FileExistsError:
++        except FileExistsError as e:
+             raise ValueError(
+                 f"relation {rel.id} already exists -- choose a different slug"
+-            )
++            ) from e
+         return rel
+ 
+     def get_relation(self, rid: str) -> Relation:
+@@ -364,10 +364,10 @@ def put_evidence(self, ev: Evidence) -> Evidence:
+         try:
+             with self._evidence_path(ev.id).open("x") as f:
+                 f.write(_yaml_dump(ev.model_dump(mode="json")))
+-        except FileExistsError:
++        except FileExistsError as e:
+             raise ValueError(
+                 f"evidence {ev.id} already exists -- choose a different slug"
+-            )
++            ) from e
+         return ev
+ 
+     def get_evidence(self, eid: str) -> Evidence:
+@@ -389,10 +389,19 @@ def put_session(self, sess: Session) -> Session:
+         try:
+             with self._session_path(sess.id).open("x") as f:
+                 f.write(_yaml_dump(sess.model_dump(mode="json")))
+-        except FileExistsError:
++        except FileExistsError as e:
+             raise ValueError(
+                 f"session {sess.id} already exists -- choose a different id"
+-            )
++            ) from e
++        return sess
++
++    def update_session(self, sess: Session) -> Session:
++        # session_end() mutates an already-on-disk session (sets ended_at /
++        # backfills proposal_ids). put_session() uses exclusive create as a
++        # guard against duplicate ids, so updates need a separate path.
++        if not self._session_path(sess.id).exists():
++            raise ArtifactNotFoundError(f"session {sess.id}")
++        self._session_path(sess.id).write_text(_yaml_dump(sess.model_dump(mode="json")))
+         return sess
+ 
+     def get_session(self, sid: str) -> Session:
+@@ -414,10 +423,10 @@ def put_proposal(self, proposal: Proposal) -> Proposal:
+         try:
+             with self._proposal_path(proposal.id).open("x") as f:
+                 f.write(_yaml_dump(proposal.model_dump(mode="json")))
+-        except FileExistsError:
++        except FileExistsError as e:
+             raise ValueError(
+                 f"proposal {proposal.id} already exists -- choose a different id"
+-            )
++            ) from e
+         return proposal
+ 
+     def get_proposal(self, proposal_id: str) -> Proposal:
+diff --git a/src/vouch/verify.py b/src/vouch/verify.py
+index a4f10ee..a622725 100644
+--- a/src/vouch/verify.py
++++ b/src/vouch/verify.py
+@@ -13,7 +13,7 @@
+ 
+ from . import audit
+ from .models import Source
+-from .storage import KBStore, sha256_hex
++from .storage import ArtifactNotFoundError, KBStore, sha256_hex
+ 
+ 
+ @dataclass
+@@ -27,9 +27,16 @@ class VerificationResult:
+ def verify_source(store: KBStore, source: Source) -> VerificationResult:
+     try:
+         body = store.read_source_content(source.id)
+-    except FileNotFoundError:
++    except ArtifactNotFoundError:
+         return VerificationResult(source=source, stored_ok=False,
+                                   external_status="n/a", note="stored content missing")
++    except OSError as e:
++        # Permission denied, TOCTOU race between exists() and read_bytes(),
++        # I/O error on the underlying filesystem — any of these should surface
++        # as a graceful per-source failure rather than aborting verify_all().
++        return VerificationResult(source=source, stored_ok=False,
++                                  external_status="n/a",
++                                  note=f"stored content unreadable: {e}")
+     stored_ok = sha256_hex(body) == source.id
+ 
+     external_status = "n/a"
+diff --git a/tests/test_verify.py b/tests/test_verify.py
+index 287b395..bd1c66e 100644
+--- a/tests/test_verify.py
++++ b/tests/test_verify.py
+@@ -28,3 +28,68 @@ def test_verify_detects_external_drift(store: KBStore, tmp_path: Path) -> None:
+     target = next(r for r in results if r.source.id == src.id)
+     assert target.stored_ok  # stored copy is still fine
+     assert target.external_status == "drift"
++
++
++def test_verify_handles_missing_stored_content(store: KBStore, tmp_path: Path) -> None:
++    # Regression for #30: verify_source caught FileNotFoundError, but
++    # store.read_source_content() raises ArtifactNotFoundError (a KeyError
++    # subclass) when the content file is missing. The mismatch crashed the
++    # entire verification sweep when even one source had missing content.
++    f = tmp_path / "doc.txt"
++    f.write_bytes(b"will-be-orphaned")
++    src = store.put_source(f.read_bytes(), title="doc", locator=str(f.resolve()))
++    # Simulate the on-disk state the bug report describes: meta.yaml present,
++    # content blob gone (e.g. partial clone, manual cleanup, disk error).
++    (store.kb_dir / "sources" / src.id / "content").unlink()
++    results = verify.verify_all(store)
++    target = next(r for r in results if r.source.id == src.id)
++    assert target.stored_ok is False
++    assert target.external_status == "n/a"
++    assert target.note == "stored content missing"
++
++
++def test_verify_handles_unreadable_stored_content(
++    store: KBStore, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
++) -> None:
++    # Sibling regression for #30: read_source_content() can also raise OSError
++    # (permission denied, TOCTOU between exists() and read_bytes(), disk I/O
++    # error). Before the fix only ArtifactNotFoundError was caught, so any of
++    # those still aborted verify_all(). Monkeypatch to make read_source_content
++    # raise PermissionError so the test is portable across CI users / filesystems.
++    f = tmp_path / "doc.txt"
++    f.write_bytes(b"original")
++    src = store.put_source(f.read_bytes(), title="doc", locator=str(f.resolve()))
++
++    def _boom(_sid: str) -> bytes:
++        raise PermissionError("simulated permission denied")
++
++    monkeypatch.setattr(store, "read_source_content", _boom)
++    results = verify.verify_all(store)
++    target = next(r for r in results if r.source.id == src.id)
++    assert target.stored_ok is False
++    assert target.external_status == "n/a"
++    assert target.note is not None
++    assert "unreadable" in target.note
++    assert "simulated permission denied" in target.note
++
++
++def test_verify_all_continues_after_one_failure(
++    store: KBStore, tmp_path: Path
++) -> None:
++    # End-to-end check that one broken source no longer takes down the sweep:
++    # register two sources, break one, ensure verify_all returns both results.
++    good = tmp_path / "good.txt"
++    good.write_bytes(b"good")
++    good_src = store.put_source(good.read_bytes(), title="good",
++                                locator=str(good.resolve()))
++    bad = tmp_path / "bad.txt"
++    bad.write_bytes(b"bad")
++    bad_src = store.put_source(bad.read_bytes(), title="bad",
++                               locator=str(bad.resolve()))
++    (store.kb_dir / "sources" / bad_src.id / "content").unlink()
++
++    results = verify.verify_all(store)
++    by_id = {r.source.id: r for r in results}
++    assert by_id[good_src.id].stored_ok is True
++    assert by_id[bad_src.id].stored_ok is False
++    assert by_id[bad_src.id].note == "stored content missing"

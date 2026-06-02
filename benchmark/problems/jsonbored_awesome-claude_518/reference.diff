@@ -1,0 +1,193 @@
+diff --git a/apps/web/src/lib/api/contracts.ts b/apps/web/src/lib/api/contracts.ts
+index 8e9d5802b1..56fe88492b 100644
+--- a/apps/web/src/lib/api/contracts.ts
++++ b/apps/web/src/lib/api/contracts.ts
+@@ -286,19 +286,33 @@ export const registryDiffQuerySchema = z.object({
+ const registryIntegrityPairMessage =
+   "Provide both artifact and hash together for verification";
+ 
++// Empty is treated as "snapshot listing" by the route handler at
++// apps/web/src/app/api/registry/integrity/route.ts (`!artifact` → status
++// `snapshot`, `artifact || null` in response). Accept it as a valid value
++// at the field level so clients that round-trip `null → ""` (HTML forms,
++// Raycast) don't get a 400 from the Zod gate. The pair-check below still
++// rejects non-empty artifact paired with empty/absent hash (and vice versa).
+ export const registryIntegrityQuerySchema = z
+   .object({
+     artifact: z
+-      .string()
+-      .trim()
+-      .max(160)
+-      .regex(/^\/?(?:[a-z0-9][a-z0-9._-]*\/)*(?:[a-z0-9][a-z0-9._-]*)$/)
++      .union([
++        z.literal(""),
++        z
++          .string()
++          .trim()
++          .max(160)
++          .regex(/^\/?(?:[a-z0-9][a-z0-9._-]*\/)*(?:[a-z0-9][a-z0-9._-]*)$/),
++      ])
+       .optional(),
+     hash: z
+-      .string()
+-      .trim()
+-      .toLowerCase()
+-      .regex(/^[a-f0-9]{64}$/)
++      .union([
++        z.literal(""),
++        z
++          .string()
++          .trim()
++          .toLowerCase()
++          .regex(/^[a-f0-9]{64}$/),
++      ])
+       .optional(),
+   })
+   .superRefine((query, ctx) => {
+diff --git a/cloudflare/api-schema-heyclaude-openapi.yaml b/cloudflare/api-schema-heyclaude-openapi.yaml
+index 89a5a4dbd9..7db7f17c89 100644
+--- a/cloudflare/api-schema-heyclaude-openapi.yaml
++++ b/cloudflare/api-schema-heyclaude-openapi.yaml
+@@ -2394,15 +2394,23 @@ paths:
+         against the deployed manifest.
+       parameters:
+         - schema:
+-            type: string
+-            maxLength: 160
+-            pattern: ^\/?(?:[a-z0-9][a-z0-9._-]*\/)*(?:[a-z0-9][a-z0-9._-]*)$
++            anyOf:
++              - type: string
++                enum:
++                  - ""
++              - type: string
++                maxLength: 160
++                pattern: ^\/?(?:[a-z0-9][a-z0-9._-]*\/)*(?:[a-z0-9][a-z0-9._-]*)$
+           required: false
+           name: artifact
+           in: query
+         - schema:
+-            type: string
+-            pattern: ^[a-f0-9]{64}$
++            anyOf:
++              - type: string
++                enum:
++                  - ""
++              - type: string
++                pattern: ^[a-f0-9]{64}$
+           required: false
+           name: hash
+           in: query
+diff --git a/tests/registry-integrity-api.test.ts b/tests/registry-integrity-api.test.ts
+index f239088bab..98008aade5 100644
+--- a/tests/registry-integrity-api.test.ts
++++ b/tests/registry-integrity-api.test.ts
+@@ -157,4 +157,60 @@ describe("/api/registry/integrity", () => {
+     });
+     expect(badArtifact.status).toBe(400);
+   });
++
++  it("treats explicit empty artifact and hash as 'snapshot listing'", async () => {
++    const { GET } =
++      await import("../apps/web/src/app/api/registry/integrity/route");
++    const emptyArtifact = await GET(
++      request("/api/registry/integrity?artifact="),
++    );
++    const bothEmpty = await GET(
++      request("/api/registry/integrity?artifact=&hash="),
++    );
++
++    // Empty artifact alone is no longer rejected by the field-level regex,
++    // and the pair-check (#516) treats both-falsy as "no verification
++    // requested" rather than a partial pair, so it returns the snapshot.
++    expect(emptyArtifact.status).toBe(200);
++    await expect(emptyArtifact.json()).resolves.toMatchObject({
++      ok: true,
++      status: "snapshot",
++      artifact: null,
++      hash: null,
++      current: null,
++    });
++
++    expect(bothEmpty.status).toBe(200);
++    await expect(bothEmpty.json()).resolves.toMatchObject({
++      ok: true,
++      status: "snapshot",
++      artifact: null,
++      hash: null,
++    });
++  });
++
++  it("still pair-rejects a non-empty artifact with an explicit empty hash", async () => {
++    // Preserves #516's invariant: a real artifact path must come with a real
++    // hash. Explicit-empty hash is treated as "no hash provided", same as
++    // omitting the param entirely, so the pair-check still fires.
++    const { GET } =
++      await import("../apps/web/src/app/api/registry/integrity/route");
++    const partialPair = await GET(
++      request("/api/registry/integrity?artifact=directory-index.json&hash="),
++    );
++    expect(partialPair.status).toBe(400);
++    await expect(partialPair.json()).resolves.toMatchObject({
++      ok: false,
++      error: {
++        code: "invalid_payload",
++        details: [
++          expect.objectContaining({
++            path: "hash",
++            message: "Provide both artifact and hash together for verification",
++            code: "custom",
++          }),
++        ],
++      },
++    });
++  });
+ });
+diff --git a/tests/registry-search-api.test.ts b/tests/registry-search-api.test.ts
+index eef9389b0a..fdee30ad57 100644
+--- a/tests/registry-search-api.test.ts
++++ b/tests/registry-search-api.test.ts
+@@ -116,4 +116,44 @@ describe("/api/registry/search", () => {
+       nextOffset: null,
+     });
+   });
++
++  it("treats explicit empty category and platform as 'no filter'", async () => {
++    const { GET } =
++      await import("../apps/web/src/app/api/registry/search/route");
++    const response = await GET(
++      new Request(
++        "https://heyclau.de/api/registry/search?q=fixture&category=&platform=",
++        { headers: { origin: "https://heyclau.de" } },
++      ),
++    );
++
++    expect(response.status).toBe(200);
++    const body = await response.json();
++    expect(body).toMatchObject({ count: 3, total: 3 });
++    expect(body.results.map((entry: SearchDocument) => entry.slug)).toEqual([
++      "fixture-a",
++      "fixture-b",
++      "fixture-c",
++    ]);
++  });
++
++  it("still rejects malformed non-empty category and platform", async () => {
++    const { GET } =
++      await import("../apps/web/src/app/api/registry/search/route");
++    const badPlatform = await GET(
++      new Request(
++        "https://heyclau.de/api/registry/search?q=fixture&platform=%21bad",
++        { headers: { origin: "https://heyclau.de" } },
++      ),
++    );
++    expect(badPlatform.status).toBe(400);
++
++    const badCategory = await GET(
++      new Request(
++        "https://heyclau.de/api/registry/search?q=fixture&category=NOT_A_SLUG",
++        { headers: { origin: "https://heyclau.de" } },
++      ),
++    );
++    expect(badCategory.status).toBe(400);
++  });
+ });

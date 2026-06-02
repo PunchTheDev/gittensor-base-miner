@@ -1,0 +1,558 @@
+diff --git a/src/queue/processors.ts b/src/queue/processors.ts
+index 0ce0849..f97ea6a 100644
+--- a/src/queue/processors.ts
++++ b/src/queue/processors.ts
+@@ -105,10 +105,12 @@ import {
+   buildMaintainerCutReadiness,
+   buildMaintainerLaneReport,
+   buildPreflightResult,
++  buildPublicCommentSignalBundle,
+   buildPublicPrIntelligenceComment,
+   buildQueueHealth,
+   detectGittensorContributor,
+ } from "../signals/engine";
++import { rewritePublicPrIntelligenceComment } from "../services/ai-summaries";
+ import { decidePublicSurface } from "../signals/settings-preview";
+ import type { LocalBranchAnalysisInput } from "../signals/local-branch";
+ import type { ContributorEvidenceRecord, GitHubWebhookPayload, JobMessage, JsonValue } from "../types";
+@@ -704,15 +706,15 @@ async function maybePublishPrPublicSurface(
+     repoBounties,
+   );
+   if (decision.willComment) {
+-    const body = buildPublicPrIntelligenceComment({
+-      repo,
+-      pr,
+-      profile,
+-      detection,
+-      queueHealth,
+-      collisions,
+-      preflight,
+-      settings,
++    const commentArgs = { repo, pr, profile, detection, queueHealth, collisions, preflight, settings };
++    const deterministicBody = buildPublicPrIntelligenceComment(commentArgs);
++    // Optional AI rewrite (issue #151): disabled by default, source-free bundle only, quota-limited,
++    // sanitizer-gated, and falls back to the deterministic body on any non-ok outcome.
++    const { body } = await rewritePublicPrIntelligenceComment(env, {
++      bundle: buildPublicCommentSignalBundle(commentArgs),
++      deterministicBody,
++      actor: author,
++      route: "github_app.pr_public_surface",
+     });
+     await createOrUpdatePrIntelligenceComment(env, installationId, repoFullName, pr.number, body);
+   }
+diff --git a/src/services/ai-summaries.ts b/src/services/ai-summaries.ts
+index ac4eb7a..cd20301 100644
+--- a/src/services/ai-summaries.ts
++++ b/src/services/ai-summaries.ts
+@@ -1,7 +1,10 @@
+ import { recordAiUsageEvent, recordAuditEvent, sumAiEstimatedNeuronsSince } from "../db/repositories";
++import { sanitizePublicComment } from "../queue-intelligence";
+ import type { JsonValue } from "../types";
+ import type { AgentRunBundle } from "./agent-orchestrator";
+ 
++const PR_INTELLIGENCE_MARKER = "<!-- gittensory-pr-intelligence -->";
++
+ type AiSummaryVisibility = "private" | "public";
+ 
+ const PRIVATE_CONTEXT_PATTERN =
+@@ -170,6 +173,16 @@ function sanitizeAiText(value: string, visibility: AiSummaryVisibility): string
+ }
+ 
+ function containsPublicForbiddenText(value: string): boolean {
++  // Route every public AI output through the canonical public/private sanitizer (issue #151).
++  // `sanitizePublicComment` throws on any forbidden public term (wallet, hotkey, raw trust score,
++  // payout, reward estimate, farming, private reviewability, public score estimate).
++  try {
++    sanitizePublicComment(value);
++  } catch {
++    return true;
++  }
++  // Defense in depth: keep the centralized local pattern, which intentionally also catches near-miss
++  // phrasings the canonical word list narrows (e.g. bare "estimated score" or seed-phrase wording).
+   return PUBLIC_FORBIDDEN_TEXT_PATTERN.test(value);
+ }
+ 
+@@ -222,6 +235,148 @@ function auditOutcomeForAiStatus(status: string): "success" | "denied" | "error"
+   return "completed";
+ }
+ 
++export type AiRewriteRequest = {
++  feature: string;
++  visibility: AiSummaryVisibility;
++  bundle: Record<string, JsonValue>;
++  fallbackText: string;
++  instructions: string;
++  actor?: string | null | undefined;
++  route?: string | null | undefined;
++  metadata?: Record<string, unknown> | undefined;
++};
++
++export type AiRewriteOutcome = {
++  status: AiSummaryResult["status"];
++  /** Always safe to publish/use: equals `fallbackText` on every non-`ok` path. */
++  text: string;
++  model?: string;
++  estimatedNeurons?: number;
++  reason?: string;
++};
++
++/**
++ * Generic, reusable rewrite layer for issue #151. Turns a compact deterministic signal bundle into
++ * clearer prose when AI is enabled, and otherwise returns the caller's deterministic `fallbackText`.
++ * The returned `text` is ALWAYS safe to use: disabled, unavailable, quota-exceeded, unsafe, and error
++ * paths all fall back to the deterministic template, and every public `ok` result is gated by the
++ * canonical public/private sanitizer before it is returned.
++ */
++export async function rewriteSignalBundleWithAi(env: Env, req: AiRewriteRequest): Promise<AiRewriteOutcome> {
++  const privateEnabled = isEnabled(env.AI_SUMMARIES_ENABLED);
++  const publicEnabled = isEnabled(env.AI_PUBLIC_COMMENTS_ENABLED);
++  if (!privateEnabled) return { status: "disabled", text: req.fallbackText, reason: "AI summaries are disabled." };
++  if (req.visibility === "public" && !publicEnabled) return { status: "disabled", text: req.fallbackText, reason: "Public AI summaries are disabled." };
++  if (!env.AI) return { status: "unavailable", text: req.fallbackText, reason: "Workers AI binding is not configured." };
++
++  const model = env.WORKERS_AI_SUMMARY_MODEL || "@cf/meta/llama-3.1-8b-instruct-fp8-fast";
++  const maxOutputTokens = clampNumber(Number(env.AI_MAX_OUTPUT_TOKENS || 256), 64, 512);
++  const prompt = buildBundlePrompt(req.bundle, req.visibility);
++  const estimatedNeurons = estimateNeurons(prompt, maxOutputTokens);
++  const budget = clampNumber(Number(env.AI_DAILY_NEURON_BUDGET || 10000), 0, 1_000_000);
++  const used = await sumAiEstimatedNeuronsSince(env, utcDayStartIso());
++  const remainingBudget = Math.max(0, budget - used);
++
++  if (estimatedNeurons > remainingBudget) {
++    await recordGenericAi(env, req, {
++      model,
++      status: "quota_exceeded",
++      estimatedNeurons: 0,
++      detail: `estimated ${estimatedNeurons} neurons exceeds remaining budget ${remainingBudget}`,
++    });
++    return { status: "quota_exceeded", text: req.fallbackText, model, estimatedNeurons };
++  }
++
++  try {
++    const response = await env.AI.run(model, {
++      messages: [
++        { role: "system", content: req.instructions },
++        { role: "user", content: prompt },
++      ],
++      max_tokens: maxOutputTokens,
++      temperature: 0.1,
++    });
++    const rawText = extractAiText(response);
++    if (!rawText) throw new Error("empty_ai_summary");
++    if (req.visibility === "public" && containsPublicForbiddenText(rawText)) {
++      await recordGenericAi(env, req, { model, status: "unsafe", estimatedNeurons, detail: "public summary failed sanitizer" });
++      return { status: "unsafe", text: req.fallbackText, model, estimatedNeurons, reason: "public summary failed sanitizer" };
++    }
++    const text = sanitizeAiText(rawText, req.visibility);
++    await recordGenericAi(env, req, { model, status: "ok", estimatedNeurons, detail: "summary generated", metadata: { visibility: req.visibility } });
++    return { status: "ok", text, model, estimatedNeurons };
++  } catch (error) {
++    const reason = error instanceof Error ? error.message : "workers_ai_failed";
++    await recordGenericAi(env, req, { model, status: "error", estimatedNeurons: 0, detail: reason });
++    return { status: "error", text: req.fallbackText, model, estimatedNeurons, reason };
++  }
++}
++
++/**
++ * Public-surface wrapper used by the GitHub App PR intelligence comment. Builds the rewrite request,
++ * preserves the sticky-comment marker, and guarantees the deterministic body is posted whenever AI is
++ * disabled, over quota, unavailable, or produces unsafe output.
++ */
++export async function rewritePublicPrIntelligenceComment(
++  env: Env,
++  args: { bundle: Record<string, JsonValue>; deterministicBody: string; actor?: string | null | undefined; route?: string | null | undefined },
++): Promise<{ body: string; outcome: AiRewriteOutcome }> {
++  const outcome = await rewriteSignalBundleWithAi(env, {
++    feature: "pr_intelligence_comment",
++    visibility: "public",
++    bundle: args.bundle,
++    fallbackText: args.deterministicBody,
++    instructions:
++      "Rewrite this deterministic Gittensory PR signal bundle as a short, friendly public GitHub comment with 3-5 bullet points. Only restate the facts provided. Never mention rewards, payouts, wallets, hotkeys, raw or estimated trust scores, score estimates, farming, or private reviewability, and never claim a guaranteed outcome.",
++    actor: args.actor,
++    route: args.route,
++  });
++  if (outcome.status !== "ok") return { body: args.deterministicBody, outcome };
++  const body = [
++    PR_INTELLIGENCE_MARKER,
++    "## Gittensory contribution context",
++    "",
++    "_AI-clarified from deterministic public GitHub metadata. Deterministic signals remain authoritative; this is not an endorsement._",
++    "",
++    outcome.text.trim(),
++  ].join("\n");
++  return { body, outcome };
++}
++
++function buildBundlePrompt(signalBundle: Record<string, JsonValue>, visibility: AiSummaryVisibility): string {
++  return [
++    `Visibility: ${visibility}`,
++    "Summarize this deterministic Gittensory signal bundle clearly and concisely.",
++    "Do not invent facts or claim guaranteed outcomes.",
++    JSON.stringify(signalBundle),
++  ].join("\n");
++}
++
++async function recordGenericAi(
++  env: Env,
++  req: AiRewriteRequest,
++  event: { model: string; status: string; estimatedNeurons: number; detail?: string; metadata?: Record<string, unknown> },
++): Promise<void> {
++  await recordAiUsageEvent(env, {
++    feature: req.feature,
++    actor: req.actor,
++    route: req.route,
++    model: event.model,
++    status: event.status,
++    estimatedNeurons: event.estimatedNeurons,
++    detail: event.detail,
++    metadata: { ...(req.metadata ?? {}), ...(event.metadata ?? {}) },
++  });
++  await recordAuditEvent(env, {
++    eventType: "ai.summary",
++    actor: req.actor,
++    route: req.route,
++    outcome: auditOutcomeForAiStatus(event.status),
++    detail: event.detail,
++    metadata: { feature: req.feature, model: event.model, estimatedNeurons: event.estimatedNeurons },
++  });
++}
++
+ export const __aiSummaryInternals = {
+   compactAgentSignalBundle,
+   estimateNeurons,
+diff --git a/src/signals/engine.ts b/src/signals/engine.ts
+index ae25c0b..16a4ba5 100644
+--- a/src/signals/engine.ts
++++ b/src/signals/engine.ts
+@@ -5,6 +5,7 @@ import type {
+   CollisionEdgeRecord,
+   ContributorRepoStatRecord,
+   IssueRecord,
++  JsonValue,
+   PullRequestDetailSyncStateRecord,
+   PullRequestFileRecord,
+   PullRequestRecord,
+@@ -3303,6 +3304,55 @@ function containsPrivatePublicTerm(value: string): boolean {
+   return /\b(reward|payout|farming|wallet|hotkey|trust score|raw trust|estimated score|scoreability|likely_duplicate|reviewability\s*\d|\/100)\b/i.test(value);
+ }
+ 
++/**
++ * Builds the compact, source-free signal bundle that the optional AI rewrite layer (issue #151)
++ * may turn into clearer public prose. It carries only deterministic, public-safe structured
++ * signals — counts, levels, booleans, role context, and finding category titles. It deliberately
++ * excludes PR title/body, diffs, finding detail text, and any other source contents so the bundle
++ * can never leak repository source through the AI provider.
++ */
++export function buildPublicCommentSignalBundle(args: {
++  repo: RepositoryRecord | null;
++  pr: PullRequestRecord;
++  profile: ContributorProfile;
++  detection: ContributorDetection;
++  queueHealth: QueueHealth;
++  collisions: CollisionReport;
++  preflight: PreflightResult;
++  settings: RepositorySettings;
++}): Record<string, JsonValue> {
++  const roleContext = buildRoleContext({
++    login: args.pr.authorLogin ?? args.profile.login,
++    repo: args.repo,
++    repoFullName: args.pr.repoFullName,
++    pullRequests: [args.pr],
++    issues: [],
++    profile: args.profile,
++  });
++  const publicFindingTitles = args.preflight.findings
++    .filter((finding) => finding.severity !== "critical")
++    .filter((finding) => args.settings.requireLinkedIssue || finding.code !== "missing_linked_issue")
++    .filter((finding) => !containsPrivatePublicTerm([finding.code, finding.title].filter(Boolean).join(" ")))
++    .slice(0, args.settings.publicSignalLevel === "minimal" ? 2 : 5)
++    .map((finding) => finding.title);
++  return {
++    confirmedMiner: args.detection.source === "official_gittensor_api",
++    minerSignalDetected: args.detection.detected,
++    priorPullRequests: args.detection.priorPullRequests,
++    priorIssues: args.detection.priorIssues,
++    role: roleContext.role,
++    maintainerLane: roleContext.maintainerLane,
++    linkedIssueCount: args.pr.linkedIssues.length,
++    requireLinkedIssue: args.settings.requireLinkedIssue,
++    laneSummary: buildLaneAdvice(args.repo, args.pr.repoFullName).summary,
++    reviewBurden: args.preflight.reviewBurden,
++    collisionClusters: args.collisions.clusters.length,
++    queueLevel: args.queueHealth.level,
++    topLanguages: args.profile.github.topLanguages.slice(0, 6),
++    publicFindingTitles,
++  } as Record<string, JsonValue>;
++}
++
+ function issueItem(issue: IssueRecord): CollisionItem {
+   return {
+     type: "issue",
+diff --git a/test/unit/ai-summaries.test.ts b/test/unit/ai-summaries.test.ts
+index 948a3b5..ec9f0ec 100644
+--- a/test/unit/ai-summaries.test.ts
++++ b/test/unit/ai-summaries.test.ts
+@@ -1,6 +1,12 @@
+ import { describe, expect, it, vi } from "vitest";
+-import { __aiSummaryInternals, summarizeAgentBundleWithAi } from "../../src/services/ai-summaries";
++import {
++  __aiSummaryInternals,
++  rewritePublicPrIntelligenceComment,
++  rewriteSignalBundleWithAi,
++  summarizeAgentBundleWithAi,
++} from "../../src/services/ai-summaries";
+ import type { AgentRunBundle } from "../../src/services/agent-orchestrator";
++import { FORBIDDEN_PUBLIC_COMMENT_WORDS } from "../../src/queue-intelligence";
+ import { createTestEnv } from "../helpers/d1";
+ 
+ const PUBLIC_FORBIDDEN_TEXT =
+@@ -63,6 +69,16 @@ describe("Workers AI summaries", () => {
+     );
+   });
+ 
++  it("applies the default daily neuron budget when AI_DAILY_NEURON_BUDGET is unset", async () => {
++    const run = vi.fn(async () => ({ response: "Summary within default budget." }));
++    const env = createTestEnv({ AI: { run } as unknown as Ai, AI_SUMMARIES_ENABLED: "true" });
++
++    const result = await summarizeAgentBundleWithAi(env, bundleFixture(), "private");
++
++    expect(result).toMatchObject({ status: "ok" });
++    expect(run).toHaveBeenCalled();
++  });
++
+   it("honors custom model and clamps output token configuration", async () => {
+     const run = vi.fn(async () => ({ response: "Custom model summary." }));
+     const env = createTestEnv({
+@@ -215,6 +231,150 @@ describe("Workers AI summaries", () => {
+   });
+ });
+ 
++describe("optional deterministic-summary rewrite layer", () => {
++  const DETERMINISTIC_BODY = "<!-- gittensory-pr-intelligence -->\n## Gittensory contribution context\n- Queue level: steady";
++  const signalBundle = () => ({ queueLevel: "steady", confirmedMiner: true, collisionClusters: 0 });
++
++  function publicEnv(overrides: Partial<Env> = {}, run: (model: string, options: unknown) => Promise<unknown> = async () => ({ response: "Clear, friendly summary." })) {
++    return createTestEnv({
++      AI: { run } as unknown as Ai,
++      AI_SUMMARIES_ENABLED: "true",
++      AI_PUBLIC_COMMENTS_ENABLED: "true",
++      AI_DAILY_NEURON_BUDGET: "10000",
++      ...overrides,
++    });
++  }
++
++  function rewriteReq(overrides: Partial<Parameters<typeof rewriteSignalBundleWithAi>[1]> = {}) {
++    return {
++      feature: "pr_intelligence_comment",
++      visibility: "public" as const,
++      bundle: signalBundle(),
++      fallbackText: DETERMINISTIC_BODY,
++      instructions: "Rewrite clearly.",
++      actor: "oktofeesh1",
++      route: "github_app.pr_public_surface",
++      ...overrides,
++    };
++  }
++
++  it("stays disabled by default and returns the deterministic fallback without calling AI", async () => {
++    const run = vi.fn();
++    const env = createTestEnv({ AI: { run } as unknown as Ai });
++    const result = await rewriteSignalBundleWithAi(env, rewriteReq());
++    expect(result).toMatchObject({ status: "disabled", text: DETERMINISTIC_BODY });
++    expect(run).not.toHaveBeenCalled();
++  });
++
++  it("keeps public rewrites disabled unless explicitly enabled, falling back to the template", async () => {
++    const run = vi.fn();
++    const env = createTestEnv({ AI: { run } as unknown as Ai, AI_SUMMARIES_ENABLED: "true", AI_PUBLIC_COMMENTS_ENABLED: "false" });
++    const result = await rewriteSignalBundleWithAi(env, rewriteReq());
++    expect(result).toMatchObject({ status: "disabled", text: DETERMINISTIC_BODY });
++    expect(run).not.toHaveBeenCalled();
++  });
++
++  it("falls back to the deterministic template when the AI binding is unavailable", async () => {
++    const env = createTestEnv({ AI_SUMMARIES_ENABLED: "true", AI_PUBLIC_COMMENTS_ENABLED: "true" });
++    const result = await rewriteSignalBundleWithAi(env, rewriteReq());
++    expect(result).toMatchObject({ status: "unavailable", text: DETERMINISTIC_BODY });
++  });
++
++  it("falls back to the deterministic template once the daily neuron quota is exhausted", async () => {
++    const run = vi.fn();
++    const result = await rewriteSignalBundleWithAi(publicEnv({ AI_DAILY_NEURON_BUDGET: "1" }, run), rewriteReq());
++    expect(result).toMatchObject({ status: "quota_exceeded", text: DETERMINISTIC_BODY });
++    expect(run).not.toHaveBeenCalled();
++  });
++
++  it("returns sanitized AI prose when enabled, in budget, and safe", async () => {
++    const result = await rewriteSignalBundleWithAi(publicEnv(), rewriteReq());
++    expect(result).toMatchObject({ status: "ok", text: "Clear, friendly summary." });
++    expect(result.text).not.toBe(DETERMINISTIC_BODY);
++  });
++
++  it("applies default model, output-token, and daily-budget configuration when env vars are unset", async () => {
++    const run = vi.fn(async () => ({ response: "Default-config summary." }));
++    const env = createTestEnv({ AI: { run } as unknown as Ai, AI_SUMMARIES_ENABLED: "true", AI_PUBLIC_COMMENTS_ENABLED: "true" });
++    const result = await rewriteSignalBundleWithAi(env, rewriteReq());
++    expect(result).toMatchObject({ status: "ok", model: "@cf/meta/llama-3.1-8b-instruct-fp8-fast" });
++    expect(run).toHaveBeenCalledWith("@cf/meta/llama-3.1-8b-instruct-fp8-fast", expect.objectContaining({ max_tokens: 256 }));
++  });
++
++  it("honors a custom model and output-token configuration", async () => {
++    const run = vi.fn(async () => ({ response: "Custom-config summary." }));
++    const env = publicEnv({ WORKERS_AI_SUMMARY_MODEL: "@cf/test/model", AI_MAX_OUTPUT_TOKENS: "128" }, run);
++    const result = await rewriteSignalBundleWithAi(env, rewriteReq());
++    expect(result).toMatchObject({ status: "ok", model: "@cf/test/model" });
++    expect(run).toHaveBeenCalledWith("@cf/test/model", expect.objectContaining({ max_tokens: 128 }));
++  });
++
++  it("falls back to the deterministic template when AI rejects with a non-Error value", async () => {
++    const throwingRun = async () => Promise.reject("string offline reason");
++    await expect(rewriteSignalBundleWithAi(publicEnv({}, throwingRun), rewriteReq())).resolves.toMatchObject({
++      status: "error",
++      text: DETERMINISTIC_BODY,
++      reason: "workers_ai_failed",
++    });
++  });
++
++  it("never sends source contents in the AI prompt", async () => {
++    const run = vi.fn((_model: string, _options: unknown) => Promise.resolve({ response: "Safe summary." }));
++    await rewriteSignalBundleWithAi(publicEnv({}, run), rewriteReq());
++    const payload = run.mock.calls[0]![1];
++    const userPrompt = (payload as { messages: { role: string; content: string }[] }).messages.find((m) => m.role === "user")!.content;
++    expect(userPrompt).not.toMatch(/source code|diff|function |body/i);
++    expect(userPrompt).toContain("steady");
++  });
++
++  it("routes every forbidden public term through the canonical sanitizer and falls back when AI is unsafe", async () => {
++    for (const word of FORBIDDEN_PUBLIC_COMMENT_WORDS) {
++      const run = vi.fn(async () => ({ response: `Looks great, includes ${word} detail.` }));
++      const result = await rewriteSignalBundleWithAi(publicEnv({}, run), rewriteReq());
++      expect(result, `forbidden word: ${word}`).toMatchObject({ status: "unsafe", text: DETERMINISTIC_BODY });
++    }
++  });
++
++  it("falls back to the deterministic template when AI errors or returns empty output", async () => {
++    const emptyRun = async () => ({ unexpected: "shape" });
++    await expect(rewriteSignalBundleWithAi(publicEnv({}, emptyRun), rewriteReq())).resolves.toMatchObject({
++      status: "error",
++      text: DETERMINISTIC_BODY,
++      reason: "empty_ai_summary",
++    });
++
++    const throwingRun = async () => Promise.reject(new Error("offline"));
++    await expect(rewriteSignalBundleWithAi(publicEnv({}, throwingRun), rewriteReq())).resolves.toMatchObject({
++      status: "error",
++      text: DETERMINISTIC_BODY,
++    });
++  });
++
++  it("preserves the sticky marker and posts the deterministic body when AI is disabled", async () => {
++    const env = createTestEnv({ AI: { run: vi.fn() } as unknown as Ai });
++    const { body, outcome } = await rewritePublicPrIntelligenceComment(env, { bundle: signalBundle(), deterministicBody: DETERMINISTIC_BODY, actor: "oktofeesh1" });
++    expect(outcome.status).toBe("disabled");
++    expect(body).toBe(DETERMINISTIC_BODY);
++    expect(body).toContain("<!-- gittensory-pr-intelligence -->");
++  });
++
++  it("wraps AI prose with the sticky marker when enabled and safe", async () => {
++    const env = publicEnv({}, vi.fn(async () => ({ response: "- Confirmed Gittensor miner\n- Queue is steady" })));
++    const { body, outcome } = await rewritePublicPrIntelligenceComment(env, { bundle: signalBundle(), deterministicBody: DETERMINISTIC_BODY, actor: "oktofeesh1" });
++    expect(outcome.status).toBe("ok");
++    expect(body).toContain("<!-- gittensory-pr-intelligence -->");
++    expect(body).toContain("Queue is steady");
++    expect(body).not.toBe(DETERMINISTIC_BODY);
++  });
++
++  it("posts the deterministic body when the AI rewrite is unsafe", async () => {
++    const env = publicEnv({}, vi.fn(async () => ({ response: "Great work, your payout will be huge" })));
++    const { body, outcome } = await rewritePublicPrIntelligenceComment(env, { bundle: signalBundle(), deterministicBody: DETERMINISTIC_BODY, actor: "oktofeesh1" });
++    expect(outcome.status).toBe("unsafe");
++    expect(body).toBe(DETERMINISTIC_BODY);
++  });
++});
++
+ function bundleFixture(): AgentRunBundle {
+   return {
+     run: {
+diff --git a/test/unit/signals.test.ts b/test/unit/signals.test.ts
+index 6d211c2..40eb3ca 100644
+--- a/test/unit/signals.test.ts
++++ b/test/unit/signals.test.ts
+@@ -20,6 +20,7 @@ import {
+   buildMaintainerCutReadiness,
+   buildMaintainerLaneReport,
+   buildPreflightResult,
++  buildPublicCommentSignalBundle,
+   buildPullRequestMaintainerPacket,
+   buildPullRequestReviewIntelligence,
+   buildPublicPrIntelligenceComment,
+@@ -350,6 +351,68 @@ describe("world-class backend signals", () => {
+     expect(comment).not.toMatch(/wallet|raw trust score|ranking|farming|reward/i);
+   });
+ 
++  it("builds a compact, source-free public AI signal bundle", () => {
++    const sourceMarker = "SECRET_SOURCE_LINE_should_never_reach_ai_provider";
++    const currentPr: PullRequestRecord = {
++      ...pullRequests[0]!,
++      title: `Implement ${sourceMarker}`,
++      body: `Diff context: ${sourceMarker}\nfunction stealMe() { return "wallet hotkey payout"; }`,
++    };
++    const detection = { ...detectGittensorContributor("oktofeesh1", currentPr, [currentPr], []), source: "official_gittensor_api" as const };
++    const settings: RepositorySettings = {
++      repoFullName: repo.fullName,
++      commentMode: "detected_contributors_only",
++      publicSignalLevel: "standard",
++      checkRunMode: "off",
++      checkRunDetailLevel: "minimal",
++      autoLabelEnabled: true,
++      gittensorLabel: "gittensor",
++      createMissingLabel: true,
++      publicSurface: "comment_and_label",
++      includeMaintainerAuthors: false,
++      requireLinkedIssue: false,
++      backfillEnabled: true,
++      privateTrustEnabled: true,
++    };
++    const collisions = buildCollisionReport(repo.fullName, issues, pullRequests);
++    const queueHealth = buildQueueHealth(repo, issues, pullRequests, collisions);
++    const preflight = buildPreflightResult(
++      { repoFullName: repo.fullName, title: currentPr.title, body: currentPr.body ?? undefined, linkedIssues: [] },
++      repo,
++      issues,
++      pullRequests,
++    );
++    const profile = buildContributorProfile("oktofeesh1", { login: "oktofeesh1", topLanguages: ["TypeScript"], source: "github" }, [currentPr], []);
++
++    const bundle = buildPublicCommentSignalBundle({ repo, pr: currentPr, profile, detection, queueHealth, collisions, preflight, settings });
++    const serialized = JSON.stringify(bundle);
++
++    // Carries only deterministic structured signals.
++    expect(bundle.confirmedMiner).toBe(true);
++    expect(bundle).toMatchObject({ queueLevel: expect.any(String), reviewBurden: expect.any(String) });
++    expect(typeof bundle.collisionClusters).toBe("number");
++    // Invariant: never ships PR source contents (title/body/diff) or forbidden public language.
++    expect(serialized).not.toContain(sourceMarker);
++    expect(serialized).not.toMatch(/wallet|hotkey|payout|raw trust score|farming/i);
++
++    // Alternate branches: missing PR author falls back to the profile login, requireLinkedIssue
++    // short-circuits the linked-issue finding filter, and "minimal" caps the finding titles at 2.
++    const anonymousPr: PullRequestRecord = { ...currentPr, authorLogin: null };
++    const minimalBundle = buildPublicCommentSignalBundle({
++      repo,
++      pr: anonymousPr,
++      profile,
++      detection,
++      queueHealth,
++      collisions,
++      preflight,
++      settings: { ...settings, requireLinkedIssue: true, publicSignalLevel: "minimal" },
++    });
++    expect(minimalBundle.requireLinkedIssue).toBe(true);
++    expect((minimalBundle.publicFindingTitles as string[]).length).toBeLessThanOrEqual(2);
++    expect(typeof minimalBundle.role).toBe("string");
++  });
++
+   it("classifies every participation lane boundary", () => {
+     const inactive = buildLaneAdvice({ ...repo, registryConfig: { ...repo.registryConfig!, emissionShare: 0 } }, repo.fullName);
+     const issueDiscovery = buildLaneAdvice({ ...repo, registryConfig: { ...repo.registryConfig!, issueDiscoveryShare: 1 } }, repo.fullName);

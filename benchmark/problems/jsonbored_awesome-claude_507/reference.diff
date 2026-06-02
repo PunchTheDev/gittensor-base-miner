@@ -1,0 +1,159 @@
+diff --git a/apps/web/src/app/api/github-stats/route.ts b/apps/web/src/app/api/github-stats/route.ts
+index 709e72bd55..9b7390951a 100644
+--- a/apps/web/src/app/api/github-stats/route.ts
++++ b/apps/web/src/app/api/github-stats/route.ts
+@@ -1,4 +1,5 @@
+ import { getCloudflareContext } from "@opennextjs/cloudflare";
++import { parseAbbreviatedCount } from "@heyclaude/registry/presentation";
+ 
+ import { apiError, apiJson, createApiHandler } from "@/lib/api/router";
+ import { logApiError, logApiInfo, logApiWarn, sample } from "@/lib/api-logs";
+@@ -75,38 +76,6 @@ async function fetchGitHubStats(
+   return { stars, forks, updatedAt };
+ }
+ 
+-function parseAbbreviatedCount(value: unknown) {
+-  const text = String(value ?? "")
+-    .trim()
+-    .toLowerCase();
+-  if (!text) return null;
+-
+-  let numberText = "";
+-  let suffix = "";
+-  for (const char of text) {
+-    if ((char >= "0" && char <= "9") || char === ".") {
+-      numberText += char;
+-      continue;
+-    }
+-    if (char === "k" || char === "m" || char === "b") {
+-      suffix = char;
+-      break;
+-    }
+-  }
+-
+-  const numeric = Number.parseFloat(numberText);
+-  if (!Number.isFinite(numeric)) return null;
+-  const multiplier =
+-    suffix === "b"
+-      ? 1_000_000_000
+-      : suffix === "m"
+-        ? 1_000_000
+-        : suffix === "k"
+-          ? 1_000
+-          : 1;
+-  return Math.round(numeric * multiplier);
+-}
+-
+ async function fetchShieldsFallback(
+   owner: string,
+   repo: string,
+diff --git a/packages/registry/src/index.d.ts b/packages/registry/src/index.d.ts
+index 0793fb8397..0c28563a92 100644
+--- a/packages/registry/src/index.d.ts
++++ b/packages/registry/src/index.d.ts
+@@ -855,6 +855,7 @@ export const SITE_URL: string;
+ export const RAYCAST_COPY_PREVIEW_LIMIT: number;
+ 
+ export function compactCount(value: number): string;
++export function parseAbbreviatedCount(value: unknown): number | null;
+ export function firstUsefulLine(value?: string | null): string;
+ export function extractConfigCommand(value?: string | null): string;
+ export function buildCollectionSequence(entry: Partial<DirectoryEntry>): string;
+diff --git a/packages/registry/src/presentation.js b/packages/registry/src/presentation.js
+index 4f5f6df4f2..8deff4a4d5 100644
+--- a/packages/registry/src/presentation.js
++++ b/packages/registry/src/presentation.js
+@@ -5,6 +5,29 @@ export function compactCount(value) {
+   return String(value);
+ }
+ 
++export function parseAbbreviatedCount(value) {
++  const text = String(value ?? "")
++    .trim()
++    .toLowerCase();
++  if (!text) return null;
++
++  const match = text.match(/^(\d+(?:\.\d+)?)([kmb])?$/);
++  if (!match) return null;
++
++  const [, numberText, suffix = ""] = match;
++  const numeric = Number.parseFloat(numberText);
++  if (!Number.isFinite(numeric)) return null;
++  const multiplier =
++    suffix === "b"
++      ? 1_000_000_000
++      : suffix === "m"
++        ? 1_000_000
++        : suffix === "k"
++          ? 1_000
++          : 1;
++  return Math.round(numeric * multiplier);
++}
++
+ export function firstUsefulLine(value) {
+   if (!value) return "";
+ 
+diff --git a/scripts/build-content-index.mjs b/scripts/build-content-index.mjs
+index a9b9230f90..41f60fbb83 100644
+--- a/scripts/build-content-index.mjs
++++ b/scripts/build-content-index.mjs
+@@ -3,7 +3,11 @@ import path from "node:path";
+ import crypto from "node:crypto";
+ import { fileURLToPath } from "node:url";
+ 
+-import { categorySpec, buildRegistryArtifactSet } from "@heyclaude/registry";
++import {
++  categorySpec,
++  buildRegistryArtifactSet,
++  parseAbbreviatedCount,
++} from "@heyclaude/registry";
+ import {
+   buildContentEntryFromMdx,
+   DEFAULT_DIRECTORY_REPO_URL,
+@@ -128,11 +132,9 @@ async function fetchShieldsStars(repo) {
+ 
+     if (!response.ok) return null;
+     const data = await response.json();
+-    const value = Number.parseFloat(
+-      String(data.value || data.message || "").replace(/[^\d.]/g, ""),
+-    );
++    const value = parseAbbreviatedCount(data.value ?? data.message);
+ 
+-    return Number.isFinite(value) ? Math.round(value) : null;
++    return value;
+   } catch {
+     return null;
+   }
+diff --git a/tests/registry-artifacts.test.ts b/tests/registry-artifacts.test.ts
+index 795ca60b07..e7c288f12d 100644
+--- a/tests/registry-artifacts.test.ts
++++ b/tests/registry-artifacts.test.ts
+@@ -21,6 +21,7 @@ import {
+   buildReadOnlyEcosystemFeed,
+   buildRaycastEnvelope,
+   buildRaycastDetailMarkdown,
++  parseAbbreviatedCount,
+   renderEntryLlms,
+   RAYCAST_COPY_PREVIEW_LIMIT,
+   buildSearchEntries,
+@@ -95,6 +96,20 @@ describe("registry artifacts", () => {
+     entries: any[];
+   }>("registry-trust-report.json");
+ 
++  it("parses abbreviated Shields fallback counts", () => {
++    expect(parseAbbreviatedCount("987")).toBe(987);
++    expect(parseAbbreviatedCount("1.2k")).toBe(1200);
++    expect(parseAbbreviatedCount("3.4m")).toBe(3_400_000);
++    expect(parseAbbreviatedCount("2.5b")).toBe(2_500_000_000);
++    expect(parseAbbreviatedCount("")).toBeNull();
++    expect(parseAbbreviatedCount("n/a")).toBeNull();
++    expect(parseAbbreviatedCount("1.2t")).toBeNull();
++    expect(parseAbbreviatedCount("1.2k stars")).toBeNull();
++    expect(parseAbbreviatedCount("1.2.3k")).toBeNull();
++    expect(parseAbbreviatedCount("1.")).toBeNull();
++    expect(parseAbbreviatedCount(null)).toBeNull();
++  });
++
+   it("does not publish the retired full content corpus JSON", () => {
+     expect(fs.existsSync(path.join(dataRoot, "content-index.json"))).toBe(
+       false,

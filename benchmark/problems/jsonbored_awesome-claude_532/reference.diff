@@ -1,0 +1,534 @@
+diff --git a/apps/web/src/app/api/jobs/route.ts b/apps/web/src/app/api/jobs/route.ts
+index 90870ece20..274f8b4029 100644
+--- a/apps/web/src/app/api/jobs/route.ts
++++ b/apps/web/src/app/api/jobs/route.ts
+@@ -7,6 +7,8 @@ import {
+   type PublicJobListing,
+ } from "@/lib/jobs";
+ 
++const MAX_OFFSET = 10_000;
++
+ function matchesQuery(job: PublicJobListing, query: string) {
+   if (!query) return true;
+   const haystack = [
+@@ -30,6 +32,24 @@ function matchesQuery(job: PublicJobListing, query: string) {
+   return haystack.includes(query);
+ }
+ 
++function matchesBoolFilter(
++  filter: "all" | "true" | "false" | "",
++  value: boolean,
++) {
++  if (!filter || filter === "all") return true;
++  return filter === "true" ? value : !value;
++}
++
++function jobPostedAtMs(job: PublicJobListing): number | null {
++  const candidates = [job.postedAt, job.firstSeenAt];
++  for (const candidate of candidates) {
++    if (!candidate) continue;
++    const parsed = Date.parse(candidate);
++    if (Number.isFinite(parsed)) return parsed;
++  }
++  return null;
++}
++
+ export const GET = createApiHandler(
+   "jobs.list",
+   async ({ request, query: parsedQuery }) => {
+@@ -37,20 +57,65 @@ export const GET = createApiHandler(
+       q: query,
+       tier,
+       remote,
++      location,
++      type,
++      sourceKind,
++      compensation,
++      claimedEmployer,
++      postedAfter,
+       limit,
++      offset,
+     } = parsedQuery as InferApiQuery<typeof publicJobsQuerySchema>;
++
++    const postedAfterMs = postedAfter ? Date.parse(postedAfter) : NaN;
++    const postedAfterCursor = Number.isFinite(postedAfterMs)
++      ? postedAfterMs
++      : null;
++    const locationNeedle = (location ?? "").toLowerCase();
++    const typeNeedle = (type ?? "").toLowerCase();
++
+     const payload = buildPublicJobsIndex(
+       await getJobs(),
+       new URL(request.url).origin,
+     );
+-    const entries = payload.entries
++
++    const matched = payload.entries
+       .filter((job) => !tier || tier === "all" || job.tier === tier)
+       .filter((job) => {
+         if (!remote || remote === "all") return true;
+         return remote === "true" ? Boolean(job.isRemote) : !job.isRemote;
+       })
+-      .filter((job) => matchesQuery(job, query))
+-      .slice(0, limit);
++      .filter((job) => {
++        if (!locationNeedle) return true;
++        return (job.location ?? "").toLowerCase().includes(locationNeedle);
++      })
++      .filter((job) => {
++        if (!typeNeedle) return true;
++        return (job.type ?? "").toLowerCase().includes(typeNeedle);
++      })
++      .filter((job) => {
++        if (!sourceKind || sourceKind === "all") return true;
++        return job.sourceKind === sourceKind;
++      })
++      .filter((job) =>
++        matchesBoolFilter(compensation, Boolean(job.compensation)),
++      )
++      .filter((job) =>
++        matchesBoolFilter(claimedEmployer, Boolean(job.claimedEmployer)),
++      )
++      .filter((job) => {
++        if (postedAfterCursor === null) return true;
++        const jobMs = jobPostedAtMs(job);
++        return jobMs !== null && jobMs >= postedAfterCursor;
++      })
++      .filter((job) => matchesQuery(job, query));
++
++    const entries = matched.slice(offset, offset + limit);
++    const nextCandidate = Math.min(offset + limit, MAX_OFFSET);
++    const nextOffset =
++      nextCandidate < matched.length && nextCandidate !== offset
++        ? nextCandidate
++        : null;
+ 
+     return cachedJsonResponse(
+       request,
+@@ -59,8 +124,20 @@ export const GET = createApiHandler(
+         query,
+         tier: tier || "all",
+         remote: remote || "all",
++        filters: {
++          location,
++          type,
++          sourceKind: sourceKind || "all",
++          compensation: compensation || "all",
++          claimedEmployer: claimedEmployer || "all",
++          postedAfter: postedAfter || "",
++        },
+         count: entries.length,
++        total: matched.length,
+         totalAvailable: payload.entries.length,
++        limit,
++        offset,
++        nextOffset,
+         entries,
+       },
+       {
+diff --git a/apps/web/src/lib/api/contracts.ts b/apps/web/src/lib/api/contracts.ts
+index 56fe88492b..befecc3b1f 100644
+--- a/apps/web/src/lib/api/contracts.ts
++++ b/apps/web/src/lib/api/contracts.ts
+@@ -109,6 +109,22 @@ const optionalHttpsUrlSchema = z
+   .optional()
+   .default("");
+ 
++const isoDateLikeSchema = z
++  .union([z.literal(""), z.iso.datetime({ offset: true }), z.iso.date()])
++  .optional()
++  .default("");
++
++export const jobSourceKindFilterSchema = z
++  .enum([
++    "all",
++    "official_ats",
++    "employer_careers",
++    "employer_submitted",
++    "",
++  ])
++  .optional()
++  .default("all");
++
+ export const publicJobsQuerySchema = z.object({
+   q: z.string().trim().toLowerCase().max(120).optional().default(""),
+   tier: z
+@@ -116,7 +132,23 @@ export const publicJobsQuerySchema = z.object({
+     .optional()
+     .default("all"),
+   remote: z.enum(["all", "true", "false", ""]).optional().default("all"),
++  location: z.string().trim().toLowerCase().max(120).optional().default(""),
++  type: z.string().trim().toLowerCase().max(60).optional().default(""),
++  sourceKind: jobSourceKindFilterSchema,
++  compensation: z.enum(["all", "true", "false", ""]).optional().default("all"),
++  claimedEmployer: z
++    .enum(["all", "true", "false", ""])
++    .optional()
++    .default("all"),
++  postedAfter: isoDateLikeSchema,
+   limit: z.coerce.number().int().min(1).max(100).optional().default(100),
++  offset: z.coerce
++    .number()
++    .int()
++    .min(0)
++    .max(10_000)
++    .default(0)
++    .meta({ type: "integer", minimum: 0, maximum: 10_000, default: 0 }),
+ });
+ 
+ export const apiErrorEnvelopeSchema = z.object({
+diff --git a/cloudflare/api-schema-heyclaude-openapi.yaml b/cloudflare/api-schema-heyclaude-openapi.yaml
+index 7db7f17c89..77e763f999 100644
+--- a/cloudflare/api-schema-heyclaude-openapi.yaml
++++ b/cloudflare/api-schema-heyclaude-openapi.yaml
+@@ -6208,6 +6208,67 @@ paths:
+           required: false
+           name: remote
+           in: query
++        - schema:
++            type: string
++            maxLength: 120
++            default: ""
++          required: false
++          name: location
++          in: query
++        - schema:
++            type: string
++            maxLength: 60
++            default: ""
++          required: false
++          name: type
++          in: query
++        - schema:
++            type: string
++            enum:
++              - all
++              - official_ats
++              - employer_careers
++              - employer_submitted
++              - ""
++            default: all
++          required: false
++          name: sourceKind
++          in: query
++        - schema:
++            type: string
++            enum:
++              - all
++              - "true"
++              - "false"
++              - ""
++            default: all
++          required: false
++          name: compensation
++          in: query
++        - schema:
++            type: string
++            enum:
++              - all
++              - "true"
++              - "false"
++              - ""
++            default: all
++          required: false
++          name: claimedEmployer
++          in: query
++        - schema:
++            anyOf:
++              - type: string
++                enum:
++                  - ""
++              - type: string
++                format: date-time
++              - type: string
++                format: date
++            default: ""
++          required: false
++          name: postedAfter
++          in: query
+         - schema:
+             type: integer
+             minimum: 1
+@@ -6216,6 +6277,14 @@ paths:
+           required: false
+           name: limit
+           in: query
++        - schema:
++            type: integer
++            minimum: 0
++            maximum: 10000
++            default: 0
++          required: false
++          name: offset
++          in: query
+       responses:
+         "200":
+           description: Request accepted.
+diff --git a/tests/api-contracts.test.ts b/tests/api-contracts.test.ts
+index bfa56679a7..451b50a38f 100644
+--- a/tests/api-contracts.test.ts
++++ b/tests/api-contracts.test.ts
+@@ -183,6 +183,20 @@ describe("OpenAPI route coverage", () => {
+     );
+   });
+ 
++  it("documents richer public job filters and pagination cursor", () => {
++    expect(parsedSchema.paths["/api/jobs"]?.get?.parameters).toEqual(
++      expect.arrayContaining([
++        expect.objectContaining({ name: "location", in: "query" }),
++        expect.objectContaining({ name: "type", in: "query" }),
++        expect.objectContaining({ name: "sourceKind", in: "query" }),
++        expect.objectContaining({ name: "compensation", in: "query" }),
++        expect.objectContaining({ name: "claimedEmployer", in: "query" }),
++        expect.objectContaining({ name: "postedAfter", in: "query" }),
++        expect.objectContaining({ name: "offset", in: "query" }),
++      ]),
++    );
++  });
++
+   it("documents registry search pagination metadata", () => {
+     const searchResponse =
+       parsedSchema.paths["/api/registry/search"]?.get?.responses?.["200"];
+diff --git a/tests/jobs-api.test.ts b/tests/jobs-api.test.ts
+new file mode 100644
+index 0000000000..a64adff3f4
+--- /dev/null
++++ b/tests/jobs-api.test.ts
+@@ -0,0 +1,237 @@
++import { beforeEach, describe, expect, it, vi } from "vitest";
++
++import type { JobListing } from "../apps/web/src/lib/jobs";
++
++const jobsMock = vi.hoisted(() => ({
++  value: [] as JobListing[],
++}));
++
++vi.mock("@opennextjs/cloudflare", () => ({
++  getCloudflareContext: () => ({ env: {} }),
++}));
++
++vi.mock("@/lib/jobs", async () => {
++  const actual =
++    await vi.importActual<typeof import("@/lib/jobs")>("@/lib/jobs");
++  return {
++    ...actual,
++    getJobs: () => Promise.resolve(jobsMock.value),
++  };
++});
++
++function makeJob(overrides: Partial<JobListing> = {}): JobListing {
++  return {
++    slug: "fixture-job",
++    title: "Fixture Engineer",
++    company: "Fixture Co",
++    location: "Remote",
++    description: "Build fixture-grade products.",
++    applyUrl: "https://example.com/apply/fixture",
++    featured: false,
++    tier: "standard",
++    status: "active",
++    source: "manual",
++    sourceKind: "employer_submitted",
++    sourceUrl: "https://example.com/apply/fixture",
++    postedAt: "2026-05-20T00:00:00.000Z",
++    firstSeenAt: "2026-05-20T00:00:00.000Z",
++    isRemote: true,
++    isWorldwide: false,
++    claimedEmployer: false,
++    ...overrides,
++  };
++}
++
++function request(query: string) {
++  return new Request(`https://heyclau.de/api/jobs${query}`, {
++    headers: { origin: "https://heyclau.de" },
++  });
++}
++
++describe("/api/jobs", () => {
++  beforeEach(() => {
++    vi.resetModules();
++    jobsMock.value = [
++      makeJob({
++        slug: "remote-eu-compensated",
++        title: "Senior Platform Engineer",
++        company: "Aether",
++        location: "Remote (EU)",
++        type: "Full-time",
++        compensation: "€90k–€130k",
++        sourceKind: "official_ats",
++        claimedEmployer: true,
++        postedAt: "2026-05-22T00:00:00.000Z",
++        firstSeenAt: "2026-05-22T00:00:00.000Z",
++        isRemote: true,
++      }),
++      makeJob({
++        slug: "onsite-us-no-comp",
++        title: "Staff Frontend Engineer",
++        company: "Borealis",
++        location: "New York City, NY, US",
++        type: "Full-time",
++        compensation: undefined,
++        sourceKind: "employer_careers",
++        claimedEmployer: false,
++        postedAt: "2026-04-30T00:00:00.000Z",
++        firstSeenAt: "2026-04-30T00:00:00.000Z",
++        isRemote: false,
++      }),
++      makeJob({
++        slug: "remote-worldwide-contract",
++        title: "Contract MCP Engineer",
++        company: "Cirrus",
++        location: "Worldwide",
++        type: "Contract",
++        compensation: "$120/hr",
++        sourceKind: "employer_submitted",
++        claimedEmployer: false,
++        postedAt: "2026-03-10T00:00:00.000Z",
++        firstSeenAt: "2026-03-10T00:00:00.000Z",
++        isRemote: true,
++        isWorldwide: true,
++      }),
++    ];
++  });
++
++  it("returns every active job with pagination metadata when no filters are applied", async () => {
++    const { GET } = await import("../apps/web/src/app/api/jobs/route");
++    const response = await GET(request(""));
++
++    expect(response.status).toBe(200);
++    const body = await response.json();
++    expect(body).toMatchObject({
++      kind: "jobs-index",
++      count: 3,
++      total: 3,
++      totalAvailable: 3,
++      limit: 100,
++      offset: 0,
++      nextOffset: null,
++    });
++    expect(body.entries).toHaveLength(3);
++  });
++
++  it("combines region, compensation, sourceKind, and claimedEmployer filters", async () => {
++    const { GET } = await import("../apps/web/src/app/api/jobs/route");
++    const response = await GET(
++      request(
++        "?location=eu&compensation=true&sourceKind=official_ats&claimedEmployer=true",
++      ),
++    );
++
++    expect(response.status).toBe(200);
++    const body = await response.json();
++    expect(body).toMatchObject({
++      count: 1,
++      total: 1,
++      filters: {
++        location: "eu",
++        sourceKind: "official_ats",
++        compensation: "true",
++        claimedEmployer: "true",
++      },
++    });
++    expect(body.entries[0].slug).toBe("remote-eu-compensated");
++  });
++
++  it("falls back to firstSeenAt when postedAt is missing for the postedAfter cursor", async () => {
++    jobsMock.value = [
++      makeJob({
++        slug: "first-seen-only",
++        title: "Edge case engineer",
++        postedAt: undefined,
++        firstSeenAt: "2026-05-22T00:00:00.000Z",
++      }),
++      makeJob({
++        slug: "old-first-seen-only",
++        title: "Older engineer",
++        postedAt: undefined,
++        firstSeenAt: "2025-12-01T00:00:00.000Z",
++      }),
++    ];
++
++    const { GET } = await import("../apps/web/src/app/api/jobs/route");
++    const response = await GET(
++      request("?postedAfter=2026-05-01T00:00:00.000Z"),
++    );
++
++    const body = await response.json();
++    expect(body.count).toBe(1);
++    expect(body.entries.map((job: { slug: string }) => job.slug)).toEqual([
++      "first-seen-only",
++    ]);
++  });
++
++  it("applies postedAfter as an inclusive date cursor", async () => {
++    const { GET } = await import("../apps/web/src/app/api/jobs/route");
++    const response = await GET(
++      request("?postedAfter=2026-05-01T00:00:00.000Z"),
++    );
++
++    const body = await response.json();
++    expect(body.count).toBe(1);
++    expect(body.entries.map((job: { slug: string }) => job.slug)).toEqual([
++      "remote-eu-compensated",
++    ]);
++  });
++
++  it("filters by job type via case-insensitive substring", async () => {
++    const { GET } = await import("../apps/web/src/app/api/jobs/route");
++    const response = await GET(request("?type=contract"));
++
++    const body = await response.json();
++    expect(body.count).toBe(1);
++    expect(body.entries[0].slug).toBe("remote-worldwide-contract");
++  });
++
++  it("returns an empty entries array but valid metadata when filters match nothing", async () => {
++    const { GET } = await import("../apps/web/src/app/api/jobs/route");
++    const response = await GET(
++      request(
++        "?location=mars&compensation=true&sourceKind=official_ats&claimedEmployer=true",
++      ),
++    );
++
++    expect(response.status).toBe(200);
++    const body = await response.json();
++    expect(body).toMatchObject({
++      count: 0,
++      total: 0,
++      totalAvailable: 3,
++      offset: 0,
++      nextOffset: null,
++    });
++    expect(body.entries).toEqual([]);
++  });
++
++  it("paginates with offset/limit and advertises nextOffset only when more results remain", async () => {
++    const { GET } = await import("../apps/web/src/app/api/jobs/route");
++    const first = await GET(request("?limit=2&offset=0"));
++    const firstBody = await first.json();
++    expect(firstBody).toMatchObject({
++      count: 2,
++      total: 3,
++      limit: 2,
++      offset: 0,
++      nextOffset: 2,
++    });
++
++    const second = await GET(request("?limit=2&offset=2"));
++    const secondBody = await second.json();
++    expect(secondBody).toMatchObject({
++      count: 1,
++      total: 3,
++      limit: 2,
++      offset: 2,
++      nextOffset: null,
++    });
++  });
++
++  it("rejects an invalid postedAfter value", async () => {
++    const { GET } = await import("../apps/web/src/app/api/jobs/route");
++    const response = await GET(request("?postedAfter=not-a-date"));
++    expect(response.status).toBe(400);
++  });
++});

@@ -1,0 +1,489 @@
+diff --git a/apps/web/src/app/api/registry/feed/route.ts b/apps/web/src/app/api/registry/feed/route.ts
+index 605ffb18d6..c419e41fa6 100644
+--- a/apps/web/src/app/api/registry/feed/route.ts
++++ b/apps/web/src/app/api/registry/feed/route.ts
+@@ -24,6 +24,7 @@ export const GET = createApiHandler("registry.feed", async ({ request }) => {
+       search:
+         "/api/registry/search?q={query}&category={category}&platform={platform}&limit=20",
+       diff: "/api/registry/diff?since={hash-or-date}&limit=100",
++      integrity: "/api/registry/integrity?artifact={artifact}&hash={sha256}",
+       entry: "/api/registry/entries/{category}/{slug}",
+       entryLlms: "/api/registry/entries/{category}/{slug}/llms",
+       jobs: "/api/jobs?limit=100",
+diff --git a/apps/web/src/app/api/registry/integrity/route.ts b/apps/web/src/app/api/registry/integrity/route.ts
+new file mode 100644
+index 0000000000..bcaa556330
+--- /dev/null
++++ b/apps/web/src/app/api/registry/integrity/route.ts
+@@ -0,0 +1,17 @@
++import { createApiHandler } from "@/lib/api/router";
++import { getRegistryManifest } from "@/lib/content";
++import { cachedJsonResponse } from "@/lib/http-cache";
++
++type Contract = { path: string; type: string; sha256: string };
++
++const normalizeArtifact = (value: string) => value.replace(/%2f/gi, "/").replace(/^\/+/, "").replace(/^data\//, "");
++
++export const GET = createApiHandler("registry.integrity", async ({ request, query }) => {
++  const { artifact = "", hash = "" } = query as { artifact?: string; hash?: string };
++  const manifest = await getRegistryManifest();
++  const artifacts = Object.entries(manifest.artifactContracts ?? {}).map(([name, contract]) => ({ name, ...(contract as Contract) })).sort((left, right) => left.name.localeCompare(right.name));
++  const artifactKey = normalizeArtifact(artifact);
++  const current = artifacts.find((item) => item.name === artifactKey || normalizeArtifact(item.path) === artifactKey) ?? null;
++  const status = !artifact || (current && !hash) ? "snapshot" : !current ? "unknown" : current.sha256 === hash ? "match" : "mismatch";
++  return cachedJsonResponse(request, { schemaVersion: 1, kind: "registry-integrity", generatedAt: manifest.generatedAt, artifact: artifact || null, hash: hash || null, ok: status !== "unknown" && status !== "mismatch", status, count: artifacts.length, current, artifacts });
++});
+diff --git a/apps/web/src/lib/api/contracts.ts b/apps/web/src/lib/api/contracts.ts
+index face4c138f..1b053a8d1b 100644
+--- a/apps/web/src/lib/api/contracts.ts
++++ b/apps/web/src/lib/api/contracts.ts
+@@ -272,6 +272,11 @@ export const registryDiffQuerySchema = z.object({
+   limit: z.coerce.number().int().min(1).max(500).optional().default(100),
+ });
+ 
++export const registryIntegrityQuerySchema = z.object({
++  artifact: z.string().trim().max(160).regex(/^\/?(?:[a-z0-9][a-z0-9._-]*\/)*(?:[a-z0-9][a-z0-9._-]*)$/).optional(),
++  hash: z.string().trim().toLowerCase().regex(/^[a-f0-9]{64}$/).optional(),
++});
++
+ export const entryParamsSchema = z.object({
+   category: safeSlugSchema,
+   slug: safeSlugSchema,
+@@ -694,6 +699,7 @@ export const apiRouteDefinitions = {
+       binding: "API_REGISTRY_RATE_LIMIT",
+     },
+   }),
++  "registry.integrity": route({ id: "registry.integrity", method: "GET", path: "/api/registry/integrity", summary: "Registry artifact integrity verification", description: "Lists current registry artifact hashes and verifies submitted artifact/hash pairs against the deployed manifest.", tags: ["Registry"], originCheck: true, querySchema: registryIntegrityQuerySchema, rateLimit: { scope: "registry-integrity", limit: 120, windowMs: 60_000, binding: "API_REGISTRY_RATE_LIMIT" } }),
+   "registry.entry": route({
+     id: "registry.entry",
+     method: "GET",
+diff --git a/cloudflare/api-schema-heyclaude-openapi.yaml b/cloudflare/api-schema-heyclaude-openapi.yaml
+index 72c324dc1a..62ca7364a8 100644
+--- a/cloudflare/api-schema-heyclaude-openapi.yaml
++++ b/cloudflare/api-schema-heyclaude-openapi.yaml
+@@ -1991,6 +1991,279 @@ paths:
+                 required:
+                   - ok
+                   - error
++  /api/registry/integrity:
++    get:
++      tags:
++        - Registry
++      summary: Registry artifact integrity verification
++      description:
++        Lists current registry artifact hashes and verifies submitted artifact/hash pairs
++        against the deployed manifest.
++      parameters:
++        - schema:
++            type: string
++            maxLength: 160
++            pattern: ^\/?(?:[a-z0-9][a-z0-9._-]*\/)*(?:[a-z0-9][a-z0-9._-]*)$
++          required: false
++          name: artifact
++          in: query
++        - schema:
++            type: string
++            pattern: ^[a-f0-9]{64}$
++          required: false
++          name: hash
++          in: query
++      responses:
++        "200":
++          description: Cacheable registry response with ETag support where applicable.
++          content:
++            application/json:
++              schema:
++                type: object
++                additionalProperties: {}
++        "400":
++          description: Invalid JSON, invalid query, invalid payload, or invalid status transition.
++          content:
++            application/json:
++              schema:
++                type: object
++                properties:
++                  ok:
++                    type: boolean
++                    enum:
++                      - false
++                  error:
++                    type: object
++                    properties:
++                      code:
++                        type: string
++                        minLength: 1
++                      message:
++                        type: string
++                      details: {}
++                    required:
++                      - code
++                  requestId:
++                    type: string
++                required:
++                  - ok
++                  - error
++        "401":
++          description: Unauthorized admin token or invalid webhook signature.
++          content:
++            application/json:
++              schema:
++                type: object
++                properties:
++                  ok:
++                    type: boolean
++                    enum:
++                      - false
++                  error:
++                    type: object
++                    properties:
++                      code:
++                        type: string
++                        minLength: 1
++                      message:
++                        type: string
++                      details: {}
++                    required:
++                      - code
++                  requestId:
++                    type: string
++                required:
++                  - ok
++                  - error
++        "403":
++          description: Forbidden origin.
++          content:
++            application/json:
++              schema:
++                type: object
++                properties:
++                  ok:
++                    type: boolean
++                    enum:
++                      - false
++                  error:
++                    type: object
++                    properties:
++                      code:
++                        type: string
++                        minLength: 1
++                      message:
++                        type: string
++                      details: {}
++                    required:
++                      - code
++                  requestId:
++                    type: string
++                required:
++                  - ok
++                  - error
++        "413":
++          description: Payload too large.
++          content:
++            application/json:
++              schema:
++                type: object
++                properties:
++                  ok:
++                    type: boolean
++                    enum:
++                      - false
++                  error:
++                    type: object
++                    properties:
++                      code:
++                        type: string
++                        minLength: 1
++                      message:
++                        type: string
++                      details: {}
++                    required:
++                      - code
++                  requestId:
++                    type: string
++                required:
++                  - ok
++                  - error
++        "415":
++          description: Invalid content type.
++          content:
++            application/json:
++              schema:
++                type: object
++                properties:
++                  ok:
++                    type: boolean
++                    enum:
++                      - false
++                  error:
++                    type: object
++                    properties:
++                      code:
++                        type: string
++                        minLength: 1
++                      message:
++                        type: string
++                      details: {}
++                    required:
++                      - code
++                  requestId:
++                    type: string
++                required:
++                  - ok
++                  - error
++        "429":
++          description: Route-level or Cloudflare-native rate limited.
++          content:
++            application/json:
++              schema:
++                type: object
++                properties:
++                  ok:
++                    type: boolean
++                    enum:
++                      - false
++                  error:
++                    type: object
++                    properties:
++                      code:
++                        type: string
++                        minLength: 1
++                      message:
++                        type: string
++                      details: {}
++                    required:
++                      - code
++                  requestId:
++                    type: string
++                required:
++                  - ok
++                  - error
++        "500":
++          description: Internal error.
++          content:
++            application/json:
++              schema:
++                type: object
++                properties:
++                  ok:
++                    type: boolean
++                    enum:
++                      - false
++                  error:
++                    type: object
++                    properties:
++                      code:
++                        type: string
++                        minLength: 1
++                      message:
++                        type: string
++                      details: {}
++                    required:
++                      - code
++                  requestId:
++                    type: string
++                required:
++                  - ok
++                  - error
++        "502":
++          description: Upstream provider error.
++          content:
++            application/json:
++              schema:
++                type: object
++                properties:
++                  ok:
++                    type: boolean
++                    enum:
++                      - false
++                  error:
++                    type: object
++                    properties:
++                      code:
++                        type: string
++                        minLength: 1
++                      message:
++                        type: string
++                      details: {}
++                    required:
++                      - code
++                  requestId:
++                    type: string
++                required:
++                  - ok
++                  - error
++        "503":
++          description: Site DB not configured, provider not configured, or endpoint unavailable.
++          content:
++            application/json:
++              schema:
++                type: object
++                properties:
++                  ok:
++                    type: boolean
++                    enum:
++                      - false
++                  error:
++                    type: object
++                    properties:
++                      code:
++                        type: string
++                        minLength: 1
++                      message:
++                        type: string
++                      details: {}
++                    required:
++                      - code
++                  requestId:
++                    type: string
++                required:
++                  - ok
++                  - error
+   /api/registry/entries/{category}/{slug}:
+     get:
+       tags:
+diff --git a/tests/api-contracts.test.ts b/tests/api-contracts.test.ts
+index 93c9186afe..9e0338c5e5 100644
+--- a/tests/api-contracts.test.ts
++++ b/tests/api-contracts.test.ts
+@@ -20,6 +20,7 @@ const apiRoutes = [
+   "/api/registry/search",
+   "/api/registry/feed",
+   "/api/registry/diff",
++  "/api/registry/integrity",
+   "/api/registry/entries/{category}/{slug}",
+   "/api/registry/entries/{category}/{slug}/llms",
+   "/api/mcp",
+diff --git a/tests/registry-integrity-api.test.ts b/tests/registry-integrity-api.test.ts
+new file mode 100644
+index 0000000000..cea24bb20a
+--- /dev/null
++++ b/tests/registry-integrity-api.test.ts
+@@ -0,0 +1,128 @@
++import { describe, expect, it, vi } from "vitest";
++
++const manifestMock = vi.hoisted(() => ({
++  value: {
++    generatedAt: "2026-05-24T00:00:00.000Z",
++    artifactContracts: {
++      "directory-index.json": {
++        path: "/data/directory-index.json",
++        type: "json",
++        sha256:
++          "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
++      },
++      "feeds/index.json": {
++        path: "/data/feeds%2Findex.json",
++        type: "json",
++        sha256:
++          "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
++      },
++    },
++  },
++}));
++
++vi.mock("@opennextjs/cloudflare", () => ({
++  getCloudflareContext: () => ({ env: {} }),
++}));
++
++vi.mock("@/lib/content", () => ({
++  getRegistryManifest: () => Promise.resolve(manifestMock.value),
++}));
++
++function request(path: string) {
++  return new Request(`https://heyclau.de${path}`, {
++    headers: { origin: "https://heyclau.de" },
++  });
++}
++
++describe("/api/registry/integrity", () => {
++  it("lists current artifact contracts without artifact bodies", async () => {
++    const { GET } =
++      await import("../apps/web/src/app/api/registry/integrity/route");
++    const response = await GET(request("/api/registry/integrity"));
++
++    await expect(response.json()).resolves.toMatchObject({
++      ok: true,
++      status: "snapshot",
++      count: 2,
++      current: null,
++      artifacts: [
++        expect.objectContaining({
++          name: "directory-index.json",
++          sha256:
++            "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
++        }),
++        expect.objectContaining({ name: "feeds/index.json" }),
++      ],
++    });
++  });
++
++  it("verifies matching, mismatched, and path-normalized artifact hashes", async () => {
++    const { GET } =
++      await import("../apps/web/src/app/api/registry/integrity/route");
++    const match = await GET(
++      request(
++        "/api/registry/integrity?artifact=directory-index.json&hash=aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
++      ),
++    );
++    const mismatch = await GET(
++      request(
++        "/api/registry/integrity?artifact=directory-index.json&hash=cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc",
++      ),
++    );
++    const encodedPath = await GET(
++      request(
++        "/api/registry/integrity?artifact=%2fdata%2ffeeds%2findex.json&hash=bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
++      ),
++    );
++    const currentSnapshot = await GET(
++      request("/api/registry/integrity?artifact=%2fdirectory-index.json"),
++    );
++
++    await expect(match.json()).resolves.toMatchObject({
++      ok: true,
++      status: "match",
++      current: expect.objectContaining({ name: "directory-index.json" }),
++    });
++    await expect(mismatch.json()).resolves.toMatchObject({
++      ok: false,
++      status: "mismatch",
++      current: expect.objectContaining({ name: "directory-index.json" }),
++    });
++    await expect(encodedPath.json()).resolves.toMatchObject({
++      ok: true,
++      status: "match",
++      current: expect.objectContaining({ name: "feeds/index.json" }),
++    });
++    await expect(currentSnapshot.json()).resolves.toMatchObject({
++      ok: true,
++      status: "snapshot",
++      current: expect.objectContaining({ name: "directory-index.json" }),
++    });
++  });
++
++  it("returns clear unknown artifact and malformed hash responses", async () => {
++    const { GET } =
++      await import("../apps/web/src/app/api/registry/integrity/route");
++    const unknown = await GET(
++      request("/api/registry/integrity?artifact=missing.json"),
++    );
++    const malformed = await GET(
++      request("/api/registry/integrity?artifact=directory-index.json&hash=nope"),
++    );
++    const badArtifact = await GET(
++      request("/api/registry/integrity?artifact=../registry-manifest.json"),
++    );
++
++    await expect(unknown.json()).resolves.toMatchObject({
++      ok: false,
++      status: "unknown",
++      current: null,
++    });
++    expect(malformed.status).toBe(400);
++    await expect(malformed.json()).resolves.toMatchObject({
++      ok: false,
++      error: { code: "invalid_payload" },
++    });
++    expect(badArtifact.status).toBe(400);
++  });
++});

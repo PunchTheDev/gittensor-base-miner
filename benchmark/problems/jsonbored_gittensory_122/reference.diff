@@ -1,0 +1,749 @@
+diff --git a/src/api/routes.ts b/src/api/routes.ts
+index 61e7735..5b2379f 100644
+--- a/src/api/routes.ts
++++ b/src/api/routes.ts
+@@ -787,6 +787,7 @@ export function createApp() {
+     ]);
+     const fit = buildContributorFit(context.profile, context.repositories, [], [], context.syncStates, context.repoStats);
+     const scoringProfile = buildContributorScoringProfile({ login: parsed.data.login, fit, scoringSnapshot: snapshot });
++    const checkSummaries = await loadCheckSummariesForPullRequests(c.env, parsed.data.repoFullName, pullRequests);
+     const analysis = buildLocalBranchAnalysis({
+       input: parsed.data,
+       repo,
+@@ -795,6 +796,7 @@ export function createApp() {
+       contributorPullRequests: context.contributorPullRequests,
+       recentMergedPullRequests,
+       repositories: context.repositories,
++      checkSummaries,
+       profile: context.profile,
+       outcomeHistory: context.outcomeHistory,
+       scoringSnapshot: snapshot,
+@@ -1314,6 +1316,11 @@ async function loadContributorFastContext(env: Env, login: string) {
+   };
+ }
+ 
++async function loadCheckSummariesForPullRequests(env: Env, repoFullName: string, pullRequests: Array<{ number: number; state?: string | null | undefined }>) {
++  const openPulls = pullRequests.filter((pr) => pr.state === "open");
++  return (await Promise.all(openPulls.map((pr) => listCheckSummaries(env, repoFullName, pr.number)))).flat();
++}
++
+ async function loadRepoDataQuality(env: Env, fullName: string) {
+   const [syncStates, syncSegments] = await Promise.all([listRepoSyncStates(env), listRepoSyncSegments(env, fullName)]);
+   return buildRepoDataQuality(
+diff --git a/src/mcp/server.ts b/src/mcp/server.ts
+index 0542615..940ef84 100644
+--- a/src/mcp/server.ts
++++ b/src/mcp/server.ts
+@@ -11,6 +11,7 @@ import {
+   getLatestRepoGithubTotalsSnapshot,
+   getIssue,
+   getRepository,
++  listCheckSummaries,
+   listContributorRepoStats,
+   listContributorIssues,
+   listContributorPullRequests,
+@@ -831,6 +832,7 @@ export class GittensoryMcp {
+     ]);
+     const fit = buildContributorFit(context.profile, context.repositories, [], [], context.syncStates, context.repoStats);
+     const scoringProfile = buildContributorScoringProfile({ login: input.login, fit, scoringSnapshot: snapshot });
++    const checkSummaries = await this.loadCheckSummariesForPullRequests(input.repoFullName, pullRequests);
+     return {
+       ...buildLocalBranchAnalysis({
+         input,
+@@ -840,6 +842,7 @@ export class GittensoryMcp {
+         contributorPullRequests: context.contributorPullRequests,
+         recentMergedPullRequests,
+         repositories: context.repositories,
++        checkSummaries,
+         profile: context.profile,
+         outcomeHistory: context.outcomeHistory,
+         scoringSnapshot: snapshot,
+@@ -850,6 +853,11 @@ export class GittensoryMcp {
+     };
+   }
+ 
++  private async loadCheckSummariesForPullRequests(repoFullName: string, pullRequests: Array<{ number: number; state?: string | null | undefined }>) {
++    const openPulls = pullRequests.filter((pr) => pr.state === "open");
++    return (await Promise.all(openPulls.map((pr) => listCheckSummaries(this.env, repoFullName, pr.number)))).flat();
++  }
++
+   private async getBountyAdvisory(id: string): Promise<ToolPayload> {
+     const bounty = await getBounty(this.env, id);
+     if (!bounty) throw new Error("Bounty not found.");
+diff --git a/src/openapi/schemas.ts b/src/openapi/schemas.ts
+index 0bc37d2..60f7f27 100644
+--- a/src/openapi/schemas.ts
++++ b/src/openapi/schemas.ts
+@@ -1276,6 +1276,15 @@ export const LocalBranchAnalysisSchema = z
+       maintainerLane: z.number(),
+       notes: z.array(z.string()),
+     }),
++    githubBranchStatus: z.object({
++      source: z.literal("cached_github_data"),
++      status: z.enum(["approved", "failing_checks", "needs_author", "blocked", "pending_review", "no_pr", "unknown"]),
++      pullNumber: z.number().optional(),
++      title: z.string().optional(),
++      reviewDecision: z.string().nullable().optional(),
++      mergeableState: z.string().nullable().optional(),
++      notes: z.array(z.string()),
++    }),
+     rewardRisk: RepoRewardRiskSchema,
+     scoreBlockers: z.array(z.string()),
+     branchQualityBlockers: z.array(z.string()),
+diff --git a/src/services/agent-orchestrator.ts b/src/services/agent-orchestrator.ts
+index 7c3deaf..ff133f4 100644
+--- a/src/services/agent-orchestrator.ts
++++ b/src/services/agent-orchestrator.ts
+@@ -2,6 +2,7 @@ import {
+   createAgentRun,
+   getAgentRun,
+   getRepository,
++  listCheckSummaries,
+   listAgentActions,
+   listAgentContextSnapshots,
+   listContributorIssues,
+@@ -304,6 +305,7 @@ async function analyzeLocalBranch(env: Env, input: LocalBranchAnalysisInput): Pr
+   const outcomeHistory = buildContributorOutcomeHistory({ login: input.login, profile, repositories, pullRequests: contributorPullRequests, issues: contributorIssues, repoStats });
+   const fit = buildContributorFit(profile, repositories, [], [], syncStates, repoStats);
+   const scoringProfile = buildContributorScoringProfile({ login: input.login, fit, scoringSnapshot });
++  const checkSummaries = await loadCheckSummariesForPullRequests(env, input.repoFullName, pullRequests);
+   return buildLocalBranchAnalysis({
+     input,
+     repo,
+@@ -312,6 +314,7 @@ async function analyzeLocalBranch(env: Env, input: LocalBranchAnalysisInput): Pr
+     contributorPullRequests,
+     recentMergedPullRequests,
+     repositories,
++    checkSummaries,
+     profile,
+     outcomeHistory,
+     scoringSnapshot,
+@@ -320,6 +323,11 @@ async function analyzeLocalBranch(env: Env, input: LocalBranchAnalysisInput): Pr
+   });
+ }
+ 
++async function loadCheckSummariesForPullRequests(env: Env, repoFullName: string, pullRequests: Array<{ number: number; state?: string | null | undefined }>) {
++  const openPulls = pullRequests.filter((pr) => pr.state === "open");
++  return (await Promise.all(openPulls.map((pr) => listCheckSummaries(env, repoFullName, pr.number)))).flat();
++}
++
+ function buildDecisionActions(run: AgentRunRecord, pack: ContributorDecisionPack, decisions: RepoDecision[]): AgentActionRecord[] {
+   const decisionByRepo = new Map(decisions.map((decision) => [decision.repoFullName, decision]));
+   const candidateActions = pack.topActions
+diff --git a/src/signals/local-branch.ts b/src/signals/local-branch.ts
+index 5b39a42..4ef02f0 100644
+--- a/src/signals/local-branch.ts
++++ b/src/signals/local-branch.ts
+@@ -1,6 +1,6 @@
+ import type { ScorePreviewInput, ScorePreviewResult } from "../scoring/preview";
+ import { buildScorePreview } from "../scoring/preview";
+-import type { IssueRecord, PullRequestRecord, RecentMergedPullRequestRecord, RepositoryRecord, ScoringModelSnapshotRecord } from "../types";
++import type { CheckSummaryRecord, IssueRecord, PullRequestRecord, RecentMergedPullRequestRecord, RepositoryRecord, ScoringModelSnapshotRecord } from "../types";
+ import { nowIso } from "../utils/json";
+ import {
+   buildLaneAdvice,
+@@ -80,6 +80,16 @@ type ObservedPullRequestScenarios = {
+   notes: string[];
+ };
+ 
++type GitHubBranchStatus = {
++  source: "cached_github_data";
++  status: "approved" | "failing_checks" | "needs_author" | "blocked" | "pending_review" | "no_pr" | "unknown";
++  pullNumber?: number | undefined;
++  title?: string | undefined;
++  reviewDecision?: string | null | undefined;
++  mergeableState?: string | null | undefined;
++  notes: string[];
++};
++
+ export type LocalBranchAnalysis = {
+   login: string;
+   repoFullName: string;
+@@ -114,6 +124,7 @@ export type LocalBranchAnalysis = {
+     blockedBy: ScorePreviewResult["blockedBy"];
+   };
+   observedPullRequestScenarios: ObservedPullRequestScenarios;
++  githubBranchStatus: GitHubBranchStatus;
+   rewardRisk: RepoRewardRisk;
+   scoreBlockers: string[];
+   branchQualityBlockers: string[];
+@@ -159,6 +170,7 @@ export function buildLocalBranchAnalysis(args: {
+   contributorPullRequests?: PullRequestRecord[] | undefined;
+   recentMergedPullRequests?: RecentMergedPullRequestRecord[] | undefined;
+   repositories?: RepositoryRecord[] | undefined;
++  checkSummaries?: CheckSummaryRecord[] | undefined;
+   profile: ContributorProfile;
+   outcomeHistory: ContributorOutcomeHistory;
+   scoringSnapshot: ScoringModelSnapshotRecord;
+@@ -206,6 +218,7 @@ export function buildLocalBranchAnalysis(args: {
+     pullRequests: args.contributorPullRequests ?? args.pullRequests,
+     repositories: args.repositories,
+   });
++  const githubBranchStatus = buildGitHubBranchStatus(args.input, args.pullRequests, args.checkSummaries ?? []);
+   const scoreInput = buildLocalScoreInput({
+     input: args.input,
+     changedFiles,
+@@ -245,7 +258,7 @@ export function buildLocalBranchAnalysis(args: {
+     issues: args.issues,
+     pullRequests: args.pullRequests,
+   });
+-  const localFindings = buildLocalFindings(args.input, changedFiles, preflight, scorePreview, baseFreshness);
++  const localFindings = buildLocalFindings(args.input, changedFiles, preflight, scorePreview, baseFreshness, githubBranchStatus);
+   const branchQualityBlockers = branchQualityBlockersFor(preflight, localFindings);
+   const accountStateBlockers = accountStateBlockersFor(scorePreview);
+   const currentScenario = scorePreview.scenarioPreviews.find((scenario) => scenario.name === "current") ?? scorePreview.scenarioPreviews[0]!;
+@@ -269,6 +282,7 @@ export function buildLocalBranchAnalysis(args: {
+     laneSummary: lane.summary,
+     localFindings,
+     baseFreshness,
++    githubBranchStatus,
+     recommendedRerunCondition,
+   });
+   const scoreBlockers = [
+@@ -290,6 +304,7 @@ export function buildLocalBranchAnalysis(args: {
+     scorePreview,
+     scenarioScorePreview,
+     observedPullRequestScenarios,
++    githubBranchStatus,
+     rewardRisk,
+     scoreBlockers: [...new Set(scoreBlockers)],
+     branchQualityBlockers,
+@@ -421,6 +436,88 @@ function observedPullRequestNotes(scenarios: Omit<ObservedPullRequestScenarios,
+   ];
+ }
+ 
++function buildGitHubBranchStatus(input: LocalBranchAnalysisInput, pullRequests: PullRequestRecord[], checkSummaries: CheckSummaryRecord[]): GitHubBranchStatus {
++  const branchKeys = new Set([input.headRef, input.branchName].filter((value): value is string => Boolean(value)).map((value) => value.toLowerCase()));
++  const inputBaseRef = normalizeRefForMatch(input.baseRef);
++  const match = pullRequests.find(
++    (pr) =>
++      pr.state === "open" &&
++      sameLogin(pr.authorLogin, input.login) &&
++      sameBaseRef(inputBaseRef, pr.baseRef) &&
++      (Boolean(input.headSha && pr.headSha === input.headSha) || Boolean(pr.headRef && branchKeys.has(pr.headRef.toLowerCase()))),
++  );
++  if (!match) return { source: "cached_github_data", status: "no_pr", notes: ["No open GitHub PR was matched to the current branch metadata."] };
++  const reviewDecision = (match.reviewDecision ?? "").toLowerCase();
++  const mergeableState = (match.mergeableState ?? "").toLowerCase();
++  const matchedChecks = matchingCheckSummaries(match, checkSummaries);
++  const status =
++    reviewDecision === "changes_requested"
++      ? "needs_author"
++      : mergeableState === "behind"
++        ? "needs_author"
++      : match.isDraft
++        ? "pending_review"
++        : ["dirty", "blocked", "conflicting", "unstable"].includes(mergeableState) || hasFailingCheck(matchedChecks)
++          ? "failing_checks"
++          : hasPendingCheck(matchedChecks)
++            ? "pending_review"
++          : mergeableState === "unknown"
++            ? "unknown"
++            : reviewDecision === "approved" || isApprovedOrMergeableOpenPr(match)
++              ? "approved"
++              : "pending_review";
++  return {
++    source: "cached_github_data",
++    status,
++    pullNumber: match.number,
++    title: match.title,
++    reviewDecision: match.reviewDecision,
++    mergeableState: match.mergeableState,
++    notes: githubBranchStatusNotes(status, match),
++  };
++}
++
++function githubBranchStatusNotes(status: GitHubBranchStatus["status"], pr: PullRequestRecord): string[] {
++  if (status === "approved") return [`PR #${pr.number} is approved or mergeable in cached GitHub metadata.`];
++  if (status === "needs_author" && (pr.mergeableState ?? "").toLowerCase() === "behind") return [`PR #${pr.number} is behind its base branch in cached GitHub metadata.`];
++  if (status === "needs_author") return [`PR #${pr.number} has requested changes in cached GitHub metadata.`];
++  if (status === "failing_checks") return [`PR #${pr.number} has failing, blocked, or conflicting GitHub status metadata.`];
++  if (status === "pending_review" && pr.isDraft) return [`PR #${pr.number} is still a draft in cached GitHub metadata.`];
++  if (status === "unknown") return [`PR #${pr.number} has incomplete GitHub status metadata; refresh checks before relying on it.`];
++  return [`PR #${pr.number} is open but not yet approved or clearly blocked in cached GitHub metadata.`];
++}
++
++function normalizeRefForMatch(ref: string | null | undefined): string | undefined {
++  const value = ref?.trim().toLowerCase();
++  if (!value) return undefined;
++  return value.replace(/^refs\/heads\//, "").replace(/^refs\/remotes\/[^/]+\//, "").replace(/^(origin|upstream)\//, "");
++}
++
++function sameBaseRef(inputBaseRef: string | undefined, prBaseRef: string | null | undefined): boolean {
++  if (!inputBaseRef) return true;
++  return normalizeRefForMatch(prBaseRef) === inputBaseRef;
++}
++
++function matchingCheckSummaries(pr: PullRequestRecord, checkSummaries: CheckSummaryRecord[]): CheckSummaryRecord[] {
++  return checkSummaries.filter(
++    (check) =>
++      (check.pullNumber !== undefined && check.pullNumber !== null && check.pullNumber === pr.number) ||
++      (check.pullNumber === undefined || check.pullNumber === null ? Boolean(pr.headSha && check.headSha === pr.headSha) : false),
++  );
++}
++
++function hasFailingCheck(checks: CheckSummaryRecord[]): boolean {
++  return checks.some((check) => ["failure", "failed", "timed_out", "cancelled", "action_required", "startup_failure"].includes((check.conclusion ?? check.status).toLowerCase()));
++}
++
++function hasPendingCheck(checks: CheckSummaryRecord[]): boolean {
++  return checks.some((check) => {
++    const status = check.status.toLowerCase();
++    const conclusion = check.conclusion?.toLowerCase();
++    return !conclusion && !["completed", "success"].includes(status);
++  });
++}
++
+ function isMaintainerAuthoredPr(pr: PullRequestRecord, repo: RepositoryRecord | undefined, login: string): boolean {
+   return sameLogin(repo?.owner, login) || ["owner", "member", "collaborator"].includes((pr.authorAssociation ?? "").toLowerCase());
+ }
+@@ -448,6 +545,7 @@ function buildLocalFindings(
+   preflight: LocalDiffPreflightResult,
+   scorePreview: ScorePreviewResult,
+   baseFreshness: LocalBranchAnalysis["baseFreshness"],
++  githubBranchStatus: GitHubBranchStatus,
+ ): LocalBranchAnalysis["localFindings"] {
+   const failedValidation = (input.validation ?? []).filter((entry) => entry.status === "failed");
+   return [
+@@ -500,6 +598,7 @@ function buildLocalFindings(
+           },
+         ]
+       : []),
++    ...githubBranchFindings(githubBranchStatus),
+     ...scorePreview.warnings.map((warning) => ({
+       code: "score_preview_warning",
+       severity: /not registered|no active|exceeds|credibility/i.test(warning) ? ("warning" as const) : ("info" as const),
+@@ -516,6 +615,32 @@ function buildLocalFindings(
+   ];
+ }
+ 
++function githubBranchFindings(status: GitHubBranchStatus): LocalBranchAnalysis["localFindings"] {
++  if (status.status === "failing_checks" || status.status === "needs_author") {
++    return [
++      {
++        code: "github_status_needs_work",
++        severity: "warning" as const,
++        title: status.status === "needs_author" ? "GitHub review needs author" : "GitHub checks need attention",
++        detail: status.notes.join(" "),
++        action: "Resolve GitHub review/check blockers before asking for maintainer review.",
++      },
++    ];
++  }
++  if (status.status === "unknown") {
++    return [
++      {
++        code: "github_status_unknown",
++        severity: "info" as const,
++        title: "GitHub status is incomplete",
++        detail: status.notes.join(" "),
++        action: "Refresh GitHub checks and reviews before final submission.",
++      },
++    ];
++  }
++  return [];
++}
++
+ function buildBaseFreshness(
+   input: LocalBranchAnalysisInput,
+   changedFileCount: number,
+@@ -625,6 +750,7 @@ function buildPublicSafePrPacket(args: {
+   laneSummary: string;
+   localFindings: LocalBranchAnalysis["localFindings"];
+   baseFreshness: LocalBranchAnalysis["baseFreshness"];
++  githubBranchStatus: GitHubBranchStatus;
+   recommendedRerunCondition: string;
+ }): LocalBranchAnalysis["prPacket"] {
+   const topPaths = args.changedFiles.slice(0, 8).map(changedFileSummary);
+@@ -654,6 +780,7 @@ function buildPublicSafePrPacket(args: {
+         lines: args.preflight.linkedIssues.length > 0 ? args.preflight.linkedIssues.map((issue) => `- Closes #${issue}`) : ["- No linked issue detected; explain why this is a no-issue PR."],
+       },
+       { heading: "Branch Freshness", lines: branchFreshnessLines(args.baseFreshness) },
++      { heading: "GitHub Status", lines: githubStatusLines(args.githubBranchStatus) },
+       { heading: "Overlap/WIP Check", lines: overlapCautionLines(args.preflight.collisions) },
+       {
+         heading: "Changed Paths",
+@@ -683,6 +810,11 @@ function branchFreshnessLines(freshness: LocalBranchAnalysis["baseFreshness"]):
+   return [`- Base freshness: ${freshness.status}.`, ...freshness.warnings.filter(isPublicSafeText).map((warning) => `- ${warning}`), freshness.passedValidationCount > 0 ? `- Validation evidence supplied: ${freshness.passedValidationCount} passed command(s).` : "- No passed validation evidence was supplied."];
+ }
+ 
++function githubStatusLines(status: GitHubBranchStatus): string[] {
++  if (status.status === "no_pr") return ["- No open GitHub PR was matched to this branch."];
++  return [`- PR #${status.pullNumber}: ${status.status.replace(/_/g, " ")}.`, ...status.notes.map((note) => `- ${note}`)].filter(isPublicSafeText);
++}
++
+ function overlapCautionLines(collisions: LocalDiffPreflightResult["collisions"]): string[] {
+   if (collisions.length === 0) return ["- No active overlap or WIP was detected from cached issue/PR metadata."];
+   return collisions
+diff --git a/test/unit/local-branch.test.ts b/test/unit/local-branch.test.ts
+index 448ac22..754da60 100644
+--- a/test/unit/local-branch.test.ts
++++ b/test/unit/local-branch.test.ts
+@@ -261,6 +261,368 @@ describe("local branch analysis", () => {
+     expect(analysis.scenarioScorePreview.afterApprovedPrsMerge?.gates.openPrCount).toBe(1);
+   });
+ 
++  it("binds cached GitHub PR status to the current branch", () => {
++    const analysis = buildLocalBranchAnalysis({
++      input: {
++        login: "oktofeesh1",
++        repoFullName: repo.fullName,
++        branchName: "fix-cache",
++        headSha: "head-sha",
++        body: "Fixes #7",
++        changedFiles: [
++          { path: "src/cache.ts", additions: 12, deletions: 1, status: "modified" },
++          { path: "src/cache.test.ts", additions: 20, deletions: 0, status: "added" },
++        ],
++        validation: [{ command: "npm test -- cache", status: "passed" }],
++      },
++      repo,
++      issues: [{ repoFullName: repo.fullName, number: 7, title: "Cache edge", state: "open", labels: ["bug"], linkedPrs: [] }],
++      pullRequests: [
++        {
++          repoFullName: repo.fullName,
++          number: 14,
++          title: "Cache branch",
++          state: "open",
++          authorLogin: "oktofeesh1",
++          authorAssociation: "CONTRIBUTOR",
++          headSha: "head-sha",
++          headRef: "fix-cache",
++          mergeableState: "UNSTABLE",
++          labels: ["bug"],
++          linkedIssues: [7],
++        },
++      ],
++      profile,
++      outcomeHistory,
++      scoringSnapshot,
++      scoringProfile,
++    });
++
++    expect(analysis.githubBranchStatus).toMatchObject({ status: "failing_checks", pullNumber: 14 });
++    expect(analysis.branchQualityBlockers).toContain("GitHub checks need attention");
++    expect(analysis.prPacket.markdown).toContain("## GitHub Status");
++    expect(analysis.prPacket.markdown).toContain("PR #14");
++    expect(JSON.stringify(analysis.prPacket)).not.toMatch(/reward|score|wallet|hotkey|farming|payout|ranking|trust score/i);
++  });
++
++  it("feeds approved current-branch PRs into private pending scenarios", () => {
++    const approvedPr = {
++      repoFullName: repo.fullName,
++      number: 15,
++      title: "Approved cache branch",
++      state: "open",
++      authorLogin: "oktofeesh1",
++      authorAssociation: "CONTRIBUTOR",
++      headRef: "fix-cache-approved",
++      reviewDecision: "APPROVED",
++      labels: ["bug"],
++      linkedIssues: [7],
++    };
++    const analysis = buildLocalBranchAnalysis({
++      input: {
++        login: "oktofeesh1",
++        repoFullName: repo.fullName,
++        branchName: "fix-cache-approved",
++        body: "Fixes #7",
++        changedFiles: [
++          { path: "src/cache.ts", additions: 12, deletions: 1, status: "modified" },
++          { path: "src/cache.test.ts", additions: 20, deletions: 0, status: "added" },
++        ],
++        validation: [{ command: "npm test -- cache", status: "passed" }],
++      },
++      repo,
++      issues: [{ repoFullName: repo.fullName, number: 7, title: "Cache edge", state: "open", labels: ["bug"], linkedPrs: [] }],
++      pullRequests: [approvedPr],
++      contributorPullRequests: [approvedPr],
++      profile,
++      outcomeHistory: { ...outcomeHistory, totals: { ...outcomeHistory.totals, openPullRequests: 1, credibility: 0.2 } },
++      scoringSnapshot,
++      scoringProfile,
++    });
++
++    expect(analysis.githubBranchStatus).toMatchObject({ status: "approved", pullNumber: 15 });
++    expect(analysis.observedPullRequestScenarios.approvedOrMergeable).toBe(1);
++    expect(analysis.scenarioScorePreview.afterApprovedPrsMerge).toMatchObject({ source: "github_observed", gates: { openPrCount: 0 } });
++    expect(analysis.scenarioScorePreview.afterApprovedPrsMerge?.gates.credibilityObserved).toBeGreaterThanOrEqual(0.8);
++  });
++
++  it("prioritizes requested changes, draft state, and contributor ownership for current-branch status", () => {
++    const basePr = {
++      repoFullName: repo.fullName,
++      state: "open",
++      authorAssociation: "CONTRIBUTOR",
++      headRef: "fix-cache",
++      labels: ["bug"],
++      linkedIssues: [7],
++    };
++    const changesRequested = buildLocalBranchAnalysis({
++      input: {
++        login: "oktofeesh1",
++        repoFullName: repo.fullName,
++        branchName: "fix-cache",
++        headSha: "shared-sha",
++        changedFiles: [{ path: "src/cache.ts", additions: 12, deletions: 1, status: "modified" }],
++        validation: [{ command: "npm test -- cache", status: "passed" }],
++      },
++      repo,
++      issues: [],
++      pullRequests: [
++        { ...basePr, number: 19, title: "Wrong contributor same SHA", authorLogin: "other", headSha: "shared-sha", reviewDecision: "APPROVED", mergeableState: "CLEAN" },
++        { ...basePr, number: 20, title: "Wrong contributor same branch", authorLogin: "other", reviewDecision: "APPROVED", mergeableState: "CLEAN" },
++        { ...basePr, number: 21, title: "Needs author", authorLogin: "oktofeesh1", headSha: "shared-sha", reviewDecision: "CHANGES_REQUESTED", mergeableState: "CLEAN" },
++      ],
++      profile,
++      outcomeHistory,
++      scoringSnapshot,
++      scoringProfile,
++    });
++
++    expect(changesRequested.githubBranchStatus).toMatchObject({ status: "needs_author", pullNumber: 21 });
++    expect(changesRequested.localFindings).toEqual(expect.arrayContaining([expect.objectContaining({ code: "github_status_needs_work" })]));
++
++    const draft = buildLocalBranchAnalysis({
++      input: {
++        login: "oktofeesh1",
++        repoFullName: repo.fullName,
++        branchName: "draft-cache",
++        changedFiles: [{ path: "src/cache.ts", additions: 12, deletions: 1, status: "modified" }],
++        validation: [{ command: "npm test -- cache", status: "passed" }],
++      },
++      repo,
++      issues: [],
++      pullRequests: [{ ...basePr, number: 22, title: "Draft clean branch", authorLogin: "oktofeesh1", headRef: "draft-cache", reviewDecision: "APPROVED", mergeableState: "CLEAN", isDraft: true }],
++      profile,
++      outcomeHistory,
++      scoringSnapshot,
++      scoringProfile,
++    });
++
++    expect(draft.githubBranchStatus).toMatchObject({ status: "pending_review", pullNumber: 22 });
++    expect(draft.githubBranchStatus.notes.join(" ")).toMatch(/draft/i);
++  });
++
++  it("requires base-ref matches and check summaries before approving current-branch status", () => {
++    const basePr = {
++      repoFullName: repo.fullName,
++      state: "open",
++      authorLogin: "oktofeesh1",
++      authorAssociation: "CONTRIBUTOR",
++      headSha: "shared-sha",
++      headRef: "fix-cache",
++      reviewDecision: "APPROVED",
++      mergeableState: "CLEAN",
++      labels: ["bug"],
++      linkedIssues: [7],
++    };
++    const failingChecks = buildLocalBranchAnalysis({
++      input: {
++        login: "oktofeesh1",
++        repoFullName: repo.fullName,
++        baseRef: "origin/main",
++        branchName: "fix-cache",
++        headSha: "shared-sha",
++        changedFiles: [{ path: "src/cache.ts", additions: 12, deletions: 1, status: "modified" }],
++        validation: [{ command: "npm test -- cache", status: "passed" }],
++      },
++      repo,
++      issues: [],
++      pullRequests: [
++        { ...basePr, number: 23, title: "Release branch status", baseRef: "release/1.0" },
++        { ...basePr, number: 24, title: "Main branch status", baseRef: "main" },
++      ],
++      checkSummaries: [
++        {
++          id: "check-24",
++          repoFullName: repo.fullName,
++          pullNumber: 24,
++          headSha: "shared-sha",
++          name: "validate",
++          status: "completed",
++          conclusion: "failure",
++          payload: {},
++        },
++      ],
++      profile,
++      outcomeHistory,
++      scoringSnapshot,
++      scoringProfile,
++    });
++
++    expect(failingChecks.githubBranchStatus).toMatchObject({ status: "failing_checks", pullNumber: 24 });
++    expect(failingChecks.localFindings).toEqual(expect.arrayContaining([expect.objectContaining({ code: "github_status_needs_work" })]));
++
++    const pendingChecks = buildLocalBranchAnalysis({
++      input: {
++        login: "oktofeesh1",
++        repoFullName: repo.fullName,
++        baseRef: "origin/main",
++        branchName: "fix-cache",
++        headSha: "shared-sha",
++        changedFiles: [{ path: "src/cache.ts", additions: 12, deletions: 1, status: "modified" }],
++        validation: [{ command: "npm test -- cache", status: "passed" }],
++      },
++      repo,
++      issues: [],
++      pullRequests: [{ ...basePr, number: 26, title: "Main branch status", baseRef: "main" }],
++      checkSummaries: [
++        {
++          id: "check-26",
++          repoFullName: repo.fullName,
++          pullNumber: 26,
++          headSha: "shared-sha",
++          name: "validate",
++          status: "in_progress",
++          payload: {},
++        },
++      ],
++      profile,
++      outcomeHistory,
++      scoringSnapshot,
++      scoringProfile,
++    });
++
++    expect(pendingChecks.githubBranchStatus).toMatchObject({ status: "pending_review", pullNumber: 26 });
++
++    const behind = buildLocalBranchAnalysis({
++      input: {
++        login: "oktofeesh1",
++        repoFullName: repo.fullName,
++        baseRef: "refs/remotes/origin/main",
++        branchName: "fix-cache",
++        changedFiles: [{ path: "src/cache.ts", additions: 12, deletions: 1, status: "modified" }],
++        validation: [{ command: "npm test -- cache", status: "passed" }],
++      },
++      repo,
++      issues: [],
++      pullRequests: [{ ...basePr, number: 25, title: "Behind branch", baseRef: "refs/heads/main", headSha: undefined, mergeableState: "BEHIND" }],
++      profile,
++      outcomeHistory,
++      scoringSnapshot,
++      scoringProfile,
++    });
++
++    expect(behind.githubBranchStatus).toMatchObject({ status: "needs_author", pullNumber: 25 });
++    expect(behind.githubBranchStatus.notes.join(" ")).toMatch(/behind/i);
++  });
++
++  it("does not apply another open PR's check summary just because the head SHA matches", () => {
++    const analysis = buildLocalBranchAnalysis({
++      input: {
++        login: "oktofeesh1",
++        repoFullName: repo.fullName,
++        baseRef: "main",
++        branchName: "shared-head",
++        headSha: "shared-sha",
++        changedFiles: [{ path: "src/checks.ts", additions: 10, deletions: 0, status: "modified" }],
++      },
++      repo,
++      issues: [],
++      pullRequests: [
++        {
++          repoFullName: repo.fullName,
++          number: 31,
++          title: "Current branch",
++          state: "open",
++          authorLogin: "oktofeesh1",
++          authorAssociation: "CONTRIBUTOR",
++          headSha: "shared-sha",
++          headRef: "shared-head",
++          baseRef: "main",
++          reviewDecision: "APPROVED",
++          mergeableState: "CLEAN",
++          labels: [],
++          linkedIssues: [],
++        },
++        {
++          repoFullName: repo.fullName,
++          number: 32,
++          title: "Other base with same SHA",
++          state: "open",
++          authorLogin: "oktofeesh1",
++          authorAssociation: "CONTRIBUTOR",
++          headSha: "shared-sha",
++          headRef: "shared-head",
++          baseRef: "release/1.0",
++          reviewDecision: "APPROVED",
++          mergeableState: "CLEAN",
++          labels: [],
++          linkedIssues: [],
++        },
++      ],
++      checkSummaries: [
++        {
++          id: "check-32",
++          repoFullName: repo.fullName,
++          pullNumber: 32,
++          headSha: "shared-sha",
++          name: "validate",
++          status: "completed",
++          conclusion: "failure",
++          payload: {},
++        },
++      ],
++      profile,
++      outcomeHistory,
++      scoringSnapshot,
++      scoringProfile,
++    });
++
++    expect(analysis.githubBranchStatus).toMatchObject({ status: "approved", pullNumber: 31 });
++  });
++
++  it("falls back cleanly when no current-branch PR or complete status is cached", () => {
++    const noPr = buildLocalBranchAnalysis({
++      input: {
++        login: "oktofeesh1",
++        repoFullName: repo.fullName,
++        branchName: "local-only",
++        changedFiles: [{ path: "src/cache.ts", additions: 12, deletions: 1, status: "modified" }],
++        validation: [{ command: "npm test -- cache", status: "passed" }],
++      },
++      repo,
++      issues: [],
++      pullRequests: [],
++      profile,
++      outcomeHistory,
++      scoringSnapshot,
++      scoringProfile,
++    });
++    expect(noPr.githubBranchStatus.status).toBe("no_pr");
++    expect(noPr.branchQualityBlockers.join(" ")).not.toMatch(/GitHub/i);
++
++    const unknown = buildLocalBranchAnalysis({
++      input: {
++        login: "oktofeesh1",
++        repoFullName: repo.fullName,
++        branchName: "unknown-status",
++        changedFiles: [{ path: "src/cache.ts", additions: 12, deletions: 1, status: "modified" }],
++        validation: [{ command: "npm test -- cache", status: "passed" }],
++      },
++      repo,
++      issues: [],
++      pullRequests: [
++        {
++          repoFullName: repo.fullName,
++          number: 16,
++          title: "Unknown status",
++          state: "open",
++          authorLogin: "oktofeesh1",
++          authorAssociation: "CONTRIBUTOR",
++          headRef: "unknown-status",
++          mergeableState: "UNKNOWN",
++          labels: [],
++          linkedIssues: [],
++        },
++      ],
++      profile,
++      outcomeHistory,
++      scoringSnapshot,
++      scoringProfile,
++    });
++    expect(unknown.githubBranchStatus).toMatchObject({ status: "unknown", pullNumber: 16 });
++    expect(unknown.localFindings).toEqual(expect.arrayContaining([expect.objectContaining({ code: "github_status_unknown" })]));
++  });
++
+   it("classifies stale base state and treats passed validation as test evidence", () => {
+     const analysis = buildLocalBranchAnalysis({
+       input: {

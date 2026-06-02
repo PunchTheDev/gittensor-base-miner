@@ -1,0 +1,761 @@
+diff --git a/apps/web/src/app/api/registry/feed/route.ts b/apps/web/src/app/api/registry/feed/route.ts
+index c419e41fa6..b3c5f0e11f 100644
+--- a/apps/web/src/app/api/registry/feed/route.ts
++++ b/apps/web/src/app/api/registry/feed/route.ts
+@@ -23,6 +23,8 @@ export const GET = createApiHandler("registry.feed", async ({ request }) => {
+       categories: "/api/registry/categories",
+       search:
+         "/api/registry/search?q={query}&category={category}&platform={platform}&limit=20",
++      trending:
++        "/api/registry/trending?category={category}&platform={platform}&limit=12",
+       diff: "/api/registry/diff?since={hash-or-date}&limit=100",
+       integrity: "/api/registry/integrity?artifact={artifact}&hash={sha256}",
+       entry: "/api/registry/entries/{category}/{slug}",
+diff --git a/apps/web/src/app/api/registry/trending/route.ts b/apps/web/src/app/api/registry/trending/route.ts
+new file mode 100644
+index 0000000000..4a17788c94
+--- /dev/null
++++ b/apps/web/src/app/api/registry/trending/route.ts
+@@ -0,0 +1,43 @@
++import { registryTrendingQuerySchema } from "@/lib/api/contracts";
++import { createApiHandler, type InferApiQuery } from "@/lib/api/router";
++import { entryCommunityTarget, safeCommunitySignalCounts } from "@/lib/community-signals";
++import { getDirectoryEntries } from "@/lib/content";
++import { communityDiscoveryScore, totalIntentCount } from "@/lib/growth-ranking";
++import { cachedJsonResponse } from "@/lib/http-cache";
++import { safeIntentEventCounts } from "@/lib/intent-events";
++import { safeVoteCounts } from "@/lib/votes";
++
++type Entry = Awaited<ReturnType<typeof getDirectoryEntries>>[number];
++
++const entryKey = (entry: Entry) => `${entry.category}:${entry.slug}`;
++const communityTarget = (entry: Entry) => entryCommunityTarget(entry.category, entry.slug);
++const entryPlatforms = (entry: Entry) => (entry.platformCompatibility ?? []).map((item) => item.platform);
++const matchesPlatform = (entry: Entry, value: string) => { const platform = String(value).trim().toLowerCase(); return !platform || entryPlatforms(entry).some((item) => String(item).trim().toLowerCase() === platform); };
++
++const reasonCodes = (input: ReturnType<typeof trendInput>) =>
++  [input.votes ? "upvotes" : "", input.communitySignals?.used ? "community_used" : "", input.communitySignals?.works ? "community_works" : "", totalIntentCount(input.intentCounts) ? "recent_intent" : "", input.firstPartyPackage ? "first_party_package" : "", input.productionVerified ? "production_verified" : ""].filter(Boolean);
++
++function trendInput(entry: Entry, states: Awaited<ReturnType<typeof readStates>>) {
++  return { communitySignals: states.community.counts[communityTarget(entry)], intentCounts: states.intent.counts[entryKey(entry)], votes: states.votes.counts[entryKey(entry)] ?? 0, firstPartyPackage: entry.downloadTrust === "first-party", productionVerified: entry.verificationStatus === "production" };
++}
++
++async function readStates(entries: Entry[]) {
++  const keys = entries.map(entryKey);
++  const [votes, community, intent] = await Promise.all([safeVoteCounts(keys), safeCommunitySignalCounts(entries.map((entry) => ({ targetKind: "entry" as const, targetKey: communityTarget(entry) }))), safeIntentEventCounts(keys)]);
++  return { votes, community, intent };
++}
++
++export const GET = createApiHandler("registry.trending", async ({ request, query: parsed }) => {
++  const { category, platform, limit } = parsed as InferApiQuery<typeof registryTrendingQuerySchema>;
++  const entries = await getDirectoryEntries();
++  const scopedEntries = entries.filter((entry) => (!category || entry.category === category) && matchesPlatform(entry, platform));
++  const states = await readStates(scopedEntries);
++  const ranked = scopedEntries
++    .map((entry) => { const input = trendInput(entry, states); return { entry, score: communityDiscoveryScore(input), reasons: reasonCodes(input) }; })
++    .filter((item) => item.score > 0)
++    .sort((left, right) => right.score - left.score || String(right.entry.dateAdded).localeCompare(String(left.entry.dateAdded)) || String(left.entry.title).localeCompare(String(right.entry.title)))
++    .slice(0, limit)
++    .map(({ entry, score, reasons }) => ({ category: entry.category, slug: entry.slug, title: entry.title, description: entry.description, canonicalUrl: entry.canonicalUrl, platforms: entryPlatforms(entry), tags: entry.tags ?? [], dateAdded: entry.dateAdded, score, reasons, trustSignals: { sourceStatus: entry.trustSignals?.sourceStatus ?? "missing" } }));
++
++  return cachedJsonResponse(request, { schemaVersion: 1, kind: "registry-trending", category: category || "all", platform: platform || "all", limit, count: ranked.length, signalsAvailable: { votes: states.votes.available, community: states.community.available, intent: states.intent.available }, entries: ranked }, { headers: { "cache-control": "public, max-age=60, stale-while-revalidate=300" } });
++});
+diff --git a/apps/web/src/lib/api/contracts.ts b/apps/web/src/lib/api/contracts.ts
+index 3661801e52..8e9d5802b1 100644
+--- a/apps/web/src/lib/api/contracts.ts
++++ b/apps/web/src/lib/api/contracts.ts
+@@ -4,14 +4,8 @@ import { validateJobPublicationQuality } from "@heyclaude/registry/commercial";
+ 
+ const entryKeySchema = z.string().regex(/^[a-z0-9-]+:[a-z0-9-]+$/);
+ const safeSlugSchema = z.string().regex(/^[a-z0-9-]+$/);
+-const platformSchema = z
+-  .string()
+-  .trim()
+-  .toLowerCase()
+-  .regex(/^[a-z0-9][a-z0-9 -]{0,48}$/)
+-  .optional()
+-  .default("");
+-const categorySchema = safeSlugSchema.optional().default("");
++const categorySchema = z.union([safeSlugSchema, z.literal("")]).optional().default("");
++const platformSchema = z.union([z.string().trim().toLowerCase().regex(/^[a-z0-9][a-z0-9 -]{0,48}$/), z.literal("")]).optional().default("");
+ const jobTierSchema = z.enum(["free", "standard", "featured", "sponsored"]);
+ const jobStatusSchema = z.enum([
+   "draft",
+@@ -245,6 +239,17 @@ export const registrySearchResponseSchema = z.object({
+   facets: registrySearchFacetsSchema.optional(),
+ });
+ 
++export const registryTrendingResponseSchema = z.object({
++  schemaVersion: z.number(),
++  kind: z.literal("registry-trending"),
++  category: z.string(),
++  platform: z.string(),
++  limit: z.number().int().min(1).max(50),
++  count: z.number().int().nonnegative(),
++  signalsAvailable: z.object({ votes: z.boolean(), community: z.boolean(), intent: z.boolean() }),
++  entries: z.array(z.object({ category: z.string(), slug: z.string(), title: z.string(), description: z.string(), canonicalUrl: z.string().url().optional(), platforms: z.array(z.string()).max(12), tags: z.array(z.string()).max(32), dateAdded: z.string(), score: z.number(), reasons: z.array(z.string()).max(6), trustSignals: z.object({ sourceStatus: z.string() }) })).max(50),
++});
++
+ export const registrySearchQuerySchema = z.object({
+   q: z.string().trim().toLowerCase().max(120).optional().default(""),
+   category: categorySchema,
+@@ -267,6 +272,12 @@ export const registrySearchQuerySchema = z.object({
+   offset: z.coerce.number().int().min(0).max(10_000).optional().default(0),
+ });
+ 
++export const registryTrendingQuerySchema = z.object({
++  category: categorySchema,
++  platform: platformSchema,
++  limit: z.coerce.number().int().min(1).max(50).optional().default(12),
++});
++
+ export const registryDiffQuerySchema = z.object({
+   since: z.string().trim().max(128).optional().default(""),
+   limit: z.coerce.number().int().min(1).max(500).optional().default(100),
+@@ -642,6 +653,7 @@ export type ApiRouteDefinition = {
+   paramsSchema?: z.ZodTypeAny;
+   bodySchema?: z.ZodTypeAny;
+   responseSchema?: z.ZodTypeAny;
++  responseSchemaName?: string;
+   responseContentType?: string;
+   staticSurface?: boolean;
+   auth?: "admin-token" | "resend-signature" | "turnstile";
+@@ -714,6 +726,25 @@ export const apiRouteDefinitions = {
+       binding: "API_REGISTRY_RATE_LIMIT",
+     },
+   }),
++  "registry.trending": route({
++    id: "registry.trending",
++    method: "GET",
++    path: "/api/registry/trending",
++    summary: "Public registry trending entries",
++    description:
++      "Returns bounded privacy-safe trending registry entries from aggregate votes, community signals, intent events, and static trust metadata.",
++    tags: ["Registry"],
++    originCheck: true,
++    querySchema: registryTrendingQuerySchema,
++    responseSchema: registryTrendingResponseSchema,
++    responseSchemaName: "RegistryTrendingResponse",
++    rateLimit: {
++      scope: "registry-trending",
++      limit: 120,
++      windowMs: 60_000,
++      binding: "API_REGISTRY_RATE_LIMIT",
++    },
++  }),
+   "registry.diff": route({
+     id: "registry.diff",
+     method: "GET",
+diff --git a/cloudflare/api-schema-heyclaude-openapi.yaml b/cloudflare/api-schema-heyclaude-openapi.yaml
+index 62ca7364a8..89a5a4dbd9 100644
+--- a/cloudflare/api-schema-heyclaude-openapi.yaml
++++ b/cloudflare/api-schema-heyclaude-openapi.yaml
+@@ -250,6 +250,102 @@ components:
+         - apiUrl
+         - trustSignals
+       additionalProperties: {}
++    RegistryTrendingResponse:
++      type: object
++      properties:
++        schemaVersion:
++          type: number
++        kind:
++          type: string
++          enum:
++            - registry-trending
++        category:
++          type: string
++        platform:
++          type: string
++        limit:
++          type: integer
++          minimum: 1
++          maximum: 50
++        count:
++          type: integer
++          minimum: 0
++        signalsAvailable:
++          type: object
++          properties:
++            votes:
++              type: boolean
++            community:
++              type: boolean
++            intent:
++              type: boolean
++          required:
++            - votes
++            - community
++            - intent
++        entries:
++          type: array
++          items:
++            type: object
++            properties:
++              category:
++                type: string
++              slug:
++                type: string
++              title:
++                type: string
++              description:
++                type: string
++              canonicalUrl:
++                type: string
++                format: uri
++              platforms:
++                type: array
++                items:
++                  type: string
++                maxItems: 12
++              tags:
++                type: array
++                items:
++                  type: string
++                maxItems: 32
++              dateAdded:
++                type: string
++              score:
++                type: number
++              reasons:
++                type: array
++                items:
++                  type: string
++                maxItems: 6
++              trustSignals:
++                type: object
++                properties:
++                  sourceStatus:
++                    type: string
++                required:
++                  - sourceStatus
++            required:
++              - category
++              - slug
++              - title
++              - description
++              - platforms
++              - tags
++              - dateAdded
++              - score
++              - reasons
++              - trustSignals
++          maxItems: 50
++      required:
++        - schemaVersion
++        - kind
++        - category
++        - platform
++        - limit
++        - count
++        - signalsAvailable
++        - entries
+     RegistryTrustSignals:
+       type: object
+       properties:
+@@ -824,15 +920,23 @@ paths:
+           name: q
+           in: query
+         - schema:
+-            type: string
+-            pattern: ^[a-z0-9-]+$
++            anyOf:
++              - type: string
++                pattern: ^[a-z0-9-]+$
++              - type: string
++                enum:
++                  - ""
+             default: ""
+           required: false
+           name: category
+           in: query
+         - schema:
+-            type: string
+-            pattern: ^[a-z0-9][a-z0-9 -]{0,48}$
++            anyOf:
++              - type: string
++                pattern: ^[a-z0-9][a-z0-9 -]{0,48}$
++              - type: string
++                enum:
++                  - ""
+             default: ""
+           required: false
+           name: platform
+@@ -1719,6 +1823,295 @@ paths:
+                 required:
+                   - ok
+                   - error
++  /api/registry/trending:
++    get:
++      tags:
++        - Registry
++      summary: Public registry trending entries
++      description:
++        Returns bounded privacy-safe trending registry entries from aggregate votes, community
++        signals, intent events, and static trust metadata.
++      parameters:
++        - schema:
++            anyOf:
++              - type: string
++                pattern: ^[a-z0-9-]+$
++              - type: string
++                enum:
++                  - ""
++            default: ""
++          required: false
++          name: category
++          in: query
++        - schema:
++            anyOf:
++              - type: string
++                pattern: ^[a-z0-9][a-z0-9 -]{0,48}$
++              - type: string
++                enum:
++                  - ""
++            default: ""
++          required: false
++          name: platform
++          in: query
++        - schema:
++            type: integer
++            minimum: 1
++            maximum: 50
++            default: 12
++          required: false
++          name: limit
++          in: query
++      responses:
++        "200":
++          description: Cacheable registry response with ETag support where applicable.
++          content:
++            application/json:
++              schema:
++                $ref: "#/components/schemas/RegistryTrendingResponse"
++        "400":
++          description: Invalid JSON, invalid query, invalid payload, or invalid status transition.
++          content:
++            application/json:
++              schema:
++                type: object
++                properties:
++                  ok:
++                    type: boolean
++                    enum:
++                      - false
++                  error:
++                    type: object
++                    properties:
++                      code:
++                        type: string
++                        minLength: 1
++                      message:
++                        type: string
++                      details: {}
++                    required:
++                      - code
++                  requestId:
++                    type: string
++                required:
++                  - ok
++                  - error
++        "401":
++          description: Unauthorized admin token or invalid webhook signature.
++          content:
++            application/json:
++              schema:
++                type: object
++                properties:
++                  ok:
++                    type: boolean
++                    enum:
++                      - false
++                  error:
++                    type: object
++                    properties:
++                      code:
++                        type: string
++                        minLength: 1
++                      message:
++                        type: string
++                      details: {}
++                    required:
++                      - code
++                  requestId:
++                    type: string
++                required:
++                  - ok
++                  - error
++        "403":
++          description: Forbidden origin.
++          content:
++            application/json:
++              schema:
++                type: object
++                properties:
++                  ok:
++                    type: boolean
++                    enum:
++                      - false
++                  error:
++                    type: object
++                    properties:
++                      code:
++                        type: string
++                        minLength: 1
++                      message:
++                        type: string
++                      details: {}
++                    required:
++                      - code
++                  requestId:
++                    type: string
++                required:
++                  - ok
++                  - error
++        "413":
++          description: Payload too large.
++          content:
++            application/json:
++              schema:
++                type: object
++                properties:
++                  ok:
++                    type: boolean
++                    enum:
++                      - false
++                  error:
++                    type: object
++                    properties:
++                      code:
++                        type: string
++                        minLength: 1
++                      message:
++                        type: string
++                      details: {}
++                    required:
++                      - code
++                  requestId:
++                    type: string
++                required:
++                  - ok
++                  - error
++        "415":
++          description: Invalid content type.
++          content:
++            application/json:
++              schema:
++                type: object
++                properties:
++                  ok:
++                    type: boolean
++                    enum:
++                      - false
++                  error:
++                    type: object
++                    properties:
++                      code:
++                        type: string
++                        minLength: 1
++                      message:
++                        type: string
++                      details: {}
++                    required:
++                      - code
++                  requestId:
++                    type: string
++                required:
++                  - ok
++                  - error
++        "429":
++          description: Route-level or Cloudflare-native rate limited.
++          content:
++            application/json:
++              schema:
++                type: object
++                properties:
++                  ok:
++                    type: boolean
++                    enum:
++                      - false
++                  error:
++                    type: object
++                    properties:
++                      code:
++                        type: string
++                        minLength: 1
++                      message:
++                        type: string
++                      details: {}
++                    required:
++                      - code
++                  requestId:
++                    type: string
++                required:
++                  - ok
++                  - error
++        "500":
++          description: Internal error.
++          content:
++            application/json:
++              schema:
++                type: object
++                properties:
++                  ok:
++                    type: boolean
++                    enum:
++                      - false
++                  error:
++                    type: object
++                    properties:
++                      code:
++                        type: string
++                        minLength: 1
++                      message:
++                        type: string
++                      details: {}
++                    required:
++                      - code
++                  requestId:
++                    type: string
++                required:
++                  - ok
++                  - error
++        "502":
++          description: Upstream provider error.
++          content:
++            application/json:
++              schema:
++                type: object
++                properties:
++                  ok:
++                    type: boolean
++                    enum:
++                      - false
++                  error:
++                    type: object
++                    properties:
++                      code:
++                        type: string
++                        minLength: 1
++                      message:
++                        type: string
++                      details: {}
++                    required:
++                      - code
++                  requestId:
++                    type: string
++                required:
++                  - ok
++                  - error
++        "503":
++          description: Site DB not configured, provider not configured, or endpoint unavailable.
++          content:
++            application/json:
++              schema:
++                type: object
++                properties:
++                  ok:
++                    type: boolean
++                    enum:
++                      - false
++                  error:
++                    type: object
++                    properties:
++                      code:
++                        type: string
++                        minLength: 1
++                      message:
++                        type: string
++                      details: {}
++                    required:
++                      - code
++                  requestId:
++                    type: string
++                required:
++                  - ok
++                  - error
+   /api/registry/diff:
+     get:
+       tags:
+diff --git a/scripts/generate-openapi.ts b/scripts/generate-openapi.ts
+index d189fe7d4c..a662310cc6 100644
+--- a/scripts/generate-openapi.ts
++++ b/scripts/generate-openapi.ts
+@@ -17,6 +17,7 @@ const require = createRequire(import.meta.url);
+ const {
+   apiErrorEnvelopeSchema,
+   registryBrandAssetSchema,
++  registryTrendingResponseSchema,
+   registrySearchResultSchema,
+   listApiRouteDefinitions,
+   registryTrustSignalsSchema,
+@@ -105,7 +106,9 @@ function responseFor(definition: ApiRouteDefinition) {
+     description: successDescription(definition),
+     content: {
+       "application/json": {
+-        schema: definition.responseSchema || z.record(z.string(), z.unknown()),
++        schema: definition.responseSchemaName
++          ? { $ref: `#/components/schemas/${definition.responseSchemaName}` }
++          : definition.responseSchema || z.record(z.string(), z.unknown()),
+       },
+     },
+   };
+@@ -161,6 +164,7 @@ function buildOpenApiDocument() {
+   registry.register("ErrorEnvelope", apiErrorEnvelopeSchema);
+   registry.register("RegistryBrandAsset", registryBrandAssetSchema);
+   registry.register("RegistrySearchResult", registrySearchResultSchema);
++  registry.register("RegistryTrendingResponse", registryTrendingResponseSchema);
+   registry.register("RegistryTrustSignals", registryTrustSignalsSchema);
+ 
+   for (const definition of listApiRouteDefinitions()) {
+diff --git a/tests/api-contracts.test.ts b/tests/api-contracts.test.ts
+index 9e0338c5e5..bfa56679a7 100644
+--- a/tests/api-contracts.test.ts
++++ b/tests/api-contracts.test.ts
+@@ -19,6 +19,7 @@ const apiRoutes = [
+   "/api/registry/categories",
+   "/api/registry/search",
+   "/api/registry/feed",
++  "/api/registry/trending",
+   "/api/registry/diff",
+   "/api/registry/integrity",
+   "/api/registry/entries/{category}/{slug}",
+@@ -67,6 +68,9 @@ describe("OpenAPI route coverage", () => {
+         patch?: unknown;
+       }
+     >;
++    components?: {
++      schemas?: Record<string, { properties?: Record<string, unknown> }>;
++    };
+   };
+ 
+   it("documents every public and limited dynamic API route", () => {
+@@ -206,6 +210,27 @@ describe("OpenAPI route coverage", () => {
+     ]);
+   });
+ 
++  it("documents concrete registry trending response metadata", () => {
++    const trendingResponse =
++      parsedSchema.paths["/api/registry/trending"]?.get?.responses?.["200"];
++    const responseSchema = (
++      trendingResponse?.content as
++        | Record<string, { schema?: { $ref?: string } }>
++        | undefined
++    )?.["application/json"]?.schema;
++    const component =
++      parsedSchema.components?.schemas?.RegistryTrendingResponse?.properties as
++        | Record<string, { maxItems?: number; minimum?: number; maximum?: number }>
++        | undefined;
++
++    expect(responseSchema?.$ref).toBe(
++      "#/components/schemas/RegistryTrendingResponse",
++    );
++    expect(component?.limit?.minimum).toBe(1);
++    expect(component?.limit?.maximum).toBe(50);
++    expect(component?.entries?.maxItems).toBe(50);
++  });
++
+   it("documents error envelopes, cacheable feeds, and registry trust signals", () => {
+     expect(schema).toContain("ErrorEnvelope:");
+     expect(schema).toContain("RegistryTrustSignals:");
+diff --git a/tests/registry-trending-api.test.ts b/tests/registry-trending-api.test.ts
+new file mode 100644
+index 0000000000..f87260ab5a
+--- /dev/null
++++ b/tests/registry-trending-api.test.ts
+@@ -0,0 +1,95 @@
++import { beforeEach, describe, expect, it, vi } from "vitest";
++
++type Counts = Record<string, unknown>;
++
++const state = vi.hoisted(() => ({
++  entries: [] as any[],
++  votes: { available: true, counts: {} as Counts },
++  community: { available: true, counts: {} as Counts },
++  intent: { available: true, counts: {} as Counts },
++}));
++
++vi.mock("@opennextjs/cloudflare", () => ({ getCloudflareContext: () => ({ env: {} }) }));
++vi.mock("@/lib/content", () => ({ getDirectoryEntries: () => Promise.resolve(state.entries) }));
++vi.mock("@/lib/votes", () => ({ safeVoteCounts: () => Promise.resolve(state.votes) }));
++vi.mock("@/lib/community-signals", () => ({ entryCommunityTarget: (category: string, slug: string) => `entry:${category}/${slug}`, safeCommunitySignalCounts: () => Promise.resolve(state.community) }));
++vi.mock("@/lib/intent-events", () => ({ safeIntentEventCounts: () => Promise.resolve(state.intent) }));
++
++function entry(slug: string, overrides: Record<string, unknown> = {}) {
++  return {
++    category: "mcp",
++    slug,
++    title: `Entry ${slug}`,
++    description: "Public trending fixture",
++    canonicalUrl: `https://heyclau.de/mcp/${slug}`,
++    platformCompatibility: [{ platform: "Claude", supportLevel: "native" }],
++    tags: ["fixture"],
++    dateAdded: "2026-05-24",
++    downloadTrust: "external",
++    verificationStatus: "unverified",
++    trustSignals: { sourceStatus: "available" },
++    ...overrides,
++  };
++}
++
++const request = (path: string) =>
++  new Request(`https://heyclau.de${path}`, { headers: { origin: "https://heyclau.de" } });
++
++describe("/api/registry/trending", () => {
++  beforeEach(() => {
++    vi.resetModules();
++    state.entries = [entry("alpha"), entry("beta"), entry("skill", { category: "skills" })];
++    state.votes = { available: true, counts: { "mcp:beta": 3, "mcp:alpha": 1 } };
++    state.community = { available: true, counts: { "entry:mcp/beta": { used: 1, works: 2, broken: 0 } } };
++    state.intent = { available: true, counts: { "mcp:beta": { copy: 1, open: 1, install: 1, download: 0, vote: 0 } } };
++  });
++
++  it("returns bounded privacy-safe trending entries with filters and reasons", async () => {
++    const { GET } = await import("../apps/web/src/app/api/registry/trending/route");
++    const response = await GET(request("/api/registry/trending?category=mcp&platform=%20Claude%20&limit=2"));
++    const body = await response.json();
++
++    expect(body).toMatchObject({
++      kind: "registry-trending",
++      category: "mcp",
++      platform: "claude",
++      count: 2,
++      signalsAvailable: { votes: true, community: true, intent: true },
++    });
++    expect(body.entries[0]).toMatchObject({
++      slug: "beta",
++      reasons: expect.arrayContaining(["upvotes", "community_works", "recent_intent"]),
++      trustSignals: { sourceStatus: "available" },
++    });
++    for (const entry of body.entries) {
++      expect(entry).not.toHaveProperty("clientId");
++      expect(entry).not.toHaveProperty("sessionId");
++    }
++  });
++
++  it("degrades to static trust reasons when dynamic state is unavailable", async () => {
++    state.entries = [entry("verified", { downloadTrust: "first-party", verificationStatus: "production" })];
++    state.votes = { available: false, counts: { "mcp:verified": 0 } };
++    state.community = { available: false, counts: { "entry:mcp/verified": { used: 0, works: 0, broken: 0 } } };
++    state.intent = { available: false, counts: { "mcp:verified": { copy: 0, open: 0, install: 0, download: 0, vote: 0 } } };
++
++    const { GET } = await import("../apps/web/src/app/api/registry/trending/route");
++    const body = await (await GET(request("/api/registry/trending"))).json();
++
++    expect(body.signalsAvailable).toEqual({ votes: false, community: false, intent: false });
++    expect(body.entries).toEqual([
++      expect.objectContaining({
++        slug: "verified",
++        score: 4,
++        reasons: ["first_party_package", "production_verified"],
++      }),
++    ]);
++  });
++
++  it("rejects malformed query parameters before route execution", async () => {
++    const { GET } = await import("../apps/web/src/app/api/registry/trending/route");
++    const response = await GET(request("/api/registry/trending?limit=1000"));
++
++    expect(response.status).toBe(400);
++  });
++});

@@ -1,0 +1,87 @@
+diff --git a/src/vouch/proposals.py b/src/vouch/proposals.py
+index 14b5d44..ddf0920 100644
+--- a/src/vouch/proposals.py
++++ b/src/vouch/proposals.py
+@@ -21,7 +21,7 @@
+     ProposalStatus,
+     Relation,
+ )
+-from .storage import KBStore
++from .storage import ArtifactNotFoundError, KBStore
+ 
+ 
+ class ProposalError(RuntimeError):
+@@ -223,6 +223,10 @@ def approve(
+             f"proposal {proposal_id} is {proposal.status.value}, not pending"
+         )
+     payload = dict(proposal.payload)
++    # Refuse to overwrite an existing artifact. Without this guard a retry
++    # after a crash between put_<kind>() and move_proposal_to_decided() would
++    # silently rewrite the artifact with new approved_by / created_at metadata.
++    _ensure_no_existing_artifact(store, proposal.kind, payload["id"])
+     result: Claim | Page | Entity | Relation
+     if proposal.kind == ProposalKind.CLAIM:
+         claim = Claim(approved_by=approved_by, **payload)
+@@ -296,6 +300,29 @@ def reject(
+     return proposal
+ 
+ 
++_ARTIFACT_GETTERS = {
++    ProposalKind.CLAIM: "get_claim",
++    ProposalKind.PAGE: "get_page",
++    ProposalKind.ENTITY: "get_entity",
++    ProposalKind.RELATION: "get_relation",
++}
++
++
++def _ensure_no_existing_artifact(
++    store: KBStore, kind: ProposalKind, artifact_id: str
++) -> None:
++    getter = getattr(store, _ARTIFACT_GETTERS[kind])
++    try:
++        getter(artifact_id)
++    except ArtifactNotFoundError:
++        return
++    raise ProposalError(
++        f"cannot approve: {kind.value} {artifact_id} already exists "
++        f"(a prior approve may have been interrupted; reconcile manually "
++        f"by removing the artifact or rejecting this proposal)"
++    )
++
++
+ def _slugify(text: str) -> str:
+     out = []
+     last_dash = False
+diff --git a/tests/test_storage.py b/tests/test_storage.py
+index 36881d4..1f3dd8a 100644
+--- a/tests/test_storage.py
++++ b/tests/test_storage.py
+@@ -222,6 +222,28 @@ def test_double_approve_rejected(store: KBStore) -> None:
+         approve(store, pr.id, approved_by="u")
+ 
+ 
++def test_approve_refuses_to_overwrite_existing_artifact(store: KBStore) -> None:
++    # Regression for #11: approve() wrote the artifact before moving the
++    # proposal to decided/. A crash between the two steps would leave the
++    # proposal PENDING with the artifact already on disk, and a retry would
++    # silently overwrite it with new approved_by / created_at metadata.
++    src = store.put_source(b"e")
++    store.put_claim(
++        Claim(id="auth-uses-jwt", text="prior write", evidence=[src.id],
++              approved_by="first-reviewer")
++    )
++    pr = propose_claim(
++        store, text="auth uses JWT", evidence=[src.id], proposed_by="agent",
++        slug_hint="auth-uses-jwt",
++    )
++    with pytest.raises(ProposalError, match="already exists"):
++        approve(store, pr.id, approved_by="second-reviewer")
++    survivor = store.get_claim("auth-uses-jwt")
++    assert survivor.text == "prior write"
++    assert survivor.approved_by == "first-reviewer"
++    assert store.get_proposal(pr.id).status == ProposalStatus.PENDING
++
++
+ def test_reject_requires_reason(store: KBStore) -> None:
+     src = store.put_source(b"e")
+     pr = propose_claim(store, text="t", evidence=[src.id], proposed_by="a")

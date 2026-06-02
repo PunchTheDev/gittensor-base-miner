@@ -1,0 +1,369 @@
+diff --git a/app/controllers/budget_categories_controller.rb b/app/controllers/budget_categories_controller.rb
+index e8cc83e6bd..b779a02245 100644
+--- a/app/controllers/budget_categories_controller.rb
++++ b/app/controllers/budget_categories_controller.rb
+@@ -42,7 +42,7 @@ def budget_category_params
+     end
+ 
+     def set_budget
+-      start_date = Budget.param_to_date(params[:budget_month_year])
++      start_date = Budget.param_to_date(params[:budget_month_year], family: Current.family)
+       @budget = Current.family.budgets.find_by(start_date: start_date)
+     end
+ end
+diff --git a/app/controllers/budgets_controller.rb b/app/controllers/budgets_controller.rb
+index 9ec26e831c..1ec8e81b62 100644
+--- a/app/controllers/budgets_controller.rb
++++ b/app/controllers/budgets_controller.rb
+@@ -35,7 +35,7 @@ def budget_params
+     end
+ 
+     def set_budget
+-      start_date = Budget.param_to_date(params[:month_year])
++      start_date = Budget.param_to_date(params[:month_year], family: Current.family)
+       @budget = Budget.find_or_bootstrap(Current.family, start_date: start_date)
+       raise ActiveRecord::RecordNotFound unless @budget
+     end
+diff --git a/app/controllers/concerns/periodable.rb b/app/controllers/concerns/periodable.rb
+index 8cf02395f0..88be0f05c1 100644
+--- a/app/controllers/concerns/periodable.rb
++++ b/app/controllers/concerns/periodable.rb
+@@ -7,7 +7,15 @@ module Periodable
+ 
+   private
+     def set_period
+-      @period = Period.from_key(params[:period] || Current.user&.default_period)
++      period_key = params[:period] || Current.user&.default_period
++
++      @period = if period_key == "current_month"
++        Period.current_month_for(Current.family)
++      elsif period_key == "last_month"
++        Period.last_month_for(Current.family)
++      else
++        Period.from_key(period_key)
++      end
+     rescue Period::InvalidKeyError
+       @period = Period.last_30_days
+     end
+diff --git a/app/controllers/users_controller.rb b/app/controllers/users_controller.rb
+index 59fa68bdb8..f74c7e6e16 100644
+--- a/app/controllers/users_controller.rb
++++ b/app/controllers/users_controller.rb
+@@ -106,7 +106,7 @@ def user_params
+       params.require(:user).permit(
+         :first_name, :last_name, :email, :profile_image, :redirect_to, :delete_profile_image, :onboarded_at,
+         :show_sidebar, :default_period, :default_account_order, :show_ai_sidebar, :ai_enabled, :theme, :set_onboarding_preferences_at, :set_onboarding_goals_at, :locale,
+-        family_attributes: [ :name, :currency, :country, :date_format, :timezone, :locale, :id ],
++        family_attributes: [ :name, :currency, :country, :date_format, :timezone, :locale, :month_start_day, :id ],
+         goals: []
+       )
+     end
+diff --git a/app/models/budget.rb b/app/models/budget.rb
+index 33f34eb2f5..c345801fc5 100644
+--- a/app/models/budget.rb
++++ b/app/models/budget.rb
+@@ -19,24 +19,41 @@ def date_to_param(date)
+       date.strftime(PARAM_DATE_FORMAT).downcase
+     end
+ 
+-    def param_to_date(param)
+-      Date.strptime(param, PARAM_DATE_FORMAT).beginning_of_month
++    def param_to_date(param, family: nil)
++      base_date = Date.strptime(param, PARAM_DATE_FORMAT)
++      if family&.uses_custom_month_start?
++        Date.new(base_date.year, base_date.month, family.month_start_day)
++      else
++        base_date.beginning_of_month
++      end
+     end
+ 
+     def budget_date_valid?(date, family:)
+-      beginning_of_month = date.beginning_of_month
+-
+-      beginning_of_month >= oldest_valid_budget_date(family) && beginning_of_month <= Date.current.end_of_month
++      if family.uses_custom_month_start?
++        budget_start = family.custom_month_start_for(date)
++        budget_start >= oldest_valid_budget_date(family) && budget_start <= family.custom_month_end_for(Date.current)
++      else
++        beginning_of_month = date.beginning_of_month
++        beginning_of_month >= oldest_valid_budget_date(family) && beginning_of_month <= Date.current.end_of_month
++      end
+     end
+ 
+     def find_or_bootstrap(family, start_date:)
+       return nil unless budget_date_valid?(start_date, family: family)
+ 
+       Budget.transaction do
++        if family.uses_custom_month_start?
++          budget_start = family.custom_month_start_for(start_date)
++          budget_end = family.custom_month_end_for(start_date)
++        else
++          budget_start = start_date.beginning_of_month
++          budget_end = start_date.end_of_month
++        end
++
+         budget = Budget.find_or_create_by!(
+           family: family,
+-          start_date: start_date.beginning_of_month,
+-          end_date: start_date.end_of_month
++          start_date: budget_start,
++          end_date: budget_end
+         ) do |b|
+           b.currency = family.currency
+         end
+@@ -49,7 +66,6 @@ def find_or_bootstrap(family, start_date:)
+ 
+     private
+       def oldest_valid_budget_date(family)
+-        # Allow going back to either the earliest entry date OR 2 years ago, whichever is earlier
+         two_years_ago = 2.years.ago.beginning_of_month
+         oldest_entry_date = family.oldest_entry_date.beginning_of_month
+         [ two_years_ago, oldest_entry_date ].min
+@@ -95,7 +111,15 @@ def transactions
+   end
+ 
+   def name
+-    start_date.strftime("%B %Y")
++    if family.uses_custom_month_start?
++      I18n.t(
++        "budgets.name.custom_range",
++        start: start_date.strftime("%b %d"),
++        end_date: end_date.strftime("%b %d, %Y")
++      )
++    else
++      I18n.t("budgets.name.month_year", month: start_date.strftime("%B %Y"))
++    end
+   end
+ 
+   def initialized?
+@@ -111,7 +135,12 @@ def expense_category_totals
+   end
+ 
+   def current?
+-    start_date == Date.today.beginning_of_month && end_date == Date.today.end_of_month
++    if family.uses_custom_month_start?
++      current_period = family.current_custom_month_period
++      start_date == current_period.start_date && end_date == current_period.end_date
++    else
++      start_date == Date.current.beginning_of_month && end_date == Date.current.end_of_month
++    end
+   end
+ 
+   def previous_budget_param
+diff --git a/app/models/family.rb b/app/models/family.rb
+index af9f0aa985..6741393ca3 100644
+--- a/app/models/family.rb
++++ b/app/models/family.rb
+@@ -40,6 +40,32 @@ class Family < ApplicationRecord
+ 
+   validates :locale, inclusion: { in: I18n.available_locales.map(&:to_s) }
+   validates :date_format, inclusion: { in: DATE_FORMATS.map(&:last) }
++  validates :month_start_day, inclusion: { in: 1..28 }
++
++  def uses_custom_month_start?
++    month_start_day != 1
++  end
++
++  def custom_month_start_for(date)
++    if date.day >= month_start_day
++      Date.new(date.year, date.month, month_start_day)
++    else
++      previous_month = date - 1.month
++      Date.new(previous_month.year, previous_month.month, month_start_day)
++    end
++  end
++
++  def custom_month_end_for(date)
++    start_date = custom_month_start_for(date)
++    next_month_start = start_date + 1.month
++    next_month_start - 1.day
++  end
++
++  def current_custom_month_period
++    start_date = custom_month_start_for(Date.current)
++    end_date = custom_month_end_for(Date.current)
++    Period.custom(start_date: start_date, end_date: end_date)
++  end
+ 
+   def assigned_merchants
+     merchant_ids = transactions.where.not(merchant_id: nil).pluck(:merchant_id).uniq
+diff --git a/app/models/period.rb b/app/models/period.rb
+index 3e369f4100..4188478f21 100644
+--- a/app/models/period.rb
++++ b/app/models/period.rb
+@@ -116,6 +116,22 @@ def all
+     def as_options
+       all.map { |period| [ period.label_short, period.key ] }
+     end
++
++    def current_month_for(family)
++      return from_key("current_month") unless family&.uses_custom_month_start?
++
++      family.current_custom_month_period
++    end
++
++    def last_month_for(family)
++      return from_key("last_month") unless family&.uses_custom_month_start?
++
++      current_start = family.custom_month_start_for(Date.current)
++      last_month_date = current_start - 1.day
++      start_date = family.custom_month_start_for(last_month_date)
++      end_date = family.custom_month_end_for(last_month_date)
++      custom(start_date: start_date, end_date: end_date)
++    end
+   end
+ 
+   PERIODS.each do |key, period|
+diff --git a/app/views/settings/preferences/show.html.erb b/app/views/settings/preferences/show.html.erb
+index 769b31801d..a9f44e029d 100644
+--- a/app/views/settings/preferences/show.html.erb
++++ b/app/views/settings/preferences/show.html.erb
+@@ -40,6 +40,17 @@
+             { label: t(".country") },
+             { data: { auto_submit_form_target: "auto" } } %>
+ 
++        <%= family_form.select :month_start_day,
++            (1..28).map { |day| [day.ordinalize, day] },
++            { label: t(".month_start_day"), hint: t(".month_start_day_hint") },
++            { data: { auto_submit_form_target: "auto" } } %>
++
++        <% if @user.family.uses_custom_month_start? %>
++          <div class="text-sm text-warning bg-warning/10 p-3 rounded-lg">
++            <%= t(".month_start_day_warning") %>
++          </div>
++        <% end %>
++
+         <p class="text-xs italic pl-2 text-secondary">Please note, we are still working on translations for various languages.</p>
+       <% end %>
+     <% end %>
+diff --git a/config/locales/views/budgets/en.yml b/config/locales/views/budgets/en.yml
+new file mode 100644
+index 0000000000..6f98a56864
+--- /dev/null
++++ b/config/locales/views/budgets/en.yml
+@@ -0,0 +1,10 @@
++---
++en:
++  budgets:
++    name:
++      custom_range: "%{start} - %{end_date}"
++      month_year: "%{month}"
++    show:
++      tabs:
++        actual: Actual
++        budgeted: Budgeted
+diff --git a/config/locales/views/settings/en.yml b/config/locales/views/settings/en.yml
+index ca407957b8..27d8cee296 100644
+--- a/config/locales/views/settings/en.yml
++++ b/config/locales/views/settings/en.yml
+@@ -44,6 +44,9 @@ en:
+         theme_system: System
+         theme_title: Theme
+         timezone: Timezone
++        month_start_day: Budget month starts on
++        month_start_day_hint: Set when your budget month starts (e.g., payday)
++        month_start_day_warning: Your budgets and MTD calculations will use this custom start day instead of the 1st of each month.
+     profiles:
+       destroy:
+         cannot_remove_self: You cannot remove yourself from the account.
+diff --git a/db/migrate/20260127213817_add_month_start_day_to_families.rb b/db/migrate/20260127213817_add_month_start_day_to_families.rb
+new file mode 100644
+index 0000000000..2b97fe6c61
+--- /dev/null
++++ b/db/migrate/20260127213817_add_month_start_day_to_families.rb
+@@ -0,0 +1,6 @@
++class AddMonthStartDayToFamilies < ActiveRecord::Migration[7.2]
++  def change
++    add_column :families, :month_start_day, :integer, default: 1, null: false
++    add_check_constraint :families, "month_start_day >= 1 AND month_start_day <= 28", name: "month_start_day_range"
++  end
++end
+diff --git a/db/schema.rb b/db/schema.rb
+index 3277c7385f..873fc72b2f 100644
+--- a/db/schema.rb
++++ b/db/schema.rb
+@@ -499,6 +499,8 @@
+     t.datetime "latest_sync_activity_at", default: -> { "CURRENT_TIMESTAMP" }
+     t.datetime "latest_sync_completed_at", default: -> { "CURRENT_TIMESTAMP" }
+     t.boolean "recurring_transactions_disabled", default: false, null: false
++    t.integer "month_start_day", default: 1, null: false
++    t.check_constraint "month_start_day >= 1 AND month_start_day <= 28", name: "month_start_day_range"
+   end
+ 
+   create_table "family_exports", id: :uuid, default: -> { "gen_random_uuid()" }, force: :cascade do |t|
+diff --git a/test/models/family/month_start_day_test.rb b/test/models/family/month_start_day_test.rb
+new file mode 100644
+index 0000000000..ca4d3c8a8b
+--- /dev/null
++++ b/test/models/family/month_start_day_test.rb
+@@ -0,0 +1,70 @@
++require "test_helper"
++
++class Family::MonthStartDayTest < ActiveSupport::TestCase
++  setup do
++    @family = families(:dylan_family)
++  end
++
++  test "month_start_day defaults to 1" do
++    assert_equal 1, @family.month_start_day
++  end
++
++  test "validates month_start_day is between 1 and 28" do
++    @family.month_start_day = 0
++    assert_not @family.valid?
++
++    @family.month_start_day = 29
++    assert_not @family.valid?
++
++    @family.month_start_day = 15
++    assert @family.valid?
++  end
++
++  test "uses_custom_month_start? returns false when month_start_day is 1" do
++    @family.month_start_day = 1
++    assert_not @family.uses_custom_month_start?
++  end
++
++  test "uses_custom_month_start? returns true when month_start_day is not 1" do
++    @family.month_start_day = 25
++    assert @family.uses_custom_month_start?
++  end
++
++  test "custom_month_start_for returns correct start date when day is after month_start_day" do
++    @family.month_start_day = 15
++
++    travel_to Date.new(2026, 1, 20) do
++      result = @family.custom_month_start_for(Date.current)
++      assert_equal Date.new(2026, 1, 15), result
++    end
++  end
++
++  test "custom_month_start_for returns correct start date when day is before month_start_day" do
++    @family.month_start_day = 15
++
++    travel_to Date.new(2026, 1, 10) do
++      result = @family.custom_month_start_for(Date.current)
++      assert_equal Date.new(2025, 12, 15), result
++    end
++  end
++
++  test "custom_month_end_for returns one day before next custom month start" do
++    @family.month_start_day = 15
++
++    travel_to Date.new(2026, 1, 20) do
++      result = @family.custom_month_end_for(Date.current)
++      assert_equal Date.new(2026, 2, 14), result
++    end
++  end
++
++  test "current_custom_month_period returns correct period" do
++    @family.month_start_day = 25
++
++    travel_to Date.new(2026, 1, 27) do
++      period = @family.current_custom_month_period
++
++      assert_equal Date.new(2026, 1, 25), period.start_date
++      assert_equal Date.new(2026, 2, 24), period.end_date
++    end
++  end
++end

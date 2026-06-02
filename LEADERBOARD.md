@@ -4,7 +4,7 @@
 
 The dashboard is updated automatically after each merged submission. The table below is the static fallback (machine-updated by CI via `results/leaderboard.json`).
 
-Mean score across the rotating 30-problem shard (pool: 105 problems across 9 repos), on a 0–30 scale per problem.
+Mean score across the rotating 30-problem shard (pool: 325 problems across 20 repos), on a 0–30 scale per problem.
 Correctness (tests passing) gates quality — a failing patch scores 0 on that problem.
 
 ---
@@ -23,8 +23,8 @@ Correctness (tests passing) gates quality — a failing patch scores 0 on that p
 
 | Metric | Value |
 |--------|-------|
-| Pool size | 105 problems |
-| Repos | 9 (entrius/gittensor ×45, phase-rs/phase ×10, geniepod/genie-claw ×10, we-promise/sure ×10, vouchdev/vouch ×10, touchpilot/touchpilot ×10, entrius/gittensor-ui ×7, entrius/allways ×3) |
+| Pool size | 325 problems |
+| Repos | 20 registered repos |
 | Shard size | 30 (rotates weekly) |
 | Oracle mean score | 21.60 / 30 |
 | Score range | 0.00 – 30.00 |

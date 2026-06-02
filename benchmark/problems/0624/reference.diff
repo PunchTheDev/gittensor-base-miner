@@ -1,0 +1,99 @@
+diff --git a/gittensor/validator/issue_competitions/storage_utils.py b/gittensor/validator/issue_competitions/storage_utils.py
+index 27c5b8b7..74fa069b 100644
+--- a/gittensor/validator/issue_competitions/storage_utils.py
++++ b/gittensor/validator/issue_competitions/storage_utils.py
+@@ -99,23 +99,30 @@ def read_contract_packed_storage_bytes(substrate, child_key: str, page_size: int
+     return bytes.fromhex(raw_hex.replace('0x', ''))
+ 
+ 
++# owner (32) + treasury hotkey (32) + netuid (2) + next_issue_id (8) + alpha_pool (16)
++_PACKED_CONTRACT_STORAGE_SIZE = 32 + 32 + 2 + 8 + 16
++
++
+ def decode_packed_contract_storage(data: bytes) -> Optional[PackedContractStorage]:
+     """Decode packed root storage bytes into typed fields."""
+-    # owner (32) + treasury hotkey (32) + netuid (2) + next_issue_id (8) + alpha_pool (16)
+-    if len(data) < 74:
++    if len(data) < _PACKED_CONTRACT_STORAGE_SIZE:
+         return None
+ 
+-    offset = 0
+-    owner = data[offset : offset + 32]
+-    offset += 32
+-    treasury_hotkey = data[offset : offset + 32]
+-    offset += 32
+-    netuid = struct.unpack_from('<H', data, offset)[0]
+-    offset += 2
+-    next_issue_id = struct.unpack_from('<Q', data, offset)[0]
+-    offset += 8
+-    alpha_pool_lo, alpha_pool_hi = struct.unpack_from('<QQ', data, offset)
+-    alpha_pool = alpha_pool_lo + (alpha_pool_hi << 64)
++    try:
++        offset = 0
++        owner = data[offset : offset + 32]
++        offset += 32
++        treasury_hotkey = data[offset : offset + 32]
++        offset += 32
++        netuid = struct.unpack_from('<H', data, offset)[0]
++        offset += 2
++        next_issue_id = struct.unpack_from('<Q', data, offset)[0]
++        offset += 8
++        alpha_pool_lo, alpha_pool_hi = struct.unpack_from('<QQ', data, offset)
++        alpha_pool = alpha_pool_lo + (alpha_pool_hi << 64)
++    except (struct.error, IndexError) as e:
++        logger.debug('Failed to decode packed contract storage: %s', e)
++        return None
+ 
+     return PackedContractStorage(
+         owner=owner,
+diff --git a/tests/utils/test_issue_competitions_storage_utils.py b/tests/utils/test_issue_competitions_storage_utils.py
+index 0ac6f368..82f55084 100644
+--- a/tests/utils/test_issue_competitions_storage_utils.py
++++ b/tests/utils/test_issue_competitions_storage_utils.py
+@@ -1,5 +1,7 @@
+ import struct
+ 
++import pytest
++
+ from gittensor.validator.issue_competitions.storage_utils import (
+     compute_ink5_lazy_key,
+     decode_issue_from_storage,
+@@ -100,6 +102,38 @@ def test_decode_packed_contract_storage_rejects_short_bytes():
+     assert decode_packed_contract_storage(b'\x00' * 73) is None
+ 
+ 
++def test_decode_packed_contract_storage_rejects_truncated_alpha_pool():
++    # Regression for #622: 74..89 used to pass the guard and crash in unpack_from.
++    assert decode_packed_contract_storage(b'\x00' * 89) is None
++
++
++@pytest.mark.parametrize('length', [0, 74, 80, 89])
++def test_decode_packed_contract_storage_rejects_any_short_buffer(length):
++    # A few boundary lengths from the #622 window (74..89) plus the empty case.
++    assert decode_packed_contract_storage(b'\x00' * length) is None
++
++
++def test_decode_packed_contract_storage_handles_maximum_field_values():
++    # Exercises the full 128-bit alpha_pool reconstruction (lo + (hi << 64)).
++    max_u16 = 0xFFFF
++    max_u64 = 0xFFFFFFFFFFFFFFFF
++    max_u128 = (1 << 128) - 1
++    data = (
++        b'\xab' * 32
++        + b'\xcd' * 32
++        + struct.pack('<H', max_u16)
++        + struct.pack('<Q', max_u64)
++        + struct.pack('<QQ', max_u64, max_u64)
++    )
++
++    decoded = decode_packed_contract_storage(data)
++
++    assert decoded is not None
++    assert decoded.netuid == max_u16
++    assert decoded.next_issue_id == max_u64
++    assert decoded.alpha_pool == max_u128
++
++
+ def test_decode_issue_from_storage_single_byte_string_length():
+     data = _build_issue_bytes(
+         issue_id=5,

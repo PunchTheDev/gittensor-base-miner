@@ -1,0 +1,351 @@
+diff --git a/app/models/assistant.rb b/app/models/assistant.rb
+index 4e9fbb340a..ca649ceacd 100644
+--- a/app/models/assistant.rb
++++ b/app/models/assistant.rb
+@@ -1,101 +1,31 @@
+-class Assistant
+-  include Provided, Configurable, Broadcastable
++module Assistant
++  Error = Class.new(StandardError)
+ 
+-  attr_reader :chat, :instructions
++  REGISTRY = {
++    "builtin" => Assistant::Builtin,
++    "external" => Assistant::External
++  }.freeze
+ 
+   class << self
+     def for_chat(chat)
+-      config = config_for(chat)
+-      new(chat, instructions: config[:instructions], functions: config[:functions])
++      implementation_for(chat).for_chat(chat)
+     end
+-  end
+-
+-  def initialize(chat, instructions: nil, functions: [])
+-    @chat = chat
+-    @instructions = instructions
+-    @functions = functions
+-  end
+ 
+-  def respond_to(message)
+-    assistant_message = AssistantMessage.new(
+-      chat: chat,
+-      content: "",
+-      ai_model: message.ai_model
+-    )
+-
+-    llm_provider = get_model_provider(message.ai_model)
+-
+-    unless llm_provider
+-      error_message = build_no_provider_error_message(message.ai_model)
+-      raise StandardError, error_message
++    def config_for(chat)
++      raise Error, "chat is required" if chat.blank?
++      Assistant::Builtin.config_for(chat)
+     end
+ 
+-    responder = Assistant::Responder.new(
+-      message: message,
+-      instructions: instructions,
+-      function_tool_caller: function_tool_caller,
+-      llm: llm_provider
+-    )
+-
+-    latest_response_id = chat.latest_assistant_response_id
+-
+-    responder.on(:output_text) do |text|
+-      if assistant_message.content.blank?
+-        stop_thinking
+-
+-        Chat.transaction do
+-          assistant_message.append_text!(text)
+-          chat.update_latest_response!(latest_response_id)
+-        end
+-      else
+-        assistant_message.append_text!(text)
+-      end
++    def available_types
++      REGISTRY.keys
+     end
+ 
+-    responder.on(:response) do |data|
+-      update_thinking("Analyzing your data...")
++    private
+ 
+-      if data[:function_tool_calls].present?
+-        assistant_message.tool_calls = data[:function_tool_calls]
+-        latest_response_id = data[:id]
+-      else
+-        chat.update_latest_response!(data[:id])
++      def implementation_for(chat)
++        raise Error, "chat is required" if chat.blank?
++        type = chat.user&.family&.assistant_type.presence || "builtin"
++        REGISTRY.fetch(type) { REGISTRY["builtin"] }
+       end
+-    end
+-
+-    responder.respond(previous_response_id: latest_response_id)
+-  rescue => e
+-    stop_thinking
+-    chat.add_error(e)
+   end
+-
+-  private
+-    attr_reader :functions
+-
+-    def function_tool_caller
+-      function_instances = functions.map do |fn|
+-        fn.new(chat.user)
+-      end
+-
+-      @function_tool_caller ||= FunctionToolCaller.new(function_instances)
+-    end
+-
+-    def build_no_provider_error_message(requested_model)
+-      available_providers = registry.providers
+-
+-      if available_providers.empty?
+-        "No LLM provider configured that supports model '#{requested_model}'. " \
+-        "Please configure an LLM provider (e.g., OpenAI) in settings."
+-      else
+-        provider_details = available_providers.map do |provider|
+-          "  - #{provider.provider_name}: #{provider.supported_models_description}"
+-        end.join("\n")
+-
+-        "No LLM provider configured that supports model '#{requested_model}'.\n\n" \
+-        "Available providers:\n#{provider_details}\n\n" \
+-        "Please either:\n" \
+-        "  1. Use a supported model from the list above, or\n" \
+-        "  2. Configure a provider that supports '#{requested_model}' in settings."
+-      end
+-    end
+ end
+diff --git a/app/models/assistant/base.rb b/app/models/assistant/base.rb
+new file mode 100644
+index 0000000000..2b77671afb
+--- /dev/null
++++ b/app/models/assistant/base.rb
+@@ -0,0 +1,13 @@
++class Assistant::Base
++  include Assistant::Broadcastable
++
++  attr_reader :chat
++
++  def initialize(chat)
++    @chat = chat
++  end
++
++  def respond_to(message)
++    raise NotImplementedError, "#{self.class}#respond_to must be implemented"
++  end
++end
+diff --git a/app/models/assistant/builtin.rb b/app/models/assistant/builtin.rb
+new file mode 100644
+index 0000000000..1d615eb5a5
+--- /dev/null
++++ b/app/models/assistant/builtin.rb
+@@ -0,0 +1,95 @@
++class Assistant::Builtin < Assistant::Base
++  include Assistant::Provided
++  include Assistant::Configurable
++
++  attr_reader :instructions
++
++  class << self
++    def for_chat(chat)
++      config = config_for(chat)
++      new(chat, instructions: config[:instructions], functions: config[:functions])
++    end
++  end
++
++  def initialize(chat, instructions: nil, functions: [])
++    super(chat)
++    @instructions = instructions
++    @functions = functions
++  end
++
++  def respond_to(message)
++    assistant_message = AssistantMessage.new(
++      chat: chat,
++      content: "",
++      ai_model: message.ai_model
++    )
++
++    llm_provider = get_model_provider(message.ai_model)
++    unless llm_provider
++      raise StandardError, build_no_provider_error_message(message.ai_model)
++    end
++
++    responder = Assistant::Responder.new(
++      message: message,
++      instructions: instructions,
++      function_tool_caller: function_tool_caller,
++      llm: llm_provider
++    )
++
++    latest_response_id = chat.latest_assistant_response_id
++
++    responder.on(:output_text) do |text|
++      if assistant_message.content.blank?
++        stop_thinking
++        Chat.transaction do
++          assistant_message.append_text!(text)
++          chat.update_latest_response!(latest_response_id)
++        end
++      else
++        assistant_message.append_text!(text)
++      end
++    end
++
++    responder.on(:response) do |data|
++      update_thinking("Analyzing your data...")
++      if data[:function_tool_calls].present?
++        assistant_message.tool_calls = data[:function_tool_calls]
++        latest_response_id = data[:id]
++      else
++        chat.update_latest_response!(data[:id])
++      end
++    end
++
++    responder.respond(previous_response_id: latest_response_id)
++  rescue => e
++    stop_thinking
++    chat.add_error(e)
++  end
++
++  private
++
++    attr_reader :functions
++
++    def function_tool_caller
++      @function_tool_caller ||= Assistant::FunctionToolCaller.new(
++        functions.map { |fn| fn.new(chat.user) }
++      )
++    end
++
++    def build_no_provider_error_message(requested_model)
++      available_providers = registry.providers
++      if available_providers.empty?
++        "No LLM provider configured that supports model '#{requested_model}'. " \
++          "Please configure an LLM provider (e.g., OpenAI) in settings."
++      else
++        provider_details = available_providers.map do |provider|
++          "  - #{provider.provider_name}: #{provider.supported_models_description}"
++        end.join("\n")
++        "No LLM provider configured that supports model '#{requested_model}'.\n\n" \
++          "Available providers:\n#{provider_details}\n\n" \
++          "Please either:\n" \
++          "  1. Use a supported model from the list above, or\n" \
++          "  2. Configure a provider that supports '#{requested_model}' in settings."
++      end
++    end
++end
+diff --git a/app/models/assistant/external.rb b/app/models/assistant/external.rb
+new file mode 100644
+index 0000000000..276595dad0
+--- /dev/null
++++ b/app/models/assistant/external.rb
+@@ -0,0 +1,14 @@
++class Assistant::External < Assistant::Base
++  class << self
++    def for_chat(chat)
++      new(chat)
++    end
++  end
++
++  def respond_to(message)
++    stop_thinking
++    chat.add_error(
++      StandardError.new("External assistant (OpenClaw/WebSocket) is not yet implemented.")
++    )
++  end
++end
+diff --git a/app/models/family.rb b/app/models/family.rb
+index 7296fa205b..75cae5bf04 100644
+--- a/app/models/family.rb
++++ b/app/models/family.rb
+@@ -19,6 +19,7 @@ class Family < ApplicationRecord
+ 
+ 
+   MONIKERS = [ "Family", "Group" ].freeze
++  ASSISTANT_TYPES = %w[builtin external].freeze
+ 
+   has_many :users, dependent: :destroy
+   has_many :accounts, dependent: :destroy
+@@ -47,6 +48,7 @@ class Family < ApplicationRecord
+   validates :date_format, inclusion: { in: DATE_FORMATS.map(&:last) }
+   validates :month_start_day, inclusion: { in: 1..28 }
+   validates :moniker, inclusion: { in: MONIKERS }
++  validates :assistant_type, inclusion: { in: ASSISTANT_TYPES }
+ 
+ 
+   def moniker_label
+diff --git a/db/migrate/20260218120001_add_assistant_type_to_families.rb b/db/migrate/20260218120001_add_assistant_type_to_families.rb
+new file mode 100644
+index 0000000000..44313cf9b2
+--- /dev/null
++++ b/db/migrate/20260218120001_add_assistant_type_to_families.rb
+@@ -0,0 +1,5 @@
++class AddAssistantTypeToFamilies < ActiveRecord::Migration[7.2]
++  def change
++    add_column :families, :assistant_type, :string, null: false, default: "builtin"
++  end
++end
+diff --git a/db/schema.rb b/db/schema.rb
+index d87e5720ab..82bfd1e0fa 100644
+--- a/db/schema.rb
++++ b/db/schema.rb
+@@ -10,7 +10,7 @@
+ #
+ # It's strongly recommended that you check this file into your version control system.
+ 
+-ActiveRecord::Schema[7.2].define(version: 2026_02_18_120000) do
++ActiveRecord::Schema[7.2].define(version: 2026_02_18_120001) do
+   # These are extensions that must be enabled in order to support this database
+   enable_extension "pgcrypto"
+   enable_extension "plpgsql"
+@@ -503,6 +503,7 @@
+     t.integer "month_start_day", default: 1, null: false
+     t.string "vector_store_id"
+     t.string "moniker", default: "Family", null: false
++    t.string "assistant_type", default: "builtin", null: false
+     t.check_constraint "month_start_day >= 1 AND month_start_day <= 28", name: "month_start_day_range"
+   end
+ 
+diff --git a/test/models/assistant_test.rb b/test/models/assistant_test.rb
+index bbb476c8f9..7ced435423 100644
+--- a/test/models/assistant_test.rb
++++ b/test/models/assistant_test.rb
+@@ -176,6 +176,31 @@ class AssistantTest < ActiveSupport::TestCase
+     end
+   end
+ 
++  test "for_chat returns Builtin by default" do
++    assert_instance_of Assistant::Builtin, Assistant.for_chat(@chat)
++  end
++
++  test "available_types includes builtin and external" do
++    assert_includes Assistant.available_types, "builtin"
++    assert_includes Assistant.available_types, "external"
++  end
++
++  test "for_chat returns External when family assistant_type is external" do
++    @chat.user.family.update!(assistant_type: "external")
++    assistant = Assistant.for_chat(@chat)
++    assert_instance_of Assistant::External, assistant
++    assert_no_difference "AssistantMessage.count" do
++      assistant.respond_to(@message)
++    end
++    @chat.reload
++    assert @chat.error.present?
++    assert_includes @chat.error, "not yet implemented"
++  end
++
++  test "for_chat raises when chat is blank" do
++    assert_raises(Assistant::Error) { Assistant.for_chat(nil) }
++  end
++
+   private
+     def provider_function_request(id:, call_id:, function_name:, function_args:)
+       Provider::LlmConcept::ChatFunctionRequest.new(

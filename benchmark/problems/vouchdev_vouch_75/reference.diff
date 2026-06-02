@@ -1,0 +1,257 @@
+diff --git a/CHANGELOG.md b/CHANGELOG.md
+index 06ce3f8..e570c8f 100644
+--- a/CHANGELOG.md
++++ b/CHANGELOG.md
+@@ -32,6 +32,17 @@ All notable changes to vouch are documented here. Format follows
+   a silent no-op. Existing Linux/macOS bundles are unchanged (their paths
+   were already POSIX); Windows bundles produced before this fix should be
+   re-exported.
++- `bundle.import_check` and `bundle.import_apply` now verify each tar
++  member's `sha256` against `manifest.json` (#74). Previously the
++  per-file hash was only enforced by `export_check`; the import side
++  trusted any tar member whose path appeared in the manifest, so a
++  tampered tarball with an unchanged manifest could land
++  attacker-controlled content into the KB while the audit log
++  recorded a clean `bundle.import` event. `import_apply` re-verifies
++  at write time and raises on mismatch, so a bundle that is tampered
++  with between `import_check` and the apply re-open is rejected
++  before anything reaches disk and the audit log does not record
++  a `bundle.import` event.
+ 
+ ## [0.0.1] — 2026-05-17
+ 
+diff --git a/src/vouch/bundle.py b/src/vouch/bundle.py
+index 45e7b1d..a059546 100644
+--- a/src/vouch/bundle.py
++++ b/src/vouch/bundle.py
+@@ -248,7 +248,8 @@ def import_check(kb_dir: Path, bundle_path: Path) -> ImportCheckResult:
+             )
+         manifest = json.loads(tar.extractfile(mf_member).read().decode())  # type: ignore[union-attr]
+         bundle_id = manifest.get("bundle_id", "")
+-        manifest_paths = {f["path"] for f in manifest["files"]}
++        recorded = {f["path"]: f for f in manifest["files"]}
++        manifest_paths = set(recorded)
+         for f in manifest["files"]:
+             try:
+                 dest = _safe_member_path(kb_dir, f["path"])
+@@ -257,7 +258,7 @@ def import_check(kb_dir: Path, bundle_path: Path) -> ImportCheckResult:
+                 continue
+             if not dest.exists():
+                 new_files.append(f["path"])
+-            elif sha256_hex(dest.read_bytes()) == f["sha256"]:
++            elif sha256_hex(dest.read_bytes()) == f.get("sha256"):
+                 identical.append(f["path"])
+             else:
+                 conflicts.append(f["path"])
+@@ -267,6 +268,15 @@ def import_check(kb_dir: Path, bundle_path: Path) -> ImportCheckResult:
+             if member.name not in manifest_paths:
+                 continue
+             body = tar.extractfile(member).read()  # type: ignore[union-attr]
++            # Manifest integrity: without this, a tampered tar member with an
++            # unchanged manifest.json would pass import_check and land in the
++            # KB via import_apply — defeating the per-file sha256 guarantee
++            # that export_check already enforces. `.get("sha256")` so a
++            # hand-crafted manifest entry missing the field is reported as a
++            # mismatch rather than raising a bare KeyError on import.
++            if sha256_hex(body) != recorded[member.name].get("sha256"):
++                issues.append(f"hash mismatch: {member.name}")
++                continue
+             _validate_content(member.name, body, issues)
+ 
+     return ImportCheckResult(
+@@ -308,16 +318,28 @@ def import_apply(
+             if member.name not in recorded:
+                 continue
+             dest = _safe_member_path(kb_dir, member.name)
++            expected_sha = recorded[member.name].get("sha256")
+             if (
+                 dest.exists()
+                 and on_conflict == "skip"
+-                and sha256_hex(dest.read_bytes())
+-                != recorded[member.name]["sha256"]
++                and sha256_hex(dest.read_bytes()) != expected_sha
+             ):
+                 skipped.append(member.name)
+                 continue
+             dest.parent.mkdir(parents=True, exist_ok=True)
+             body = tar.extractfile(member).read()  # type: ignore[union-attr]
++            # Re-verify the manifest sha256 at write time as defence in
++            # depth against a TOCTOU between import_check (which already
++            # ran above) and this re-open of the tarball. The only way to
++            # reach here is mid-import tampering — raise rather than skip
++            # so the audit log doesn't record a `bundle.import` event for
++            # an import that silently dropped a member. This is exactly
++            # the audit-truthfulness anti-pattern #74 was about.
++            if sha256_hex(body) != expected_sha:
++                raise RuntimeError(
++                    f"refusing to import: hash mismatch at write time: "
++                    f"{member.name}"
++                )
+             val_issues: list[str] = []
+             _validate_content(member.name, body, val_issues)
+             if val_issues:
+diff --git a/tests/test_bundle.py b/tests/test_bundle.py
+index 4b1e486..20e8d08 100644
+--- a/tests/test_bundle.py
++++ b/tests/test_bundle.py
+@@ -153,3 +153,160 @@ def test_import_check_flags_path_traversal(store: KBStore, tmp_path: Path) -> No
+         "traversal" in i or "unsafe" in i or "absolute path" in i
+         for i in result.issues
+     )
++
++
++def _write_hash_mismatched_bundle(
++    bundle_path: Path,
++    member_name: str,
++    declared_payload: bytes,
++    actual_payload: bytes,
++) -> None:
++    """Build a bundle where the manifest records the sha256 of
++    `declared_payload` but the tar member at the same path contains
++    `actual_payload`. Models the smallest possible integrity attack:
++    swap a member's body without re-signing the manifest."""
++    manifest = {
++        "spec": bundle.SPEC_VERSION,
++        "bundle_id": "deadbeef",
++        "files": [
++            {
++                "path": member_name,
++                "size": len(declared_payload),
++                "sha256": hashlib.sha256(declared_payload).hexdigest(),
++            }
++        ],
++        "counts": {},
++        "safety": {"has_proposed": False, "has_state_db": False, "has_audit_log": False},
++    }
++    with tarfile.open(bundle_path, "w:gz") as tar:
++        info = tarfile.TarInfo(member_name)
++        info.size = len(actual_payload)
++        tar.addfile(info, io.BytesIO(actual_payload))
++        mf_bytes = json.dumps(manifest).encode()
++        mf_info = tarfile.TarInfo(bundle.MANIFEST_NAME)
++        mf_info.size = len(mf_bytes)
++        tar.addfile(mf_info, io.BytesIO(mf_bytes))
++
++
++def test_import_rejects_member_with_mismatched_sha256(
++    store: KBStore, tmp_path: Path
++) -> None:
++    """Regression for #74: a tar member whose body does not hash to the
++    sha256 the manifest claims is a documented integrity violation —
++    export_check flags it, so import_check and import_apply must too."""
++    legitimate = b"text: original\n"
++    tampered = b"text: TAMPERED\n"
++    bundle_path = tmp_path / "tampered.tar.gz"
++    _write_hash_mismatched_bundle(bundle_path, "claims/c1.yaml", legitimate, tampered)
++
++    diff = bundle.import_check(store.kb_dir, bundle_path)
++    assert not diff.ok
++    assert any("hash mismatch" in i for i in diff.issues), diff.issues
++
++    with pytest.raises(RuntimeError, match="hash mismatch"):
++        bundle.import_apply(store.kb_dir, bundle_path)
++    assert not (store.kb_dir / "claims" / "c1.yaml").exists()
++
++
++def test_import_rejects_source_content_mismatch(
++    store: KBStore, tmp_path: Path
++) -> None:
++    """`_validate_content` skips `sources/*/content` files, so the manifest
++    sha256 is the only thing that can detect substituted source bytes."""
++    legitimate = b"original source bytes"
++    tampered = b"attacker-controlled bytes"
++    bundle_path = tmp_path / "tampered.tar.gz"
++    _write_hash_mismatched_bundle(
++        bundle_path, "sources/deadbeef/content", legitimate, tampered
++    )
++
++    diff = bundle.import_check(store.kb_dir, bundle_path)
++    assert not diff.ok
++    assert any("hash mismatch" in i for i in diff.issues)
++
++    with pytest.raises(RuntimeError, match="hash mismatch"):
++        bundle.import_apply(store.kb_dir, bundle_path)
++    assert not (store.kb_dir / "sources" / "deadbeef" / "content").exists()
++
++
++def test_import_apply_raises_on_write_time_hash_mismatch(
++    store: KBStore, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
++) -> None:
++    """Regression for #74 review feedback: if a tampered bundle slips past
++    import_check (e.g. TOCTOU between the check and the apply re-open),
++    import_apply must raise rather than silently dropping the member and
++    still logging a clean `bundle.import` audit event with the legitimate
++    bundle_id — that is exactly the audit-truthfulness anti-pattern #74
++    was filed to fix."""
++    legitimate = b"text: original\n"
++    tampered = b"text: TAMPERED\n"
++    bundle_path = tmp_path / "tampered.tar.gz"
++    _write_hash_mismatched_bundle(
++        bundle_path, "claims/c1.yaml", legitimate, tampered,
++    )
++
++    # Force the pre-write check to look clean so the apply path reaches
++    # the write-time re-verify branch.
++    monkeypatch.setattr(
++        bundle, "import_check",
++        lambda *_a, **_k: bundle.ImportCheckResult(
++            ok=True, bundle_id="deadbeef",
++            new_files=["claims/c1.yaml"], conflicts=[], identical=[], issues=[],
++        ),
++    )
++
++    with pytest.raises(RuntimeError, match="hash mismatch at write time"):
++        bundle.import_apply(store.kb_dir, bundle_path)
++    assert not (store.kb_dir / "claims" / "c1.yaml").exists()
++    audit_path = store.kb_dir / "audit.log.jsonl"
++    audit_text = audit_path.read_text() if audit_path.exists() else ""
++    assert "bundle.import" not in audit_text, audit_text
++
++
++def test_import_treats_missing_manifest_sha256_as_mismatch(
++    store: KBStore, tmp_path: Path
++) -> None:
++    """Regression for #74 review feedback: a hand-crafted manifest entry
++    without a `sha256` field used to raise a bare KeyError in import_check
++    and import_apply. Treat the missing field as a hash mismatch so the
++    bundle is rejected with a clean issue / RuntimeError."""
++    payload = b"text: any content\n"
++    bundle_path = tmp_path / "no-sha.tar.gz"
++    manifest = {
++        "spec": bundle.SPEC_VERSION,
++        "bundle_id": "deadbeef",
++        "files": [{"path": "claims/c1.yaml", "size": len(payload)}],
++        "counts": {},
++        "safety": {
++            "has_proposed": False, "has_state_db": False, "has_audit_log": False,
++        },
++    }
++    with tarfile.open(bundle_path, "w:gz") as tar:
++        info = tarfile.TarInfo("claims/c1.yaml")
++        info.size = len(payload)
++        tar.addfile(info, io.BytesIO(payload))
++        mf_bytes = json.dumps(manifest).encode()
++        mf_info = tarfile.TarInfo(bundle.MANIFEST_NAME)
++        mf_info.size = len(mf_bytes)
++        tar.addfile(mf_info, io.BytesIO(mf_bytes))
++
++    diff = bundle.import_check(store.kb_dir, bundle_path)
++    assert not diff.ok
++    assert any("hash mismatch" in i for i in diff.issues), diff.issues
++
++    with pytest.raises(RuntimeError, match="hash mismatch"):
++        bundle.import_apply(store.kb_dir, bundle_path)
++    assert not (store.kb_dir / "claims" / "c1.yaml").exists()
++
++
++def test_import_check_passes_when_member_matches_manifest(
++    store: KBStore, tmp_path: Path
++) -> None:
++    """The hash check is positive too: a member that matches manifest
++    sha256 should not be reported as `hash mismatch`."""
++    payload = b"text: original\n"
++    bundle_path = tmp_path / "good.tar.gz"
++    _write_hash_mismatched_bundle(bundle_path, "claims/c1.yaml", payload, payload)
++
++    diff = bundle.import_check(store.kb_dir, bundle_path)
++    assert not any("hash mismatch" in i for i in diff.issues), diff.issues

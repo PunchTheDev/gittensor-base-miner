@@ -1,0 +1,864 @@
+diff --git a/app/controllers/imports_controller.rb b/app/controllers/imports_controller.rb
+index 94526c310a..194a55dd3d 100644
+--- a/app/controllers/imports_controller.rb
++++ b/app/controllers/imports_controller.rb
+@@ -2,6 +2,7 @@ class ImportsController < ApplicationController
+   include SettingsHelper
+ 
+   before_action :set_import, only: %i[show update publish destroy revert apply_template]
++  before_action :require_statement_import_permission!, only: %i[update publish destroy revert apply_template]
+ 
+   def update
+     # Handle both pdf_import[account_id] and import[account_id] param formats
+@@ -13,7 +14,9 @@ def update
+         redirect_back_or_to import_path(@import), alert: t("imports.update.invalid_account", default: "Account not found.")
+         return
+       end
+-      @import.update!(account: account)
++      return if @import.account_statement.present? && !require_account_permission!(account)
++
++      @import.is_a?(PdfImport) ? @import.assign_account!(account) : @import.update!(account: account)
+     end
+ 
+     redirect_to import_path(@import), notice: t("imports.update.account_saved", default: "Account saved.")
+@@ -134,24 +137,32 @@ def destroy
+ 
+   private
+     def set_import
+-      @import = Current.family.imports.includes(:account).find(params[:id])
++      @import = Current.family.imports.includes(:account, :account_statement).find(params[:id])
++      raise ActiveRecord::RecordNotFound if @import.account_statement.present? && !@import.account_statement.viewable_by?(Current.user)
+     end
+ 
+     def import_params
+       params.require(:import).permit(:import_file)
+     end
+ 
++    def require_statement_import_permission!
++      return if @import.account_statement.blank? || @import.account_statement.manageable_by?(Current.user)
++
++      redirect_target = @import.account || @import.account_statement
++      redirect_back_or_to redirect_target, alert: t("accounts.not_authorized")
++    end
++
+     def create_pdf_import(file)
+-      if file.size > Import::MAX_PDF_SIZE
+-        redirect_to new_import_path, alert: t("imports.create.pdf_too_large", max_size: Import::MAX_PDF_SIZE / 1.megabyte)
+-        return
+-      end
++      return redirect_to new_import_path, alert: t("accounts.not_authorized") unless AccountStatement.statement_manager?(Current.user)
++      return redirect_to new_import_path, alert: t("imports.create.pdf_too_large", max_size: Import::MAX_PDF_SIZE / 1.megabyte) if file.size > Import::MAX_PDF_SIZE
+ 
+-      pdf_import = Current.family.imports.create!(type: "PdfImport")
+-      pdf_import.pdf_file.attach(file)
++      pdf_import = PdfImport.create_from_upload!(family: Current.family, file: file, user: Current.user)
+       pdf_import.process_with_ai_later
+-
+       redirect_to import_path(pdf_import), notice: t("imports.create.pdf_processing")
++    rescue AccountStatement::DuplicateUploadError
++      redirect_to new_import_path, alert: t("imports.create.duplicate_pdf_unavailable")
++    rescue AccountStatement::InvalidUploadError
++      redirect_to new_import_path, alert: t("imports.create.invalid_pdf")
+     end
+ 
+     def create_document_import(file)
+diff --git a/app/jobs/process_pdf_job.rb b/app/jobs/process_pdf_job.rb
+index 1ed48cf492..c577806dc0 100644
+--- a/app/jobs/process_pdf_job.rb
++++ b/app/jobs/process_pdf_job.rb
+@@ -3,9 +3,9 @@ class ProcessPdfJob < ApplicationJob
+ 
+   def perform(pdf_import)
+     return unless pdf_import.is_a?(PdfImport)
+-    return unless pdf_import.pdf_uploaded?
++    return reset_processing_claim(pdf_import) unless pdf_import.pdf_uploaded?
+     return if pdf_import.status == "complete"
+-    return if pdf_import.ai_processed? && (!pdf_import.statement_with_transactions? || pdf_import.rows_count > 0)
++    return reset_processing_claim(pdf_import) if pdf_import.ai_processed? && (!pdf_import.statement_with_transactions? || pdf_import.rows_count > 0)
+ 
+     pdf_import.update!(status: :importing)
+ 
+@@ -62,12 +62,11 @@ def sanitize_error_message(error)
+     end
+ 
+     def upload_to_vector_store(pdf_import, document_type:)
+-      filename = pdf_import.pdf_file.filename.to_s
+       file_content = pdf_import.pdf_file_content
+ 
+       family_document = pdf_import.family.upload_document(
+         file_content: file_content,
+-        filename: filename,
++        filename: pdf_import.pdf_filename,
+         metadata: { "type" => document_type }
+       )
+ 
+@@ -85,4 +84,8 @@ def resolve_document_type(pdf_import, process_result)
+     def statement_with_transactions?(document_type)
+       document_type.in?(%w[bank_statement credit_card_statement])
+     end
++
++    def reset_processing_claim(pdf_import)
++      pdf_import.with_lock { pdf_import.update!(status: :pending) if pdf_import.importing? && pdf_import.updated_at <= 30.minutes.ago }
++    end
+ end
+diff --git a/app/models/account_statement.rb b/app/models/account_statement.rb
+index 07cc80c86f..5240093fd9 100644
+--- a/app/models/account_statement.rb
++++ b/app/models/account_statement.rb
+@@ -33,6 +33,7 @@ def initialize(statement)
+   belongs_to :account, optional: true
+   belongs_to :suggested_account, class_name: "Account", optional: true
+ 
++  has_many :pdf_imports, -> { where(type: "PdfImport").ordered }, class_name: "PdfImport", dependent: :restrict_with_error
+   has_one_attached :original_file, dependent: :purge_later
+ 
+   enum :source, { manual_upload: "manual_upload" }, validate: true, default: "manual_upload"
+@@ -360,6 +361,10 @@ def xlsx?
+     content_type.in?(ALLOWED_EXTENSION_CONTENT_TYPES[".xlsx"])
+   end
+ 
++  def latest_reusable_pdf_import
++    pdf_imports.where.not(status: :failed).order(created_at: :desc).first
++  end
++
+   private
+ 
+     def reconciliation_check(key:, statement_amount:, ledger_amount:)
+diff --git a/app/models/import.rb b/app/models/import.rb
+index 71887faed8..d70a19eb29 100644
+--- a/app/models/import.rb
++++ b/app/models/import.rb
+@@ -40,6 +40,7 @@ def self.max_csv_size
+ 
+   belongs_to :family
+   belongs_to :account, optional: true
++  belongs_to :account_statement, optional: true
+ 
+   before_validation :set_default_number_format
+   before_validation :ensure_utf8_encoding
+diff --git a/app/models/pdf_import.rb b/app/models/pdf_import.rb
+index f610e6b0f7..1e1f494ef9 100644
+--- a/app/models/pdf_import.rb
++++ b/app/models/pdf_import.rb
+@@ -2,6 +2,32 @@ class PdfImport < Import
+   has_one_attached :pdf_file, dependent: :purge_later
+ 
+   validates :document_type, inclusion: { in: DOCUMENT_TYPES }, allow_nil: true
++  validate :account_statement_matches_import
++
++  class << self
++    def create_from_upload!(family:, file:, user:)
++      statement = AccountStatement.create_from_prepared_upload!(
++        family: family,
++        account: nil,
++        prepared_upload: AccountStatement.prepare_upload!(file)
++      )
++
++      create_from_statement!(statement: statement)
++    rescue AccountStatement::DuplicateUploadError => e
++      raise unless e.statement.manageable_by?(user)
++
++      create_from_statement!(statement: e.statement)
++    end
++
++    def create_from_statement!(statement:)
++      reusable_import = statement.latest_reusable_pdf_import
++      return reusable_import if reusable_import &&
++                                reusable_import.account_id == statement.account_id &&
++                                reusable_import.date_format == statement.family.date_format
++
++      create!(family: statement.family, account: statement.account, account_statement: statement, date_format: statement.family.date_format, status: :pending)
++    end
++  end
+ 
+   def import!
+     raise "Account required for PDF import" unless account.present?
+@@ -31,8 +57,18 @@ def import!
+     end
+   end
+ 
++  def assign_account!(account)
++    transaction do
++      update!(account: account)
++      if (statement = account_statement)
++        statement.lock!
++        statement.link_to_account!(account) if statement.account_id != account.id
++      end
++    end
++  end
++
+   def pdf_uploaded?
+-    pdf_file.attached?
++    statement_backed? || pdf_file.attached?
+   end
+ 
+   def ai_processed?
+@@ -40,7 +76,16 @@ def ai_processed?
+   end
+ 
+   def process_with_ai_later
+-    ProcessPdfJob.perform_later(self)
++    return false unless with_lock { pending? && !ai_processed? && rows_count.zero? && pdf_uploaded? && update!(status: :importing) }
++
++    begin
++      ProcessPdfJob.perform_later(self)
++      true
++    rescue StandardError => e
++      Rails.logger.error("Failed to enqueue PDF processing for import #{id}: #{e.class.name} - #{e.message}")
++      reload.with_lock { update!(status: :pending) }
++      false
++    end
+   end
+ 
+   def process_with_ai
+@@ -172,9 +217,20 @@ def requires_csv_workflow?
+   end
+ 
+   def pdf_file_content
+-    return nil unless pdf_file.attached?
++    return @pdf_file_content if defined?(@pdf_file_content)
++    return @pdf_file_content = account_statement.original_file.download if statement_backed?
++
++    @pdf_file_content = pdf_file.download if pdf_file.attached?
++  end
++
++  def pdf_filename
++    return account_statement.filename if statement_backed?
+ 
+-    pdf_file.download
++    pdf_file.filename.to_s if pdf_file.attached?
++  end
++
++  def statement_backed?
++    account_statement&.original_file&.attached?
+   end
+ 
+   def required_column_keys
+@@ -199,4 +255,10 @@ def format_date_for_import(date_str)
+     rescue ArgumentError
+       date_str.to_s
+     end
++
++    def account_statement_matches_import
++      return if account_statement.blank? || (account_statement.family_id == family_id && account_statement.pdf?)
++
++      errors.add(:account_statement, :invalid)
++    end
+ end
+diff --git a/app/views/imports/_pdf_import.html.erb b/app/views/imports/_pdf_import.html.erb
+index 068d55da99..4d82ce324f 100644
+--- a/app/views/imports/_pdf_import.html.erb
++++ b/app/views/imports/_pdf_import.html.erb
+@@ -14,16 +14,25 @@
+       </div>
+ 
+       <div class="bg-container border border-primary rounded-xl p-4 space-y-4">
++        <% if import.account_statement.present? %>
++          <div class="space-y-2">
++            <h2 class="font-medium text-primary"><%= t("imports.pdf_import.source_statement") %></h2>
++            <p class="text-sm text-secondary px-3 py-2 bg-container-inset rounded-lg">
++              <%= link_to import.account_statement.filename, account_statement_path(import.account_statement), class: "text-primary hover:text-primary-hover" %>
++            </p>
++          </div>
++        <% end %>
++
+         <div class="space-y-2">
+           <h2 class="font-medium text-primary"><%= t("imports.pdf_import.document_type_label") %></h2>
+-          <p class="text-sm text-secondary px-3 py-2 bg-gray-tint-5 rounded-lg">
++          <p class="text-sm text-secondary px-3 py-2 bg-container-inset rounded-lg">
+             <%= t("imports.document_types.#{import.document_type}", default: import.document_type&.humanize || t("imports.pdf_import.unknown_document_type", default: "Unknown")) %>
+           </p>
+         </div>
+ 
+         <div class="space-y-2">
+           <h2 class="font-medium text-primary"><%= t("imports.pdf_import.transactions_extracted", default: "Transactions Extracted") %></h2>
+-          <p class="text-sm text-secondary px-3 py-2 bg-gray-tint-5 rounded-lg">
++          <p class="text-sm text-secondary px-3 py-2 bg-container-inset rounded-lg">
+             <%= t("imports.pdf_import.transactions_extracted_count", count: import.rows_count, default: "%{count} transactions") %>
+           </p>
+         </div>
+@@ -38,7 +47,7 @@
+                 <p class="text-xs text-secondary"><%= t("imports.pdf_import.select_account_hint", default: "Choose which account to import these transactions into.") %></p>
+               <% end %>
+             <% else %>
+-              <p class="text-sm text-secondary px-3 py-2 bg-yellow-500/10 rounded-lg">
++              <p class="text-sm text-secondary px-3 py-2 bg-warning/10 rounded-lg">
+                 <%= t("imports.pdf_import.no_accounts", default: "No accounts available. Please create an account first.") %>
+               </p>
+               <%= render DS::Link.new(text: t("imports.pdf_import.create_account", default: "Create Account"), href: new_account_path(return_to: import_path(import)), variant: "primary", full_width: true, frame: :modal) %>
+@@ -106,16 +115,25 @@
+       </div>
+ 
+       <div class="bg-container border border-primary rounded-xl p-4 space-y-4">
++        <% if import.account_statement.present? %>
++          <div class="space-y-2">
++            <h2 class="font-medium text-primary"><%= t("imports.pdf_import.source_statement") %></h2>
++            <p class="text-sm text-secondary px-3 py-2 bg-container-inset rounded-lg">
++              <%= link_to import.account_statement.filename, account_statement_path(import.account_statement), class: "text-primary hover:text-primary-hover" %>
++            </p>
++          </div>
++        <% end %>
++
+         <div class="space-y-2">
+           <h2 class="font-medium text-primary"><%= t("imports.pdf_import.document_type_label") %></h2>
+-          <p class="text-sm text-secondary px-3 py-2 bg-gray-tint-5 rounded-lg">
++          <p class="text-sm text-secondary px-3 py-2 bg-container-inset rounded-lg">
+             <%= t("imports.document_types.#{import.document_type}", default: import.document_type&.humanize || t("imports.pdf_import.unknown_document_type", default: "Unknown")) %>
+           </p>
+         </div>
+ 
+         <div class="space-y-2">
+           <h2 class="font-medium text-primary"><%= t("imports.pdf_import.summary_label") %></h2>
+-          <p class="text-sm text-secondary px-3 py-2 bg-gray-tint-5 rounded-lg whitespace-pre-wrap">
++          <p class="text-sm text-secondary px-3 py-2 bg-container-inset rounded-lg whitespace-pre-wrap">
+             <%= import.ai_summary %>
+           </p>
+         </div>
+diff --git a/config/locales/views/imports/en.yml b/config/locales/views/imports/en.yml
+index d97b7cf214..7d83f0793d 100644
+--- a/config/locales/views/imports/en.yml
++++ b/config/locales/views/imports/en.yml
+@@ -384,6 +384,7 @@ en:
+       pdf_too_large: PDF file is too large. Maximum size is %{max_size}MB.
+       pdf_processing: Your PDF is being processed. You will receive an email when analysis is complete.
+       invalid_pdf: The uploaded file is not a valid PDF.
++      duplicate_pdf_unavailable: This PDF is already stored as a statement you cannot access.
+       document_too_large: Document file is too large. Maximum size is %{max_size}MB.
+       invalid_document_file_type: Invalid document file type for the active vector store.
+       document_uploaded: Document uploaded successfully.
+@@ -425,6 +426,7 @@ en:
+       complete_title: Document analyzed
+       complete_description: We've analyzed your PDF and here's what we found.
+       document_type_label: Document Type
++      source_statement: Source statement
+       summary_label: Summary
+       email_sent_notice: An email has been sent to you with next steps.
+       back_to_imports: Back to imports
+diff --git a/db/migrate/20260513120000_add_account_statement_to_imports.rb b/db/migrate/20260513120000_add_account_statement_to_imports.rb
+new file mode 100644
+index 0000000000..3d346212a8
+--- /dev/null
++++ b/db/migrate/20260513120000_add_account_statement_to_imports.rb
+@@ -0,0 +1,5 @@
++class AddAccountStatementToImports < ActiveRecord::Migration[7.2]
++  def change
++    add_reference :imports, :account_statement, type: :uuid, foreign_key: { on_delete: :nullify }, index: true
++  end
++end
+diff --git a/db/schema.rb b/db/schema.rb
+index c7fcf54aea..12e8ad30c1 100644
+--- a/db/schema.rb
++++ b/db/schema.rb
+@@ -923,6 +923,8 @@
+     t.jsonb "extracted_data"
+     t.jsonb "expected_record_counts", default: {}, null: false
+     t.jsonb "readback_verification", default: {}, null: false
++    t.uuid "account_statement_id"
++    t.index ["account_statement_id"], name: "index_imports_on_account_statement_id"
+     t.index ["family_id"], name: "index_imports_on_family_id"
+   end
+ 
+@@ -1930,6 +1932,7 @@
+   add_foreign_key "impersonation_sessions", "users", column: "impersonated_id"
+   add_foreign_key "impersonation_sessions", "users", column: "impersonator_id"
+   add_foreign_key "import_rows", "imports"
++  add_foreign_key "imports", "account_statements", on_delete: :nullify
+   add_foreign_key "imports", "families"
+   add_foreign_key "indexa_capital_accounts", "indexa_capital_items"
+   add_foreign_key "indexa_capital_items", "families"
+diff --git a/test/controllers/imports_controller_test.rb b/test/controllers/imports_controller_test.rb
+index eea32693ac..1b48bd9539 100644
+--- a/test/controllers/imports_controller_test.rb
++++ b/test/controllers/imports_controller_test.rb
+@@ -1,6 +1,8 @@
+ require "test_helper"
+ 
+ class ImportsControllerTest < ActionDispatch::IntegrationTest
++  include ActiveJob::TestHelper
++
+   setup do
+     sign_in @user = users(:family_admin)
+     ensure_tailwind_build
+@@ -85,20 +87,244 @@ class ImportsControllerTest < ActionDispatch::IntegrationTest
+     @user.family.expects(:upload_document).never
+ 
+     assert_difference "Import.count", 1 do
+-      post imports_url, params: {
+-        import: {
+-          type: "DocumentImport",
+-          import_file: file_fixture_upload("imports/sample_bank_statement.pdf", "application/pdf")
++      assert_difference "AccountStatement.count", 1 do
++        post imports_url, params: {
++          import: {
++            type: "DocumentImport",
++            import_file: file_fixture_upload("imports/sample_bank_statement.pdf", "application/pdf")
++          }
+         }
+-      }
++      end
+     end
+ 
+     created_import = Import.order(:created_at).last
+     assert_equal "PdfImport", created_import.type
++    assert_equal AccountStatement.order(:created_at).last, created_import.account_statement
++    assert_not created_import.pdf_file.attached?
++    assert_redirected_to import_url(created_import)
++    assert_equal I18n.t("imports.create.pdf_processing"), flash[:notice]
++  end
++
++  test "uploads pdf import through account statement" do
++    assert_difference "AccountStatement.count", 1 do
++      assert_difference "Import.where(type: 'PdfImport').count", 1 do
++        post imports_url, params: {
++          import: {
++            import_file: file_fixture_upload("imports/sample_bank_statement.pdf", "application/pdf")
++          }
++        }
++      end
++    end
++
++    statement = AccountStatement.order(:created_at).last
++    created_import = PdfImport.order(:created_at).last
++    assert_equal statement, created_import.account_statement
++    assert_not created_import.pdf_file.attached?
+     assert_redirected_to import_url(created_import)
+     assert_equal I18n.t("imports.create.pdf_processing"), flash[:notice]
+   end
+ 
++  test "guest cannot create statement backed pdf import" do
++    sign_in users(:intro_user)
++
++    assert_no_difference [ "AccountStatement.count", "Import.where(type: 'PdfImport').count" ] do
++      assert_no_enqueued_jobs only: ProcessPdfJob do
++        post imports_url, params: {
++          import: {
++            import_file: file_fixture_upload("imports/sample_bank_statement.pdf", "application/pdf")
++          }
++        }
++      end
++    end
++
++    assert_redirected_to new_import_url
++    assert_equal I18n.t("accounts.not_authorized"), flash[:alert]
++  end
++
++  test "duplicate pdf import reuses account statement" do
++    statement = AccountStatement.create_from_upload!(
++      family: @user.family,
++      account: nil,
++      file: uploaded_file(
++        filename: "existing_statement.pdf",
++        content_type: "application/pdf",
++        content: file_fixture("imports/sample_bank_statement.pdf").binread
++      )
++    )
++
++    assert_no_difference "AccountStatement.count" do
++      assert_difference "Import.where(type: 'PdfImport').count", 1 do
++        post imports_url, params: {
++          import: {
++            import_file: file_fixture_upload("imports/sample_bank_statement.pdf", "application/pdf")
++          }
++        }
++      end
++    end
++
++    created_import = PdfImport.order(:created_at).last
++    assert_equal statement, created_import.account_statement
++    assert_redirected_to import_url(created_import)
++  end
++
++  test "duplicate pdf import does not enqueue processing twice for reused import" do
++    assert_difference "AccountStatement.count", 1 do
++      assert_difference "Import.where(type: 'PdfImport').count", 1 do
++        assert_enqueued_jobs 1, only: ProcessPdfJob do
++          post imports_url, params: {
++            import: {
++              import_file: file_fixture_upload("imports/sample_bank_statement.pdf", "application/pdf")
++            }
++          }
++
++          post imports_url, params: {
++            import: {
++              import_file: file_fixture_upload("imports/sample_bank_statement.pdf", "application/pdf")
++            }
++          }
++        end
++      end
++    end
++
++    created_import = PdfImport.order(:created_at).last
++    assert_equal "importing", created_import.status
++    assert_redirected_to import_url(created_import)
++  end
++
++  test "duplicate pdf import for inaccessible statement does not create import" do
++    AccountStatement.create_from_upload!(
++      family: @user.family,
++      account: accounts(:investment),
++      file: uploaded_file(
++        filename: "existing_statement.pdf",
++        content_type: "application/pdf",
++        content: file_fixture("imports/sample_bank_statement.pdf").binread
++      )
++    )
++
++    sign_in users(:family_member)
++
++    assert_no_difference [ "AccountStatement.count", "Import.where(type: 'PdfImport').count" ] do
++      post imports_url, params: {
++        import: {
++          import_file: file_fixture_upload("imports/sample_bank_statement.pdf", "application/pdf")
++        }
++      }
++    end
++
++    assert_redirected_to new_import_url
++    assert_equal I18n.t("imports.create.duplicate_pdf_unavailable"), flash[:alert]
++  end
++
++  test "read only shared user cannot reuse duplicate statement backed pdf import" do
++    AccountStatement.create_from_upload!(
++      family: @user.family,
++      account: accounts(:credit_card),
++      file: uploaded_file(
++        filename: "existing_statement.pdf",
++        content_type: "application/pdf",
++        content: file_fixture("imports/sample_bank_statement.pdf").binread
++      )
++    )
++
++    sign_in users(:family_member)
++
++    assert_no_difference [ "AccountStatement.count", "Import.where(type: 'PdfImport').count" ] do
++      assert_no_enqueued_jobs only: ProcessPdfJob do
++        post imports_url, params: {
++          import: {
++            import_file: file_fixture_upload("imports/sample_bank_statement.pdf", "application/pdf")
++          }
++        }
++      end
++    end
++
++    assert_redirected_to new_import_url
++    assert_equal I18n.t("imports.create.duplicate_pdf_unavailable"), flash[:alert]
++  end
++
++  test "setting statement backed pdf import account links source statement" do
++    statement = AccountStatement.create_from_upload!(
++      family: @user.family,
++      account: nil,
++      file: uploaded_file(
++        filename: "statement.pdf",
++        content_type: "application/pdf",
++        content: file_fixture("imports/sample_bank_statement.pdf").binread
++      )
++    )
++    pdf_import = PdfImport.create_from_statement!(statement: statement)
++    account = accounts(:depository)
++
++    patch import_url(pdf_import), params: { import: { account_id: account.id } }
++
++    assert_redirected_to import_url(pdf_import)
++    assert_equal I18n.t("imports.update.account_saved", default: "Account saved."), flash[:notice]
++    assert_equal account, pdf_import.reload.account
++    assert_equal account, statement.reload.account
++  end
++
++  test "read only shared user cannot link source statement through pdf import account update" do
++    account = accounts(:credit_card)
++    statement = AccountStatement.create_from_upload!(
++      family: @user.family,
++      account: nil,
++      file: uploaded_file(
++        filename: "statement.pdf",
++        content_type: "application/pdf",
++        content: file_fixture("imports/sample_bank_statement.pdf").binread
++      )
++    )
++    pdf_import = PdfImport.create_from_statement!(statement: statement)
++
++    sign_in users(:family_member)
++    patch import_url(pdf_import), params: { import: { account_id: account.id } }
++
++    assert_redirected_to account_url(account)
++    assert_equal I18n.t("accounts.not_authorized"), flash[:alert]
++    assert_nil pdf_import.reload.account
++    assert_nil statement.reload.account
++  end
++
++  test "user cannot view statement backed pdf import for inaccessible statement" do
++    statement = AccountStatement.create_from_upload!(
++      family: @user.family,
++      account: accounts(:investment),
++      file: uploaded_file(
++        filename: "statement.pdf",
++        content_type: "application/pdf",
++        content: file_fixture("imports/sample_bank_statement.pdf").binread
++      )
++    )
++    pdf_import = PdfImport.create_from_statement!(statement: statement)
++
++    sign_in users(:family_member)
++    get import_url(pdf_import)
++
++    assert_response :not_found
++  end
++
++  test "read only shared user cannot publish statement backed pdf import" do
++    account = accounts(:credit_card)
++    statement = AccountStatement.create_from_upload!(
++      family: @user.family,
++      account: account,
++      file: uploaded_file(
++        filename: "statement.pdf",
++        content_type: "application/pdf",
++        content: file_fixture("imports/sample_bank_statement.pdf").binread
++      )
++    )
++    pdf_import = PdfImport.create_from_statement!(statement: statement)
++    PdfImport.any_instance.expects(:publish_later).never
++
++    sign_in users(:family_member)
++    post publish_import_url(pdf_import)
++
++    assert_redirected_to account_url(account)
++    assert_equal I18n.t("accounts.not_authorized"), flash[:alert]
++  end
++
+   test "rejects unsupported document type for DocumentImport option" do
+     adapter = mock("vector_store_adapter")
+     adapter.stubs(:supported_extensions).returns(%w[.pdf .txt])
+diff --git a/test/jobs/process_pdf_job_test.rb b/test/jobs/process_pdf_job_test.rb
+index 29d4a49776..1d9540dccd 100644
+--- a/test/jobs/process_pdf_job_test.rb
++++ b/test/jobs/process_pdf_job_test.rb
+@@ -18,12 +18,22 @@ class ProcessPdfJobTest < ActiveJob::TestCase
+ 
+   test "skips if PDF not uploaded" do
+     assert_not @import.pdf_uploaded?
++    @import.update_columns(status: "importing", updated_at: 31.minutes.ago)
+ 
+     ProcessPdfJob.perform_now(@import)
+ 
+     assert_equal "pending", @import.reload.status
+   end
+ 
++  test "skips if PDF not uploaded without releasing fresh processing claim" do
++    assert_not @import.pdf_uploaded?
++    @import.update!(status: :importing)
++
++    ProcessPdfJob.perform_now(@import)
++
++    assert_equal "importing", @import.reload.status
++  end
++
+   test "skips if already processed" do
+     processed_import = imports(:pdf_processed)
+ 
+@@ -33,6 +43,29 @@ class ProcessPdfJobTest < ActiveJob::TestCase
+     assert_equal "complete", processed_import.reload.status
+   end
+ 
++  test "skips already processed importing import and releases processing claim" do
++    processed_import = imports(:pdf_processed)
++    attach_pdf!(processed_import)
++    processed_import.update!(document_type: "financial_document")
++    processed_import.update_columns(status: "importing", updated_at: 31.minutes.ago)
++    processed_import.expects(:process_with_ai).never
++
++    ProcessPdfJob.perform_now(processed_import)
++
++    assert_equal "pending", processed_import.reload.status
++  end
++
++  test "skips already processed importing import without releasing fresh processing claim" do
++    processed_import = imports(:pdf_processed)
++    attach_pdf!(processed_import)
++    processed_import.update!(status: :importing, document_type: "financial_document")
++    processed_import.expects(:process_with_ai).never
++
++    ProcessPdfJob.perform_now(processed_import)
++
++    assert_equal "importing", processed_import.reload.status
++  end
++
+   test "uploads non-bank PDF to vector store with classified type metadata" do
+     pdf_content = attach_pdf!(@import)
+     process_result = Struct.new(:document_type).new("financial_document")
+diff --git a/test/models/pdf_import_test.rb b/test/models/pdf_import_test.rb
+index e6d89bfe2f..df4ebdc91b 100644
+--- a/test/models/pdf_import_test.rb
++++ b/test/models/pdf_import_test.rb
+@@ -13,6 +13,16 @@ class PdfImportTest < ActiveSupport::TestCase
+     assert_not @import.pdf_uploaded?
+   end
+ 
++  test "pdf_uploaded? returns true for statement backed import" do
++    statement = create_pdf_statement
++    import = PdfImport.create_from_statement!(statement: statement)
++
++    assert import.pdf_uploaded?
++    assert import.statement_backed?
++    assert_equal statement.original_file.download, import.pdf_file_content
++    assert_equal statement.filename, import.pdf_filename
++  end
++
+   test "ai_processed? returns false when no summary present" do
+     assert_not @import.ai_processed?
+   end
+@@ -77,9 +87,40 @@ class PdfImportTest < ActiveSupport::TestCase
+   end
+ 
+   test "process_with_ai_later enqueues ProcessPdfJob" do
+-    assert_enqueued_with job: ProcessPdfJob, args: [ @import ] do
+-      @import.process_with_ai_later
++    import = PdfImport.create_from_statement!(statement: create_pdf_statement)
++
++    assert_enqueued_with job: ProcessPdfJob, args: [ import ] do
++      assert import.process_with_ai_later
+     end
++
++    assert_equal "importing", import.reload.status
++  end
++
++  test "process_with_ai_later does not enqueue duplicate jobs while importing" do
++    import = PdfImport.create_from_statement!(statement: create_pdf_statement)
++
++    assert_enqueued_jobs 1, only: ProcessPdfJob do
++      assert import.process_with_ai_later
++      assert_not import.reload.process_with_ai_later
++    end
++
++    assert_equal "importing", import.reload.status
++  end
++
++  test "process_with_ai_later does not claim import without pdf content" do
++    assert_no_enqueued_jobs only: ProcessPdfJob do
++      assert_not @import.process_with_ai_later
++    end
++
++    assert_equal "pending", @import.reload.status
++  end
++
++  test "process_with_ai_later resets pending when enqueue fails" do
++    import = PdfImport.create_from_statement!(statement: create_pdf_statement)
++    ProcessPdfJob.stubs(:perform_later).raises(StandardError, "queue offline")
++
++    assert_not import.process_with_ai_later
++    assert_equal "pending", import.reload.status
+   end
+ 
+   test "generate_rows_from_extracted_data creates import rows" do
+@@ -163,4 +204,111 @@ class PdfImportTest < ActiveSupport::TestCase
+ 
+     assert_not ActiveStorage::Attachment.exists?(attachment_id)
+   end
++
++  test "destroying statement backed import keeps statement file" do
++    statement = create_pdf_statement
++    import = PdfImport.create_from_statement!(statement: statement)
++    attachment_id = statement.original_file.id
++
++    perform_enqueued_jobs do
++      import.destroy!
++    end
++
++    assert ActiveStorage::Attachment.exists?(attachment_id)
++  end
++
++  test "statement backed import prevents source statement destroy" do
++    statement = create_pdf_statement
++    import = PdfImport.create_from_statement!(statement: statement)
++
++    assert_no_difference "AccountStatement.count" do
++      assert_not statement.destroy
++    end
++
++    assert_equal statement, import.reload.account_statement
++  end
++
++  test "statement backed import memoizes pdf content" do
++    statement = create_pdf_statement
++    import = PdfImport.create_from_statement!(statement: statement)
++    statement.original_file.expects(:download).once.returns("%PDF-test")
++
++    assert_equal "%PDF-test", import.pdf_file_content
++    assert_equal "%PDF-test", import.pdf_file_content
++  end
++
++  test "statement backed import reuse requires current account and date format" do
++    statement = create_pdf_statement
++    stale_import = PdfImport.create_from_statement!(statement: statement)
++    formats = Family::DATE_FORMATS.map(&:last)
++    alternate_date_format = (formats - [ statement.family.date_format ]).first || "#{statement.family.date_format}-alternate"
++    stale_import.update!(account: nil, date_format: alternate_date_format)
++
++    fresh_import = PdfImport.create_from_statement!(statement: statement)
++
++    assert_not_equal stale_import, fresh_import
++    assert_equal statement.account, fresh_import.account
++    assert_equal statement.family.date_format, fresh_import.date_format
++  end
++
++  test "statement backed import reuses matching reusable import" do
++    statement = create_pdf_statement
++    existing_import = PdfImport.create_from_statement!(statement: statement)
++
++    assert_equal existing_import, PdfImport.create_from_statement!(statement: statement)
++  end
++
++  test "assigning account links statement backed import statement" do
++    statement = create_pdf_statement(account: nil)
++    import = PdfImport.create_from_statement!(statement: statement)
++    account = accounts(:depository)
++
++    import.assign_account!(account)
++
++    assert_equal account, import.reload.account
++    assert_equal account, statement.reload.account
++    assert statement.linked?
++  end
++
++  test "statement backed import requires pdf statement" do
++    csv_statement = AccountStatement.create_from_upload!(
++      family: @import.family,
++      account: nil,
++      file: uploaded_file(filename: "statement.csv", content_type: "text/csv", content: "date,amount\n2024-01-01,1\n")
++    )
++    import = PdfImport.new(family: @import.family, account_statement: csv_statement)
++
++    assert_not import.valid?
++    assert import.errors[:account_statement].present?
++  end
++
++  test "statement backed import requires statement from same family" do
++    statement = AccountStatement.create_from_upload!(
++      family: families(:empty),
++      account: nil,
++      file: uploaded_file(
++        filename: "other_family_statement.pdf",
++        content_type: "application/pdf",
++        content: file_fixture("imports/sample_bank_statement.pdf").binread
++      )
++    )
++    import = PdfImport.new(family: @import.family, account_statement: statement)
++
++    assert_not import.valid?
++    assert import.errors[:account_statement].present?
++  end
++
++  private
++
++    def create_pdf_statement(account: accounts(:depository))
++      AccountStatement.create_from_upload!(
++        family: @import.family,
++        account: account,
++        file: uploaded_file(
++          filename: "sample_bank_statement.pdf",
++          content_type: "application/pdf",
++          content: file_fixture("imports/sample_bank_statement.pdf").binread
++        )
++      )
++    end
+ end

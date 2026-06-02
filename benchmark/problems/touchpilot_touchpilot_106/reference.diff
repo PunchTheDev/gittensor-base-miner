@@ -1,0 +1,444 @@
+diff --git a/app/src/main/java/dev/touchpilot/app/MainActivity.kt b/app/src/main/java/dev/touchpilot/app/MainActivity.kt
+index 340afdf..53000f8 100644
+--- a/app/src/main/java/dev/touchpilot/app/MainActivity.kt
++++ b/app/src/main/java/dev/touchpilot/app/MainActivity.kt
+@@ -745,6 +745,11 @@ class MainActivity : Activity() {
+                 }
+             }.apply { id = R.id.focus_input_button }
+         )
++        contentRoot.addView(
++            secondaryButton("Clear Focused Field") {
++                executeAndRender("clear_text", emptyMap())
++            }.apply { id = R.id.clear_text_button }
++        )
+ 
+         val actionRow = LinearLayout(this).apply { orientation = LinearLayout.HORIZONTAL }
+         actionRow.addView(
+diff --git a/app/src/main/java/dev/touchpilot/app/androidcontrol/AccessibilityBridge.kt b/app/src/main/java/dev/touchpilot/app/androidcontrol/AccessibilityBridge.kt
+index d9c499d..c3161fc 100644
+--- a/app/src/main/java/dev/touchpilot/app/androidcontrol/AccessibilityBridge.kt
++++ b/app/src/main/java/dev/touchpilot/app/androidcontrol/AccessibilityBridge.kt
+@@ -91,4 +91,13 @@ object AccessibilityBridge {
+         return service?.focusInput(text, nodeId, bounds, viewId)
+             ?: FocusResult(false, "TouchPilot Control is not enabled.")
+     }
++
++    fun clearFocusedField(): Boolean {
++        return service?.clearFocusedField() ?: false
++    }
++
++    fun clearNode(nodeId: String): Boolean {
++        if (nodeId.isBlank()) return false
++        return service?.clearNode(nodeId) ?: false
++    }
+ }
+diff --git a/app/src/main/java/dev/touchpilot/app/androidcontrol/TouchPilotAccessibilityService.kt b/app/src/main/java/dev/touchpilot/app/androidcontrol/TouchPilotAccessibilityService.kt
+index de7a050..c1a36aa 100644
+--- a/app/src/main/java/dev/touchpilot/app/androidcontrol/TouchPilotAccessibilityService.kt
++++ b/app/src/main/java/dev/touchpilot/app/androidcontrol/TouchPilotAccessibilityService.kt
+@@ -133,6 +133,23 @@ class TouchPilotAccessibilityService : AccessibilityService() {
+         return setNodeText(node, text)
+     }
+ 
++    fun clearFocusedField(): Boolean {
++        val root = rootInActiveWindow ?: return false
++        val focused = root.findFocus(AccessibilityNodeInfo.FOCUS_INPUT)
++            ?: findNode(root) { it.isFocused }
++            ?: return false
++        if (!focused.isEnabled || !focused.isEditableTarget()) return false
++        return setNodeText(focused, "")
++    }
++
++    fun clearNode(nodeId: String): Boolean {
++        val root = rootInActiveWindow ?: return false
++        val node = findNodeById(root, nodeId) ?: return false
++        if (!node.isEnabled || !node.isEditableTarget()) return false
++        node.performAction(AccessibilityNodeInfo.ACTION_FOCUS)
++        return setNodeText(node, "")
++    }
++
+     fun focusInput(text: String, nodeId: String, bounds: String, viewId: String): FocusResult {
+         val root = rootInActiveWindow ?: return FocusResult(false, "No active window is available.")
+ 
+diff --git a/app/src/main/java/dev/touchpilot/app/tools/AndroidToolExecutor.kt b/app/src/main/java/dev/touchpilot/app/tools/AndroidToolExecutor.kt
+index 1ffe08b..1a60e0d 100644
+--- a/app/src/main/java/dev/touchpilot/app/tools/AndroidToolExecutor.kt
++++ b/app/src/main/java/dev/touchpilot/app/tools/AndroidToolExecutor.kt
+@@ -10,6 +10,7 @@ import dev.touchpilot.app.security.PolicyDecision
+ import dev.touchpilot.app.security.SensitiveTextRedactor
+ import dev.touchpilot.app.security.ToolPolicyRequest
+ import dev.touchpilot.app.security.ToolSource
++import dev.touchpilot.app.tools.targets.ClearTextTarget
+ import dev.touchpilot.app.tools.targets.ScrollResolution
+ import dev.touchpilot.app.tools.targets.ScrollResolver
+ import dev.touchpilot.app.tools.targets.ScrollTarget
+@@ -205,6 +206,9 @@ class AndroidToolExecutor(
+                     data = foregroundAppData(info)
+                 )
+             }
++            "clear_text" -> {
++                executeClearText(args)
++            }
+             else -> {
+                 record(name, args.toString(), false, "unhandled tool")
+                 ToolResult(false, "Unhandled tool: $name")
+@@ -418,6 +422,78 @@ class AndroidToolExecutor(
+         }
+     }
+ 
++    private fun executeClearText(args: Map<String, String>): ToolResult {
++        if (!ClearTextTarget.hasTarget(args)) {
++            val ok = AccessibilityBridge.clearFocusedField()
++            record("clear_text", "target=focused", ok, if (ok) "clearFocusedField" else "No editable focused input is available")
++            return ToolResult(ok, if (ok) "clearFocusedField" else "No editable focused input is available")
++        }
++
++        val selector = ClearTextTarget.selectorFromArgs(args)
++        val resolution = targetResolver.resolve(
++            context = AccessibilityBridge.observeScreenContext(),
++            selector = selector
++        )
++
++        return when (resolution) {
++            is TargetResolutionResult.Resolved -> {
++                val node = resolution.candidate.node
++                val nodeId = node.nodeId
++                if (nodeId.isNullOrBlank() || !node.isInputField) {
++                    val message = "Resolved target is not an editable input"
++                    record("clear_text", clearTextLogArgs(resolution.candidate.selector), false, message)
++                    ToolResult(
++                        ok = false,
++                        message = message,
++                        data = mapOf(
++                            "target" to resolution.candidate.selector.toRedactedJson(),
++                            "confidence" to resolution.candidate.confidence.toString(),
++                        )
++                    )
++                } else {
++                    val ok = AccessibilityBridge.clearNode(nodeId)
++                    val message = if (ok) "clearResolvedInput" else "Unable to focus or clear resolved input"
++                    record("clear_text", clearTextLogArgs(resolution.candidate.selector), ok, message)
++                    ToolResult(
++                        ok = ok,
++                        message = message,
++                        data = mapOf(
++                            "node_id" to nodeId,
++                            "confidence" to resolution.candidate.confidence.toString(),
++                        )
++                    )
++                }
++            }
++            is TargetResolutionResult.Ambiguous -> {
++                val message = "Ambiguous input target: ${resolution.reason}"
++                record("clear_text", "target=ambiguous", false, message)
++                ToolResult(
++                    ok = false,
++                    message = message,
++                    data = mapOf("candidate_count" to resolution.candidates.size.toString())
++                )
++            }
++            is TargetResolutionResult.NotFound -> {
++                val message = "Input target not found: ${resolution.reason}"
++                record("clear_text", "target=not_found", false, message)
++                ToolResult(
++                    ok = false,
++                    message = message,
++                    data = mapOf("debug_context" to resolution.debugContext)
++                )
++            }
++        }
++    }
++
++    private fun clearTextLogArgs(selector: TargetSelector): String {
++        val label = selector.text?.displaySafe
++            ?: selector.contentDescription?.displaySafe
++            ?: selector.nodeId?.let { "node_id=$it" }
++            ?: selector.viewIdResourceName?.let { "view_id=$it" }
++            ?: selector.bounds?.let { "bounds=${it.toBoundsArg()}" }
++            ?: "resolved"
++        return "target=\"$label\""
++    }
+     private fun typeTextLogArgs(text: String, selector: TargetSelector): String {
+         val label = selector.text?.displaySafe
+             ?: selector.contentDescription?.displaySafe
+diff --git a/app/src/main/java/dev/touchpilot/app/tools/ToolModels.kt b/app/src/main/java/dev/touchpilot/app/tools/ToolModels.kt
+index 543c5cf..27015ea 100644
+--- a/app/src/main/java/dev/touchpilot/app/tools/ToolModels.kt
++++ b/app/src/main/java/dev/touchpilot/app/tools/ToolModels.kt
+@@ -1,5 +1,6 @@
+ package dev.touchpilot.app.tools
+ 
++import dev.touchpilot.app.tools.targets.ClearTextTarget
+ import dev.touchpilot.app.tools.targets.ScrollTarget
+ import dev.touchpilot.app.tools.targets.TypeTextTarget
+ 
+@@ -116,6 +117,19 @@ object AndroidToolCatalog {
+             description = "Return the foreground app's package, label, window title, and activity for post-action verification.",
+             risk = ToolRisk.LOW,
+             arguments = emptyMap()
++        ),
++        ToolSpec(
++            name = "clear_text",
++            description = "Clear the focused or resolved editable input field.",
++            risk = ToolRisk.MEDIUM,
++            arguments = mapOf(
++                ClearTextTarget.TargetTextArg to "Visible input label to focus and clear.",
++                ClearTextTarget.TargetNodeIdArg to "Stable input node_id from observe_screen.",
++                ClearTextTarget.TargetBoundsArg to "Input bounds from observe_screen as left,top,right,bottom.",
++                ClearTextTarget.TargetViewIdArg to "Input viewIdResourceName from observe_screen.",
++                ClearTextTarget.TargetContentDescriptionArg to "Input content description to focus and clear.",
++            ),
++            requiredArguments = emptySet()
+         )
+     )
+ 
+@@ -165,6 +179,20 @@ object AndroidToolCatalog {
+             }
+         }
+ 
++        if (name == "clear_text") {
++            val selectors = ClearTextTarget.selectorArgs.filter { args[it].isNullOrBlank().not() }
++            if (selectors.size > 1) {
++                return "clear_text requires at most one selector: target_text, target_node_id, target_bounds, target_view_id, or target_content_description"
++            }
++            val malformedBounds = args[ClearTextTarget.TargetBoundsArg]
++                ?.takeIf { it.isNotBlank() }
++                ?.let { dev.touchpilot.app.tools.targets.TargetBounds.parse(it) == null }
++                ?: false
++            if (malformedBounds) {
++                return "target_bounds must be left,top,right,bottom"
++            }
++        }
++
+         if (name == "scroll") {
+             val direction = args["direction"].orEmpty()
+             if (!direction.equals("forward", ignoreCase = true) &&
+diff --git a/app/src/main/java/dev/touchpilot/app/tools/ToolVerification.kt b/app/src/main/java/dev/touchpilot/app/tools/ToolVerification.kt
+index b5f4bc2..8572a71 100644
+--- a/app/src/main/java/dev/touchpilot/app/tools/ToolVerification.kt
++++ b/app/src/main/java/dev/touchpilot/app/tools/ToolVerification.kt
+@@ -34,6 +34,7 @@ class ToolVerifier {
+                     "package_name" to (result.data["package_name"] ?: ""),
+                 )
+             )
++            "clear_text" -> verifyClearText(after)
+             else -> ToolVerificationResult.Skipped("no verifier for $toolName")
+         }
+     }
+@@ -180,6 +181,22 @@ class ToolVerifier {
+         }
+     }
+ 
++    private fun verifyClearText(after: ScreenContext): ToolVerificationResult {
++        val focused = after.nodes.firstOrNull { it.focused && it.isInputField }
++            ?: return ToolVerificationResult.Skipped("no focused input field in snapshot after clear")
++        return if (focused.text.raw.isEmpty()) {
++            ToolVerificationResult.Passed(
++                reason = "focused input field is empty after clear",
++                data = mapOf("node_id" to focused.nodeId.orEmpty())
++            )
++        } else {
++            ToolVerificationResult.Failed(
++                reason = "focused input field still contains text after clear",
++                data = mapOf("node_id" to focused.nodeId.orEmpty())
++            )
++        }
++    }
++
+     private fun sameSnapshot(a: ScreenContext, b: ScreenContext): Boolean {
+         if (a.nodes.size != b.nodes.size) return false
+         return a.toRedactedJson() == b.toRedactedJson()
+diff --git a/app/src/main/java/dev/touchpilot/app/tools/targets/ClearTextTarget.kt b/app/src/main/java/dev/touchpilot/app/tools/targets/ClearTextTarget.kt
+new file mode 100644
+index 0000000..0de31aa
+--- /dev/null
++++ b/app/src/main/java/dev/touchpilot/app/tools/targets/ClearTextTarget.kt
+@@ -0,0 +1,35 @@
++package dev.touchpilot.app.tools.targets
++
++object ClearTextTarget {
++    const val TargetTextArg = "target_text"
++    const val TargetNodeIdArg = "target_node_id"
++    const val TargetBoundsArg = "target_bounds"
++    const val TargetViewIdArg = "target_view_id"
++    const val TargetContentDescriptionArg = "target_content_description"
++
++    val selectorArgs = listOf(
++        TargetTextArg,
++        TargetNodeIdArg,
++        TargetBoundsArg,
++        TargetViewIdArg,
++        TargetContentDescriptionArg,
++    )
++
++    fun hasTarget(args: Map<String, String>): Boolean {
++        return selectorArgs.any { !args[it].isNullOrBlank() }
++    }
++
++    fun selectorFromArgs(args: Map<String, String>): TargetSelector {
++        return TargetSelector(
++            text = args[TargetTextArg]?.takeIf { it.isNotBlank() }?.let { SelectorText.of(it) },
++            contentDescription = args[TargetContentDescriptionArg]
++                ?.takeIf { it.isNotBlank() }
++                ?.let { SelectorText.of(it) },
++            nodeId = args[TargetNodeIdArg]?.takeIf { it.isNotBlank() },
++            bounds = args[TargetBoundsArg]?.takeIf { it.isNotBlank() }?.let { TargetBounds.parse(it) },
++            viewIdResourceName = args[TargetViewIdArg]?.takeIf { it.isNotBlank() },
++            role = TargetRole.INPUT,
++            source = SelectorSource.AGENT,
++        )
++    }
++}
+diff --git a/app/src/main/res/values/ids.xml b/app/src/main/res/values/ids.xml
+index c8e573e..0fad3f9 100644
+--- a/app/src/main/res/values/ids.xml
++++ b/app/src/main/res/values/ids.xml
+@@ -18,6 +18,7 @@
+     <item name="wait_for_text_button" type="id" />
+     <item name="focus_input_input" type="id" />
+     <item name="focus_input_button" type="id" />
++    <item name="clear_text_button" type="id" />
+     <item name="agent_provider_url_input" type="id" />
+     <item name="agent_model_input" type="id" />
+     <item name="agent_api_key_input" type="id" />
+diff --git a/app/src/test/java/dev/touchpilot/app/tools/ClearTextTest.kt b/app/src/test/java/dev/touchpilot/app/tools/ClearTextTest.kt
+new file mode 100644
+index 0000000..10a4c0f
+--- /dev/null
++++ b/app/src/test/java/dev/touchpilot/app/tools/ClearTextTest.kt
+@@ -0,0 +1,116 @@
++package dev.touchpilot.app.tools
++
++import dev.touchpilot.app.tools.targets.ClearTextTarget
++import kotlin.test.Test
++import kotlin.test.assertContains
++import kotlin.test.assertNotNull
++import kotlin.test.assertNull
++import kotlin.test.assertTrue
++
++class ClearTextTest {
++
++    @Test
++    fun catalogContainsClearText() {
++        assertNotNull(AndroidToolCatalog.find("clear_text"))
++    }
++
++    @Test
++    fun clearTextSpecHasAllSelectorArgs() {
++        val spec = AndroidToolCatalog.find("clear_text")!!
++        assertTrue(spec.arguments.containsKey(ClearTextTarget.TargetTextArg))
++        assertTrue(spec.arguments.containsKey(ClearTextTarget.TargetNodeIdArg))
++        assertTrue(spec.arguments.containsKey(ClearTextTarget.TargetBoundsArg))
++        assertTrue(spec.arguments.containsKey(ClearTextTarget.TargetViewIdArg))
++        assertTrue(spec.arguments.containsKey(ClearTextTarget.TargetContentDescriptionArg))
++    }
++
++    @Test
++    fun clearTextRiskIsMedium() {
++        val spec = AndroidToolCatalog.find("clear_text")!!
++        assertTrue(spec.risk == ToolRisk.MEDIUM)
++    }
++
++    @Test
++    fun validationAcceptsFocusedMode() {
++        assertNull(AndroidToolCatalog.validate("clear_text", emptyMap()))
++    }
++
++    @Test
++    fun validationAcceptsTargetTextSelector() {
++        assertNull(AndroidToolCatalog.validate("clear_text", mapOf(ClearTextTarget.TargetTextArg to "Search")))
++    }
++
++    @Test
++    fun validationAcceptsTargetNodeIdSelector() {
++        assertNull(AndroidToolCatalog.validate("clear_text", mapOf(ClearTextTarget.TargetNodeIdArg to "0.1.2")))
++    }
++
++    @Test
++    fun validationAcceptsTargetBoundsSelector() {
++        assertNull(AndroidToolCatalog.validate("clear_text", mapOf(ClearTextTarget.TargetBoundsArg to "0,0,100,50")))
++    }
++
++    @Test
++    fun validationAcceptsTargetViewIdSelector() {
++        assertNull(AndroidToolCatalog.validate("clear_text", mapOf(ClearTextTarget.TargetViewIdArg to "com.example:id/search")))
++    }
++
++    @Test
++    fun validationAcceptsTargetContentDescriptionSelector() {
++        assertNull(AndroidToolCatalog.validate("clear_text", mapOf(ClearTextTarget.TargetContentDescriptionArg to "Search field")))
++    }
++
++    @Test
++    fun validationRejectsMultipleSelectors() {
++        val error = AndroidToolCatalog.validate(
++            "clear_text",
++            mapOf(
++                ClearTextTarget.TargetTextArg to "Search",
++                ClearTextTarget.TargetNodeIdArg to "0.1",
++            )
++        )
++        assertNotNull(error)
++        assertContains(error, "at most one selector")
++    }
++
++    @Test
++    fun validationRejectsAllSelectorsCombined() {
++        val error = AndroidToolCatalog.validate(
++            "clear_text",
++            mapOf(
++                ClearTextTarget.TargetTextArg to "a",
++                ClearTextTarget.TargetNodeIdArg to "0.1",
++                ClearTextTarget.TargetBoundsArg to "0,0,1,1",
++                ClearTextTarget.TargetViewIdArg to "com.ex:id/f",
++                ClearTextTarget.TargetContentDescriptionArg to "field",
++            )
++        )
++        assertNotNull(error)
++        assertContains(error, "at most one selector")
++    }
++
++    @Test
++    fun validationRejectsMalformedBounds() {
++        val error = AndroidToolCatalog.validate(
++            "clear_text",
++            mapOf(ClearTextTarget.TargetBoundsArg to "bad,bounds")
++        )
++        assertNotNull(error)
++        assertContains(error, "target_bounds must be left,top,right,bottom")
++    }
++
++    @Test
++    fun validationRejectsUnknownArgs() {
++        val error = AndroidToolCatalog.validate("clear_text", mapOf("unknown" to "foo"))
++        assertNotNull(error)
++        assertContains(error, "Unknown argument")
++    }
++
++    @Test
++    fun existingToolsUnaffected() {
++        assertNull(AndroidToolCatalog.validate("tap", mapOf("text" to "OK")))
++        assertNull(AndroidToolCatalog.validate("type_text", mapOf("text" to "hello")))
++        assertNull(AndroidToolCatalog.validate("focus_input", mapOf("text" to "Search")))
++        assertNull(AndroidToolCatalog.validate("scroll", mapOf("direction" to "forward")))
++    }
++}
+diff --git a/docs/TOOL_SPEC.md b/docs/TOOL_SPEC.md
+index a680196..c45d940 100644
+--- a/docs/TOOL_SPEC.md
++++ b/docs/TOOL_SPEC.md
+@@ -26,10 +26,12 @@ Tools are the only way an agent may affect the Android device.
+ - `press_back`: send Android back.
+ - `press_home`: return to launcher.
+ - `wait_for_ui`: wait for a screen change or expected text.
++- `focus_input`: focus a visible editable input field without typing.
++- `clear_text`: clear the focused or resolved editable input field.
+ 
+ The app implements `observe_screen`, `open_app`, `tap`, `type_text`, `scroll`,
+-`press_back`, `press_home`, and `wait_for_ui` from the Android Tools screen and
+-the agent command-provider loop.
++`press_back`, `press_home`, `wait_for_ui`, `focus_input`, and `clear_text` from
++the Android Tools screen and the agent command-provider loop.
+ 
+ All command providers return one JSON command at a time:
+ 

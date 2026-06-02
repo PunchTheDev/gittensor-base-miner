@@ -1,0 +1,219 @@
+diff --git a/gittensor/classes.py b/gittensor/classes.py
+index d030f1e0..ac40126d 100644
+--- a/gittensor/classes.py
++++ b/gittensor/classes.py
+@@ -374,6 +374,7 @@ class MinerEvaluation:
+     merged_pull_requests: List[PullRequest] = field(default_factory=list)
+     open_pull_requests: List[PullRequest] = field(default_factory=list)
+     closed_pull_requests: List[PullRequest] = field(default_factory=list)
++    stale_closed_pull_requests: List[PullRequest] = field(default_factory=list)
+ 
+     # Populated by gittensor.validator.oss_contributions.mirror.combine.combine
+     # when the mirror scoring path runs. Empty for legacy-only evaluations.
+@@ -485,6 +486,13 @@ def add_closed_pull_request(self, raw_pr: Dict):
+             PullRequest.from_graphql_response(raw_pr, self.uid, self.hotkey, self.github_id)
+         )
+ 
++    def add_stale_closed_pull_request(self, raw_pr: Dict):
++        """Track a stale CLOSED PR so storage can refresh its pull_requests row."""
++        bt.logging.info(f'Stale CLOSED PR #{raw_pr["number"]} in {parse_repo_name(raw_pr["repository"])}')
++        self.stale_closed_pull_requests.append(
++            PullRequest.from_graphql_response(raw_pr, self.uid, self.hotkey, self.github_id)
++        )
++
+ 
+ @dataclass
+ class ScoreBreakdown:
+diff --git a/gittensor/utils/github_api_tools.py b/gittensor/utils/github_api_tools.py
+index 50cc4b86..f1220afb 100644
+--- a/gittensor/utils/github_api_tools.py
++++ b/gittensor/utils/github_api_tools.py
+@@ -759,9 +759,9 @@ def try_add_open_or_closed_pr(
+         closed_dt = parse_github_iso_to_utc(closed_at)
+         created_dt = parse_github_iso_to_utc(created_at)
+ 
+-        # Ignore stale PRs that were created before the scoring lookback window.
+         # This allows users to close old PRs without receiving a fresh credibility penalty.
+         if created_dt < lookback_date_filter:
++            miner_eval.add_stale_closed_pull_request(pr_raw)
+             return
+ 
+         if closed_dt >= lookback_date_filter:
+diff --git a/gittensor/validator/utils/storage.py b/gittensor/validator/utils/storage.py
+index 26ba38b6..21e2e11c 100644
+--- a/gittensor/validator/utils/storage.py
++++ b/gittensor/validator/utils/storage.py
+@@ -71,6 +71,9 @@ def _adapt_mirror(scored_list):
+             result.stored_counts['closed_pull_requests'] = self.repo.store_pull_requests_bulk(
+                 miner_eval.closed_pull_requests + _adapt_mirror(miner_eval.mirror_closed_prs), commit=False
+             )
++            result.stored_counts['stale_closed_pull_requests'] = self.repo.store_pull_requests_bulk(
++                miner_eval.stale_closed_pull_requests, commit=False
++            )
+             result.stored_counts['issues'] = self.repo.store_issues_bulk(miner_eval.get_all_issues(), commit=False)
+             result.stored_counts['file_changes'] = self.repo.store_file_changes_bulk(
+                 miner_eval.get_all_file_changes(), commit=False
+diff --git a/tests/validator/test_unscored_stale_prs.py b/tests/validator/test_unscored_stale_prs.py
+new file mode 100644
+index 00000000..a72f7a00
+--- /dev/null
++++ b/tests/validator/test_unscored_stale_prs.py
+@@ -0,0 +1,132 @@
++# The MIT License (MIT)
++# Copyright © 2025 Entrius
++
++"""Regression tests for stale-closed PR capture in a storage-only bucket.
++
++Covers the invariant that stale-CLOSED PRs (created before the lookback window):
++- do not enter `closed_pull_requests` (preserves the #406 drop-from-scoring)
++- do enter `stale_closed_pull_requests` so storage can refresh pr_state
++- are not reflected in total counts or scoring buckets
++"""
++
++from datetime import datetime, timedelta, timezone
++from unittest.mock import patch
++
++from gittensor.classes import MinerEvaluation, PRState
++from gittensor.utils.github_api_tools import try_add_open_or_closed_pr
++
++
++def _pr_node(number: int, created_at: str, closed_at: str, state: str = 'CLOSED') -> dict:
++    return {
++        'number': number,
++        'title': f'test PR {number}',
++        'state': state,
++        'repository': {
++            'name': 'gittensor',
++            'owner': {'login': 'entrius'},
++            'defaultBranchRef': {'name': 'test'},
++        },
++        'headRepository': {'name': 'gittensor', 'owner': {'login': 'contributor'}},
++        'author': {'login': 'contributor'},
++        'authorAssociation': 'CONTRIBUTOR',
++        'mergedBy': None,
++        'mergedAt': None,
++        'createdAt': created_at,
++        'closedAt': closed_at,
++        'lastEditedAt': None,
++        'additions': 10,
++        'deletions': 5,
++        'commits': {'totalCount': 1},
++        'baseRefName': 'test',
++        'baseRefOid': 'abc',
++        'headRefName': 'feature',
++        'headRefOid': 'def',
++        'bodyText': '',
++        'closingIssuesReferences': {'nodes': []},
++        'changesRequestedReviews': {'nodes': []},
++        'labels': {'nodes': []},
++        'timelineItems': {'nodes': []},
++    }
++
++
++@patch('gittensor.utils.github_api_tools.bt.logging')
++def test_stale_closed_pr_goes_to_storage_only_bucket(_):
++    miner_eval = MinerEvaluation(uid=74, hotkey='hk', github_id='1', github_pat='fake')
++    now = datetime.now(timezone.utc)
++    lookback = now - timedelta(days=35)
++    stale = (lookback - timedelta(days=10)).strftime('%Y-%m-%dT%H:%M:%SZ')
++    recent_close = (now - timedelta(days=5)).strftime('%Y-%m-%dT%H:%M:%SZ')
++
++    try_add_open_or_closed_pr(miner_eval, _pr_node(1, stale, recent_close), PRState.CLOSED.value, lookback)
++
++    assert len(miner_eval.closed_pull_requests) == 0, 'stale PR must not enter scoring bucket'
++    assert len(miner_eval.stale_closed_pull_requests) == 1, 'stale PR must enter storage-only bucket'
++    assert miner_eval.stale_closed_pull_requests[0].number == 1
++    assert miner_eval.stale_closed_pull_requests[0].pr_state == PRState.CLOSED
++
++
++@patch('gittensor.utils.github_api_tools.bt.logging')
++def test_stale_closed_pr_not_counted_in_totals(_):
++    miner_eval = MinerEvaluation(uid=74, hotkey='hk', github_id='1', github_pat='fake')
++    now = datetime.now(timezone.utc)
++    lookback = now - timedelta(days=35)
++    stale = (lookback - timedelta(days=10)).strftime('%Y-%m-%dT%H:%M:%SZ')
++    close_at = (now - timedelta(days=5)).strftime('%Y-%m-%dT%H:%M:%SZ')
++
++    try_add_open_or_closed_pr(miner_eval, _pr_node(1, stale, close_at), PRState.CLOSED.value, lookback)
++
++    assert miner_eval.total_closed_prs == 0
++    assert miner_eval.total_prs == 0
++    assert miner_eval.total_open_prs == 0
++    assert miner_eval.total_merged_prs == 0
++
++
++@patch('gittensor.utils.github_api_tools.bt.logging')
++def test_fresh_closed_pr_still_goes_to_scored_bucket(_):
++    """Regression: the drop-path must not accidentally capture fresh PRs."""
++    miner_eval = MinerEvaluation(uid=74, hotkey='hk', github_id='1', github_pat='fake')
++    now = datetime.now(timezone.utc)
++    lookback = now - timedelta(days=35)
++    fresh = (now - timedelta(days=10)).strftime('%Y-%m-%dT%H:%M:%SZ')
++    close_at = (now - timedelta(days=5)).strftime('%Y-%m-%dT%H:%M:%SZ')
++
++    try_add_open_or_closed_pr(miner_eval, _pr_node(1, fresh, close_at), PRState.CLOSED.value, lookback)
++
++    assert len(miner_eval.closed_pull_requests) == 1
++    assert len(miner_eval.stale_closed_pull_requests) == 0
++    assert miner_eval.total_closed_prs == 1
++
++
++@patch('gittensor.utils.github_api_tools.bt.logging')
++def test_mixed_fresh_and_stale_closed_prs(_):
++    miner_eval = MinerEvaluation(uid=74, hotkey='hk', github_id='1', github_pat='fake')
++    now = datetime.now(timezone.utc)
++    lookback = now - timedelta(days=35)
++    fresh = (now - timedelta(days=10)).strftime('%Y-%m-%dT%H:%M:%SZ')
++    stale = (lookback - timedelta(days=10)).strftime('%Y-%m-%dT%H:%M:%SZ')
++    close_at = (now - timedelta(days=5)).strftime('%Y-%m-%dT%H:%M:%SZ')
++
++    try_add_open_or_closed_pr(miner_eval, _pr_node(10, fresh, close_at), PRState.CLOSED.value, lookback)
++    try_add_open_or_closed_pr(miner_eval, _pr_node(11, stale, close_at), PRState.CLOSED.value, lookback)
++
++    assert len(miner_eval.closed_pull_requests) == 1
++    assert len(miner_eval.stale_closed_pull_requests) == 1
++    assert miner_eval.total_closed_prs == 1  # storage-only stale PRs do not inflate totals
++
++
++@patch('gittensor.utils.github_api_tools.bt.logging')
++def test_stale_closed_storage_bucket_does_not_inflate_any_totals(_):
++    miner_eval = MinerEvaluation(uid=74, hotkey='hk', github_id='1', github_pat='fake')
++    now = datetime.now(timezone.utc)
++    lookback = now - timedelta(days=35)
++    stale = (lookback - timedelta(days=10)).strftime('%Y-%m-%dT%H:%M:%SZ')
++    close_at = (now - timedelta(days=5)).strftime('%Y-%m-%dT%H:%M:%SZ')
++
++    for i in range(3):
++        try_add_open_or_closed_pr(miner_eval, _pr_node(100 + i, stale, close_at), PRState.CLOSED.value, lookback)
++
++    assert miner_eval.total_merged_prs == 0
++    assert miner_eval.total_open_prs == 0
++    assert miner_eval.total_closed_prs == 0
++    assert miner_eval.total_prs == 0
++    assert len(miner_eval.stale_closed_pull_requests) == 3
+diff --git a/tests/validator/utils/test_storage_mirror.py b/tests/validator/utils/test_storage_mirror.py
+index 34141f0b..f0b15d3b 100644
+--- a/tests/validator/utils/test_storage_mirror.py
++++ b/tests/validator/utils/test_storage_mirror.py
+@@ -165,6 +165,21 @@ def test_no_legacy_prs_passes_mirror_only(self):
+         assert merged_arg[0].number == 100
+         assert isinstance(merged_arg[0], PullRequest)
+ 
++    def test_stale_closed_prs_are_stored_separately(self):
++        storage, mock_repo = _make_storage_with_mock_repo()
++
++        eval_ = MinerEvaluation(uid=1, hotkey='hk', github_id='123')
++        eval_.stale_closed_pull_requests = [_legacy_pr(7, state=PRState.CLOSED)]
++
++        storage.store_evaluation(eval_)
++
++        stale_call = mock_repo.store_pull_requests_bulk.call_args_list[3]
++        stale_arg = stale_call.args[0]
++        assert len(stale_arg) == 1
++        assert stale_arg[0].number == 7
++        assert stale_arg[0].pr_state == PRState.CLOSED
++        assert eval_.total_closed_prs == 0
++
+ 
+ def test_cleanup_stale_called_with_commit_false():
+     """cleanup_stale_miner_data must be called with commit=False inside the transaction.

@@ -1,0 +1,190 @@
+diff --git a/app/controllers/transactions_controller.rb b/app/controllers/transactions_controller.rb
+index 00bc8f0dac..a1441439ae 100644
+--- a/app/controllers/transactions_controller.rb
++++ b/app/controllers/transactions_controller.rb
+@@ -5,7 +5,11 @@ class TransactionsController < ApplicationController
+   before_action :store_params!, only: :index
+ 
+   def new
++    prefill_params_from_duplicate!
+     super
++    apply_duplicate_attributes!
++    @income_categories = Current.family.categories.incomes.alphabetically
++    @expense_categories = Current.family.categories.expenses.alphabetically
+     @categories = Current.family.categories.alphabetically
+   end
+ 
+@@ -306,6 +310,35 @@ def update_preferences
+   end
+ 
+   private
++    def duplicate_source
++      return @duplicate_source if defined?(@duplicate_source)
++      @duplicate_source = if params[:duplicate_entry_id].present?
++        source = Current.family.entries.find_by(id: params[:duplicate_entry_id])
++        source if source&.transaction?
++      end
++    end
++
++    def prefill_params_from_duplicate!
++      return unless duplicate_source
++      params[:nature] ||= duplicate_source.amount.negative? ? "inflow" : "outflow"
++      params[:account_id] ||= duplicate_source.account_id.to_s
++    end
++
++    def apply_duplicate_attributes!
++      return unless duplicate_source
++      @entry.assign_attributes(
++        name: duplicate_source.name,
++        amount: duplicate_source.amount.abs,
++        currency: duplicate_source.currency,
++        notes: duplicate_source.notes
++      )
++      @entry.entryable.assign_attributes(
++        category_id: duplicate_source.entryable.category_id,
++        merchant_id: duplicate_source.entryable.merchant_id
++      )
++      @entry.entryable.tag_ids = duplicate_source.entryable.tag_ids
++    end
++
+     def set_entry_for_unlock
+       transaction = Current.family.transactions.find(params[:id])
+       @entry = transaction.entry
+diff --git a/app/javascript/controllers/bulk_select_controller.js b/app/javascript/controllers/bulk_select_controller.js
+index 0851da7ade..271b6a0f51 100644
+--- a/app/javascript/controllers/bulk_select_controller.js
++++ b/app/javascript/controllers/bulk_select_controller.js
+@@ -8,6 +8,7 @@ export default class extends Controller {
+     "selectionBar",
+     "selectionBarText",
+     "bulkEditDrawerHeader",
++    "duplicateLink",
+   ];
+   static values = {
+     singularLabel: String,
+@@ -135,6 +136,18 @@ export default class extends Controller {
+     this.selectionBarTarget.classList.toggle("hidden", count === 0);
+     this.selectionBarTarget.querySelector("input[type='checkbox']").checked =
+       count > 0;
++
++    if (this.hasDuplicateLinkTarget) {
++      this.duplicateLinkTarget.classList.toggle("hidden", count !== 1);
++      if (count === 1) {
++        const url = new URL(
++          this.duplicateLinkTarget.href,
++          window.location.origin,
++        );
++        url.searchParams.set("duplicate_entry_id", this.selectedIdsValue[0]);
++        this.duplicateLinkTarget.href = url.toString();
++      }
++    }
+   }
+ 
+   _pluralizedResourceName() {
+diff --git a/app/views/transactions/_form.html.erb b/app/views/transactions/_form.html.erb
+index 063fe394bb..2717dd57c4 100644
+--- a/app/views/transactions/_form.html.erb
++++ b/app/views/transactions/_form.html.erb
+@@ -30,6 +30,11 @@
+ 
+   <%= render DS::Disclosure.new(title: t(".details")) do %>
+     <%= f.fields_for :entryable do |ef| %>
++      <%= ef.collection_select :merchant_id,
++                Current.family.available_merchants.alphabetically,
++                :id, :name,
++                { include_blank: t(".none"),
++                  label: t(".merchant_label") } %>
+       <%= ef.select :tag_ids,
+                     Current.family.tags.alphabetically.pluck(:name, :id),
+                     {
+diff --git a/app/views/transactions/_selection_bar.html.erb b/app/views/transactions/_selection_bar.html.erb
+index 062b442ad5..bfec49418c 100644
+--- a/app/views/transactions/_selection_bar.html.erb
++++ b/app/views/transactions/_selection_bar.html.erb
+@@ -7,9 +7,20 @@
+ 
+   <div class="flex items-center gap-1 text-secondary">
+     <%= turbo_frame_tag "bulk_transaction_edit_drawer" %>
++
++    <%= link_to new_transaction_path,
++                class: "p-1.5 group/duplicate hover:bg-inverse flex items-center justify-center rounded-md hidden",
++                title: t("transactions.selection_bar.duplicate"),
++                data: {
++                  turbo_frame: "modal",
++                  bulk_select_target: "duplicateLink"
++                } do %>
++      <%= icon "copy", class: "group-hover/duplicate:text-inverse" %>
++    <% end %>
++
+     <%= link_to new_transactions_bulk_update_path,
+                 class: "p-1.5 group/edit hover:bg-inverse flex items-center justify-center rounded-md",
+-                title: "Edit",
++                title: t("transactions.selection_bar.edit"),
+                 data: { turbo_frame: "bulk_transaction_edit_drawer" } do %>
+       <%= icon "pencil-line", class: "group-hover/edit:text-inverse" %>
+     <% end %>
+diff --git a/config/locales/views/transactions/en.yml b/config/locales/views/transactions/en.yml
+index 02287d644c..3fa19b1da6 100644
+--- a/config/locales/views/transactions/en.yml
++++ b/config/locales/views/transactions/en.yml
+@@ -2,6 +2,9 @@
+ en:
+   transactions:
+     unknown_name: Unknown transaction
++    selection_bar:
++      duplicate: Duplicate
++      edit: Edit
+     form:
+       account: Account
+       account_prompt: Select an Account
+@@ -13,6 +16,7 @@ en:
+       description_placeholder: Describe transaction
+       expense: Expense
+       income: Income
++      merchant_label: Merchant
+       none: (none)
+       note_label: Notes
+       note_placeholder: Enter a note
+diff --git a/test/controllers/transactions_controller_test.rb b/test/controllers/transactions_controller_test.rb
+index 2e3cf5e510..f3faea9416 100644
+--- a/test/controllers/transactions_controller_test.rb
++++ b/test/controllers/transactions_controller_test.rb
+@@ -309,6 +309,38 @@ class TransactionsControllerTest < ActionDispatch::IntegrationTest
+     assert_not entry.protected_from_sync?
+   end
+ 
++  test "new with duplicate_entry_id pre-fills form from source transaction" do
++    @entry.reload
++
++    get new_transaction_url(duplicate_entry_id: @entry.id)
++    assert_response :success
++    assert_select "input[name='entry[name]'][value=?]", @entry.name
++    assert_select "input[type='number'][name='entry[amount]']" do |elements|
++      assert_equal sprintf("%.2f", @entry.amount.abs), elements.first["value"]
++    end
++    assert_select "input[type='hidden'][name='entry[entryable_attributes][merchant_id]']"
++  end
++
++  test "new with invalid duplicate_entry_id renders empty form" do
++    get new_transaction_url(duplicate_entry_id: -1)
++    assert_response :success
++    assert_select "input[name='entry[name]']" do |elements|
++      assert_nil elements.first["value"]
++    end
++  end
++
++  test "new with duplicate_entry_id from another family does not prefill form" do
++    other_family = families(:empty)
++    other_account = other_family.accounts.create!(name: "Other", balance: 0, currency: "USD", accountable: Depository.new)
++    other_entry = create_transaction(account: other_account, name: "Should not leak", amount: 50)
++
++    get new_transaction_url(duplicate_entry_id: other_entry.id)
++    assert_response :success
++    assert_select "input[name='entry[name]']" do |elements|
++      assert_nil elements.first["value"]
++    end
++  end
++
+   test "unlock clears import_locked flag" do
+     family = families(:empty)
+     sign_in users(:empty)

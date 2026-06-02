@@ -1,0 +1,727 @@
+diff --git a/crates/engine/src/game/combat_damage.rs b/crates/engine/src/game/combat_damage.rs
+index 81f6207ed7..bbf79b390a 100644
+--- a/crates/engine/src/game/combat_damage.rs
++++ b/crates/engine/src/game/combat_damage.rs
+@@ -649,8 +649,10 @@ pub(crate) fn apply_combat_damage(
+     assignments: &[(ObjectId, DamageAssignment)],
+ ) -> Vec<GameEvent> {
+     let mut events = Vec::new();
+-    let mut combat_damage_to_players: Vec<(crate::types::player::PlayerId, Vec<ObjectId>)> =
+-        Vec::new();
++    // CR 510.2: accumulates per-player, per-source damage for this step only.
++    // `(player, [(source_id, amount)], step_total)`.
++    type PerPlayerCombatDamage = (crate::types::player::PlayerId, Vec<(ObjectId, u32)>, u32);
++    let mut combat_damage_to_players: Vec<PerPlayerCombatDamage> = Vec::new();
+ 
+     // --- Phase A: Collect proposed damage events (CR 510.2) ---
+     // Gated assignments (0-damage, protection, prohibition) contribute nothing
+@@ -732,17 +734,25 @@ pub(crate) fn apply_combat_damage(
+         // Combat-only bookkeeping (not part of the shared damage pipeline):
+         if let DamageTarget::Player(player_id) = &entry.assignment.target {
+             let source_id = entry.ctx.source_id;
+-            // Track CombatDamageDealtToPlayer source batching
+-            let player_sources = combat_damage_to_players
++            // CR 510.2: Track per-source amounts for this step. Each source
++            // appears at most once per player per step; dedup guards any edge
++            // where the same source is re-applied (e.g. split-damage riders).
++            if let Some((_, sources, total)) = combat_damage_to_players
+                 .iter_mut()
+-                .find(|(damaged_player, _)| *damaged_player == *player_id)
+-                .map(|(_, source_ids)| source_ids);
+-            if let Some(source_ids) = player_sources {
+-                if !source_ids.contains(&source_id) {
+-                    source_ids.push(source_id);
++                .find(|(damaged_player, _, _)| *damaged_player == *player_id)
++            {
++                if let Some((_, amt)) = sources.iter_mut().find(|(id, _)| *id == source_id) {
++                    *amt += actual_amount;
++                } else {
++                    sources.push((source_id, actual_amount));
+                 }
++                *total += actual_amount;
+             } else {
+-                combat_damage_to_players.push((*player_id, vec![source_id]));
++                combat_damage_to_players.push((
++                    *player_id,
++                    vec![(source_id, actual_amount)],
++                    actual_amount,
++                ));
+             }
+ 
+             // CR 704.6c: Track commander combat damage for the 21-damage loss condition.
+@@ -766,10 +776,11 @@ pub(crate) fn apply_combat_damage(
+         }
+     }
+ 
+-    for (player_id, source_ids) in combat_damage_to_players {
++    for (player_id, source_amounts, total_damage) in combat_damage_to_players {
+         events.push(GameEvent::CombatDamageDealtToPlayer {
+             player_id,
+-            source_ids,
++            source_amounts,
++            total_damage,
+         });
+     }
+ 
+@@ -1669,11 +1680,12 @@ mod tests {
+                 event,
+                 GameEvent::CombatDamageDealtToPlayer {
+                     player_id,
+-                    source_ids,
++                    source_amounts,
++                    ..
+                 } if *player_id == PlayerId(1)
+-                    && source_ids.len() == 2
+-                    && source_ids.contains(&attacker_a)
+-                    && source_ids.contains(&attacker_b)
++                    && source_amounts.len() == 2
++                    && source_amounts.iter().any(|(id, _)| *id == attacker_a)
++                    && source_amounts.iter().any(|(id, _)| *id == attacker_b)
+             )
+         }));
+     }
+diff --git a/crates/engine/src/game/effects/ring.rs b/crates/engine/src/game/effects/ring.rs
+index 47dea49329..b42a8d6943 100644
+--- a/crates/engine/src/game/effects/ring.rs
++++ b/crates/engine/src/game/effects/ring.rs
+@@ -374,7 +374,8 @@ mod tests {
+             &mut state,
+             &[GameEvent::CombatDamageDealtToPlayer {
+                 player_id: PlayerId(1),
+-                source_ids: vec![bearer],
++                source_amounts: vec![(bearer, 3)],
++                total_damage: 3,
+             }],
+         );
+ 
+diff --git a/crates/engine/src/game/log.rs b/crates/engine/src/game/log.rs
+index c52737ccaa..87a825e4fb 100644
+--- a/crates/engine/src/game/log.rs
++++ b/crates/engine/src/game/log.rs
+@@ -528,11 +528,12 @@ fn format_segments(event: &GameEvent, state: &GameState) -> Vec<LogSegment> {
+ 
+         GameEvent::CombatDamageDealtToPlayer {
+             player_id,
+-            source_ids,
++            source_amounts,
++            ..
+         } => vec![
+             player_seg(state, *player_id),
+             text(" is dealt combat damage by "),
+-            num(source_ids.len() as i32),
++            num(source_amounts.len() as i32),
+             text(" creature(s)"),
+         ],
+ 
+diff --git a/crates/engine/src/game/targeting.rs b/crates/engine/src/game/targeting.rs
+index ba63c45346..289b725ad2 100644
+--- a/crates/engine/src/game/targeting.rs
++++ b/crates/engine/src/game/targeting.rs
+@@ -878,6 +878,10 @@ pub(crate) fn extract_amount_from_event(event: &crate::types::events::GameEvent)
+         // CR 706.2: the final number of a die roll is its result. Lets
+         // `EventContextAmount` resolve "where X is the result" pump effects.
+         GameEvent::DieRolled { result, .. } => Some(*result as i32),
++        // CR 120.1 + CR 603.7c: total combat damage dealt to this player by the
++        // matching source set. For DamageDoneOnceByController triggers, this is
++        // the filtered total stamped by matching_damage_done_once_by_controller_event.
++        GameEvent::CombatDamageDealtToPlayer { total_damage, .. } => Some(*total_damage as i32),
+         _ => None,
+     }
+ }
+@@ -1414,19 +1418,18 @@ pub(crate) fn latest_tracked_set_id(state: &GameState) -> Option<TrackedSetId> {
+ /// creatures" on the resolving trigger can refer to the filtered source set
+ /// carried by `CombatDamageDealtToPlayer`.
+ pub(crate) fn current_combat_damage_source_filter(state: &GameState) -> Option<TargetFilter> {
+-    let source_ids = match state.current_trigger_event.as_ref()? {
+-        GameEvent::CombatDamageDealtToPlayer { source_ids, .. } => source_ids,
++    let source_amounts = match state.current_trigger_event.as_ref()? {
++        GameEvent::CombatDamageDealtToPlayer { source_amounts, .. } => source_amounts,
+         _ => return None,
+     };
+ 
+-    match source_ids.as_slice() {
++    match source_amounts.as_slice() {
+         [] => None,
+-        [id] => Some(TargetFilter::SpecificObject { id: *id }),
+-        ids => Some(TargetFilter::Or {
+-            filters: ids
++        [(id, _)] => Some(TargetFilter::SpecificObject { id: *id }),
++        pairs => Some(TargetFilter::Or {
++            filters: pairs
+                 .iter()
+-                .copied()
+-                .map(|id| TargetFilter::SpecificObject { id })
++                .map(|(id, _)| TargetFilter::SpecificObject { id: *id })
+                 .collect(),
+         }),
+     }
+@@ -1500,6 +1503,16 @@ mod tests {
+     use crate::types::keywords::ProtectionTarget;
+     use crate::types::zones::Zone;
+ 
++    #[test]
++    fn extract_amount_from_combat_damage_dealt_to_player_returns_total_damage() {
++        let event = GameEvent::CombatDamageDealtToPlayer {
++            player_id: PlayerId(1),
++            source_amounts: vec![(ObjectId(1), 7)],
++            total_damage: 7,
++        };
++        assert_eq!(extract_amount_from_event(&event), Some(7));
++    }
++
+     fn setup_with_creatures() -> (GameState, ObjectId, ObjectId) {
+         let mut state = GameState::new_two_player(42);
+ 
+diff --git a/crates/engine/src/game/trigger_matchers.rs b/crates/engine/src/game/trigger_matchers.rs
+index e53969b9a3..e538a2bb3a 100644
+--- a/crates/engine/src/game/trigger_matchers.rs
++++ b/crates/engine/src/game/trigger_matchers.rs
+@@ -972,7 +972,8 @@ pub(super) fn match_damage_done_once_by_controller(
+ ) -> bool {
+     let GameEvent::CombatDamageDealtToPlayer {
+         player_id,
+-        source_ids,
++        source_amounts,
++        ..
+     } = event
+     else {
+         return false;
+@@ -1002,12 +1003,12 @@ pub(super) fn match_damage_done_once_by_controller(
+     }
+ 
+     if let Some(filter) = &trigger.valid_source {
+-        return source_ids
++        return source_amounts
+             .iter()
+-            .any(|source| target_filter_matches_object(state, *source, filter, source_id));
++            .any(|(source, _)| target_filter_matches_object(state, *source, filter, source_id));
+     }
+ 
+-    source_ids.contains(&source_id)
++    source_amounts.iter().any(|(id, _)| *id == source_id)
+ }
+ 
+ pub(super) fn matching_damage_done_once_by_controller_event(
+@@ -1022,7 +1023,8 @@ pub(super) fn matching_damage_done_once_by_controller_event(
+     // effects read this filtered event context.
+     let GameEvent::CombatDamageDealtToPlayer {
+         player_id,
+-        source_ids,
++        source_amounts,
++        ..
+     } = event
+     else {
+         return None;
+@@ -1032,14 +1034,23 @@ pub(super) fn matching_damage_done_once_by_controller_event(
+         return None;
+     }
+ 
+-    let matching_sources = if let Some(filter) = &trigger.valid_source {
+-        source_ids
++    // CR 120.1 + CR 510.2 + CR 608.2c: Filter to matching sources using the
++    // step-local per-source amounts carried by the event (the resolving ability
++    // reads its triggering-event context per the function header above). This
++    // avoids summing `damage_dealt_this_turn` which accumulates across combat
++    // damage steps and would inflate the total on double-strike / extra-combat.
++    let matching_sources: Vec<(ObjectId, u32)> = if let Some(filter) = &trigger.valid_source {
++        source_amounts
+             .iter()
++            .filter(|(src, _)| target_filter_matches_object(state, *src, filter, source_id))
+             .copied()
+-            .filter(|source| target_filter_matches_object(state, *source, filter, source_id))
+-            .collect::<Vec<_>>()
+-    } else if source_ids.contains(&source_id) {
+-        vec![source_id]
++            .collect()
++    } else if source_amounts.iter().any(|(id, _)| *id == source_id) {
++        source_amounts
++            .iter()
++            .filter(|(id, _)| *id == source_id)
++            .copied()
++            .collect()
+     } else {
+         Vec::new()
+     };
+@@ -1047,9 +1058,11 @@ pub(super) fn matching_damage_done_once_by_controller_event(
+     if matching_sources.is_empty() {
+         None
+     } else {
++        let filtered_total: u32 = matching_sources.iter().map(|(_, amt)| amt).sum();
+         Some(GameEvent::CombatDamageDealtToPlayer {
+             player_id: *player_id,
+-            source_ids: matching_sources,
++            source_amounts: matching_sources,
++            total_damage: filtered_total,
+         })
+     }
+ }
+@@ -5399,7 +5412,8 @@ mod tests {
+ 
+         let event = GameEvent::CombatDamageDealtToPlayer {
+             player_id: PlayerId(1),
+-            source_ids: vec![source_a, source_b],
++            source_amounts: vec![(source_a, 2), (source_b, 3)],
++            total_damage: 5,
+         };
+         assert!(match_damage_done_once_by_controller(
+             &event,
+@@ -5442,7 +5456,8 @@ mod tests {
+ 
+         let event = GameEvent::CombatDamageDealtToPlayer {
+             player_id: PlayerId(1),
+-            source_ids: vec![source],
++            source_amounts: vec![(source, 3)],
++            total_damage: 3,
+         };
+ 
+         assert!(matching_damage_done_once_by_controller_event(
+@@ -5454,6 +5469,82 @@ mod tests {
+         .is_none());
+     }
+ 
++    #[test]
++    fn matching_damage_done_once_by_controller_event_computes_filtered_total() {
++        // CR 120.1 + CR 510.2 + CR 608.2c: when only a subset of the
++        // combat-damage sources satisfy the trigger's source filter, the rebuilt
++        // event's total_damage must reflect ONLY the matching sources' damage —
++        // not the aggregate. The per-source amounts come directly from the
++        // event's `source_amounts` field (step-local), so double-strike /
++        // extra-combat records in `damage_dealt_this_turn` do NOT inflate this.
++        let mut state = setup();
++        let trigger_source = create_object(
++            &mut state,
++            CardId(1),
++            PlayerId(0),
++            "Combat Damage Watcher".to_string(),
++            Zone::Battlefield,
++        );
++
++        // creature_a: a Fractal creature controlled by player 0 — matches the filter.
++        let creature_a = create_object(
++            &mut state,
++            CardId(2),
++            PlayerId(0),
++            "Fractal".to_string(),
++            Zone::Battlefield,
++        );
++        {
++            let obj = state.objects.get_mut(&creature_a).unwrap();
++            obj.card_types.core_types.push(CoreType::Creature);
++            obj.card_types.subtypes.push("Fractal".to_string());
++        }
++
++        // creature_b: a plain creature controlled by player 0 — fails the subtype filter.
++        let creature_b = create_object(
++            &mut state,
++            CardId(3),
++            PlayerId(0),
++            "Bear".to_string(),
++            Zone::Battlefield,
++        );
++        {
++            let obj = state.objects.get_mut(&creature_b).unwrap();
++            obj.card_types.core_types.push(CoreType::Creature);
++        }
++
++        // The event carries step-local per-source amounts. No damage_dealt_this_turn
++        // setup needed — the function reads directly from source_amounts.
++        let event = GameEvent::CombatDamageDealtToPlayer {
++            player_id: PlayerId(1),
++            source_amounts: vec![(creature_a, 3), (creature_b, 2)],
++            total_damage: 5,
++        };
++
++        // Trigger matches only Fractal creatures (i.e., creature_a) controlled by you.
++        let mut trigger = make_trigger(TriggerMode::DamageDoneOnceByController);
++        trigger.valid_source = Some(TargetFilter::Typed(
++            TypedFilter::creature()
++                .controller(ControllerRef::You)
++                .subtype("Fractal".to_string()),
++        ));
++
++        let rebuilt =
++            matching_damage_done_once_by_controller_event(&event, &trigger, trigger_source, &state)
++                .expect("a matching source should fire the trigger");
++        let GameEvent::CombatDamageDealtToPlayer {
++            source_amounts: rebuilt_amounts,
++            total_damage,
++            ..
++        } = rebuilt
++        else {
++            panic!("expected CombatDamageDealtToPlayer, got {rebuilt:?}");
++        };
++        assert_eq!(rebuilt_amounts, vec![(creature_a, 3)]);
++        // Only creature_a's 3 damage counts, not the aggregate 5.
++        assert_eq!(total_damage, 3);
++    }
++
+     #[test]
+     fn spell_cast_matches() {
+         let state = setup();
+diff --git a/crates/engine/src/game/triggers.rs b/crates/engine/src/game/triggers.rs
+index 8bd3707da4..46cc62f069 100644
+--- a/crates/engine/src/game/triggers.rs
++++ b/crates/engine/src/game/triggers.rs
+@@ -1834,8 +1834,8 @@ fn collect_ring_emblem_triggers(
+                 // CR 701.54c: Once the Ring has tempted a player four or more
+                 // times, it has "Whenever your Ring-bearer deals combat damage
+                 // to a player, each opponent loses 3 life."
+-                if let GameEvent::CombatDamageDealtToPlayer { source_ids, .. } = event {
+-                    if source_ids.contains(&bearer_id) {
++                if let GameEvent::CombatDamageDealtToPlayer { source_amounts, .. } = event {
++                    if source_amounts.iter().any(|(id, _)| *id == bearer_id) {
+                         pending.push(ring_pending_trigger(
+                             bearer_id,
+                             player,
+diff --git a/crates/engine/src/parser/oracle_effect/sequence.rs b/crates/engine/src/parser/oracle_effect/sequence.rs
+index 8b2af5b156..396d40ba91 100644
+--- a/crates/engine/src/parser/oracle_effect/sequence.rs
++++ b/crates/engine/src/parser/oracle_effect/sequence.rs
+@@ -3414,6 +3414,15 @@ fn try_parse_put_counters_on_token_followup(lower: &str) -> Option<ContinuationA
+             let qty_text = rest_where.trim().trim_end_matches('.');
+             parse_cda_quantity(qty_text)
+                 .or_else(|| parse_quantity_ref(qty_text).map(|q| QuantityExpr::Ref { qty: q }))
++        } else if let Ok((rest_equal, _)) =
++            tag::<_, _, OracleError<'_>>("equal to ").parse(rest.trim_start_matches(['.', ' ']))
++        {
++            // CR 122.6a: "put a number of counters on it equal to [qty]" — dynamic
++            // counter count in the imperative followup form (Primo, the Unbounded).
++            // allow-noncombinator: trailing-period cleanup on a pre-tokenized suffix.
++            let qty_text = rest_equal.trim().trim_end_matches('.');
++            parse_cda_quantity(qty_text)
++                .or_else(|| parse_quantity_ref(qty_text).map(|q| QuantityExpr::Ref { qty: q }))
+         } else {
+             None
+         };
+@@ -4922,6 +4931,31 @@ mod tests {
+         }
+     }
+ 
++    #[test]
++    fn put_counters_on_token_followup_equal_to_damage_dealt() {
++        // Primo, the Unbounded: "Put a number of +1/+1 counters on it equal to
++        // the damage dealt." After sentence splitting the continuation sees:
++        // "put a number of +1/+1 counters on it equal to the damage dealt"
++        let result = try_parse_put_counters_on_token_followup(
++            "put a number of +1/+1 counters on it equal to the damage dealt",
++        );
++        let Some(ContinuationAst::TokenEntersWithCounters {
++            counter_type,
++            count,
++        }) = result
++        else {
++            panic!("expected TokenEntersWithCounters, got {result:?}");
++        };
++        assert_eq!(counter_type, CounterType::Plus1Plus1);
++        assert_eq!(
++            count,
++            QuantityExpr::Ref {
++                qty: QuantityRef::EventContextAmount
++            },
++            "count must be EventContextAmount (the damage dealt)"
++        );
++    }
++
+     #[test]
+     fn put_counters_on_it_followup_minus_counters() {
+         // -1/-1 counter form (uncommon for tokens, but the helper supports it).
+diff --git a/crates/engine/src/parser/oracle_nom/quantity.rs b/crates/engine/src/parser/oracle_nom/quantity.rs
+index 3b5ff5c16a..51dc67f110 100644
+--- a/crates/engine/src/parser/oracle_nom/quantity.rs
++++ b/crates/engine/src/parser/oracle_nom/quantity.rs
+@@ -1490,6 +1490,11 @@ fn parse_event_context_refs(input: &str) -> OracleResult<'_, QuantityRef> {
+         value(QuantityRef::EventContextAmount, tag("that much")),
+         value(QuantityRef::EventContextAmount, tag("that many")),
+         value(QuantityRef::EventContextAmount, tag("that damage")),
++        // CR 120.1 + CR 603.7c: "the damage dealt" bare form in a triggered
++        // ability body — refers to the total from the triggering combat-damage
++        // event. Distinct from "that damage" (different article+verb) and
++        // "damage dealt this way" (PreviousEffectAmount).
++        value(QuantityRef::EventContextAmount, tag("the damage dealt")),
+         value(
+             QuantityRef::Power {
+                 scope: ObjectScope::CostPaidObject,
+@@ -3759,6 +3764,11 @@ mod tests {
+         assert_eq!(q, QuantityRef::EventContextAmount);
+         assert_eq!(rest, "");
+ 
++        // CR 603.7c: bare "the damage dealt" form maps to EventContextAmount.
++        let (rest, q) = parse_quantity_ref("the damage dealt").unwrap();
++        assert_eq!(q, QuantityRef::EventContextAmount);
++        assert_eq!(rest, "");
++
+         let (rest2, q2) = parse_quantity_ref("that creature's power").unwrap();
+         assert_eq!(
+             q2,
+diff --git a/crates/engine/src/parser/oracle_trigger.rs b/crates/engine/src/parser/oracle_trigger.rs
+index c5e6dcb811..bd27041a46 100644
+--- a/crates/engine/src/parser/oracle_trigger.rs
++++ b/crates/engine/src/parser/oracle_trigger.rs
+@@ -15,7 +15,7 @@ use super::oracle_ir::context::ParseContext;
+ use super::oracle_ir::trigger::{TriggerBody, TriggerIr, TriggerModifiers};
+ use super::oracle_nom::condition::parse_inner_condition;
+ use super::oracle_nom::error::{oracle_err, OracleResult};
+-use super::oracle_nom::filter::parse_enters_origin_zone;
++use super::oracle_nom::filter::{parse_enters_origin_zone, parse_with_property};
+ use super::oracle_nom::primitives::{
+     self as nom_primitives, scan_contains, scan_preceded, scan_split_at_phrase,
+ };
+@@ -7097,7 +7097,25 @@ fn try_parse_one_or_more_combat_damage_to_player(
+             // CR 205.3m: Handle "ninja or rogue creatures you control" compound subtypes
+             or_filter
+         } else {
+-            continue;
++            // Try to parse "with [property]" qualifiers appended after the type phrase.
++            // Covers cards like Primo, the Unbounded: "creatures you control with base power 0".
++            let mut rem = remainder.trim();
++            let mut extra_props = Vec::new();
++            while let Ok((next_rem, prop)) = parse_with_property(rem) {
++                extra_props.push(prop);
++                rem = next_rem.trim();
++            }
++            if !extra_props.is_empty() && rem.is_empty() {
++                match filter {
++                    TargetFilter::Typed(mut tf) => {
++                        tf.properties.extend(extra_props);
++                        TargetFilter::Typed(tf)
++                    }
++                    other => other,
++                }
++            } else {
++                continue;
++            }
+         };
+ 
+         let mut def = make_base();
+@@ -10875,6 +10893,91 @@ mod tests {
+         assert_eq!(def.valid_target, Some(TargetFilter::Player));
+     }
+ 
++    #[test]
++    fn primo_the_unbounded_combat_damage_trigger() {
++        // Primo, the Unbounded (#1361): the triggering creatures' base power is 0,
++        // and the Fractal token enters with +1/+1 counters equal to the combat
++        // damage dealt (EventContextAmount). Verifies the full trigger:
++        //   - DamageDoneOnceByController mode
++        //   - valid_source carries a base-power-0 check (CR 208.4b)
++        //   - the token-creation body has no Unimplemented effects
++        let def = parse_trigger_line(
++            "Whenever one or more creatures you control with base power 0 deal combat damage to a player, create a 0/0 green and blue Fractal creature token. Put a number of +1/+1 counters on it equal to the damage dealt.",
++            "Primo, the Unbounded",
++        );
++        assert_eq!(def.mode, TriggerMode::DamageDoneOnceByController);
++        assert_eq!(def.damage_kind, DamageKindFilter::CombatOnly);
++        assert_eq!(def.valid_target, Some(TargetFilter::Player));
++
++        // CR 208.4b: source filter must include a base-power-0 comparison.
++        let TargetFilter::Typed(tf) = def
++            .valid_source
++            .as_ref()
++            .expect("valid_source should be present")
++        else {
++            panic!(
++                "valid_source should be a typed filter, got {:?}",
++                def.valid_source
++            );
++        };
++        assert!(
++            tf.properties.iter().any(|p| matches!(
++                p,
++                FilterProp::PtComparison {
++                    stat: PtStat::Power,
++                    scope: PtValueScope::Base,
++                    comparator: Comparator::EQ,
++                    value: QuantityExpr::Fixed { value: 0 },
++                }
++            )),
++            "expected base-power-0 PtComparison in source filter, got: {:?}",
++            tf.properties
++        );
++
++        // No Unimplemented effects anywhere in the trigger body.
++        let execute: &AbilityDefinition =
++            def.execute.as_deref().expect("trigger should have execute");
++        let mut current: Option<&AbilityDefinition> = Some(execute);
++        while let Some(ability) = current {
++            assert!(
++                !matches!(*ability.effect, Effect::Unimplemented { .. }),
++                "trigger body must not contain Unimplemented, got: {:?}",
++                ability.effect
++            );
++            current = ability.sub_ability.as_deref();
++        }
++
++        // The Fractal token must enter with +1/+1 counters equal to the combat
++        // damage dealt (EventContextAmount), not a fixed count. Walk the
++        // sub-ability chain to find the Token effect and verify its
++        // enter_with_counters payload.
++        let mut current: Option<&AbilityDefinition> = Some(execute);
++        let mut enter_with_counters: Option<&Vec<(CounterType, QuantityExpr)>> = None;
++        while let Some(ability) = current {
++            if let Effect::Token {
++                enter_with_counters: counters,
++                ..
++            } = &*ability.effect
++            {
++                enter_with_counters = Some(counters);
++                break;
++            }
++            current = ability.sub_ability.as_deref();
++        }
++        let counters = enter_with_counters.expect("trigger body should contain a Token effect");
++        let expected: Vec<(CounterType, QuantityExpr)> = vec![(
++            CounterType::Plus1Plus1,
++            QuantityExpr::Ref {
++                qty: QuantityRef::EventContextAmount,
++            },
++        )];
++        assert_eq!(
++            counters, &expected,
++            "Fractal token must enter with +1/+1 counters equal to damage dealt, got: {:?}",
++            counters
++        );
++    }
++
+     #[test]
+     fn trigger_combat_damage_create_treasure_and_manifest_that_players_library() {
+         let def = parse_trigger_line(
+diff --git a/crates/engine/src/types/events.rs b/crates/engine/src/types/events.rs
+index a843a5ef30..bca5b45dd8 100644
+--- a/crates/engine/src/types/events.rs
++++ b/crates/engine/src/types/events.rs
+@@ -437,7 +437,29 @@ pub enum GameEvent {
+     },
+     CombatDamageDealtToPlayer {
+         player_id: PlayerId,
+-        source_ids: Vec<ObjectId>,
++        /// CR 120.1 + CR 510.2: Per-source combat damage amounts for this
++        /// specific combat damage step. Using step-local amounts instead of a
++        /// bare `Vec<ObjectId>` prevents double-strike / extra-combat inflation
++        /// in `matching_damage_done_once_by_controller_event`: each
++        /// `apply_combat_damage` call produces exactly one event per player with
++        /// the amounts from that step only.
++        ///
++        /// Migration note: this field replaces the former `source_ids:
++        /// Vec<ObjectId>`. `#[serde(default)]` keeps deserialization of older
++        /// persisted state infallible, but an old-format event (a game persisted
++        /// mid-combat-damage-trigger by a pre-rename binary and restored after an
++        /// upgrade) decodes to an empty set — the legacy `source_ids` array is
++        /// dropped. This is acceptable: the event is transient (produced and
++        /// consumed within one combat-damage step), the window is the rare
++        /// mid-trigger save across a server upgrade, and it degrades to "no
++        /// matching sources" rather than crashing. The old format carried no
++        /// amounts, so no migration shim could recover `total_damage` regardless.
++        #[serde(default)]
++        source_amounts: Vec<(ObjectId, u32)>,
++        /// CR 120.1: Total actual damage dealt to this player in this combat
++        /// damage step — the sum of all `source_amounts` entries.
++        #[serde(default)]
++        total_damage: u32,
+     },
+     PlayerEliminated {
+         player_id: PlayerId,
+@@ -768,7 +790,8 @@ mod tests {
+     fn combat_damage_dealt_to_player_roundtrips() {
+         let event = GameEvent::CombatDamageDealtToPlayer {
+             player_id: PlayerId(1),
+-            source_ids: vec![ObjectId(10), ObjectId(11)],
++            source_amounts: vec![(ObjectId(10), 3), (ObjectId(11), 4)],
++            total_damage: 7,
+         };
+         let serialized = serde_json::to_string(&event).unwrap();
+         let deserialized: GameEvent = serde_json::from_str(&serialized).unwrap();
+diff --git a/crates/engine/tests/integration/main.rs b/crates/engine/tests/integration/main.rs
+index f7e21fa067..8775e31c21 100644
+--- a/crates/engine/tests/integration/main.rs
++++ b/crates/engine/tests/integration/main.rs
+@@ -72,6 +72,7 @@ mod old_growth_troll_return_as_aura;
+ mod oracle_parser;
+ mod ponder_decline_shuffle_regression;
+ mod power_fist_combat_damage_regression;
++mod primo_unbounded_fractal_counters;
+ mod refurbished_familiar;
+ mod riot_control_regression;
+ mod ripples_of_undeath_regression;
+diff --git a/crates/engine/tests/integration/primo_unbounded_fractal_counters.rs b/crates/engine/tests/integration/primo_unbounded_fractal_counters.rs
+new file mode 100644
+index 0000000000..56f7c7857d
+--- /dev/null
++++ b/crates/engine/tests/integration/primo_unbounded_fractal_counters.rs
+@@ -0,0 +1,77 @@
++//! Runtime regression for Primo, the Unbounded (#1361), driven through the real
++//! `apply` pipeline (combat → trigger → token creation).
++//!
++//! Primo Oracle: "Whenever one or more creatures you control with base power 0
++//! deal combat damage to a player, create a 0/0 green and blue Fractal creature
++//! token. Put a number of +1/+1 counters on it equal to the damage dealt."
++//!
++//! The bug (#1361): the Fractal entered with ZERO counters because (a) the parser
++//! dropped the `equal to [qty]` counter quantity (→ `Variable("X")` = 0), and
++//! (b) `CombatDamageDealtToPlayer` carried no damage total for
++//! `EventContextAmount` to read. The unit tests in `parser/`, `trigger_matchers`,
++//! and `targeting` pin each hop; THIS test composes them end-to-end through
++//! `apply` and asserts the resulting token's counters equal the combat damage —
++//! the assertion that fails pre-fix (counters == 0) and passes post-fix.
++//!
++//! CR 120.1 + CR 510.2 + CR 603.7c: the triggering combat-damage step's total is
++//! available to the resolving ability via the event context.
++
++use super::rules::{run_combat, GameScenario, Phase, P0, P1};
++use engine::types::counter::CounterType;
++
++const PRIMO_ORACLE: &str = "Trample\nPrimo enters with twice X +1/+1 counters on it.\nWhenever one or more creatures you control with base power 0 deal combat damage to a player, create a 0/0 green and blue Fractal creature token. Put a number of +1/+1 counters on it equal to the damage dealt.";
++
++#[test]
++fn primo_fractal_token_enters_with_counters_equal_to_combat_damage() {
++    let mut scenario = GameScenario::new();
++    scenario.at_phase(Phase::PreCombatMain);
++
++    // Primo on the battlefield as the trigger source. Its own P/T is irrelevant
++    // (it does not attack); use 4/4 so a 0-toughness body doesn't die to SBA.
++    // Built from real Oracle text so the parser produces the
++    // DamageDoneOnceByController trigger + base-power-0 source filter + Token body.
++    scenario.add_creature_from_oracle(P0, "Primo, the Unbounded", 4, 4, PRIMO_ORACLE);
++
++    // The attacker: a Fractal-shaped creature with BASE power 0 (matches Primo's
++    // "base power 0" source filter, CR 208.4b) but CURRENT power 3 via three
++    // +1/+1 counters (CR 613.7c). It deals 3 combat damage.
++    let attacker = scenario.add_creature(P0, "Zero Striker", 3, 3).id();
++
++    let mut runner = scenario.build();
++    {
++        let obj = runner.state_mut().objects.get_mut(&attacker).unwrap();
++        obj.base_power = Some(0);
++        obj.base_toughness = Some(0);
++        obj.counters.insert(CounterType::Plus1Plus1, 3);
++    }
++
++    let p1_life_before = runner.life(P1);
++
++    // Zero Striker attacks P1 unblocked → 3 combat damage → Primo's trigger fires.
++    run_combat(&mut runner, vec![attacker], vec![]);
++    runner.advance_until_stack_empty();
++
++    assert_eq!(
++        runner.life(P1),
++        p1_life_before - 3,
++        "attacker must deal 3 combat damage to P1 (proves combat actually happened)"
++    );
++
++    // Primo must have created a Fractal token, and it must enter with +1/+1
++    // counters EQUAL TO the 3 combat damage dealt. Pre-fix this was 0.
++    let fractal = runner
++        .state()
++        .objects
++        .values()
++        .find(|o| o.is_token && o.card_types.subtypes.iter().any(|s| s == "Fractal"))
++        .expect("Primo must create a Fractal token after combat damage");
++    assert_eq!(
++        fractal
++            .counters
++            .get(&CounterType::Plus1Plus1)
++            .copied()
++            .unwrap_or(0),
++        3,
++        "Fractal token must enter with +1/+1 counters equal to the combat damage dealt (#1361)"
++    );
++}

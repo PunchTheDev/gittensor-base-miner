@@ -1,0 +1,649 @@
+diff --git a/app/src/main/java/dev/touchpilot/app/MainActivity.kt b/app/src/main/java/dev/touchpilot/app/MainActivity.kt
+index 4017ee0..8e6e531 100644
+--- a/app/src/main/java/dev/touchpilot/app/MainActivity.kt
++++ b/app/src/main/java/dev/touchpilot/app/MainActivity.kt
+@@ -10,7 +10,6 @@ import android.graphics.Typeface
+ import android.graphics.drawable.GradientDrawable
+ import android.os.Bundle
+ import android.provider.Settings
+-import android.text.InputType
+ import android.view.Gravity
+ import android.view.View
+ import android.view.ViewGroup
+@@ -29,7 +28,6 @@ import dev.touchpilot.app.agent.ConversationalGate
+ import dev.touchpilot.app.agent.DefaultLocalReasoningCore
+ import dev.touchpilot.app.agent.LocalReasoningContext
+ import dev.touchpilot.app.agent.LocalReasoningCore
+-import dev.touchpilot.app.agent.ProviderConfig
+ import dev.touchpilot.app.agent.defaultAgentRunInvocation
+ import dev.touchpilot.app.androidcontrol.AccessibilityBridge
+ import dev.touchpilot.app.localinference.LiteRtCommandModelRuntime
+@@ -37,7 +35,6 @@ import dev.touchpilot.app.localinference.LocalModelStatus
+ import dev.touchpilot.app.mcp.McpHttpClient
+ import dev.touchpilot.app.memory.Skill
+ import dev.touchpilot.app.memory.SkillStore
+-import dev.touchpilot.app.security.ProviderSecretStore
+ import dev.touchpilot.app.security.SensitiveTextRedactor
+ import dev.touchpilot.app.security.ToolApprovalRequest
+ import dev.touchpilot.app.security.ToolApprovalProvider
+@@ -55,7 +52,6 @@ import java.util.concurrent.atomic.AtomicBoolean
+ 
+ class MainActivity : Activity() {
+     private lateinit var preferences: SharedPreferences
+-    private lateinit var secretStore: ProviderSecretStore
+     private lateinit var skills: List<Skill>
+     private lateinit var toolExecutor: AndroidToolExecutor
+     private lateinit var localModelRuntime: LiteRtCommandModelRuntime
+@@ -73,7 +69,6 @@ class MainActivity : Activity() {
+         super.onCreate(savedInstanceState)
+ 
+         preferences = getSharedPreferences("touchpilot", MODE_PRIVATE)
+-        secretStore = ProviderSecretStore(this)
+         skills = SkillStore(this).loadSkills()
+         toolExecutor = AndroidToolExecutor(this)
+         localModelRuntime = LiteRtCommandModelRuntime(this)
+@@ -425,19 +420,9 @@ class MainActivity : Activity() {
+ 
+     private fun currentReasoningContext(): LocalReasoningContext {
+         val providerMode = currentProviderMode()
+-        val providerConfig = ProviderConfig(
+-            baseUrl = preferences.getString("provider_url", DefaultProviderUrl).orEmpty(),
+-            apiKey = if (providerMode == AgentProviderMode.CLOUD) {
+-                runCatching { secretStore.loadApiKey().orEmpty() }.getOrDefault("")
+-            } else {
+-                ""
+-            },
+-            model = preferences.getString("provider_model", DefaultModel).orEmpty()
+-        )
+         return LocalReasoningContext(
+             skill = selectedSkill(),
+-            providerMode = providerMode,
+-            providerConfig = providerConfig
++            providerMode = providerMode
+         )
+     }
+ 
+@@ -519,7 +504,6 @@ class MainActivity : Activity() {
+             primaryButton("Save Runtime") {
+                 val mode = when (providerModeSpinner.selectedItemPosition) {
+                     1 -> AgentProviderMode.LOCAL_MODEL
+-                    2 -> AgentProviderMode.CLOUD
+                     else -> AgentProviderMode.LOCAL_ROUTER
+                 }
+                 preferences.edit().putString("agent_provider_mode", mode.name).apply()
+@@ -737,40 +721,11 @@ class MainActivity : Activity() {
+ 
+     private fun renderSettingsScreen() {
+         contentRoot.addView(sectionTitle("Settings"))
+-        contentRoot.addView(timelineCard("Cloud fallback", "Optional. Local router remains the default runtime."))
+-
+-        val urlInput = editText("Cloud fallback chat completions URL").apply {
+-            id = R.id.agent_provider_url_input
+-            setText(preferences.getString("provider_url", DefaultProviderUrl))
+-        }
+-        val modelInput = editText("Model name").apply {
+-            id = R.id.agent_model_input
+-            setText(preferences.getString("provider_model", DefaultModel))
+-        }
+-        val apiKeyInput = editText(
+-            if (secretStore.hasApiKey()) {
+-                "Cloud API key stored; leave blank to keep it"
+-            } else {
+-                "Cloud API key"
+-            }
+-        ).apply {
+-            id = R.id.agent_api_key_input
+-            inputType = InputType.TYPE_CLASS_TEXT or InputType.TYPE_TEXT_VARIATION_PASSWORD
+-        }
+-
+-        contentRoot.addView(urlInput)
+-        contentRoot.addView(modelInput)
+-        contentRoot.addView(apiKeyInput)
+         contentRoot.addView(
+-            primaryButton("Save Settings") {
+-                preferences.edit()
+-                    .putString("provider_url", urlInput.text.toString())
+-                    .putString("provider_model", modelInput.text.toString())
+-                    .apply()
+-                resolveApiKey(apiKeyInput, secretStore)
+-                outputText = "Settings saved."
+-                showSection(Section.SETTINGS)
+-            }
++            timelineCard(
++                "Local-first runtime",
++                "TouchPilot keeps the normal product path on device. Use Local Runtime to switch between deterministic routing and the LiteRT local model path."
++            )
+         )
+     }
+ 
+@@ -801,7 +756,6 @@ class MainActivity : Activity() {
+ 
+     private fun currentProviderMode(): AgentProviderMode {
+         return when (preferences.getString("agent_provider_mode", AgentProviderMode.LOCAL_ROUTER.name)) {
+-            AgentProviderMode.CLOUD.name -> AgentProviderMode.CLOUD
+             AgentProviderMode.LOCAL_MODEL.name -> AgentProviderMode.LOCAL_MODEL
+             else -> AgentProviderMode.LOCAL_ROUTER
+         }
+@@ -1000,14 +954,12 @@ class MainActivity : Activity() {
+     private fun providerModeIndex(savedMode: String?): Int {
+         return when (savedMode) {
+             AgentProviderMode.LOCAL_MODEL.name -> 1
+-            AgentProviderMode.CLOUD.name -> 2
+             else -> 0
+         }
+     }
+ 
+     private fun AgentProviderMode.label(): String {
+         return when (this) {
+-            AgentProviderMode.CLOUD -> "Experimental cloud fallback"
+             AgentProviderMode.LOCAL_MODEL -> "Local model with router fallback"
+             AgentProviderMode.LOCAL_ROUTER -> "Local router"
+         }
+@@ -1021,25 +973,6 @@ class MainActivity : Activity() {
+         }
+     }
+ 
+-    private fun resolveApiKey(
+-        apiKeyInput: EditText,
+-        secretStore: ProviderSecretStore
+-    ): String {
+-        val enteredApiKey = apiKeyInput.text.toString()
+-        if (enteredApiKey.isNotBlank()) {
+-            secretStore.saveApiKey(enteredApiKey)
+-            apiKeyInput.text.clear()
+-            apiKeyInput.hint = "Cloud API key stored; leave blank to keep it"
+-            return enteredApiKey
+-        }
+-
+-        return runCatching { secretStore.loadApiKey().orEmpty() }
+-            .getOrElse {
+-                secretStore.clearApiKey()
+-                ""
+-            }
+-    }
+-
+     private fun approveAgentTool(request: ToolApprovalRequest): Boolean {
+         val latch = CountDownLatch(1)
+         val approved = AtomicBoolean(false)
+@@ -1132,9 +1065,7 @@ class MainActivity : Activity() {
+     private companion object {
+         const val ApprovalTimeoutMs = 5 * 60 * 1000L
+         const val MaxApprovalArgLength = 500
+-        const val DefaultProviderUrl = "https://api.openai.com/v1/chat/completions"
+-        const val DefaultModel = "gpt-5.2-mini"
+-        val ProviderModeLabels = listOf("Local router", "Local model", "Experimental cloud fallback")
++        val ProviderModeLabels = listOf("Local router", "Local model")
+     }
+ 
+     private object Theme {
+diff --git a/app/src/main/java/dev/touchpilot/app/agent/AgentCommandProvider.kt b/app/src/main/java/dev/touchpilot/app/agent/AgentCommandProvider.kt
+index ce9bb9d..c91d174 100644
+--- a/app/src/main/java/dev/touchpilot/app/agent/AgentCommandProvider.kt
++++ b/app/src/main/java/dev/touchpilot/app/agent/AgentCommandProvider.kt
+@@ -6,16 +6,6 @@ fun interface AgentCommandProvider {
+     fun complete(systemPrompt: String, context: String): String
+ }
+ 
+-class OpenAiAgentCommandProvider(
+-    private val config: ProviderConfig
+-) : AgentCommandProvider {
+-    private val client = OpenAiCompatibleClient(config)
+-
+-    override fun complete(systemPrompt: String, context: String): String {
+-        return client.complete(systemPrompt, context)
+-    }
+-}
+-
+ /**
+  * Returns a pre-decided tool command on the first call and a final answer on
+  * every call after. Used by [DefaultLocalReasoningCore] for
+@@ -74,7 +64,7 @@ class LocalRouterCommandProvider(
+             }
+         }
+ 
+-        return """{"final":"Local router completed its safe routing pass. Use cloud mode for complex reasoning."}"""
++        return """{"final":"Local router completed its safe routing pass. Try a more specific request, a skill, or local model mode for ambiguous tasks."}"""
+     }
+ 
+     private fun routeTask(task: String): LocalRoute? {
+diff --git a/app/src/main/java/dev/touchpilot/app/agent/AgentModels.kt b/app/src/main/java/dev/touchpilot/app/agent/AgentModels.kt
+index 3faee96..0642f50 100644
+--- a/app/src/main/java/dev/touchpilot/app/agent/AgentModels.kt
++++ b/app/src/main/java/dev/touchpilot/app/agent/AgentModels.kt
+@@ -1,13 +1,6 @@
+ package dev.touchpilot.app.agent
+ 
+-data class ProviderConfig(
+-    val baseUrl: String,
+-    val apiKey: String,
+-    val model: String
+-)
+-
+ enum class AgentProviderMode {
+-    CLOUD,
+     LOCAL_MODEL,
+     LOCAL_ROUTER
+ }
+diff --git a/app/src/main/java/dev/touchpilot/app/agent/IntentGate.kt b/app/src/main/java/dev/touchpilot/app/agent/IntentGate.kt
+index b14d08d..920d63d 100644
+--- a/app/src/main/java/dev/touchpilot/app/agent/IntentGate.kt
++++ b/app/src/main/java/dev/touchpilot/app/agent/IntentGate.kt
+@@ -50,8 +50,8 @@ sealed class IntentDecision {
+     ) : IntentDecision()
+ 
+     /**
+-     * No deterministic path matched — defer to the configured provider (local
+-     * model or cloud fallback) for reasoning.
++     * No deterministic path matched — defer to the configured local model path
++     * for reasoning.
+      */
+     data class LocalModelNeeded(
+         override val reason: String
+diff --git a/app/src/main/java/dev/touchpilot/app/agent/LocalReasoningCore.kt b/app/src/main/java/dev/touchpilot/app/agent/LocalReasoningCore.kt
+index 15f6cc0..4555712 100644
+--- a/app/src/main/java/dev/touchpilot/app/agent/LocalReasoningCore.kt
++++ b/app/src/main/java/dev/touchpilot/app/agent/LocalReasoningCore.kt
+@@ -26,7 +26,6 @@ fun interface AgentEventListener {
+ data class LocalReasoningContext(
+     val skill: Skill?,
+     val providerMode: AgentProviderMode,
+-    val providerConfig: ProviderConfig,
+     /**
+      * When set, [buildCommandProvider] returns a [FixedCommandProvider] that
+      * emits exactly this command on the next runner step. Populated by the
+@@ -214,7 +213,6 @@ fun buildCommandProvider(
+     }
+     val localRouter = LocalRouterCommandProvider(task, context.skill)
+     return when (context.providerMode) {
+-        AgentProviderMode.CLOUD -> OpenAiAgentCommandProvider(context.providerConfig)
+         AgentProviderMode.LOCAL_MODEL -> LocalModelCommandProvider(
+             runtime = localModelRuntime,
+             fallback = localRouter,
+@@ -226,7 +224,6 @@ fun buildCommandProvider(
+ }
+ 
+ private fun AgentProviderMode.toToolSource(): ToolSource = when (this) {
+-    AgentProviderMode.CLOUD -> ToolSource.CLOUD_FALLBACK
+     AgentProviderMode.LOCAL_MODEL -> ToolSource.LOCAL_MODEL
+     AgentProviderMode.LOCAL_ROUTER -> ToolSource.LOCAL_ROUTER
+ }
+diff --git a/app/src/main/java/dev/touchpilot/app/agent/OpenAiCompatibleClient.kt b/app/src/main/java/dev/touchpilot/app/agent/OpenAiCompatibleClient.kt
+deleted file mode 100644
+index 33e27d9..0000000
+--- a/app/src/main/java/dev/touchpilot/app/agent/OpenAiCompatibleClient.kt
++++ /dev/null
+@@ -1,51 +0,0 @@
+-package dev.touchpilot.app.agent
+-
+-import org.json.JSONArray
+-import org.json.JSONObject
+-import java.io.OutputStreamWriter
+-import java.net.HttpURLConnection
+-import java.net.URL
+-
+-class OpenAiCompatibleClient(
+-    private val config: ProviderConfig
+-) {
+-    fun complete(systemPrompt: String, userPrompt: String): String {
+-        val body = JSONObject()
+-            .put("model", config.model)
+-            .put("temperature", 0)
+-            .put(
+-                "messages",
+-                JSONArray()
+-                    .put(JSONObject().put("role", "system").put("content", systemPrompt))
+-                    .put(JSONObject().put("role", "user").put("content", userPrompt))
+-            )
+-
+-        val connection = URL(config.baseUrl).openConnection() as HttpURLConnection
+-        connection.requestMethod = "POST"
+-        connection.connectTimeout = 30_000
+-        connection.readTimeout = 60_000
+-        connection.doOutput = true
+-        connection.setRequestProperty("Content-Type", "application/json")
+-        if (config.apiKey.isNotBlank()) {
+-            connection.setRequestProperty("Authorization", "Bearer ${config.apiKey}")
+-        }
+-
+-        OutputStreamWriter(connection.outputStream).use { writer ->
+-            writer.write(body.toString())
+-        }
+-
+-        val responseText = if (connection.responseCode in 200..299) {
+-            connection.inputStream.bufferedReader().use { it.readText() }
+-        } else {
+-            val errorText = connection.errorStream?.bufferedReader()?.use { it.readText() }.orEmpty()
+-            error("Provider returned HTTP ${connection.responseCode}: $errorText")
+-        }
+-
+-        val response = JSONObject(responseText)
+-        return response
+-            .getJSONArray("choices")
+-            .getJSONObject(0)
+-            .getJSONObject("message")
+-            .optString("content")
+-    }
+-}
+diff --git a/app/src/main/java/dev/touchpilot/app/security/ActionPolicy.kt b/app/src/main/java/dev/touchpilot/app/security/ActionPolicy.kt
+index 0b0e6ff..d5bd814 100644
+--- a/app/src/main/java/dev/touchpilot/app/security/ActionPolicy.kt
++++ b/app/src/main/java/dev/touchpilot/app/security/ActionPolicy.kt
+@@ -6,7 +6,6 @@ import dev.touchpilot.app.tools.ToolSpec
+ enum class ToolSource {
+     LOCAL_ROUTER,
+     LOCAL_MODEL,
+-    CLOUD_FALLBACK,
+     SKILL_SELECTED,
+     DIRECT_DEBUG,
+     MCP
+diff --git a/app/src/main/java/dev/touchpilot/app/security/ProviderSecretStore.kt b/app/src/main/java/dev/touchpilot/app/security/ProviderSecretStore.kt
+deleted file mode 100644
+index b09e1bf..0000000
+--- a/app/src/main/java/dev/touchpilot/app/security/ProviderSecretStore.kt
++++ /dev/null
+@@ -1,84 +0,0 @@
+-package dev.touchpilot.app.security
+-
+-import android.content.Context
+-import android.security.keystore.KeyGenParameterSpec
+-import android.security.keystore.KeyProperties
+-import android.util.Base64
+-import java.security.KeyStore
+-import javax.crypto.Cipher
+-import javax.crypto.KeyGenerator
+-import javax.crypto.SecretKey
+-import javax.crypto.spec.GCMParameterSpec
+-
+-class ProviderSecretStore(context: Context) {
+-    private val appContext = context.applicationContext
+-    private val preferences = appContext.getSharedPreferences(PreferencesName, Context.MODE_PRIVATE)
+-
+-    fun hasApiKey(): Boolean {
+-        return preferences.contains(ApiKeyCiphertextKey) && preferences.contains(ApiKeyIvKey)
+-    }
+-
+-    fun loadApiKey(): String? {
+-        val ciphertext = preferences.getString(ApiKeyCiphertextKey, null) ?: return null
+-        val iv = preferences.getString(ApiKeyIvKey, null) ?: return null
+-        val cipher = Cipher.getInstance(Transformation)
+-        cipher.init(
+-            Cipher.DECRYPT_MODE,
+-            getOrCreateKey(),
+-            GCMParameterSpec(GcmTagLengthBits, Base64.decode(iv, Base64.NO_WRAP))
+-        )
+-        val plaintext = cipher.doFinal(Base64.decode(ciphertext, Base64.NO_WRAP))
+-        return plaintext.decodeToString()
+-    }
+-
+-    fun saveApiKey(apiKey: String) {
+-        if (apiKey.isBlank()) return
+-
+-        val cipher = Cipher.getInstance(Transformation)
+-        cipher.init(Cipher.ENCRYPT_MODE, getOrCreateKey())
+-        val ciphertext = cipher.doFinal(apiKey.encodeToByteArray())
+-
+-        preferences.edit()
+-            .putString(ApiKeyCiphertextKey, Base64.encodeToString(ciphertext, Base64.NO_WRAP))
+-            .putString(ApiKeyIvKey, Base64.encodeToString(cipher.iv, Base64.NO_WRAP))
+-            .apply()
+-    }
+-
+-    fun clearApiKey() {
+-        preferences.edit()
+-            .remove(ApiKeyCiphertextKey)
+-            .remove(ApiKeyIvKey)
+-            .apply()
+-    }
+-
+-    private fun getOrCreateKey(): SecretKey {
+-        val keyStore = KeyStore.getInstance(AndroidKeyStore).apply { load(null) }
+-        keyStore.getKey(KeyAlias, null)?.let { return it as SecretKey }
+-
+-        val keyGenerator = KeyGenerator.getInstance(
+-            KeyProperties.KEY_ALGORITHM_AES,
+-            AndroidKeyStore
+-        )
+-        val keySpec = KeyGenParameterSpec.Builder(
+-            KeyAlias,
+-            KeyProperties.PURPOSE_ENCRYPT or KeyProperties.PURPOSE_DECRYPT
+-        )
+-            .setBlockModes(KeyProperties.BLOCK_MODE_GCM)
+-            .setEncryptionPaddings(KeyProperties.ENCRYPTION_PADDING_NONE)
+-            .setRandomizedEncryptionRequired(true)
+-            .build()
+-
+-        keyGenerator.init(keySpec)
+-        return keyGenerator.generateKey()
+-    }
+-
+-    private companion object {
+-        const val PreferencesName = "touchpilot_secrets"
+-        const val ApiKeyCiphertextKey = "provider_api_key_ciphertext"
+-        const val ApiKeyIvKey = "provider_api_key_iv"
+-        const val AndroidKeyStore = "AndroidKeyStore"
+-        const val KeyAlias = "touchpilot_provider_api_key"
+-        const val Transformation = "AES/GCM/NoPadding"
+-        const val GcmTagLengthBits = 128
+-    }
+-}
+diff --git a/app/src/test/java/dev/touchpilot/app/agent/LocalReasoningCoreTest.kt b/app/src/test/java/dev/touchpilot/app/agent/LocalReasoningCoreTest.kt
+index cf5b74b..8b14727 100644
+--- a/app/src/test/java/dev/touchpilot/app/agent/LocalReasoningCoreTest.kt
++++ b/app/src/test/java/dev/touchpilot/app/agent/LocalReasoningCoreTest.kt
+@@ -15,8 +15,7 @@ import kotlin.test.assertTrue
+ class LocalReasoningCoreTest {
+     private val defaultContext = LocalReasoningContext(
+         skill = null,
+-        providerMode = AgentProviderMode.LOCAL_ROUTER,
+-        providerConfig = ProviderConfig(baseUrl = "", apiKey = "", model = "")
++        providerMode = AgentProviderMode.LOCAL_ROUTER
+     )
+ 
+     @Test
+@@ -139,24 +138,6 @@ class LocalReasoningCoreTest {
+         assertIs<LocalModelCommandProvider>(provider)
+     }
+ 
+-    @Test
+-    fun providerFactoryPicksCloudWhenModeIsCloud() {
+-        val ctx = defaultContext.copy(
+-            providerMode = AgentProviderMode.CLOUD,
+-            providerConfig = ProviderConfig(
+-                baseUrl = "https://example.com/v1/chat/completions",
+-                apiKey = "k",
+-                model = "m"
+-            )
+-        )
+-        val provider = buildCommandProvider(
+-            task = "open Settings",
+-            context = ctx,
+-            localModelRuntime = NeverCalledRuntime
+-        )
+-        assertIs<OpenAiAgentCommandProvider>(provider)
+-    }
+-
+     @Test
+     fun localRouterRespectsSkillAllowlist() {
+         val restrictedSkill = Skill(
+@@ -177,7 +158,10 @@ class LocalReasoningCoreTest {
+         assertEquals("observe_screen", first.tool)
+         val second = AgentCommandParser.parse(provider.complete("", ""))
+         assertNull(second.tool)
+-        assertEquals("Local router completed its safe routing pass. Use cloud mode for complex reasoning.", second.finalAnswer)
++        assertEquals(
++            "Local router completed its safe routing pass. Try a more specific request, a skill, or local model mode for ambiguous tasks.",
++            second.finalAnswer
++        )
+     }
+ 
+     @Test
+@@ -233,17 +217,16 @@ class LocalReasoningCoreTest {
+     @Test
+     fun exactCommandIntentForcesLocalRouterModeOnInvocation() {
+         val ctxsSeen = mutableListOf<LocalReasoningContext>()
+-        val cloudContext = LocalReasoningContext(
++        val localModelContext = LocalReasoningContext(
+             skill = null,
+-            providerMode = AgentProviderMode.CLOUD,
+-            providerConfig = ProviderConfig(baseUrl = "u", apiKey = "k", model = "m")
++            providerMode = AgentProviderMode.LOCAL_MODEL
+         )
+         val core = DefaultLocalReasoningCore(
+             invocation = { _, ctx ->
+                 ctxsSeen += ctx
+                 AgentRunResult(transcript = "", finalAnswer = null, events = emptyList())
+             },
+-            sessionContext = { cloudContext }
++            sessionContext = { localModelContext }
+         )
+ 
+         core.run("Go back")
+@@ -300,23 +283,22 @@ class LocalReasoningCoreTest {
+     @Test
+     fun localModelNeededIntentLeavesContextUntouched() {
+         val ctxsSeen = mutableListOf<LocalReasoningContext>()
+-        val cloudContext = LocalReasoningContext(
++        val localModelContext = LocalReasoningContext(
+             skill = null,
+-            providerMode = AgentProviderMode.CLOUD,
+-            providerConfig = ProviderConfig(baseUrl = "u", apiKey = "k", model = "m")
++            providerMode = AgentProviderMode.LOCAL_MODEL
+         )
+         val core = DefaultLocalReasoningCore(
+             invocation = { _, ctx ->
+                 ctxsSeen += ctx
+                 AgentRunResult(transcript = "", finalAnswer = null, events = emptyList())
+             },
+-            sessionContext = { cloudContext }
++            sessionContext = { localModelContext }
+         )
+ 
+         core.run("Find the Wi-Fi toggle")
+ 
+         assertEquals(1, ctxsSeen.size)
+-        assertEquals(AgentProviderMode.CLOUD, ctxsSeen[0].providerMode)
++        assertEquals(AgentProviderMode.LOCAL_MODEL, ctxsSeen[0].providerMode)
+     }
+ 
+     @Test
+diff --git a/app/src/test/java/dev/touchpilot/app/agent/OfflineMilestone2Test.kt b/app/src/test/java/dev/touchpilot/app/agent/OfflineMilestone2Test.kt
+index 86c6f91..25ff137 100644
+--- a/app/src/test/java/dev/touchpilot/app/agent/OfflineMilestone2Test.kt
++++ b/app/src/test/java/dev/touchpilot/app/agent/OfflineMilestone2Test.kt
+@@ -38,7 +38,6 @@ class OfflineMilestone2Test {
+     private val baseContext = LocalReasoningContext(
+         skill = null,
+         providerMode = AgentProviderMode.LOCAL_ROUTER,
+-        providerConfig = ProviderConfig(baseUrl = "", apiKey = "", model = ""),
+         exactCommand = null
+     )
+ 
+@@ -303,7 +302,6 @@ class OfflineMilestone2Test {
+     )
+ 
+     private fun AgentProviderMode.toToolSource(): ToolSource = when (this) {
+-        AgentProviderMode.CLOUD -> ToolSource.CLOUD_FALLBACK
+         AgentProviderMode.LOCAL_MODEL -> ToolSource.LOCAL_MODEL
+         AgentProviderMode.LOCAL_ROUTER -> ToolSource.LOCAL_ROUTER
+     }
+diff --git a/app/src/test/java/dev/touchpilot/app/security/DefaultActionPolicyTest.kt b/app/src/test/java/dev/touchpilot/app/security/DefaultActionPolicyTest.kt
+index f14f5ae..1320abf 100644
+--- a/app/src/test/java/dev/touchpilot/app/security/DefaultActionPolicyTest.kt
++++ b/app/src/test/java/dev/touchpilot/app/security/DefaultActionPolicyTest.kt
+@@ -28,7 +28,7 @@ class DefaultActionPolicyTest {
+             ToolPolicyRequest(
+                 tool = mediumTool("type_text"),
+                 args = mapOf("text" to "password=correct horse battery staple"),
+-                source = ToolSource.CLOUD_FALLBACK
++                source = ToolSource.LOCAL_MODEL
+             )
+         )
+ 
+diff --git a/docs/OFFLINE_VALIDATION_M2.md b/docs/OFFLINE_VALIDATION_M2.md
+index 53679ca..07001c0 100644
+--- a/docs/OFFLINE_VALIDATION_M2.md
++++ b/docs/OFFLINE_VALIDATION_M2.md
+@@ -104,7 +104,7 @@ Validated live:
+ - `help` produced the conversational help reply, no tool call.
+ - `Open Settings` emitted an `open_app` approval card with `target: settings`, MEDIUM risk. Approving it launched `com.android.settings/.Settings` (confirmed via `dumpsys activity activities | grep ResumedActivity`).
+ - `Go back` emitted a `press_back` approval card. Approving it executed `pressBack` and navigated TouchPilot to the background.
+-- `show me something useful` ran two steps locally: `observe_screen` then the deterministic final answer `Local router completed its safe routing pass. Use cloud mode for complex reasoning.` — no model and no cloud call.
++- `show me something useful` ran two steps locally: `observe_screen` then the deterministic final answer `Local router completed its safe routing pass. Try a more specific request, a skill, or local model mode for ambiguous tasks.` — no cloud call.
+ - `type_text` from the Tools panel with `my password is hunter2` was blocked by `DefaultActionPolicy` before execution: `type_text({text=my password is hunter2}) -> false: TouchPilot blocked this request because password workflows are blocked.` (logged in `ToolExecutionLog`.)
+ - `dumpsys netstats detail` showed no rx or tx bytes attributed to `dev.touchpilot.app` (uid 10209) for the duration of the run — the app uid was absent from `mAppUidStatsMap`.
+ 
+diff --git a/docs/ROADMAP.md b/docs/ROADMAP.md
+index 3228b48..b1ad2b1 100644
+--- a/docs/ROADMAP.md
++++ b/docs/ROADMAP.md
+@@ -42,8 +42,8 @@ and safety-focused rather than a clone of any reference project.
+ | Milestone | Status | Purpose |
+ | --- | --- | --- |
+ | Milestone 1 | Complete | Local-first Android agent foundation. |
+-| Milestone 2 | Next | Hybrid local AI core. |
+-| Milestone 3 | Planned | Screen context and local understanding. |
++| Milestone 2 | Complete | Hybrid local AI core. |
++| Milestone 3 | Next | Screen context and local understanding. |
+ | Milestone 4 | Planned | Reliable Android control. |
+ | Milestone 5 | Planned | Local multi-step agent loop. |
+ | Milestone 6 | Planned | Skills system v2. |
+@@ -57,8 +57,8 @@ and safety-focused rather than a clone of any reference project.
+ | Milestone 14 | Planned | Advanced local AI. |
+ | Milestone 15 | Planned | 1.0 release. |
+ 
+-The active roadmap starts at Milestone 2. Milestone 1 is retained only as the
+-completed baseline so future work has a clear starting point.
++The active roadmap now starts at Milestone 3. Milestones 1 and 2 are retained
++as completed baselines so future work has a clear starting point.
+ 
+ ## Completed Baseline: Milestone 1
+ 
+@@ -100,12 +100,14 @@ Completed scope:
+ - CI, lint, unit-test workflow, issue templates, PR template, and labels
+ - live emulator validation
+ 
+-## Future Roadmap
+-
+ ## Milestone 2: Hybrid Local AI Core
+ 
+ Goal: make TouchPilot a real local AI product, not only a command router.
+ 
++Status: complete. Milestone 2 established the local reasoning core boundary,
++intent gate, agent event contract, local model contracts, known-skill routing,
++local-only runtime selection, and offline validation for the main user flows.
++
+ ```text
+ user message
+     │
+@@ -124,22 +126,24 @@ user message
+ 
+ Deliverables:
+ 
+-- Define the local reasoning core boundary.
+-- Add an intent gate for exact commands, known skills, unsafe requests, and
++- [x] Define the local reasoning core boundary.
++- [x] Add an intent gate for exact commands, known skills, unsafe requests, and
+   model-needed requests.
+-- Remove cloud/provider fallback from the normal product path.
+-- Define local model input/output contracts for intent, tool selection, target
++- [x] Remove cloud/provider fallback from the normal product path.
++- [x] Define local model input/output contracts for intent, tool selection, target
+   ranking, and final answer.
+-- Build agent event types for messages, tool calls, approvals, errors, and
++- [x] Build agent event types for messages, tool calls, approvals, errors, and
+   final responses.
+-- Keep deterministic router as fallback and test baseline.
+-- Add offline-only validation for the main user flows.
++- [x] Keep deterministic router as fallback and test baseline.
++- [x] Add offline-only validation for the main user flows.
+ 
+ Exit criteria:
+ 
+ TouchPilot can route simple requests deterministically, use a local model path
+ for ambiguous requests, and expose all work as local agent events.
+ 
++## Future Roadmap
++
+ ## Milestone 3: Screen Context and Understanding
+ 
+ Goal: let TouchPilot understand the current Android screen locally.

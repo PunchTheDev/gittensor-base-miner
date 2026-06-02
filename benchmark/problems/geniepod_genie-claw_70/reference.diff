@@ -1,0 +1,240 @@
+diff --git a/Makefile b/Makefile
+index d60e9b7..ca81420 100644
+--- a/Makefile
++++ b/Makefile
+@@ -120,12 +120,12 @@ deploy-docker:
+ 
+ deploy-setup:
+ 	scp deploy/setup-jetson.sh $(JETSON_TARGET):/tmp/
+-	scp deploy/scripts/genie-wake-listen.py deploy/scripts/genie-wakeword.py deploy/scripts/detect-audio-device.sh deploy/scripts/genie-restart-all.sh deploy/scripts/start_all.sh deploy/scripts/stop_all.sh deploy/scripts/genie-audio-init $(JETSON_TARGET):/tmp/
++	scp deploy/scripts/genie-wake-listen.py deploy/scripts/genie-wakeword.py deploy/scripts/detect-audio-device.sh deploy/scripts/genie-restart-all.sh deploy/scripts/start_all.sh deploy/scripts/stop_all.sh deploy/scripts/genie-model-cache-status.sh deploy/scripts/genie-audio-init $(JETSON_TARGET):/tmp/
+ 	ssh $(JETSON_TARGET) 'sudo cp /tmp/setup-jetson.sh $(INSTALL_DIR)/setup-jetson.sh && \
+ 		sudo chmod +x $(INSTALL_DIR)/setup-jetson.sh && \
+ 		sudo mkdir -p $(INSTALL_DIR)/bin && \
+-		sudo cp /tmp/genie-wake-listen.py /tmp/genie-wakeword.py /tmp/detect-audio-device.sh /tmp/genie-restart-all.sh /tmp/start_all.sh /tmp/stop_all.sh /tmp/genie-audio-init $(INSTALL_DIR)/bin/ && \
+-		sudo chmod +x $(INSTALL_DIR)/bin/genie-wake-listen.py $(INSTALL_DIR)/bin/genie-wakeword.py $(INSTALL_DIR)/bin/detect-audio-device.sh $(INSTALL_DIR)/bin/genie-restart-all.sh $(INSTALL_DIR)/bin/start_all.sh $(INSTALL_DIR)/bin/stop_all.sh $(INSTALL_DIR)/bin/genie-audio-init'
++		sudo cp /tmp/genie-wake-listen.py /tmp/genie-wakeword.py /tmp/detect-audio-device.sh /tmp/genie-restart-all.sh /tmp/start_all.sh /tmp/stop_all.sh /tmp/genie-model-cache-status.sh /tmp/genie-audio-init $(INSTALL_DIR)/bin/ && \
++		sudo chmod +x $(INSTALL_DIR)/bin/genie-wake-listen.py $(INSTALL_DIR)/bin/genie-wakeword.py $(INSTALL_DIR)/bin/detect-audio-device.sh $(INSTALL_DIR)/bin/genie-restart-all.sh $(INSTALL_DIR)/bin/start_all.sh $(INSTALL_DIR)/bin/stop_all.sh $(INSTALL_DIR)/bin/genie-model-cache-status.sh $(INSTALL_DIR)/bin/genie-audio-init'
+ 
+ # ── Alternate LLM runtime: genie-ai-runtime (issue #54) ─────────
+ #
+diff --git a/crates/genie-core/tests/tool_dispatch_test.rs b/crates/genie-core/tests/tool_dispatch_test.rs
+index 39cb712..0e7f6b7 100644
+--- a/crates/genie-core/tests/tool_dispatch_test.rs
++++ b/crates/genie-core/tests/tool_dispatch_test.rs
+@@ -201,6 +201,7 @@ fn jetson_lifecycle_scripts_are_valid_shell() {
+         "deploy/scripts/genie-restart-all.sh",
+         "deploy/scripts/start_all.sh",
+         "deploy/scripts/stop_all.sh",
++        "deploy/scripts/genie-model-cache-status.sh",
+     ] {
+         let path = workspace_root().join(script);
+         assert!(path.exists(), "{script} should exist");
+@@ -224,7 +225,12 @@ fn makefile_deploys_lifecycle_helpers() {
+     let path = workspace_root().join("Makefile");
+     let contents = std::fs::read_to_string(&path).unwrap();
+ 
+-    for script in ["genie-restart-all.sh", "start_all.sh", "stop_all.sh"] {
++    for script in [
++        "genie-restart-all.sh",
++        "start_all.sh",
++        "stop_all.sh",
++        "genie-model-cache-status.sh",
++    ] {
+         assert!(
+             contents.contains(&format!("deploy/scripts/{script}")),
+             "Makefile should copy {script} during deploy"
+@@ -260,6 +266,42 @@ fn start_all_uses_configured_llm_backend() {
+     );
+ }
+ 
++/// Verify genie-ai-runtime service preserves warm GGUF pages across restarts.
++#[test]
++fn genie_ai_runtime_service_preserves_model_page_cache() {
++    let path = workspace_root().join("deploy/systemd/genie-ai-runtime.service");
++    let contents = std::fs::read_to_string(&path).unwrap();
++
++    assert!(
++        !contents.contains("ExecStartPre="),
++        "genie-ai-runtime.service should not force cold model reloads"
++    );
++    assert!(
++        contents.contains("page cache") && contents.contains("issue #69"),
++        "service should document why page cache is preserved"
++    );
++}
++
++/// Verify the model cache helper can inspect GGUF page-cache residency.
++#[test]
++fn model_cache_status_helper_reports_residency() {
++    let path = workspace_root().join("deploy/scripts/genie-model-cache-status.sh");
++    let contents = std::fs::read_to_string(&path).unwrap();
++
++    assert!(
++        contents.contains("llm_model_path"),
++        "helper should default to the configured LLM model path"
++    );
++    assert!(
++        contents.contains("mincore"),
++        "helper should use Linux mincore to inspect page residency"
++    );
++    assert!(
++        contents.contains("Resident:"),
++        "helper should print resident model bytes"
++    );
++}
++
+ /// Verify systemd deploy replaces stale or masked unit-file symlinks.
+ #[test]
+ fn makefile_installs_systemd_units_instead_of_copying_through_symlinks() {
+diff --git a/deploy/scripts/genie-model-cache-status.sh b/deploy/scripts/genie-model-cache-status.sh
+new file mode 100644
+index 0000000..def5ea3
+--- /dev/null
++++ b/deploy/scripts/genie-model-cache-status.sh
+@@ -0,0 +1,116 @@
++#!/bin/bash
++# Report how much of the active LLM GGUF is resident in Linux page cache.
++
++set -euo pipefail
++
++CONFIG_FILE="${GENIEPOD_CONFIG:-/etc/geniepod/geniepod.toml}"
++DEFAULT_MODEL="/opt/geniepod/models/Qwen3-4B-Q4_K_M.gguf"
++
++usage() {
++    echo "Usage: $0 [MODEL_PATH]"
++    echo ""
++    echo "With no MODEL_PATH, reads [core].llm_model_path from $CONFIG_FILE"
++    echo "and falls back to $DEFAULT_MODEL."
++}
++
++if [ "${1:-}" = "-h" ] || [ "${1:-}" = "--help" ]; then
++    usage
++    exit 0
++fi
++
++if [ $# -gt 1 ]; then
++    usage >&2
++    exit 2
++fi
++
++if [ "$(id -u)" -eq 0 ]; then
++    AWK=(awk)
++else
++    AWK=(sudo awk)
++fi
++
++read_configured_model() {
++    "${AWK[@]}" -F'"' '
++        /^\[core\]/ { in_core = 1; next }
++        /^\[/ && !/^\[core\]/ { in_core = 0 }
++        in_core && /^llm_model_path = / { print $2; exit }
++    ' "$CONFIG_FILE" 2>/dev/null || true
++}
++
++MODEL_PATH="${1:-}"
++if [ -z "$MODEL_PATH" ]; then
++    MODEL_PATH="$(read_configured_model)"
++fi
++if [ -z "$MODEL_PATH" ]; then
++    MODEL_PATH="$DEFAULT_MODEL"
++fi
++
++if [ ! -f "$MODEL_PATH" ]; then
++    echo "ERROR: model file not found: $MODEL_PATH" >&2
++    exit 1
++fi
++
++if ! command -v python3 > /dev/null 2>&1; then
++    echo "ERROR: python3 is required to call mincore without extra packages" >&2
++    exit 1
++fi
++
++python3 - "$MODEL_PATH" <<'PY'
++import ctypes
++import mmap
++import os
++import sys
++
++path = sys.argv[1]
++page_size = os.sysconf("SC_PAGE_SIZE")
++size = os.path.getsize(path)
++
++if size == 0:
++    print(f"Model: {path}")
++    print("Size: 0 MB")
++    print("Resident: 0 / 0 MB (0.0%) cold")
++    sys.exit(0)
++
++fd = os.open(path, os.O_RDONLY)
++try:
++    mm = mmap.mmap(fd, size, access=mmap.ACCESS_COPY)
++finally:
++    os.close(fd)
++
++buf = None
++try:
++    buf = (ctypes.c_char * 1).from_buffer(mm)
++    addr = ctypes.addressof(buf)
++    pages = (size + page_size - 1) // page_size
++    vec = (ctypes.c_ubyte * pages)()
++
++    libc = ctypes.CDLL(None, use_errno=True)
++    mincore = libc.mincore
++    mincore.argtypes = [ctypes.c_void_p, ctypes.c_size_t, ctypes.POINTER(ctypes.c_ubyte)]
++    mincore.restype = ctypes.c_int
++
++    if mincore(ctypes.c_void_p(addr), ctypes.c_size_t(size), vec) != 0:
++        errno = ctypes.get_errno()
++        raise OSError(errno, os.strerror(errno))
++
++    resident_pages = sum(1 for value in vec if value & 1)
++    resident_bytes = min(resident_pages * page_size, size)
++    pct = (resident_bytes / size) * 100.0
++    size_mb = size / 1048576.0
++    resident_mb = resident_bytes / 1048576.0
++
++    if pct >= 95.0:
++        state = "warm"
++    elif pct <= 1.0:
++        state = "cold"
++    else:
++        state = "partial"
++
++    print(f"Model: {path}")
++    print(f"Size: {size_mb:.0f} MB")
++    print(f"Resident: {resident_mb:.0f} / {size_mb:.0f} MB ({pct:.1f}%) {state}")
++finally:
++    if buf is not None:
++        del buf
++    mm.close()
++PY
+diff --git a/deploy/setup-jetson.sh b/deploy/setup-jetson.sh
+index 3098572..cd88f7d 100755
+--- a/deploy/setup-jetson.sh
++++ b/deploy/setup-jetson.sh
+@@ -743,6 +743,9 @@ echo "Check status:"
+ echo "  genie-ctl status"
+ echo "  genie-ctl health"
+ echo ""
++echo "Check model weight cache:"
++echo "  /opt/geniepod/bin/genie-model-cache-status.sh"
++echo ""
+ echo "After future updates:"
+ echo "  /opt/geniepod/bin/genie-restart-all.sh"
+ echo ""
+diff --git a/deploy/systemd/genie-ai-runtime.service b/deploy/systemd/genie-ai-runtime.service
+index 84442bc..4c28e7a 100644
+--- a/deploy/systemd/genie-ai-runtime.service
++++ b/deploy/systemd/genie-ai-runtime.service
+@@ -10,8 +10,8 @@ Conflicts=genie-llm.service
+ 
+ [Service]
+ Type=simple
+-# Drop page cache before loading model — Jetson NvMap needs contiguous blocks.
+-ExecStartPre=/bin/sh -c 'sync && echo 3 > /proc/sys/vm/drop_caches'
++# Keep the GGUF in page cache across restarts when the kernel can. Clearing
++# VM caches here made every runtime restart cold-load Qwen3 again (issue #69).
+ # v1.0.0 only accepts `-m <model> -p <port>`. Any llama.cpp-style flags
+ # (--n-gpu-layers, --flash-attn, --ctx-size, --threads) are intentionally
+ # absent — the runtime hard-codes its own Jetson-tuned defaults.

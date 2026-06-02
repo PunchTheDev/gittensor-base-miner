@@ -1,0 +1,407 @@
+diff --git a/src/scoring/model.ts b/src/scoring/model.ts
+index 589209c..771f5f7 100644
+--- a/src/scoring/model.ts
++++ b/src/scoring/model.ts
+@@ -11,8 +11,6 @@ export const DEFAULT_SCORING_CONSTANTS: Record<string, number> = {
+   ISSUE_TREASURY_EMISSION_SHARE: 0.1,
+   PR_LOOKBACK_DAYS: 30,
+   MERGED_PR_BASE_SCORE: 25,
+-  MIN_TOKEN_SCORE_FOR_BASE_SCORE: 5,
+-  MAX_CODE_DENSITY_MULTIPLIER: 1.15,
+   MAX_CONTRIBUTION_BONUS: 25,
+   CONTRIBUTION_SCORE_FOR_FULL_BONUS: 1500,
+   TEST_FILE_CONTRIBUTION_WEIGHT: 0.05,
+@@ -39,7 +37,7 @@ export const SCORING_CONSTANTS_URL =
+ export const PROGRAMMING_LANGUAGES_URL =
+   "https://raw.githubusercontent.com/entrius/gittensor/test/gittensor/validator/weights/programming_languages.json";
+ 
+-const SCORING_CONSTANT_NAMES = new Set(Object.keys(DEFAULT_SCORING_CONSTANTS));
++const SCORING_CONSTANT_NAMES = new Set([...Object.keys(DEFAULT_SCORING_CONSTANTS), "MIN_TOKEN_SCORE_FOR_BASE_SCORE", "MAX_CODE_DENSITY_MULTIPLIER"]);
+ 
+ export async function refreshScoringModelSnapshot(env: Env): Promise<ScoringModelSnapshotRecord> {
+   const warnings: string[] = [];
+@@ -52,12 +50,15 @@ export async function refreshScoringModelSnapshot(env: Env): Promise<ScoringMode
+ 
+   let sourceKind: ScoringModelSnapshotRecord["sourceKind"] = "raw-github";
+   let constants = { ...DEFAULT_SCORING_CONSTANTS };
++  let activeModelConstants: Record<string, number> = {};
+   let constantsPayload: Record<string, JsonValue> = {};
+ 
+   if (constantsResult.ok) {
+     const parsed = parsePythonNumberConstants(constantsResult.value);
+     constants = { ...constants, ...parsed };
++    activeModelConstants = parsed;
+     constantsPayload = { parsedConstantCount: Object.keys(parsed).length, sourceBytes: constantsResult.value.length };
++    warnings.push(...activeModelWarnings(parsed));
+   } else {
+     sourceKind = "fallback";
+     warnings.push(`Scoring constants fetch failed: ${constantsResult.error}`);
+@@ -71,7 +72,7 @@ export async function refreshScoringModelSnapshot(env: Env): Promise<ScoringMode
+     sourceKind,
+     sourceUrl: SCORING_CONSTANTS_URL,
+     fetchedAt,
+-    activeModel: detectActiveModel(constants),
++    activeModel: detectActiveModel(activeModelConstants),
+     constants,
+     programmingLanguages: programmingLanguages as Record<string, JsonValue>,
+     registrySnapshotId: registrySnapshot?.id,
+@@ -104,13 +105,31 @@ export function parsePythonNumberConstants(source: string): Record<string, numbe
+ }
+ 
+ export function detectActiveModel(constants: Record<string, number>): ScoringModelSnapshotRecord["activeModel"] {
+-  if (Number.isFinite(constants.MAX_CODE_DENSITY_MULTIPLIER) && Number.isFinite(constants.MIN_TOKEN_SCORE_FOR_BASE_SCORE)) {
++  if (hasSaturationConstants(constants)) return "pending_saturation_model";
++  if (hasDensityConstants(constants)) {
+     return "current_density_model";
+   }
+-  if (Number.isFinite(constants.SRC_TOK_SATURATION_SCALE)) return "pending_saturation_model";
+   return "unknown";
+ }
+ 
++function activeModelWarnings(constants: Record<string, number>): string[] {
++  const hasSaturation = hasSaturationConstants(constants);
++  const hasDensity = hasDensityConstants(constants);
++  if (hasSaturation && hasDensity) {
++    return ["Scoring constants include both exponential saturation and density-era indicators; using exponential saturation as the active model."];
++  }
++  if (!hasSaturation && !hasDensity) return ["Scoring constants did not include a recognized active-model indicator."];
++  return [];
++}
++
++function hasSaturationConstants(constants: Record<string, number>): boolean {
++  return Number.isFinite(constants.SRC_TOK_SATURATION_SCALE);
++}
++
++function hasDensityConstants(constants: Record<string, number>): boolean {
++  return Number.isFinite(constants.MAX_CODE_DENSITY_MULTIPLIER) && Number.isFinite(constants.MIN_TOKEN_SCORE_FOR_BASE_SCORE);
++}
++
+ async function fetchText(url: string, token?: string): Promise<{ ok: true; value: string } | { ok: false; error: string }> {
+   try {
+     const response = await fetch(url, { headers: githubHeaders(token, "text/plain") });
+diff --git a/src/scoring/preview.ts b/src/scoring/preview.ts
+index fb0db6a..aa7ac40 100644
+--- a/src/scoring/preview.ts
++++ b/src/scoring/preview.ts
+@@ -209,14 +209,22 @@ function computeScoreCore(
+   const fixedBaseScore = input.fixedBaseScore ?? config?.fixedBaseScore ?? undefined;
+   const rawDensity = sourceTokenScore / sourceLines;
+   const densityMultiplier = clamp(rawDensity || 0, 0, constant(constants, "MAX_CODE_DENSITY_MULTIPLIER", 1.15));
+-  const baseTokenGatePassed = sourceTokenScore >= constant(constants, "MIN_TOKEN_SCORE_FOR_BASE_SCORE", 5);
+-  const contributionBonus =
++  const densityTokenGatePassed = sourceTokenScore >= constant(constants, "MIN_TOKEN_SCORE_FOR_BASE_SCORE", 5);
++  const baseTokenGatePassed = snapshot.activeModel === "pending_saturation_model" ? sourceTokenScore > 0 : densityTokenGatePassed;
++  const densityContributionBonus =
+     clamp(totalTokenScore / constant(constants, "CONTRIBUTION_SCORE_FOR_FULL_BONUS", 1500), 0, 1) *
+     constant(constants, "MAX_CONTRIBUTION_BONUS", 25);
++  const saturationContributionBonusValue = saturationContributionBonus(totalTokenScore, constants);
++  const saturationBaseScore = saturationScore(sourceTokenScore, totalTokenScore, constants);
++  const densityBaseScore =
++    (densityTokenGatePassed ? constant(constants, "MERGED_PR_BASE_SCORE", 25) * densityMultiplier : 0) + densityContributionBonus;
+   const baseScore =
+     fixedBaseScore !== undefined
+       ? fixedBaseScore
+-      : (baseTokenGatePassed ? constant(constants, "MERGED_PR_BASE_SCORE", 25) * densityMultiplier : 0) + contributionBonus;
++      : snapshot.activeModel === "pending_saturation_model"
++        ? saturationBaseScore
++        : densityBaseScore;
++  const activeContributionBonus = snapshot.activeModel === "pending_saturation_model" ? saturationContributionBonusValue : densityContributionBonus;
+   const labelMultiplier = selectLabelMultiplier(input.labels ?? [], config?.labelMultipliers ?? {}, config?.defaultLabelMultiplier ?? 1);
+   const issueMultiplier = selectIssueMultiplier(input.linkedIssueMode ?? "none", constants);
+   const credibilityObserved = clamp(input.credibility ?? inferCredibility(contributorEvidence), 0, 1);
+@@ -232,10 +240,7 @@ function computeScoreCore(
+   );
+   const openPrMultiplier = openPrCount <= openPrThreshold ? 1 : 0;
+   const estimatedMergedScore = roundScore(baseScore * labelMultiplier * issueMultiplier * credibilityMultiplier * reviewPenaltyMultiplier * openPrMultiplier);
+-  const pendingSaturationScore = roundScore(
+-    constant(constants, "MERGED_PR_BASE_SCORE", 25) * (1 - Math.exp(-sourceTokenScore / constant(constants, "SRC_TOK_SATURATION_SCALE", 58))) +
+-      clamp(totalTokenScore / constant(constants, "CONTRIBUTION_SCORE_FOR_FULL_BONUS", 1500), 0, 1) * 5,
+-  );
++  const pendingSaturationScore = roundScore(saturationBaseScore);
+   return {
+     laneMath: {
+       repoEmissionShare: emissionShare,
+@@ -248,7 +253,7 @@ function computeScoreCore(
+     scoreEstimate: {
+       baseScore: roundScore(baseScore),
+       densityMultiplier: roundScore(densityMultiplier),
+-      contributionBonus: roundScore(contributionBonus),
++      contributionBonus: roundScore(activeContributionBonus),
+       labelMultiplier,
+       issueMultiplier,
+       credibilityMultiplier: roundScore(credibilityMultiplier),
+@@ -543,6 +548,19 @@ function constant(constants: Record<string, number>, key: string, fallback: numb
+   return typeof value === "number" && Number.isFinite(value) ? value : fallback;
+ }
+ 
++function saturationScore(sourceTokenScore: number, totalTokenScore: number, constants: Record<string, number>): number {
++  const scale = Math.max(constant(constants, "SRC_TOK_SATURATION_SCALE", 58), 1);
++  return (
++    constant(constants, "MERGED_PR_BASE_SCORE", 25) * (1 - Math.exp(-sourceTokenScore / scale)) +
++    saturationContributionBonus(totalTokenScore, constants)
++  );
++}
++
++function saturationContributionBonus(totalTokenScore: number, constants: Record<string, number>): number {
++  const contributionBonusCap = Math.min(constant(constants, "MAX_CONTRIBUTION_BONUS", 5), 5);
++  return clamp(totalTokenScore / constant(constants, "CONTRIBUTION_SCORE_FOR_FULL_BONUS", 1500), 0, 1) * contributionBonusCap;
++}
++
+ function nonNegative(value: number | undefined): number {
+   return Number.isFinite(value) ? Math.max(0, value ?? 0) : 0;
+ }
+diff --git a/test/integration/api.test.ts b/test/integration/api.test.ts
+index cb45405..de4f64d 100644
+--- a/test/integration/api.test.ts
++++ b/test/integration/api.test.ts
+@@ -1140,7 +1140,7 @@ describe("api routes", () => {
+       fetchedCount: 2,
+       expectedCount: 2,
+       pageCount: 1,
+-      completedAt: "2026-05-23T00:00:00.000Z",
++      completedAt: new Date().toISOString(),
+       warnings: [],
+     });
+     const refreshingReadiness = await app.request("/v1/readiness", { headers: apiHeaders(refreshingEnv) }, refreshingEnv);
+@@ -2351,6 +2351,9 @@ async function mcpJson(response: Response): Promise<unknown> {
+ }
+ 
+ async function seedSignalData(env: Env): Promise<void> {
++  const freshAt = new Date().toISOString();
++  const previousFreshAt = new Date(Date.now() - 60_000).toISOString();
++
+   await upsertInstallation(env, {
+     installation: {
+       id: 123,
+@@ -2371,7 +2374,7 @@ async function seedSignalData(env: Env): Promise<void> {
+     missingEvents: [],
+     permissions: { metadata: "read", pull_requests: "read", issues: "write" },
+     events: ["issues", "pull_request", "repository"],
+-    checkedAt: "2026-05-23T00:00:00.000Z",
++    checkedAt: freshAt,
+   });
+   const snapshot = normalizeRegistryPayload(
+     {
+@@ -2384,7 +2387,7 @@ async function seedSignalData(env: Env): Promise<void> {
+       },
+     },
+     { kind: "raw-github", url: "https://example.test/master_repositories.json" },
+-    "2026-05-23T00:00:00.000Z",
++    freshAt,
+   );
+   await persistRegistrySnapshot(
+     env,
+@@ -2399,7 +2402,7 @@ async function seedSignalData(env: Env): Promise<void> {
+         },
+       },
+       { kind: "raw-github", url: "https://example.test/old_master_repositories.json" },
+-      "2026-05-22T00:00:00.000Z",
++      previousFreshAt,
+     ),
+   );
+   await persistRegistrySnapshot(env, snapshot);
+@@ -2414,7 +2417,7 @@ async function seedSignalData(env: Env): Promise<void> {
+     id: "scoring-1",
+     sourceKind: "test",
+     sourceUrl: "fixture://scoring",
+-    fetchedAt: "2026-05-23T00:00:00.000Z",
++    fetchedAt: freshAt,
+     activeModel: "current_density_model",
+     constants: {
+       OSS_EMISSION_SHARE: 0.9,
+@@ -2459,7 +2462,7 @@ async function seedSignalData(env: Env): Promise<void> {
+     closedUnmergedPullRequestsTotal: 0,
+     labelsTotal: 2,
+     sourceKind: "github",
+-    fetchedAt: "2026-05-23T00:00:00.000Z",
++    fetchedAt: freshAt,
+     payload: {},
+   });
+   await Promise.all(
+@@ -2482,7 +2485,7 @@ async function seedSignalData(env: Env): Promise<void> {
+         fetchedCount: record.fetchedCount,
+         expectedCount: record.expectedCount,
+         pageCount: 1,
+-        completedAt: "2026-05-23T00:00:00.000Z",
++        completedAt: freshAt,
+         warnings: [],
+       }),
+     ),
+@@ -2516,7 +2519,7 @@ async function seedSignalData(env: Env): Promise<void> {
+     missingEvents: [],
+     permissions: { metadata: "read", pull_requests: "read", issues: "write" },
+     events: ["issues", "issue_comment", "pull_request", "repository"],
+-    checkedAt: "2026-05-23T00:00:00.000Z",
++    checkedAt: freshAt,
+   });
+   await upsertIssueFromGitHub(env, "entrius/allways-ui", {
+     number: 7,
+@@ -2552,10 +2555,10 @@ async function seedSignalData(env: Env): Promise<void> {
+     repoFullName: "entrius/allways-ui",
+     pullNumber: 12,
+     status: "complete",
+-    filesSyncedAt: "2026-05-23T00:00:00.000Z",
+-    reviewsSyncedAt: "2026-05-23T00:00:00.000Z",
+-    checksSyncedAt: "2026-05-23T00:00:00.000Z",
+-    lastSyncedAt: "2026-05-23T00:00:00.000Z",
++    filesSyncedAt: freshAt,
++    reviewsSyncedAt: freshAt,
++    checksSyncedAt: freshAt,
++    lastSyncedAt: freshAt,
+   });
+   await upsertPullRequestFile(env, {
+     repoFullName: "entrius/allways-ui",
+@@ -2600,10 +2603,10 @@ async function seedSignalData(env: Env): Promise<void> {
+     repoFullName: "entrius/allways-ui",
+     pullNumber: 13,
+     status: "complete",
+-    filesSyncedAt: "2026-05-23T00:00:00.000Z",
+-    reviewsSyncedAt: "2026-05-23T00:00:00.000Z",
+-    checksSyncedAt: "2026-05-23T00:00:00.000Z",
+-    lastSyncedAt: "2026-05-23T00:00:00.000Z",
++    filesSyncedAt: freshAt,
++    reviewsSyncedAt: freshAt,
++    checksSyncedAt: freshAt,
++    lastSyncedAt: freshAt,
+   });
+   await upsertRecentMergedPullRequest(env, {
+     repoFullName: "entrius/allways-ui",
+diff --git a/test/unit/scoring.test.ts b/test/unit/scoring.test.ts
+index d2e4c71..9e51051 100644
+--- a/test/unit/scoring.test.ts
++++ b/test/unit/scoring.test.ts
+@@ -70,6 +70,100 @@ IGNORED = "not numeric"
+     expect(detectActiveModel({})).toBe("unknown");
+   });
+ 
++  it("prefers exponential saturation when mixed upstream constants are present", () => {
++    const parsed = parsePythonNumberConstants(`
++MERGED_PR_BASE_SCORE = 25
++MAX_CONTRIBUTION_BONUS = 5
++CONTRIBUTION_SCORE_FOR_FULL_BONUS = 1500
++SRC_TOK_SATURATION_SCALE = 58.0
++MIN_TOKEN_SCORE_FOR_BASE_SCORE = 5
++MAX_CODE_DENSITY_MULTIPLIER = 1.15
++`);
++    expect(parsed).toMatchObject({ SRC_TOK_SATURATION_SCALE: 58, MAX_CONTRIBUTION_BONUS: 5 });
++    expect(detectActiveModel(parsed)).toBe("pending_saturation_model");
++  });
++
++  it("detects the active model from fetched constants before default fallback constants", async () => {
++    const env = createTestEnv({ GITHUB_PUBLIC_TOKEN: "token" });
++    vi.stubGlobal("fetch", async (input: RequestInfo | URL) => {
++      const url = input.toString();
++      if (url.includes("constants.py")) {
++        return new Response("MIN_TOKEN_SCORE_FOR_BASE_SCORE = 5\nMAX_CODE_DENSITY_MULTIPLIER = 1.15\n");
++      }
++      if (url.includes("programming_languages.json")) return Response.json({ TypeScript: 1 });
++      return new Response("not found", { status: 404 });
++    });
++
++    const refreshed = await refreshScoringModelSnapshot(env);
++
++    expect(refreshed.activeModel).toBe("current_density_model");
++    expect(refreshed.constants.MAX_CONTRIBUTION_BONUS).toBe(25);
++    expect(refreshed.constants.SRC_TOK_SATURATION_SCALE).toBe(58);
++    expect(refreshed.warnings).not.toEqual(expect.arrayContaining([expect.stringContaining("density-era indicators")]));
++  });
++
++  it("uses saturation math as the active private preview model", () => {
++    const saturationSnapshot: ScoringModelSnapshotRecord = {
++      ...snapshot,
++      activeModel: "pending_saturation_model",
++      constants: {
++        ...snapshot.constants,
++        MAX_CONTRIBUTION_BONUS: 25,
++        SRC_TOK_SATURATION_SCALE: 58,
++      },
++    };
++    const preview = buildScorePreview({
++      repo,
++      snapshot: saturationSnapshot,
++      input: {
++        repoFullName: repo.fullName,
++        labels: ["bug"],
++        linkedIssueMode: "standard",
++        sourceTokenScore: 58,
++        totalTokenScore: 1500,
++        sourceLines: 120,
++        openPrCount: 0,
++        credibility: 1,
++      },
++    });
++
++    expect(preview.activeModel).toBe("pending_saturation_model");
++    expect(preview.scoreEstimate.baseScore).toBeCloseTo(20.803, 3);
++    expect(preview.scoreEstimate.contributionBonus).toBe(5);
++    expect(preview.scoreEstimate.pendingSaturationScore).toBe(preview.scoreEstimate.baseScore);
++    expect(preview.scoreEstimate.estimatedMergedScore).toBeCloseTo(33.2016, 3);
++    expect(preview.gates.baseTokenGatePassed).toBe(true);
++    expect(JSON.stringify(preview.scoreEstimate)).not.toMatch(/reward estimate|wallet|hotkey|farming|payout/i);
++  });
++
++  it("keeps pending saturation projection bonus capped for density-era snapshots", () => {
++    const densitySnapshot: ScoringModelSnapshotRecord = {
++      ...snapshot,
++      activeModel: "current_density_model",
++      constants: {
++        ...snapshot.constants,
++        MAX_CONTRIBUTION_BONUS: 25,
++        SRC_TOK_SATURATION_SCALE: 58,
++      },
++    };
++    const preview = buildScorePreview({
++      repo,
++      snapshot: densitySnapshot,
++      input: {
++        repoFullName: repo.fullName,
++        sourceTokenScore: 58,
++        totalTokenScore: 1500,
++        sourceLines: 120,
++        openPrCount: 0,
++        credibility: 1,
++      },
++    });
++
++    expect(preview.scoreEstimate.contributionBonus).toBe(25);
++    expect(preview.scoreEstimate.pendingSaturationScore).toBeCloseTo(20.803, 3);
++    expect(preview.underlyingPotentialScore).toBeLessThan(30);
++  });
++
+   it("keeps lane math tied to the recorded model snapshot and clamps score gates", () => {
+     const preview = buildScorePreview({
+       repo,
+@@ -254,7 +348,7 @@ IGNORED = "not numeric"
+     vi.stubGlobal("fetch", async (input: RequestInfo | URL) => {
+       const url = input.toString();
+       if (url.includes("constants.py")) {
+-        return new Response("OSS_EMISSION_SHARE = 0.90\nMIN_TOKEN_SCORE_FOR_BASE_SCORE = 5\nMAX_CODE_DENSITY_MULTIPLIER = 1.15\n");
++        return new Response("OSS_EMISSION_SHARE = 0.90\nMERGED_PR_BASE_SCORE = 25\nSRC_TOK_SATURATION_SCALE = 58\nMIN_TOKEN_SCORE_FOR_BASE_SCORE = 5\nMAX_CODE_DENSITY_MULTIPLIER = 1.15\n");
+       }
+       if (url.includes("programming_languages.json")) return Response.json({ TypeScript: 1, Python: 0.8 });
+       return new Response("not found", { status: 404 });
+@@ -262,7 +356,8 @@ IGNORED = "not numeric"
+ 
+     const refreshed = await refreshScoringModelSnapshot(env);
+     expect(refreshed.sourceKind).toBe("raw-github");
+-    expect(refreshed.activeModel).toBe("current_density_model");
++    expect(refreshed.activeModel).toBe("pending_saturation_model");
++    expect(refreshed.warnings.join(" ")).toMatch(/density-era indicators/i);
+     expect(refreshed.programmingLanguages).toMatchObject({ TypeScript: 1 });
+     await expect(getLatestScoringModelSnapshot(env)).resolves.toMatchObject({ id: refreshed.id });
+ 
+@@ -270,6 +365,7 @@ IGNORED = "not numeric"
+     vi.stubGlobal("fetch", async () => new Response("missing", { status: 404 }));
+     const fallback = await refreshScoringModelSnapshot(fallbackEnv);
+     expect(fallback.sourceKind).toBe("fallback");
++    expect(fallback.activeModel).toBe("unknown");
+     expect(fallback.warnings.join(" ")).toMatch(/fetch failed/i);
+     expect(fallback.constants.OSS_EMISSION_SHARE).toBe(0.9);
+ 
+@@ -278,5 +374,6 @@ IGNORED = "not numeric"
+     });
+     const thrownFallback = await refreshScoringModelSnapshot(createTestEnv());
+     expect(thrownFallback.sourceKind).toBe("fallback");
++    expect(thrownFallback.activeModel).toBe("unknown");
+   });
+ });

@@ -1,0 +1,248 @@
+diff --git a/gittensor/classes.py b/gittensor/classes.py
+index fc66298f..cb4e28f5 100644
+--- a/gittensor/classes.py
++++ b/gittensor/classes.py
+@@ -337,6 +337,7 @@ class MinerEvaluation:
+     total_leaf_count: int = 0
+     total_leaf_score: float = 0.0
+     failed_reason: Optional[str] = None
++    github_pr_fetch_failed: bool = False
+     evaluation_timestamp: Optional[datetime] = None
+     merged_pull_requests: List[PullRequest] = field(default_factory=list)
+     open_pull_requests: List[PullRequest] = field(default_factory=list)
+@@ -373,6 +374,10 @@ def total_open_prs(self) -> int:
+     def total_closed_prs(self) -> int:
+         return len(self.closed_pull_requests)
+ 
++    @property
++    def should_use_cache_fallback(self) -> bool:
++        return self.github_pr_fetch_failed and self.total_prs == 0
++
+     def get_all_issues(self) -> List[Issue]:
+         """Aggregate all issues from all pull requests (merged, open, closed)."""
+         all_issues = []
+diff --git a/gittensor/utils/github_api_tools.py b/gittensor/utils/github_api_tools.py
+index dbafbc7b..8bdc33c9 100644
+--- a/gittensor/utils/github_api_tools.py
++++ b/gittensor/utils/github_api_tools.py
+@@ -978,6 +978,7 @@ def load_miners_prs(
+         max_prs: Maximum merged PRs to fetch
+     """
+     bt.logging.info('*****Fetching PRs*****')
++    miner_eval.github_pr_fetch_failed = False
+ 
+     if not miner_eval.github_pat:
+         bt.logging.warning(f'UID {miner_eval.uid} has no github_pat, skipping PR fetch')
+@@ -1005,20 +1006,28 @@ def load_miners_prs(
+ 
+             if not result.response:
+                 bt.logging.warning('No response from github, breaking fetch loop...')
++                miner_eval.github_pr_fetch_failed = True
+                 break
+ 
+-            data: Dict = result.response.json()
++            try:
++                data: Dict = result.response.json()
++            except Exception as e:
++                bt.logging.error(f'Failed to parse GraphQL JSON response: {e}')
++                miner_eval.github_pr_fetch_failed = True
++                break
+ 
+             # Resource limit errors are already handled in get_github_graphql_query; break on others
+             if 'errors' in data:
+                 non_resource_errors = [e for e in data['errors'] if e.get('type') != 'RESOURCE_LIMITS_EXCEEDED']
+                 if non_resource_errors:
+                     bt.logging.error(f'GraphQL errors: {non_resource_errors}')
++                    miner_eval.github_pr_fetch_failed = True
+                     break
+ 
+             user_data: Dict = data.get('data', {}).get('node')
+             if not user_data:
+                 bt.logging.warning('User not found or no pull requests')
++                miner_eval.github_pr_fetch_failed = True
+                 break
+ 
+             # Extract open issue count from first page (User-level field, not paginated)
+@@ -1076,6 +1085,7 @@ def load_miners_prs(
+ 
+     except Exception as e:
+         bt.logging.error(f'Unexpected error fetching PRs via GraphQL: {e}')
++        miner_eval.github_pr_fetch_failed = True
+ 
+     bt.logging.info(
+         f'Fetched {len(miner_eval.merged_pull_requests)} merged PRs, {len(miner_eval.open_pull_requests)} open PRs, '
+diff --git a/neurons/validator.py b/neurons/validator.py
+index a1b662f3..69577473 100644
+--- a/neurons/validator.py
++++ b/neurons/validator.py
+@@ -156,16 +156,21 @@ def store_or_use_cached_evaluation(self, miner_evaluations: Dict[int, MinerEvalu
+             if miner_eval.failed_reason is not None:
+                 continue
+ 
+-            # Successful evaluation with PRs - store to cache
+-            if miner_eval.total_prs > 0:
+-                self.evaluation_cache.store(miner_eval)
++            if not miner_eval.github_pr_fetch_failed:
++                if miner_eval.total_prs > 0:
++                    self.evaluation_cache.store(miner_eval)
++                continue
++
++            if not miner_eval.should_use_cache_fallback:
++                bt.logging.warning(
++                    f'UID {uid}: GitHub fetch failed after partial PR load; skipping cache store/fallback this round'
++                )
+                 continue
+ 
+-            # if failure, try cache fallback
+             cached_eval = self.evaluation_cache.get(uid, miner_eval.hotkey, miner_eval.github_id)
+             if cached_eval is not None:
+                 bt.logging.info(
+-                    f'UID {uid}: GitHub returned no PRs, using cached evaluation '
++                    f'UID {uid}: GitHub fetch failed, using cached evaluation '
+                     f'(merged={cached_eval.total_merged_prs}, open={cached_eval.total_open_prs}, '
+                     f'closed={cached_eval.total_closed_prs})'
+                 )
+diff --git a/tests/utils/test_github_api_tools.py b/tests/utils/test_github_api_tools.py
+index 6b7d7745..1bdeb997 100644
+--- a/tests/utils/test_github_api_tools.py
++++ b/tests/utils/test_github_api_tools.py
+@@ -1156,6 +1156,52 @@ def test_null_closing_issues_skips_bad_pr_continues_rest(self, mock_logging, moc
+         assert any('PR #2' in w for w in warning_calls), f'Expected a warning about PR #2, got: {warning_calls}'
+ 
+ 
++class TestLoadMinersPrsFetchFailureSignal:
++    """Tests for explicit fetch-failure signaling in load_miners_prs."""
++
++    @patch('gittensor.utils.github_api_tools.get_github_graphql_query')
++    @patch('gittensor.utils.github_api_tools.bt.logging')
++    def test_empty_pr_list_keeps_fetch_failed_false(self, mock_logging, mock_graphql_query):
++        from gittensor.classes import MinerEvaluation
++        from gittensor.utils.github_api_tools import GraphQLPageResult
++
++        mock_response = Mock()
++        mock_response.status_code = 200
++        mock_response.json.return_value = {
++            'data': {
++                'node': {
++                    'issues': {'totalCount': 0},
++                    'pullRequests': {
++                        'pageInfo': {'hasNextPage': False, 'endCursor': None},
++                        'nodes': [],
++                    },
++                }
++            }
++        }
++        mock_graphql_query.return_value = GraphQLPageResult(response=mock_response, page_size=100)
++
++        miner_eval = MinerEvaluation(uid=74, hotkey='test_hotkey', github_id='12345', github_pat='fake_pat')
++
++        load_miners_prs(miner_eval, {})
++
++        assert miner_eval.github_pr_fetch_failed is False
++        assert miner_eval.total_prs == 0
++
++    @patch('gittensor.utils.github_api_tools.get_github_graphql_query')
++    @patch('gittensor.utils.github_api_tools.bt.logging')
++    def test_no_graphql_response_sets_fetch_failed_true(self, mock_logging, mock_graphql_query):
++        from gittensor.classes import MinerEvaluation
++        from gittensor.utils.github_api_tools import GraphQLPageResult
++
++        mock_graphql_query.return_value = GraphQLPageResult(response=None, page_size=100)
++
++        miner_eval = MinerEvaluation(uid=74, hotkey='test_hotkey', github_id='12345', github_pat='fake_pat')
++
++        load_miners_prs(miner_eval, {})
++
++        assert miner_eval.github_pr_fetch_failed is True
++
++
+ # ============================================================================
+ # GraphQL Batch-Size Limit Tests
+ # ============================================================================
+diff --git a/tests/validator/test_validator_cache_fallback.py b/tests/validator/test_validator_cache_fallback.py
+new file mode 100644
+index 00000000..4387e3df
+--- /dev/null
++++ b/tests/validator/test_validator_cache_fallback.py
+@@ -0,0 +1,81 @@
++# Entrius 2025
++
++from datetime import datetime, timezone
++from typing import cast
++
++from gittensor.classes import MinerEvaluation, MinerEvaluationCache, PRState, PullRequest
++from neurons.validator import Validator
++
++
++class _DummyValidator:
++    def __init__(self):
++        self.evaluation_cache = MinerEvaluationCache()
++
++
++def _make_pr(uid: int) -> PullRequest:
++    now = datetime.now(timezone.utc)
++    return PullRequest(
++        number=1,
++        repository_full_name='owner/repo',
++        uid=uid,
++        hotkey='hotkey_1',
++        github_id='12345',
++        title='cached pr',
++        author_login='miner',
++        merged_at=now,
++        created_at=now,
++        pr_state=PRState.MERGED,
++        file_changes=[],
++    )
++
++
++def _build_eval(uid: int, merged_prs: int, fetch_failed: bool) -> MinerEvaluation:
++    eval_ = MinerEvaluation(uid=uid, hotkey='hotkey_1', github_id='12345')
++    eval_.merged_pull_requests = [_make_pr(uid) for _ in range(merged_prs)]
++    eval_.github_pr_fetch_failed = fetch_failed
++    return eval_
++
++
++class TestStoreOrUseCachedEvaluation:
++    def test_legitimate_zero_prs_does_not_use_cache(self):
++        validator = _DummyValidator()
++        validator.evaluation_cache.store(_build_eval(uid=1, merged_prs=1, fetch_failed=False))
++
++        current_eval = _build_eval(uid=1, merged_prs=0, fetch_failed=False)
++        miner_evaluations = {1: current_eval}
++
++        cached_uids = Validator.store_or_use_cached_evaluation(cast(Validator, validator), miner_evaluations)
++
++        assert cached_uids == set()
++        assert miner_evaluations[1] is current_eval
++        assert miner_evaluations[1].total_prs == 0
++
++    def test_fetch_failure_with_zero_prs_uses_cache(self):
++        validator = _DummyValidator()
++        validator.evaluation_cache.store(_build_eval(uid=1, merged_prs=1, fetch_failed=False))
++
++        current_eval = _build_eval(uid=1, merged_prs=0, fetch_failed=True)
++        miner_evaluations = {1: current_eval}
++
++        cached_uids = Validator.store_or_use_cached_evaluation(cast(Validator, validator), miner_evaluations)
++
++        assert cached_uids == {1}
++        assert miner_evaluations[1] is not current_eval
++        assert miner_evaluations[1].total_prs == 1
++
++    def test_fetch_failure_after_partial_load_skips_cache_store_and_fallback(self):
++        validator = _DummyValidator()
++        validator.evaluation_cache.store(_build_eval(uid=1, merged_prs=2, fetch_failed=False))
++
++        current_eval = _build_eval(uid=1, merged_prs=1, fetch_failed=True)
++        miner_evaluations = {1: current_eval}
++
++        cached_uids = Validator.store_or_use_cached_evaluation(cast(Validator, validator), miner_evaluations)
++
++        assert cached_uids == set()
++        assert miner_evaluations[1] is current_eval
++        assert miner_evaluations[1].total_prs == 1
++
++        cached_eval = validator.evaluation_cache.get(uid=1, hotkey='hotkey_1', github_id='12345')
++        assert cached_eval is not None
++        assert cached_eval.total_prs == 2

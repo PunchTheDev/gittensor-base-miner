@@ -1,0 +1,642 @@
+diff --git a/integrations/raycast/src/feed.ts b/integrations/raycast/src/feed.ts
+index 6ce447aa7f..7206ae3129 100644
+--- a/integrations/raycast/src/feed.ts
++++ b/integrations/raycast/src/feed.ts
+@@ -13,9 +13,11 @@ export const SUBMIT_URL = "https://heyclau.de/submit";
+ export const GITHUB_NEW_ISSUE_URL =
+   "https://github.com/JSONbored/awesome-claude/issues/new";
+ export const CACHE_KEY = "heyclaude-raycast-index";
++export const FEED_METADATA_CACHE_KEY = "heyclaude-raycast-feed-metadata";
+ export const DETAIL_CACHE_PREFIX = "heyclaude-raycast-detail";
+ export const FAVORITES_KEY = "favorite-entry-keys";
+ const RAYCAST_FEED_PATH = "/data/raycast-index.json";
++const REGISTRY_MANIFEST_PATH = "/data/registry-manifest.json";
+ 
+ export type DownloadTrust = "first-party" | "external" | null;
+ 
+@@ -91,6 +93,20 @@ export type RaycastDetail = {
+ export type ParsedFeed = {
+   entries: RaycastEntry[];
+   generatedAt: string;
++  signature?: string;
++  refreshStatus?: "updated" | "unchanged" | "stale";
++  refreshWarning?: string;
++};
++
++export type FeedSnapshotMetadata = {
++  generatedAt: string;
++  signature: string;
++  detailCacheNamespace: string;
++};
++
++export type RegistryManifestSnapshot = {
++  generatedAt: string;
++  signature: string;
+ };
+ 
+ export type CategoryOption = {
+@@ -173,11 +189,20 @@ export function feedCacheKey(feedUrl = FEED_URL) {
+   return scopedCacheKey(CACHE_KEY, feedUrl);
+ }
+ 
++export function feedMetadataCacheKey(feedUrl = FEED_URL) {
++  return scopedCacheKey(FEED_METADATA_CACHE_KEY, feedUrl);
++}
++
+ export function detailCacheKey(
+   entry: Pick<RaycastEntry, "category" | "slug">,
+   feedUrl = FEED_URL,
++  detailCacheNamespace = "",
+ ) {
+-  return scopedCacheKey(`${DETAIL_CACHE_PREFIX}:${entryKey(entry)}`, feedUrl);
++  const namespace = detailCacheNamespace ? `:${detailCacheNamespace}` : "";
++  return scopedCacheKey(
++    `${DETAIL_CACHE_PREFIX}:${entryKey(entry)}${namespace}`,
++    feedUrl,
++  );
+ }
+ 
+ export function categoryLabel(category: string) {
+@@ -188,6 +213,10 @@ export function absoluteDataUrl(value: string, baseUrl = FEED_URL) {
+   return new URL(value, baseUrl).toString();
+ }
+ 
++export function registryManifestUrl(feedUrl = FEED_URL) {
++  return absoluteDataUrl(REGISTRY_MANIFEST_PATH, feedUrl);
++}
++
+ function setOptionalParam(
+   params: URLSearchParams,
+   key: string,
+@@ -361,6 +390,69 @@ export function parseFeed(value: string): ParsedFeed {
+   };
+ }
+ 
++export function buildFeedSnapshotMetadata(
++  feed: Pick<ParsedFeed, "generatedAt">,
++  manifestSnapshot?: RegistryManifestSnapshot | null,
++): FeedSnapshotMetadata {
++  const generatedAt = manifestSnapshot?.generatedAt || feed.generatedAt || "";
++  const signature = manifestSnapshot?.signature || generatedAt;
++
++  return {
++    generatedAt,
++    signature,
++    detailCacheNamespace: signature || generatedAt || "unknown",
++  };
++}
++
++export function parseFeedSnapshotMetadata(
++  value: string | undefined,
++): FeedSnapshotMetadata | null {
++  if (!value) return null;
++
++  try {
++    const parsed = JSON.parse(value) as unknown;
++    if (!isRecord(parsed)) return null;
++
++    const generatedAt = optionalString(parsed.generatedAt);
++    const signature = optionalString(parsed.signature) || generatedAt;
++    const detailCacheNamespace =
++      optionalString(parsed.detailCacheNamespace) || signature;
++    if (!signature && !generatedAt) return null;
++
++    return {
++      generatedAt,
++      signature,
++      detailCacheNamespace: detailCacheNamespace || "unknown",
++    };
++  } catch {
++    return null;
++  }
++}
++
++export function parseRegistryManifestSnapshot(
++  value: string,
++): RegistryManifestSnapshot | null {
++  const parsed = JSON.parse(value) as unknown;
++  if (!isRecord(parsed)) return null;
++
++  const generatedAt = optionalString(parsed.generatedAt);
++  const contracts = isRecord(parsed.artifactContracts)
++    ? parsed.artifactContracts
++    : {};
++  const raycastContract = isRecord(contracts["raycast-index.json"])
++    ? contracts["raycast-index.json"]
++    : null;
++  const signature = raycastContract
++    ? optionalString(raycastContract.sha256)
++    : "";
++
++  if (!signature && !generatedAt) return null;
++  return {
++    generatedAt,
++    signature: signature || generatedAt,
++  };
++}
++
+ export function isRaycastDetail(value: unknown): value is RaycastDetail {
+   const detail = value as Partial<RaycastDetail>;
+   return (
+diff --git a/integrations/raycast/src/registry-command.tsx b/integrations/raycast/src/registry-command.tsx
+index 7f88382742..3b42945dc9 100644
+--- a/integrations/raycast/src/registry-command.tsx
++++ b/integrations/raycast/src/registry-command.tsx
+@@ -156,10 +156,18 @@ export function createRegistryCommand(options: RegistryCommandOptions = {}) {
+         setEntries(nextFeed.entries);
+         setGeneratedAt(nextFeed.generatedAt);
+         if (showSuccess) {
++          const isCurrent = nextFeed.refreshStatus === "unchanged";
++          const isStale = nextFeed.refreshStatus === "stale";
+           await showToast({
+-            style: Toast.Style.Success,
+-            title: "HeyClaude feed refreshed",
+-            message: `${nextFeed.entries.length} entries`,
++            style: isStale ? Toast.Style.Failure : Toast.Style.Success,
++            title: isStale
++              ? "Could not check for feed updates"
++              : isCurrent
++                ? "HeyClaude feed already current"
++                : "HeyClaude feed refreshed",
++            message: isStale
++              ? nextFeed.refreshWarning
++              : `${nextFeed.entries.length} entries`,
+           });
+         }
+       } catch (error) {
+diff --git a/integrations/raycast/src/runtime.ts b/integrations/raycast/src/runtime.ts
+index a78707d16e..9f2db16eb8 100644
+--- a/integrations/raycast/src/runtime.ts
++++ b/integrations/raycast/src/runtime.ts
+@@ -1,15 +1,22 @@
+ import {
+   FEED_URL,
+   absoluteDataUrl,
++  buildFeedSnapshotMetadata,
+   detailCacheKey,
+   fallbackDetail,
+   feedCacheKey,
++  feedMetadataCacheKey,
+   isRaycastDetail,
+   parseFeed,
++  parseFeedSnapshotMetadata,
++  parseRegistryManifestSnapshot,
++  registryManifestUrl,
+   resolveFeedUrl,
++  type FeedSnapshotMetadata,
+   type ParsedFeed,
+   type RaycastDetail,
+   type RaycastEntry,
++  type RegistryManifestSnapshot,
+ } from "./feed";
+ 
+ export type RaycastTextCache = {
+@@ -23,6 +30,33 @@ export type FetchLike = (
+   init?: RequestInit,
+ ) => Promise<Response>;
+ 
++function loadCachedFeedMetadata(
++  cache: RaycastTextCache,
++  feedUrl = FEED_URL,
++): FeedSnapshotMetadata | null {
++  return parseFeedSnapshotMetadata(cache.get(feedMetadataCacheKey(feedUrl)));
++}
++
++function saveFeedSnapshotMetadata(
++  cache: RaycastTextCache,
++  feedUrl: string,
++  metadata: FeedSnapshotMetadata,
++) {
++  cache.set(feedMetadataCacheKey(feedUrl), JSON.stringify(metadata));
++}
++
++function enrichFeedWithMetadata(
++  feed: ParsedFeed,
++  metadata: FeedSnapshotMetadata | null,
++): ParsedFeed {
++  if (!metadata) return feed;
++  return {
++    ...feed,
++    generatedAt: metadata.generatedAt || feed.generatedAt,
++    signature: metadata.signature,
++  };
++}
++
+ export function loadCachedFeed(
+   cache: RaycastTextCache,
+   feedUrl = FEED_URL,
+@@ -32,35 +66,167 @@ export function loadCachedFeed(
+   if (!cached) return { entries: [], generatedAt: "" };
+ 
+   try {
+-    return parseFeed(cached);
++    return enrichFeedWithMetadata(
++      parseFeed(cached),
++      loadCachedFeedMetadata(cache, feedUrl),
++    );
+   } catch {
+     cache.remove(cacheKey);
++    cache.remove(feedMetadataCacheKey(feedUrl));
+     return { entries: [], generatedAt: "" };
+   }
+ }
+ 
+-export async function fetchFreshFeed(options: {
++async function fetchRegistryManifestSnapshot(
++  fetchFn: FetchLike,
++  feedUrl: string,
++): Promise<RegistryManifestSnapshot | null> {
++  const response = await fetchFn(registryManifestUrl(feedUrl), {
++    headers: { accept: "application/json" },
++  });
++  if (!response.ok) {
++    throw new Error(`Registry manifest responded with ${response.status}`);
++  }
++
++  const snapshot = parseRegistryManifestSnapshot(await response.text());
++  if (!snapshot) {
++    throw new Error("Registry manifest payload was malformed");
++  }
++  return snapshot;
++}
++
++function isSameFeedSnapshot(
++  cachedFeed: ParsedFeed,
++  cachedMetadata: FeedSnapshotMetadata | null,
++  manifestSnapshot: RegistryManifestSnapshot,
++) {
++  if (cachedMetadata?.signature) {
++    return cachedMetadata.signature === manifestSnapshot.signature;
++  }
++  return Boolean(
++    cachedFeed.generatedAt &&
++    manifestSnapshot.generatedAt &&
++    cachedFeed.generatedAt === manifestSnapshot.generatedAt,
++  );
++}
++
++function removeDetailCacheForSnapshot(options: {
+   cache: RaycastTextCache;
+-  fetchFn?: FetchLike;
+-  feedUrl?: string;
++  entries: RaycastEntry[];
++  feedUrl: string;
++  detailCacheNamespace: string;
+ }) {
+-  const fetchFn = options.fetchFn ?? fetch;
+-  const feedUrl = resolveFeedUrl(options.feedUrl);
++  for (const entry of options.entries) {
++    options.cache.remove(
++      detailCacheKey(entry, options.feedUrl, options.detailCacheNamespace),
++    );
++  }
++}
++
++function invalidateDetailCacheWhenSnapshotChanges(options: {
++  cache: RaycastTextCache;
++  entries: RaycastEntry[];
++  feedUrl: string;
++  previousMetadata: FeedSnapshotMetadata | null;
++  nextMetadata: FeedSnapshotMetadata;
++}) {
++  const previousNamespace =
++    options.previousMetadata?.detailCacheNamespace || "";
++  if (previousNamespace === options.nextMetadata.detailCacheNamespace) return;
++
++  removeDetailCacheForSnapshot({
++    cache: options.cache,
++    entries: options.entries,
++    feedUrl: options.feedUrl,
++    detailCacheNamespace: previousNamespace,
++  });
++}
++
++function isFeedPayloadValidationError(error: unknown) {
++  return (
++    error instanceof SyntaxError ||
++    (error instanceof Error && error.message === "Feed contained no entries")
++  );
++}
++
++async function fetchFeedPayload(
++  fetchFn: FetchLike,
++  feedUrl: string,
++): Promise<string> {
+   const response = await fetchFn(feedUrl, {
+     headers: { accept: "application/json" },
+   });
+   if (!response.ok) {
+     throw new Error(`Feed responded with ${response.status}`);
+   }
++  return response.text();
++}
++
++export async function fetchFreshFeed(options: {
++  cache: RaycastTextCache;
++  fetchFn?: FetchLike;
++  feedUrl?: string;
++}) {
++  const fetchFn = options.fetchFn ?? fetch;
++  const feedUrl = resolveFeedUrl(options.feedUrl);
++  const cachedFeed = loadCachedFeed(options.cache, feedUrl);
++  const cachedMetadata = loadCachedFeedMetadata(options.cache, feedUrl);
++  let manifestSnapshot: RegistryManifestSnapshot | null = null;
++  let manifestError: Error | null = null;
+ 
+-  const text = await response.text();
+-  const nextFeed = parseFeed(text);
+-  if (nextFeed.entries.length === 0) {
+-    throw new Error("Feed contained no entries");
++  try {
++    manifestSnapshot = await fetchRegistryManifestSnapshot(fetchFn, feedUrl);
++    if (
++      cachedFeed.entries.length > 0 &&
++      manifestSnapshot &&
++      isSameFeedSnapshot(cachedFeed, cachedMetadata, manifestSnapshot)
++    ) {
++      const metadata = buildFeedSnapshotMetadata(cachedFeed, manifestSnapshot);
++      saveFeedSnapshotMetadata(options.cache, feedUrl, metadata);
++      return {
++        ...enrichFeedWithMetadata(cachedFeed, metadata),
++        refreshStatus: "unchanged" as const,
++      };
++    }
++  } catch (error) {
++    manifestError = error instanceof Error ? error : new Error(String(error));
+   }
+ 
+-  options.cache.set(feedCacheKey(feedUrl), text);
+-  return nextFeed;
++  try {
++    const text = await fetchFeedPayload(fetchFn, feedUrl);
++    const nextFeed = parseFeed(text);
++    if (nextFeed.entries.length === 0) {
++      throw new Error("Feed contained no entries");
++    }
++
++    const nextMetadata = buildFeedSnapshotMetadata(nextFeed, manifestSnapshot);
++    options.cache.set(feedCacheKey(feedUrl), text);
++    saveFeedSnapshotMetadata(options.cache, feedUrl, nextMetadata);
++    invalidateDetailCacheWhenSnapshotChanges({
++      cache: options.cache,
++      entries: nextFeed.entries,
++      feedUrl,
++      previousMetadata: cachedMetadata,
++      nextMetadata,
++    });
++    return {
++      ...enrichFeedWithMetadata(nextFeed, nextMetadata),
++      refreshStatus: "updated" as const,
++    };
++  } catch (error) {
++    if (
++      cachedFeed.entries.length > 0 &&
++      manifestError &&
++      !isFeedPayloadValidationError(error)
++    ) {
++      return {
++        ...cachedFeed,
++        refreshStatus: "stale" as const,
++        refreshWarning: manifestError.message,
++      };
++    }
++    throw error;
++  }
+ }
+ 
+ export async function loadEntryDetail(options: {
+@@ -73,7 +239,12 @@ export async function loadEntryDetail(options: {
+   if (!entry.detailUrl) return fallbackDetail(entry);
+ 
+   const feedUrl = resolveFeedUrl(options.feedUrl);
+-  const cacheKey = detailCacheKey(entry, feedUrl);
++  const metadata = loadCachedFeedMetadata(cache, feedUrl);
++  const cacheKey = detailCacheKey(
++    entry,
++    feedUrl,
++    metadata?.detailCacheNamespace,
++  );
+   const cached = cache.get(cacheKey);
+   if (cached) {
+     try {
+diff --git a/integrations/raycast/test/feed.test.ts b/integrations/raycast/test/feed.test.ts
+index ef0a32f446..4f10f3ef2c 100644
+--- a/integrations/raycast/test/feed.test.ts
++++ b/integrations/raycast/test/feed.test.ts
+@@ -7,6 +7,7 @@ import {
+   CACHE_KEY,
+   DETAIL_CACHE_PREFIX,
+   absoluteDataUrl,
++  buildFeedSnapshotMetadata,
+   buildContributeEntryUrl,
+   buildEntrySummary,
+   buildSuggestChangeUrl,
+@@ -16,11 +17,13 @@ import {
+   entryKey,
+   fallbackDetail,
+   feedCacheKey,
++  feedMetadataCacheKey,
+   filterEntriesByCategory,
+   isRaycastDetail,
+   parseDetail,
+   parseFavoriteKeys,
+   parseFeed,
++  registryManifestUrl,
+   resolveFeedUrl,
+   serializeFavoriteKeys,
+   sortedCategoryOptions,
+@@ -666,6 +669,151 @@ describe("Raycast feed helpers", () => {
+     );
+   });
+ 
++  it("skips the full Raycast feed when the manifest signature is unchanged", async () => {
++    const cache = new MemoryCache();
++    const devFeed = "https://preview.example.com/data/raycast-index.json";
++    const metadata = buildFeedSnapshotMetadata(
++      { generatedAt: "2026-04-28T00:00:00.000Z" },
++      {
++        generatedAt: "2026-04-28T00:00:00.000Z",
++        signature: "same-signature",
++      },
++    );
++    cache.set(
++      feedCacheKey(devFeed),
++      JSON.stringify({
++        generatedAt: "2026-04-28T00:00:00.000Z",
++        entries: [sampleEntry],
++      }),
++    );
++    cache.set(feedMetadataCacheKey(devFeed), JSON.stringify(metadata));
++
++    const requestedUrls: string[] = [];
++    const feed = await fetchFreshFeed({
++      cache,
++      feedUrl: devFeed,
++      fetchFn: async (input) => {
++        requestedUrls.push(String(input));
++        return response({
++          generatedAt: "2026-04-28T00:00:00.000Z",
++          artifactContracts: {
++            "raycast-index.json": {
++              path: "/data/raycast-index.json",
++              type: "json",
++              sha256: "same-signature",
++            },
++          },
++        });
++      },
++    });
++
++    assert.equal(feed.refreshStatus, "unchanged");
++    assert.equal(feed.entries.length, 1);
++    assert.deepEqual(requestedUrls, [registryManifestUrl(devFeed)]);
++    assert.equal(
++      JSON.parse(cache.get(feedMetadataCacheKey(devFeed)) || "{}").signature,
++      "same-signature",
++    );
++  });
++
++  it("refreshes changed feeds and invalidates previous detail snapshots", async () => {
++    const cache = new MemoryCache();
++    const devFeed = "https://preview.example.com/data/raycast-index.json";
++    const oldMetadata = buildFeedSnapshotMetadata(
++      { generatedAt: "2026-04-28T00:00:00.000Z" },
++      {
++        generatedAt: "2026-04-28T00:00:00.000Z",
++        signature: "old-signature",
++      },
++    );
++    const oldDetailKey = detailCacheKey(
++      sampleEntry,
++      devFeed,
++      oldMetadata.detailCacheNamespace,
++    );
++    cache.set(
++      feedCacheKey(devFeed),
++      JSON.stringify({
++        generatedAt: "2026-04-28T00:00:00.000Z",
++        entries: [sampleEntry],
++      }),
++    );
++    cache.set(feedMetadataCacheKey(devFeed), JSON.stringify(oldMetadata));
++    cache.set(
++      oldDetailKey,
++      JSON.stringify({
++        copyText: "stale detail",
++        detailMarkdown: "# Stale",
++      }),
++    );
++
++    const requestedUrls: string[] = [];
++    const feed = await fetchFreshFeed({
++      cache,
++      feedUrl: devFeed,
++      fetchFn: async (input) => {
++        requestedUrls.push(String(input));
++        if (String(input).endsWith("/data/registry-manifest.json")) {
++          return response({
++            generatedAt: "2026-04-29T00:00:00.000Z",
++            artifactContracts: {
++              "raycast-index.json": {
++                path: "/data/raycast-index.json",
++                type: "json",
++                sha256: "new-signature",
++              },
++            },
++          });
++        }
++        return response({
++          generatedAt: "2026-04-29T00:00:00.000Z",
++          entries: [{ ...sampleEntry, title: "Context7 Updated" }],
++        });
++      },
++    });
++
++    assert.equal(feed.refreshStatus, "updated");
++    assert.equal(feed.signature, "new-signature");
++    assert.equal(feed.entries[0].title, "Context7 Updated");
++    assert.deepEqual(requestedUrls, [registryManifestUrl(devFeed), devFeed]);
++    assert.equal(cache.get(oldDetailKey), undefined);
++    assert.equal(
++      JSON.parse(cache.get(feedMetadataCacheKey(devFeed)) || "{}").signature,
++      "new-signature",
++    );
++  });
++
++  it("keeps stale cached feed data usable when signature and feed checks fail", async () => {
++    const cache = new MemoryCache();
++    const devFeed = "https://preview.example.com/data/raycast-index.json";
++    cache.set(
++      feedCacheKey(devFeed),
++      JSON.stringify({
++        generatedAt: "2026-04-28T00:00:00.000Z",
++        entries: [sampleEntry],
++      }),
++    );
++    cache.set(
++      feedMetadataCacheKey(devFeed),
++      JSON.stringify({
++        generatedAt: "2026-04-28T00:00:00.000Z",
++        signature: "cached-signature",
++        detailCacheNamespace: "cached-signature",
++      }),
++    );
++
++    const feed = await fetchFreshFeed({
++      cache,
++      feedUrl: devFeed,
++      fetchFn: async () => response({}, { status: 503 }),
++    });
++
++    assert.equal(feed.refreshStatus, "stale");
++    assert.match(feed.refreshWarning || "", /Registry manifest responded/);
++    assert.equal(feed.entries[0].slug, sampleEntry.slug);
++    assert.match(cache.get(feedCacheKey(devFeed)) || "", /context7/);
++  });
++
+   it("loads detail payloads on demand and falls back only when no detail URL exists", async () => {
+     const cache = new MemoryCache();
+     let requestedUrl = "";
+@@ -716,4 +864,42 @@ describe("Raycast feed helpers", () => {
+       fallbackDetail(sampleEntry),
+     );
+   });
++
++  it("uses feed snapshot metadata when reading and writing detail cache entries", async () => {
++    const cache = new MemoryCache();
++    const devFeed = "https://preview.example.com/data/raycast-index.json";
++    cache.set(
++      feedMetadataCacheKey(devFeed),
++      JSON.stringify({
++        generatedAt: "2026-04-29T00:00:00.000Z",
++        signature: "current-signature",
++        detailCacheNamespace: "current-signature",
++      }),
++    );
++    cache.set(
++      detailCacheKey(sampleEntry, devFeed, "old-signature"),
++      JSON.stringify({
++        copyText: "stale detail",
++        detailMarkdown: "# Stale",
++      }),
++    );
++
++    const detail = await loadEntryDetail({
++      entry: sampleEntry,
++      cache,
++      feedUrl: devFeed,
++      fetchFn: async () =>
++        response({
++          copyText: "current detail",
++          detailMarkdown: "# Current",
++        }),
++    });
++
++    assert.equal(detail.copyText, "current detail");
++    assert.match(
++      cache.get(detailCacheKey(sampleEntry, devFeed, "current-signature")) ||
++        "",
++      /current detail/,
++    );
++  });
+ });

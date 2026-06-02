@@ -1,0 +1,318 @@
+diff --git a/apps/web/src/app/api/registry/search/route.ts b/apps/web/src/app/api/registry/search/route.ts
+index 1db511c33e..d20ec49440 100644
+--- a/apps/web/src/app/api/registry/search/route.ts
++++ b/apps/web/src/app/api/registry/search/route.ts
+@@ -8,6 +8,8 @@ import { createApiHandler, type InferApiQuery } from "@/lib/api/router";
+ import { getSearchIndex } from "@/lib/content";
+ import { cachedJsonResponse } from "@/lib/http-cache";
+ 
++const MAX_OFFSET = 10_000;
++
+ export const GET = createApiHandler(
+   "registry.search",
+   async ({ request, query: parsedQuery }) => {
+@@ -21,6 +23,7 @@ export const GET = createApiHandler(
+       claimStatus: requestedClaimStatus,
+       sourceStatus: requestedSourceStatus,
+       limit,
++      offset,
+     } = parsedQuery as InferApiQuery<typeof registrySearchQuerySchema>;
+ 
+     const filters: RegistrySearchFilterState = {
+@@ -36,8 +39,9 @@ export const GET = createApiHandler(
+ 
+     const entries = await getSearchIndex();
+     const matched = filterEntries(entries, filters);
+-    const results = matched.slice(0, limit);
++    const results = matched.slice(offset, offset + limit);
+     const facets = computeRegistrySearchFacets(entries, filters);
++    const nextOffset = Math.min(offset + limit, MAX_OFFSET);
+ 
+     return cachedJsonResponse(
+       request,
+@@ -54,6 +58,13 @@ export const GET = createApiHandler(
+           sourceStatus: requestedSourceStatus,
+         },
+         count: results.length,
++        total: matched.length,
++        limit,
++        offset,
++        nextOffset:
++          nextOffset < matched.length && nextOffset !== offset
++            ? nextOffset
++            : null,
+         results,
+         facets,
+       },
+diff --git a/apps/web/src/lib/api/contracts.ts b/apps/web/src/lib/api/contracts.ts
+index 5980e2ae63..face4c138f 100644
+--- a/apps/web/src/lib/api/contracts.ts
++++ b/apps/web/src/lib/api/contracts.ts
+@@ -237,6 +237,10 @@ export const registrySearchResponseSchema = z.object({
+     })
+     .optional(),
+   count: z.number().int().nonnegative(),
++  total: z.number().int().nonnegative(),
++  limit: z.number().int().min(1).max(50),
++  offset: z.number().int().min(0).max(10_000),
++  nextOffset: z.number().int().min(0).max(10_000).nullable(),
+   results: z.array(registrySearchResultSchema).max(50),
+   facets: registrySearchFacetsSchema.optional(),
+ });
+@@ -260,6 +264,7 @@ export const registrySearchQuerySchema = z.object({
+     .optional()
+     .default("all"),
+   limit: z.coerce.number().int().min(1).max(50).optional().default(20),
++  offset: z.coerce.number().int().min(0).max(10_000).optional().default(0),
+ });
+ 
+ export const registryDiffQuerySchema = z.object({
+diff --git a/cloudflare/api-schema-heyclaude-openapi.yaml b/cloudflare/api-schema-heyclaude-openapi.yaml
+index ff665f252b..72c324dc1a 100644
+--- a/cloudflare/api-schema-heyclaude-openapi.yaml
++++ b/cloudflare/api-schema-heyclaude-openapi.yaml
+@@ -897,6 +897,16 @@ paths:
+           required: false
+           name: limit
+           in: query
++        - schema:
++            type:
++              - integer
++              - "null"
++            minimum: 0
++            maximum: 10000
++            default: 0
++          required: false
++          name: offset
++          in: query
+       responses:
+         "200":
+           description: Cacheable registry response with ETag support where applicable.
+@@ -935,6 +945,23 @@ paths:
+                   count:
+                     type: integer
+                     minimum: 0
++                  total:
++                    type: integer
++                    minimum: 0
++                  limit:
++                    type: integer
++                    minimum: 1
++                    maximum: 50
++                  offset:
++                    type: integer
++                    minimum: 0
++                    maximum: 10000
++                  nextOffset:
++                    type:
++                      - integer
++                      - "null"
++                    minimum: 0
++                    maximum: 10000
+                   results:
+                     type: array
+                     items:
+@@ -1185,6 +1212,10 @@ paths:
+                   - category
+                   - platform
+                   - count
++                  - total
++                  - limit
++                  - offset
++                  - nextOffset
+                   - results
+         "400":
+           description: Invalid JSON, invalid query, invalid payload, or invalid status transition.
+diff --git a/tests/api-contracts.test.ts b/tests/api-contracts.test.ts
+index c0fab2834d..93c9186afe 100644
+--- a/tests/api-contracts.test.ts
++++ b/tests/api-contracts.test.ts
+@@ -126,6 +126,7 @@ describe("OpenAPI route coverage", () => {
+         expect.objectContaining({ name: "hasSafetyNotes", in: "query" }),
+         expect.objectContaining({ name: "downloadTrust", in: "query" }),
+         expect.objectContaining({ name: "claimStatus", in: "query" }),
++        expect.objectContaining({ name: "offset", in: "query" }),
+       ]),
+     );
+     expect(
+@@ -146,7 +147,9 @@ describe("OpenAPI route coverage", () => {
+     const searchResponse =
+       parsedSchema.paths["/api/registry/search"]?.get?.responses?.["200"];
+     const jsonContent = (
+-      searchResponse?.content as Record<string, { schema?: unknown }> | undefined
++      searchResponse?.content as
++        | Record<string, { schema?: unknown }>
++        | undefined
+     )?.["application/json"];
+     const responseSchema = jsonContent?.schema as
+       | {
+@@ -160,7 +163,9 @@ describe("OpenAPI route coverage", () => {
+       | undefined;
+ 
+     expect(responseSchema?.properties?.facets?.type).toBe("object");
+-    expect(Object.keys(responseSchema?.properties?.facets?.properties ?? {})).toEqual(
++    expect(
++      Object.keys(responseSchema?.properties?.facets?.properties ?? {}),
++    ).toEqual(
+       expect.arrayContaining([
+         "categories",
+         "platforms",
+@@ -173,6 +178,33 @@ describe("OpenAPI route coverage", () => {
+     );
+   });
+ 
++  it("documents registry search pagination metadata", () => {
++    const searchResponse =
++      parsedSchema.paths["/api/registry/search"]?.get?.responses?.["200"];
++    const jsonContent = (
++      searchResponse?.content as
++        | Record<string, { schema?: unknown }>
++        | undefined
++    )?.["application/json"];
++    const responseSchema = jsonContent?.schema as
++      | {
++          required?: string[];
++          properties?: Record<string, { type?: string | string[] }>;
++        }
++      | undefined;
++
++    expect(responseSchema?.required).toEqual(
++      expect.arrayContaining(["total", "limit", "offset", "nextOffset"]),
++    );
++    expect(responseSchema?.properties?.total?.type).toBe("integer");
++    expect(responseSchema?.properties?.limit?.type).toBe("integer");
++    expect(responseSchema?.properties?.offset?.type).toBe("integer");
++    expect(responseSchema?.properties?.nextOffset?.type).toEqual([
++      "integer",
++      "null",
++    ]);
++  });
++
+   it("documents error envelopes, cacheable feeds, and registry trust signals", () => {
+     expect(schema).toContain("ErrorEnvelope:");
+     expect(schema).toContain("RegistryTrustSignals:");
+diff --git a/tests/registry-search-api.test.ts b/tests/registry-search-api.test.ts
+new file mode 100644
+index 0000000000..548f1c5e1b
+--- /dev/null
++++ b/tests/registry-search-api.test.ts
+@@ -0,0 +1,119 @@
++import type { SearchDocument } from "@heyclaude/registry";
++import { beforeEach, describe, expect, it, vi } from "vitest";
++
++const searchIndexMock = vi.hoisted(() => ({
++  entries: [] as SearchDocument[],
++}));
++
++vi.mock("@opennextjs/cloudflare", () => ({
++  getCloudflareContext: () => ({ env: {} }),
++}));
++
++vi.mock("@/lib/content", () => ({
++  getSearchIndex: () => Promise.resolve(searchIndexMock.entries),
++}));
++
++function makeEntry(slug: string): SearchDocument {
++  return {
++    category: "mcp",
++    slug,
++    title: `Fixture ${slug}`,
++    description: "fixture search pagination",
++    tags: [slug],
++    keywords: ["fixture"],
++    author: "tester",
++    dateAdded: "2026-05-24",
++    installable: false,
++    downloadTrust: null,
++    verificationStatus: "unverified",
++    platforms: ["claude-code"],
++    documentationUrl: "https://example.com/docs",
++    repoUrl: "https://example.com/repo",
++    url: "https://example.com",
++    canonicalUrl: "https://example.com",
++    llmsUrl: "https://example.com/llms.txt",
++    apiUrl: "https://example.com/api",
++    trustSignals: {
++      firstPartyEditorial: false,
++      packageVerified: false,
++      packageTrust: null,
++      packageChecksum: "",
++      checksumPresent: false,
++      sourceUrlCount: 0,
++      sourceUrls: [],
++      sourceStatus: "available",
++      lastVerifiedAt: "",
++      adapterGenerated: false,
++      platforms: ["claude-code"],
++      supportLevels: [],
++    },
++  } as SearchDocument;
++}
++
++describe("/api/registry/search", () => {
++  beforeEach(() => {
++    vi.resetModules();
++    searchIndexMock.entries = ["a", "b", "c"].map((slug) =>
++      makeEntry(`fixture-${slug}`),
++    );
++  });
++
++  it("returns page metadata while preserving full-result facets", async () => {
++    const { GET } =
++      await import("../apps/web/src/app/api/registry/search/route");
++    const response = await GET(
++      new Request(
++        "https://heyclau.de/api/registry/search?q=fixture&limit=2&offset=2",
++        { headers: { origin: "https://heyclau.de" } },
++      ),
++    );
++
++    expect(response.status).toBe(200);
++    const body = await response.json();
++    expect(body).toMatchObject({
++      count: 1,
++      total: 3,
++      limit: 2,
++      offset: 2,
++      nextOffset: null,
++    });
++    expect(body.results.map((entry: SearchDocument) => entry.slug)).toEqual([
++      "fixture-c",
++    ]);
++    expect(body.facets.categories.mcp).toBe(3);
++  });
++
++  it("does not advertise an offset beyond the documented maximum", async () => {
++    searchIndexMock.entries = Array.from({ length: 10_001 }, (_, index) =>
++      makeEntry(`fixture-${index}`),
++    );
++
++    const { GET } =
++      await import("../apps/web/src/app/api/registry/search/route");
++    const cappedPage = await GET(
++      new Request(
++        "https://heyclau.de/api/registry/search?limit=50&offset=9990",
++        { headers: { origin: "https://heyclau.de" } },
++      ),
++    );
++
++    await expect(cappedPage.json()).resolves.toMatchObject({
++      count: 11,
++      total: 10_001,
++      nextOffset: 10_000,
++    });
++
++    const finalPage = await GET(
++      new Request(
++        "https://heyclau.de/api/registry/search?limit=50&offset=10000",
++        { headers: { origin: "https://heyclau.de" } },
++      ),
++    );
++
++    await expect(finalPage.json()).resolves.toMatchObject({
++      count: 1,
++      total: 10_001,
++      nextOffset: null,
++    });
++  });
++});

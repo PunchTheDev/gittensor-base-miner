@@ -1,0 +1,1339 @@
+diff --git a/CONTRIBUTING.md b/CONTRIBUTING.md
+index 6a1fd86..be6633c 100644
+--- a/CONTRIBUTING.md
++++ b/CONTRIBUTING.md
+@@ -56,10 +56,13 @@ Issue titles should be clear and user-facing:
+ - `Bug: Tap by node_id fails after screen transition`
+ - `Feature: Add local runtime status screen`
+ 
+-Pull request titles should use a short prefix:
++Pull request titles should use a short prefix, optionally with an area scope in
++parentheses (the scope should match one of the `area:` labels below):
+ 
+ - `fix: handle missing accessibility root`
+ - `feat: add local runtime screen`
++- `feat(android-control): add swipe tool`
++- `fix(settings): flip panel transition direction`
+ - `docs: add live testing checklist`
+ - `test: add emulator validation fixture`
+ - `ci: add Android lint workflow`
+diff --git a/app/src/main/assets/skills/browser/SKILL.md b/app/src/main/assets/skills/browser/SKILL.md
+index 303ad0e..5659328 100644
+--- a/app/src/main/assets/skills/browser/SKILL.md
++++ b/app/src/main/assets/skills/browser/SKILL.md
+@@ -10,5 +10,6 @@ Allowed initial tools:
+ - `tap`
+ - `type_text`
+ - `scroll`
++- `swipe`
+ - `press_back`
+ - `wait_for_ui`
+diff --git a/app/src/main/assets/skills/messages/SKILL.md b/app/src/main/assets/skills/messages/SKILL.md
+index 4234ed3..8a97ea2 100644
+--- a/app/src/main/assets/skills/messages/SKILL.md
++++ b/app/src/main/assets/skills/messages/SKILL.md
+@@ -10,5 +10,6 @@ Allowed initial tools:
+ - `tap`
+ - `type_text`
+ - `scroll`
++- `swipe`
+ - `press_back`
+ - `wait_for_ui`
+diff --git a/app/src/main/java/dev/touchpilot/app/MainActivity.kt b/app/src/main/java/dev/touchpilot/app/MainActivity.kt
+index 2c6bf83..1ab6215 100644
+--- a/app/src/main/java/dev/touchpilot/app/MainActivity.kt
++++ b/app/src/main/java/dev/touchpilot/app/MainActivity.kt
+@@ -1246,6 +1246,40 @@ class MainActivity : Activity() {
+         )
+         contentRoot.addView(scrollRow)
+ 
++        val swipeHorizontalRow = LinearLayout(this).apply { orientation = LinearLayout.HORIZONTAL }
++        swipeHorizontalRow.addView(
++            secondaryButton("Swipe Left") {
++                executeAndRender("swipe", mapOf("direction" to "left"))
++                showSection(Section.TOOLS)
++            }.apply { id = R.id.swipe_left_button },
++            rowButtonParams()
++        )
++        swipeHorizontalRow.addView(
++            secondaryButton("Swipe Right") {
++                executeAndRender("swipe", mapOf("direction" to "right"))
++                showSection(Section.TOOLS)
++            }.apply { id = R.id.swipe_right_button },
++            rowButtonParams()
++        )
++        contentRoot.addView(swipeHorizontalRow)
++
++        val swipeVerticalRow = LinearLayout(this).apply { orientation = LinearLayout.HORIZONTAL }
++        swipeVerticalRow.addView(
++            secondaryButton("Swipe Up") {
++                executeAndRender("swipe", mapOf("direction" to "up"))
++                showSection(Section.TOOLS)
++            }.apply { id = R.id.swipe_up_button },
++            rowButtonParams()
++        )
++        swipeVerticalRow.addView(
++            secondaryButton("Swipe Down") {
++                executeAndRender("swipe", mapOf("direction" to "down"))
++                showSection(Section.TOOLS)
++            }.apply { id = R.id.swipe_down_button },
++            rowButtonParams()
++        )
++        contentRoot.addView(swipeVerticalRow)
++
+         val waitInput = editText("Text to wait for").apply { id = R.id.wait_for_text_input }
+         contentRoot.addView(waitInput)
+         contentRoot.addView(
+diff --git a/app/src/main/java/dev/touchpilot/app/androidcontrol/AccessibilityBridge.kt b/app/src/main/java/dev/touchpilot/app/androidcontrol/AccessibilityBridge.kt
+index c9d39d1..dc2418c 100644
+--- a/app/src/main/java/dev/touchpilot/app/androidcontrol/AccessibilityBridge.kt
++++ b/app/src/main/java/dev/touchpilot/app/androidcontrol/AccessibilityBridge.kt
+@@ -1,5 +1,6 @@
+ package dev.touchpilot.app.androidcontrol
+ 
++import dev.touchpilot.app.screen.NodeBounds
+ import dev.touchpilot.app.screen.ScreenContext
+ 
+ data class FocusResult(val ok: Boolean, val message: String)
+@@ -47,6 +48,14 @@ object AccessibilityBridge {
+         return service?.tapByBounds(bounds) ?: false
+     }
+ 
++    fun activeWindowBounds(): NodeBounds? {
++        return service?.activeWindowBounds()
++    }
++
++    fun swipe(startX: Int, startY: Int, endX: Int, endY: Int, durationMs: Long): Boolean {
++        return service?.swipe(startX, startY, endX, endY, durationMs) ?: false
++    }
++
+     fun typeIntoFocusedField(text: String): Boolean {
+         if (text.isBlank()) return false
+         return service?.typeIntoFocusedField(text) ?: false
+diff --git a/app/src/main/java/dev/touchpilot/app/androidcontrol/TouchPilotAccessibilityService.kt b/app/src/main/java/dev/touchpilot/app/androidcontrol/TouchPilotAccessibilityService.kt
+index a9aecf8..86a6f70 100644
+--- a/app/src/main/java/dev/touchpilot/app/androidcontrol/TouchPilotAccessibilityService.kt
++++ b/app/src/main/java/dev/touchpilot/app/androidcontrol/TouchPilotAccessibilityService.kt
+@@ -7,6 +7,7 @@ import android.graphics.Rect
+ import android.os.Bundle
+ import android.view.accessibility.AccessibilityEvent
+ import android.view.accessibility.AccessibilityNodeInfo
++import dev.touchpilot.app.screen.NodeBounds
+ import android.view.accessibility.AccessibilityWindowInfo
+ import dev.touchpilot.app.screen.ScreenContext
+ import dev.touchpilot.app.screen.ScreenContextBuilder
+@@ -117,6 +118,57 @@ class TouchPilotAccessibilityService : AccessibilityService() {
+         return tap(bounds.centerX().toFloat(), bounds.centerY().toFloat())
+     }
+ 
++    /**
++     * Bounds of the active window in screen pixels, used by the `swipe` tool to
++     * plan a full-screen direction swipe when no container target is given.
++     */
++    fun activeWindowBounds(): NodeBounds? {
++        val root = rootInActiveWindow ?: return null
++        val bounds = Rect()
++        root.getBoundsInScreen(bounds)
++        if (bounds.isEmpty) return null
++        return NodeBounds(bounds.left, bounds.top, bounds.right, bounds.bottom)
++    }
++
++    /**
++     * Dispatch a swipe: a single drag stroke from (startX, startY) to
++     * (endX, endY) held for [durationMs]. Unlike `scroll`, this is a raw gesture
++     * and works on surfaces that expose no accessibility scroll action (pagers,
++     * carousels, drawers, maps).
++     */
++    fun swipe(startX: Int, startY: Int, endX: Int, endY: Int, durationMs: Long): Boolean {
++        val duration = durationMs.coerceIn(MinSwipeDurationMs, MaxSwipeDurationMs)
++        val path = Path().apply {
++            moveTo(startX.toFloat(), startY.toFloat())
++            lineTo(endX.toFloat(), endY.toFloat())
++        }
++        val gesture = GestureDescription.Builder()
++            .addStroke(GestureDescription.StrokeDescription(path, 0L, duration))
++            .build()
++        val completed = AtomicBoolean(false)
++        val latch = CountDownLatch(1)
++
++        val dispatched = dispatchGesture(
++            gesture,
++            object : GestureResultCallback() {
++                override fun onCompleted(gestureDescription: GestureDescription?) {
++                    completed.set(true)
++                    latch.countDown()
++                }
++
++                override fun onCancelled(gestureDescription: GestureDescription?) {
++                    completed.set(false)
++                    latch.countDown()
++                }
++            },
++            null
++        )
++
++        if (!dispatched) return false
++        latch.await(duration + GestureCallbackTimeoutMs, TimeUnit.MILLISECONDS)
++        return completed.get()
++    }
++
+     fun typeIntoFocusedField(text: String): Boolean {
+         val root = rootInActiveWindow ?: return false
+         val focused = root.findFocus(AccessibilityNodeInfo.FOCUS_INPUT)
+@@ -487,4 +539,15 @@ class TouchPilotAccessibilityService : AccessibilityService() {
+             label.contains(text, ignoreCase = true)
+         } != null
+     }
++
++    private companion object {
++        /** Lower bound so a swipe still registers as a gesture rather than a tap. */
++        const val MinSwipeDurationMs = 50L
++
++        /** Upper bound so a runaway duration cannot hold the gesture indefinitely. */
++        const val MaxSwipeDurationMs = 5_000L
++
++        /** Extra time beyond the gesture duration to wait for the result callback. */
++        const val GestureCallbackTimeoutMs = 1_000L
++    }
+ }
+diff --git a/app/src/main/java/dev/touchpilot/app/tools/AndroidToolExecutor.kt b/app/src/main/java/dev/touchpilot/app/tools/AndroidToolExecutor.kt
+index fb42cb3..7d484d4 100644
+--- a/app/src/main/java/dev/touchpilot/app/tools/AndroidToolExecutor.kt
++++ b/app/src/main/java/dev/touchpilot/app/tools/AndroidToolExecutor.kt
+@@ -5,6 +5,7 @@ import android.content.Intent
+ import android.content.ActivityNotFoundException
+ import android.content.pm.ResolveInfo
+ import android.net.Uri
++import dev.touchpilot.app.agent.ClarificationFromToolResult
+ import dev.touchpilot.app.androidcontrol.AccessibilityBridge
+ import dev.touchpilot.app.androidcontrol.DismissKeyboardOutcome
+ import dev.touchpilot.app.androidcontrol.ForegroundAppInfo
+@@ -13,11 +14,16 @@ import dev.touchpilot.app.security.PolicyDecision
+ import dev.touchpilot.app.security.SensitiveTextRedactor
+ import dev.touchpilot.app.security.ToolPolicyRequest
+ import dev.touchpilot.app.security.ToolSource
++import dev.touchpilot.app.screen.NodeBounds
+ import dev.touchpilot.app.tools.targets.ClearTextTarget
+ import dev.touchpilot.app.tools.targets.ScrollResolution
+ import dev.touchpilot.app.tools.targets.ScrollResolver
+ import dev.touchpilot.app.tools.targets.ScrollTarget
+-import dev.touchpilot.app.agent.ClarificationFromToolResult
++import dev.touchpilot.app.tools.targets.SwipeDirection
++import dev.touchpilot.app.tools.targets.SwipeGesture
++import dev.touchpilot.app.tools.targets.SwipeRequest
++import dev.touchpilot.app.tools.targets.SwipeTarget
++import dev.touchpilot.app.tools.targets.TargetBounds
+ import dev.touchpilot.app.tools.targets.TargetResolutionResult
+ import dev.touchpilot.app.tools.targets.TargetResolver
+ import dev.touchpilot.app.tools.targets.TargetSelector
+@@ -169,6 +175,9 @@ class AndroidToolExecutor(
+             "scroll" -> {
+                 executeScroll(args)
+             }
++            "swipe" -> {
++                executeSwipe(args)
++            }
+             "press_back" -> {
+                 val ok = AccessibilityBridge.pressBack()
+                 record(name, "", ok, "pressBack")
+@@ -567,12 +576,152 @@ class AndroidToolExecutor(
+         }
+     }
+ 
++    private fun executeSwipe(args: Map<String, String>): ToolResult {
++        val before = AccessibilityBridge.observeScreenContext()
++
++        val explicit = SwipeTarget.explicitCoordinates(args)
++        if (explicit != null) {
++            val window = AccessibilityBridge.activeWindowBounds()?.toTargetBounds()
++            if (window != null && !window.isEmpty && !explicit.within(window)) {
++                val message = "Swipe coordinates (${explicit.startX},${explicit.startY})->" +
++                    "(${explicit.endX},${explicit.endY}) are outside the screen bounds ${window.toBoundsArg()}"
++                record("swipe", swipeLogArgs("coordinates", explicit), false, message)
++                return ToolResult(false, message, mapOf("screen_bounds" to window.toBoundsArg()))
++            }
++            return dispatchSwipe(explicit, before, "coordinates")
++        }
++
++        val direction = SwipeDirection.parse(args[SwipeTarget.DirectionArg])
++            ?: return ToolResult(false, "Invalid swipe direction")
++        val duration = SwipeTarget.durationOrDefault(args)
++
++        val area = if (SwipeTarget.hasTarget(args)) {
++            when (val resolved = resolveSwipeContainer(args, before)) {
++                is SwipeArea.Resolved -> resolved.bounds
++                is SwipeArea.Failure -> return resolved.result
++            }
++        } else {
++            val window = AccessibilityBridge.activeWindowBounds()?.toTargetBounds()
++            if (window == null || window.isEmpty) {
++                val message = "No active window is available to swipe."
++                record("swipe", swipeLogArgs(direction.label(), null), false, message)
++                return ToolResult(false, message)
++            }
++            window
++        }
++
++        val request = SwipeGesture.forDirection(direction, area, duration)
++        return dispatchSwipe(request, before, direction.label())
++    }
++
++    private fun resolveSwipeContainer(
++        args: Map<String, String>,
++        context: dev.touchpilot.app.screen.ScreenContext,
++    ): SwipeArea {
++        val selector = SwipeTarget.selectorFromArgs(args)
++        return when (val resolution = targetResolver.resolve(context, selector)) {
++            is TargetResolutionResult.Resolved -> {
++                val bounds = resolution.candidate.node.bounds.toTargetBounds()
++                if (bounds.isEmpty) {
++                    val message = "Resolved swipe container has no usable bounds"
++                    record("swipe", "target=resolved_no_bounds", false, message)
++                    SwipeArea.Failure(
++                        ToolResult(
++                            ok = false,
++                            message = message,
++                            data = mapOf("target" to resolution.candidate.selector.toRedactedJson())
++                        )
++                    )
++                } else {
++                    SwipeArea.Resolved(bounds)
++                }
++            }
++            is TargetResolutionResult.Ambiguous -> {
++                val message = "Ambiguous swipe target: ${resolution.reason}"
++                record("swipe", "target=ambiguous", false, message)
++                SwipeArea.Failure(
++                    ToolResult(
++                        ok = false,
++                        message = message,
++                        data = mapOf("candidate_count" to resolution.candidates.size.toString())
++                    )
++                )
++            }
++            is TargetResolutionResult.NotFound -> {
++                val message = "Swipe target not found: ${resolution.reason}"
++                record("swipe", "target=not_found", false, message)
++                SwipeArea.Failure(
++                    ToolResult(
++                        ok = false,
++                        message = message,
++                        data = mapOf("debug_context" to resolution.debugContext)
++                    )
++                )
++            }
++        }
++    }
++
++    private fun dispatchSwipe(
++        request: SwipeRequest,
++        beforeContext: dev.touchpilot.app.screen.ScreenContext,
++        label: String,
++    ): ToolResult {
++        val attempted = AccessibilityBridge.swipe(
++            request.startX,
++            request.startY,
++            request.endX,
++            request.endY,
++            request.durationMs,
++        )
++        val verification = verifyScreenChanged(
++            beforeContext = beforeContext,
++            scrollAttempted = attempted,
++            idleTimeoutMs = retryPolicy.configFor("swipe").idleTimeoutMs,
++        )
++        val message = when {
++            !attempted -> "Unable to perform swipe"
++            !verification.changed -> "Swipe performed but screen did not change"
++            else -> "swipe"
++        }
++        val ok = attempted && verification.changed
++        record("swipe", swipeLogArgs(label, request), ok, message)
++        return ToolResult(
++            ok = ok,
++            message = message,
++            data = mapOf(
++                "gesture" to label,
++                "start" to "${request.startX},${request.startY}",
++                "end" to "${request.endX},${request.endY}",
++                "duration_ms" to request.durationMs.toString(),
++                "screen_changed" to verification.changed.toString(),
++            )
++        )
++    }
++
++    private fun swipeLogArgs(label: String, request: SwipeRequest?): String {
++        if (request == null) return "gesture=\"$label\""
++        return "gesture=\"$label\", start=${request.startX},${request.startY}, " +
++            "end=${request.endX},${request.endY}, duration_ms=${request.durationMs}"
++    }
++
++    private fun SwipeDirection.label(): String = name.lowercase()
++
++    private fun NodeBounds.toTargetBounds(): TargetBounds {
++        return TargetBounds(left = left, top = top, right = right, bottom = bottom)
++    }
++
++    private sealed class SwipeArea {
++        data class Resolved(val bounds: TargetBounds) : SwipeArea()
++        data class Failure(val result: ToolResult) : SwipeArea()
++    }
++
+     private fun verifyScreenChanged(
+         beforeContext: dev.touchpilot.app.screen.ScreenContext,
+-        scrollAttempted: Boolean
++        scrollAttempted: Boolean,
++        idleTimeoutMs: Long = retryPolicy.configFor("scroll").idleTimeoutMs,
+     ): ScrollVerification {
+         if (!scrollAttempted) return ScrollVerification(changed = false)
+-        AccessibilityBridge.waitForIdle(retryPolicy.configFor("scroll").idleTimeoutMs)
++        AccessibilityBridge.waitForIdle(idleTimeoutMs)
+         val after = AccessibilityBridge.observeScreenContext()
+         val changed = !sameSnapshot(beforeContext, after)
+         return ScrollVerification(changed = changed)
+diff --git a/app/src/main/java/dev/touchpilot/app/tools/RetryPolicy.kt b/app/src/main/java/dev/touchpilot/app/tools/RetryPolicy.kt
+index b67219a..2292e83 100644
+--- a/app/src/main/java/dev/touchpilot/app/tools/RetryPolicy.kt
++++ b/app/src/main/java/dev/touchpilot/app/tools/RetryPolicy.kt
+@@ -91,6 +91,7 @@ class AndroidToolRetryPolicy(
+                 "tap" to action,
+                 "type_text" to action,
+                 "scroll" to action,
++                "swipe" to action,
+                 "press_back" to action,
+                 "press_home" to action,
+                 "wait_for_ui" to action.copy(waitForIdleAfterSuccess = false),
+diff --git a/app/src/main/java/dev/touchpilot/app/tools/ToolModels.kt b/app/src/main/java/dev/touchpilot/app/tools/ToolModels.kt
+index 6e01ad9..fc80c0e 100644
+--- a/app/src/main/java/dev/touchpilot/app/tools/ToolModels.kt
++++ b/app/src/main/java/dev/touchpilot/app/tools/ToolModels.kt
+@@ -2,6 +2,9 @@ package dev.touchpilot.app.tools
+ 
+ import dev.touchpilot.app.tools.targets.ClearTextTarget
+ import dev.touchpilot.app.tools.targets.ScrollTarget
++import dev.touchpilot.app.tools.targets.SwipeDirection
++import dev.touchpilot.app.tools.targets.SwipeTarget
++import dev.touchpilot.app.tools.targets.TargetBounds
+ import dev.touchpilot.app.tools.targets.TypeTextTarget
+ 
+ enum class ToolRisk {
+@@ -95,6 +98,25 @@ object AndroidToolCatalog {
+             ),
+             requiredArguments = setOf("direction")
+         ),
++        ToolSpec(
++            name = "swipe",
++            description = "Swipe a gesture surface (pager, carousel, drawer, map) by direction, or between explicit start/end coordinates.",
++            risk = ToolRisk.MEDIUM,
++            arguments = mapOf(
++                SwipeTarget.DirectionArg to "left, right, up, or down (direction the finger travels).",
++                SwipeTarget.StartXArg to "Optional gesture start x in screen pixels.",
++                SwipeTarget.StartYArg to "Optional gesture start y in screen pixels.",
++                SwipeTarget.EndXArg to "Optional gesture end x in screen pixels.",
++                SwipeTarget.EndYArg to "Optional gesture end y in screen pixels.",
++                SwipeTarget.DurationArg to "Optional gesture duration in milliseconds.",
++                SwipeTarget.TargetTextArg to "Visible text of the container to swipe within.",
++                SwipeTarget.TargetNodeIdArg to "Container node_id from observe_screen.",
++                SwipeTarget.TargetBoundsArg to "Container bounds from observe_screen as left,top,right,bottom.",
++                SwipeTarget.TargetViewIdArg to "Container viewIdResourceName from observe_screen.",
++                SwipeTarget.TargetContentDescriptionArg to "Container content description.",
++            ),
++            requiredArguments = emptySet()
++        ),
+         ToolSpec(
+             name = "press_back",
+             description = "Send Android back.",
+@@ -290,6 +312,26 @@ object AndroidToolCatalog {
+             }
+         }
+ 
++        if (name == "swipe") {
++            val direction = args[SwipeTarget.DirectionArg]?.takeIf { it.isNotBlank() }
++            val hasCoordinate = SwipeTarget.hasAnyCoordinate(args)
++            if (direction == null && !hasCoordinate) {
++                return "swipe requires a direction (left, right, up, down) or explicit start/end coordinates"
++            }
++            if (direction != null && SwipeDirection.parse(direction) == null) {
++                return "Invalid swipe direction: $direction. Use left, right, up, or down."
++            }
++            SwipeTarget.validateCoordinates(args)?.let { return it }
++            SwipeTarget.validateDuration(args)?.let { return it }
++            val malformedBounds = args[SwipeTarget.TargetBoundsArg]
++                ?.takeIf { it.isNotBlank() }
++                ?.let { TargetBounds.parse(it) == null }
++                ?: false
++            if (malformedBounds) {
++                return "target_bounds must be left,top,right,bottom"
++            }
++        }
++
+         if (name == "find_element") {
+             val filters = listOf("text", "content_description", "node_id", "class_name")
+                 .filter { args[it].isNullOrBlank().not() }
+diff --git a/app/src/main/java/dev/touchpilot/app/tools/ToolVerification.kt b/app/src/main/java/dev/touchpilot/app/tools/ToolVerification.kt
+index 1760677..4649946 100644
+--- a/app/src/main/java/dev/touchpilot/app/tools/ToolVerification.kt
++++ b/app/src/main/java/dev/touchpilot/app/tools/ToolVerification.kt
+@@ -24,6 +24,7 @@ class ToolVerifier {
+             "tap" -> verifyChangedOrFocused(before, after, "tap")
+             "type_text" -> verifyTypeText(args, after)
+             "scroll" -> verifyScroll(result, before, after)
++            "swipe" -> verifySwipe(result, before, after)
+             "press_back" -> verifyChangedOrFocused(before, after, "press_back")
+             "press_home" -> verifyHome(after)
+             "wait_for_ui" -> verifyWaitForUi(args, after)
+@@ -168,6 +169,26 @@ class ToolVerifier {
+         }
+     }
+ 
++    private fun verifySwipe(
++        result: ToolResult,
++        before: ScreenContext,
++        after: ScreenContext,
++    ): ToolVerificationResult {
++        val resultChanged = result.data["screen_changed"]?.toBooleanStrictOrNull()
++        val changed = resultChanged ?: !sameSnapshot(before, after)
++        return if (changed) {
++            ToolVerificationResult.Passed(
++                reason = "swipe changed visible screen content",
++                data = mapOf("screen_changed" to "true")
++            )
++        } else {
++            ToolVerificationResult.Failed(
++                reason = "swipe reported success but screen content did not change",
++                data = mapOf("screen_changed" to "false")
++            )
++        }
++    }
++
+     private fun verifyHome(after: ScreenContext): ToolVerificationResult {
+         val packageName = after.packageName.orEmpty().lowercase()
+         val appLabel = after.appLabel.orEmpty().lowercase()
+diff --git a/app/src/main/java/dev/touchpilot/app/tools/targets/SwipeGesture.kt b/app/src/main/java/dev/touchpilot/app/tools/targets/SwipeGesture.kt
+new file mode 100644
+index 0000000..ba67e81
+--- /dev/null
++++ b/app/src/main/java/dev/touchpilot/app/tools/targets/SwipeGesture.kt
+@@ -0,0 +1,95 @@
++package dev.touchpilot.app.tools.targets
++
++import kotlin.math.roundToInt
++
++/**
++ * Direction of a `swipe` gesture, expressed as the direction the finger
++ * travels (issue #86).
++ *
++ * "swipe left" means the contact point moves from right to left — the gesture a
++ * user makes to advance a horizontal pager to the next page or close a drawer.
++ * This is the natural reading of the spoken instruction and is kept distinct
++ * from content movement to avoid the scroll-vs-swipe ambiguity called out in
++ * the issue.
++ */
++enum class SwipeDirection {
++    LEFT,
++    RIGHT,
++    UP,
++    DOWN;
++
++    companion object {
++        fun parse(raw: String?): SwipeDirection? {
++            return when (raw?.trim()?.lowercase()) {
++                "left" -> LEFT
++                "right" -> RIGHT
++                "up" -> UP
++                "down" -> DOWN
++                else -> null
++            }
++        }
++    }
++}
++
++/**
++ * A fully resolved swipe: absolute start/end screen coordinates plus the
++ * gesture duration. This is the deterministic "execution request" the tool
++ * layer builds and hands to the Accessibility service — the service only ever
++ * sees plain coordinates, so the gesture-planning logic stays in the tools
++ * layer (and unit-testable) without inverting the androidcontrol → tools
++ * dependency direction.
++ */
++data class SwipeRequest(
++    val startX: Int,
++    val startY: Int,
++    val endX: Int,
++    val endY: Int,
++    val durationMs: Long,
++) {
++    /** True when both endpoints fall inside (inclusive) the given [area]. */
++    fun within(area: TargetBounds): Boolean {
++        return startX in area.left..area.right &&
++            endX in area.left..area.right &&
++            startY in area.top..area.bottom &&
++            endY in area.top..area.bottom
++    }
++}
++
++/**
++ * Plans the concrete [SwipeRequest] for a swipe.
++ *
++ * Direction-based swipes travel along the center axis of the supplied [area]
++ * (the resolved container, or the active window when no container target was
++ * given), keeping an [EdgeInsetFraction] margin from each edge so the gesture
++ * starts and ends well inside the surface rather than on a system edge gesture
++ * zone.
++ */
++object SwipeGesture {
++    /** Typical fling-length swipe; long enough to register, short enough to feel responsive. */
++    const val DefaultDurationMs = 300L
++
++    /** Fraction of each edge left untouched so the stroke avoids edge gesture zones. */
++    const val EdgeInsetFraction = 0.1f
++
++    fun forDirection(
++        direction: SwipeDirection,
++        area: TargetBounds,
++        durationMs: Long = DefaultDurationMs,
++    ): SwipeRequest {
++        val insetX = (area.width * EdgeInsetFraction).roundToInt()
++        val insetY = (area.height * EdgeInsetFraction).roundToInt()
++        val left = area.left + insetX
++        val right = area.right - insetX
++        val top = area.top + insetY
++        val bottom = area.bottom - insetY
++        val centerX = area.centerX
++        val centerY = area.centerY
++
++        return when (direction) {
++            SwipeDirection.LEFT -> SwipeRequest(right, centerY, left, centerY, durationMs)
++            SwipeDirection.RIGHT -> SwipeRequest(left, centerY, right, centerY, durationMs)
++            SwipeDirection.UP -> SwipeRequest(centerX, bottom, centerX, top, durationMs)
++            SwipeDirection.DOWN -> SwipeRequest(centerX, top, centerX, bottom, durationMs)
++        }
++    }
++}
+diff --git a/app/src/main/java/dev/touchpilot/app/tools/targets/SwipeTarget.kt b/app/src/main/java/dev/touchpilot/app/tools/targets/SwipeTarget.kt
+new file mode 100644
+index 0000000..7716b6f
+--- /dev/null
++++ b/app/src/main/java/dev/touchpilot/app/tools/targets/SwipeTarget.kt
+@@ -0,0 +1,125 @@
++package dev.touchpilot.app.tools.targets
++
++/**
++ * Argument-name conventions and input parsing for the `swipe` tool (issue #86).
++ *
++ * `swipe` has two input modes:
++ *
++ * 1. **Direction mode (primary)** — the caller passes [DirectionArg]
++ *    (`left`/`right`/`up`/`down`). The gesture is planned within an optional
++ *    container target (the [selectorArgs], mirroring [ScrollTarget]) or, when no
++ *    container is given, the full active window.
++ *
++ * 2. **Coordinate mode** — the caller passes an explicit start/end point via
++ *    [coordinateArgs]. All four coordinates are required together.
++ *
++ * Both modes accept an optional [DurationArg].
++ *
++ * Unlike [ScrollTarget], the container selector imposes **no** [TargetRole]:
++ * swipe targets gesture surfaces (pagers, carousels, drawers, maps) that often
++ * do not expose the accessibility `scrollable` flag, so constraining by role
++ * would reject valid targets. `swipe` resolves through the shared
++ * [TargetResolver] only to locate the container's bounds.
++ */
++object SwipeTarget {
++    const val DirectionArg = "direction"
++
++    const val StartXArg = "start_x"
++    const val StartYArg = "start_y"
++    const val EndXArg = "end_x"
++    const val EndYArg = "end_y"
++    const val DurationArg = "duration_ms"
++
++    const val TargetTextArg = "target_text"
++    const val TargetNodeIdArg = "target_node_id"
++    const val TargetBoundsArg = "target_bounds"
++    const val TargetViewIdArg = "target_view_id"
++    const val TargetContentDescriptionArg = "target_content_description"
++
++    val coordinateArgs: List<String> = listOf(StartXArg, StartYArg, EndXArg, EndYArg)
++
++    val selectorArgs: List<String> = listOf(
++        TargetTextArg,
++        TargetNodeIdArg,
++        TargetBoundsArg,
++        TargetViewIdArg,
++        TargetContentDescriptionArg,
++    )
++
++    fun hasTarget(args: Map<String, String>): Boolean {
++        return selectorArgs.any { !args[it].isNullOrBlank() }
++    }
++
++    fun hasAnyCoordinate(args: Map<String, String>): Boolean {
++        return coordinateArgs.any { !args[it].isNullOrBlank() }
++    }
++
++    fun selectorFromArgs(args: Map<String, String>): TargetSelector {
++        return TargetSelector(
++            text = args[TargetTextArg]?.takeIf { it.isNotBlank() }?.let { SelectorText.of(it) },
++            contentDescription = args[TargetContentDescriptionArg]
++                ?.takeIf { it.isNotBlank() }
++                ?.let { SelectorText.of(it) },
++            nodeId = args[TargetNodeIdArg]?.takeIf { it.isNotBlank() },
++            bounds = args[TargetBoundsArg]?.takeIf { it.isNotBlank() }?.let { TargetBounds.parse(it) },
++            viewIdResourceName = args[TargetViewIdArg]?.takeIf { it.isNotBlank() },
++            source = SelectorSource.AGENT,
++        )
++    }
++
++    /** Resolved duration, falling back to [SwipeGesture.DefaultDurationMs]. */
++    fun durationOrDefault(args: Map<String, String>): Long {
++        return args[DurationArg]?.trim()?.toLongOrNull()?.takeIf { it > 0 }
++            ?: SwipeGesture.DefaultDurationMs
++    }
++
++    /**
++     * Build a coordinate-mode [SwipeRequest] when all four coordinates are
++     * present and parse cleanly, otherwise null. Callers in direction mode rely
++     * on null to fall through to direction planning.
++     */
++    fun explicitCoordinates(args: Map<String, String>): SwipeRequest? {
++        if (coordinateArgs.any { args[it].isNullOrBlank() }) return null
++        val sx = args[StartXArg]?.trim()?.toIntOrNull() ?: return null
++        val sy = args[StartYArg]?.trim()?.toIntOrNull() ?: return null
++        val ex = args[EndXArg]?.trim()?.toIntOrNull() ?: return null
++        val ey = args[EndYArg]?.trim()?.toIntOrNull() ?: return null
++        return SwipeRequest(sx, sy, ex, ey, durationOrDefault(args))
++    }
++
++    /**
++     * Validate the optional coordinate inputs. Returns a useful error message
++     * for partial, malformed, negative, or zero-length coordinate sets, or null
++     * when coordinates are either absent or fully valid (issue #86 acceptance
++     * criteria 3 and 4).
++     */
++    fun validateCoordinates(args: Map<String, String>): String? {
++        val present = coordinateArgs.filter { !args[it].isNullOrBlank() }
++        if (present.isEmpty()) return null
++        if (present.size != coordinateArgs.size) {
++            return "swipe coordinates require all of start_x, start_y, end_x, end_y"
++        }
++        val parsed = coordinateArgs.map { args[it]?.trim()?.toIntOrNull() }
++        if (parsed.any { it == null }) {
++            return "swipe coordinates must be integers"
++        }
++        val ints = parsed.map { it!! }
++        if (ints.any { it < 0 }) {
++            return "swipe coordinates must be non-negative"
++        }
++        val (sx, sy, ex, ey) = ints
++        if (sx == ex && sy == ey) {
++            return "swipe start and end coordinates must differ"
++        }
++        return null
++    }
++
++    fun validateDuration(args: Map<String, String>): String? {
++        val duration = args[DurationArg]?.takeIf { it.isNotBlank() } ?: return null
++        val parsed = duration.trim().toLongOrNull()
++        if (parsed == null || parsed <= 0L) {
++            return "duration_ms must be a positive number"
++        }
++        return null
++    }
++}
+diff --git a/app/src/main/res/values/ids.xml b/app/src/main/res/values/ids.xml
+index dac8afa..b6b1894 100644
+--- a/app/src/main/res/values/ids.xml
++++ b/app/src/main/res/values/ids.xml
+@@ -20,6 +20,10 @@
+     <item name="home_button" type="id" />
+     <item name="scroll_down_button" type="id" />
+     <item name="scroll_up_button" type="id" />
++    <item name="swipe_left_button" type="id" />
++    <item name="swipe_right_button" type="id" />
++    <item name="swipe_up_button" type="id" />
++    <item name="swipe_down_button" type="id" />
+     <item name="wait_for_text_input" type="id" />
+     <item name="wait_for_text_button" type="id" />
+     <item name="wait_for_idle_button" type="id" />
+diff --git a/app/src/test/java/dev/touchpilot/app/tools/AndroidToolRetryPolicyTest.kt b/app/src/test/java/dev/touchpilot/app/tools/AndroidToolRetryPolicyTest.kt
+index 08a7ba9..e0abd59 100644
+--- a/app/src/test/java/dev/touchpilot/app/tools/AndroidToolRetryPolicyTest.kt
++++ b/app/src/test/java/dev/touchpilot/app/tools/AndroidToolRetryPolicyTest.kt
+@@ -19,9 +19,34 @@ class AndroidToolRetryPolicyTest {
+         assertEquals(1_500L, tap.idleTimeoutMs)
+         assertTrue(tap.waitForIdleAfterSuccess)
+ 
++        val swipe = policy.configFor("swipe")
++        assertEquals(3, swipe.maxAttempts)
++        assertTrue(swipe.retryable)
++        assertTrue(swipe.waitForIdleAfterSuccess)
++
+         assertFalse(policy.configFor("wait_for_ui").waitForIdleAfterSuccess)
+     }
+ 
++    @Test
++    fun unableToPerformSwipeIsRetryableTransient() {
++        val result = ToolResult(ok = false, message = "Unable to perform swipe")
++
++        val decision = policy.shouldRetry("swipe", result, attempt = 0)
++
++        assertTrue(decision.retry)
++        assertEquals(ToolFailureCategory.RETRYABLE_TRANSIENT, decision.category)
++    }
++
++    @Test
++    fun ambiguousSwipeTargetIsNotRetryable() {
++        val result = ToolResult(ok = false, message = "Ambiguous swipe target: two matches")
++
++        val decision = policy.shouldRetry("swipe", result, attempt = 0)
++
++        assertFalse(decision.retry)
++        assertEquals(ToolFailureCategory.NON_RETRYABLE, decision.category)
++    }
++
+     @Test
+     fun retryableTransientFailuresCanRetryWithinBound() {
+         val result = ToolResult(ok = false, message = "Unable to perform scroll on resolved container")
+diff --git a/app/src/test/java/dev/touchpilot/app/tools/ToolVerifierTest.kt b/app/src/test/java/dev/touchpilot/app/tools/ToolVerifierTest.kt
+index 4dbbcf5..051a325 100644
+--- a/app/src/test/java/dev/touchpilot/app/tools/ToolVerifierTest.kt
++++ b/app/src/test/java/dev/touchpilot/app/tools/ToolVerifierTest.kt
+@@ -111,6 +111,33 @@ class ToolVerifierTest {
+         assertIs<ToolVerificationResult.Passed>(result)
+     }
+ 
++    @Test
++    fun swipeUsesExistingScreenChangedData() {
++        val result = verifier.verify(
++            toolName = "swipe",
++            args = mapOf("direction" to "left"),
++            result = ToolResult(ok = true, message = "swipe", data = mapOf("screen_changed" to "true")),
++            before = screen(),
++            after = screen(),
++        )
++
++        assertIs<ToolVerificationResult.Passed>(result)
++    }
++
++    @Test
++    fun swipeFailsWhenScreenDidNotChange() {
++        val before = screen(nodes = listOf(button("0", "Page 1")))
++        val result = verifier.verify(
++            toolName = "swipe",
++            args = mapOf("direction" to "left"),
++            result = ToolResult(ok = true, message = "swipe", data = mapOf("screen_changed" to "false")),
++            before = before,
++            after = before,
++        )
++
++        assertIs<ToolVerificationResult.Failed>(result)
++    }
++
+     @Test
+     fun waitForUiPassesWhenExpectedTextIsPresent() {
+         val result = verifier.verify(
+diff --git a/app/src/test/java/dev/touchpilot/app/tools/targets/SwipeGestureTest.kt b/app/src/test/java/dev/touchpilot/app/tools/targets/SwipeGestureTest.kt
+new file mode 100644
+index 0000000..3f65468
+--- /dev/null
++++ b/app/src/test/java/dev/touchpilot/app/tools/targets/SwipeGestureTest.kt
+@@ -0,0 +1,96 @@
++package dev.touchpilot.app.tools.targets
++
++import kotlin.test.Test
++import kotlin.test.assertEquals
++import kotlin.test.assertFalse
++import kotlin.test.assertTrue
++
++/**
++ * Execution-request construction for `swipe` (issue #86 acceptance criterion 5).
++ *
++ * Verifies that direction-based swipes produce a deterministic [SwipeRequest]
++ * travelling along the correct axis and finger direction within the supplied
++ * area, with an edge inset on both ends.
++ */
++class SwipeGestureTest {
++    private val area = TargetBounds(left = 0, top = 0, right = 1000, bottom = 2000)
++
++    @Test
++    fun rightSwipeMovesFingerLeftToRightAlongVerticalCenter() {
++        val request = SwipeGesture.forDirection(SwipeDirection.RIGHT, area)
++
++        assertTrue(request.startX < request.endX)
++        assertEquals(area.centerY, request.startY)
++        assertEquals(area.centerY, request.endY)
++        // 10% inset from each horizontal edge.
++        assertEquals(100, request.startX)
++        assertEquals(900, request.endX)
++    }
++
++    @Test
++    fun leftSwipeMovesFingerRightToLeft() {
++        val request = SwipeGesture.forDirection(SwipeDirection.LEFT, area)
++
++        assertTrue(request.startX > request.endX)
++        assertEquals(900, request.startX)
++        assertEquals(100, request.endX)
++        assertEquals(area.centerY, request.startY)
++    }
++
++    @Test
++    fun downSwipeMovesFingerTopToBottomAlongHorizontalCenter() {
++        val request = SwipeGesture.forDirection(SwipeDirection.DOWN, area)
++
++        assertTrue(request.startY < request.endY)
++        assertEquals(area.centerX, request.startX)
++        assertEquals(area.centerX, request.endX)
++        assertEquals(200, request.startY)
++        assertEquals(1800, request.endY)
++    }
++
++    @Test
++    fun upSwipeMovesFingerBottomToTop() {
++        val request = SwipeGesture.forDirection(SwipeDirection.UP, area)
++
++        assertTrue(request.startY > request.endY)
++        assertEquals(1800, request.startY)
++        assertEquals(200, request.endY)
++        assertEquals(area.centerX, request.startX)
++    }
++
++    @Test
++    fun directionSwipeUsesDefaultDurationUnlessOverridden() {
++        assertEquals(
++            SwipeGesture.DefaultDurationMs,
++            SwipeGesture.forDirection(SwipeDirection.UP, area).durationMs,
++        )
++        assertEquals(
++            750L,
++            SwipeGesture.forDirection(SwipeDirection.UP, area, durationMs = 750L).durationMs,
++        )
++    }
++
++    @Test
++    fun planStaysWithinTheSuppliedArea() {
++        for (direction in SwipeDirection.values()) {
++            val request = SwipeGesture.forDirection(direction, area)
++            assertTrue(request.within(area), "$direction swipe should stay within the area")
++        }
++    }
++
++    @Test
++    fun withinDetectsOutOfRangeEndpoints() {
++        val request = SwipeRequest(startX = 10, startY = 10, endX = 1200, endY = 10, durationMs = 300L)
++        assertFalse(request.within(area))
++    }
++
++    @Test
++    fun swipeIsPlannedWithinAResolvedContainerRatherThanTheScreen() {
++        val container = TargetBounds(left = 100, top = 400, right = 500, bottom = 600)
++        val request = SwipeGesture.forDirection(SwipeDirection.RIGHT, container)
++
++        assertTrue(request.within(container))
++        assertEquals(container.centerY, request.startY)
++        assertTrue(request.startX in container.left..container.right)
++    }
++}
+diff --git a/app/src/test/java/dev/touchpilot/app/tools/targets/SwipeResolutionTest.kt b/app/src/test/java/dev/touchpilot/app/tools/targets/SwipeResolutionTest.kt
+new file mode 100644
+index 0000000..86f60f2
+--- /dev/null
++++ b/app/src/test/java/dev/touchpilot/app/tools/targets/SwipeResolutionTest.kt
+@@ -0,0 +1,74 @@
++package dev.touchpilot.app.tools.targets
++
++import dev.touchpilot.app.screen.NodeBounds
++import dev.touchpilot.app.screen.NodeRole
++import dev.touchpilot.app.screen.ScreenContext
++import dev.touchpilot.app.screen.ScreenNode
++import dev.touchpilot.app.screen.ScreenText
++import kotlin.test.Test
++import kotlin.test.assertEquals
++import kotlin.test.assertIs
++import kotlin.test.assertTrue
++
++/**
++ * Confirms `swipe` container selectors flow through the shared [TargetResolver]
++ * and resolve gesture surfaces that are not accessibility-scrollable (issue #86).
++ * Because swipe imposes no role constraint it must resolve such containers and
++ * still surface explicit ambiguity / not-found failures.
++ */
++class SwipeResolutionTest {
++    private val resolver = TargetResolver()
++
++    @Test
++    fun resolvesNonScrollableContainerByText() {
++        val context = screen(
++            ScreenNode(
++                nodeId = "0.1",
++                role = NodeRole.CONTAINER,
++                text = ScreenText.of("Photo carousel"),
++                bounds = NodeBounds(0, 100, 1080, 700),
++                // Deliberately not scrollable: a ViewPager often exposes no
++                // accessibility scroll action but is still a valid swipe surface.
++                scrollable = false,
++            )
++        )
++        val selector = SwipeTarget.selectorFromArgs(mapOf(SwipeTarget.TargetTextArg to "Photo carousel"))
++
++        val resolved = assertIs<TargetResolutionResult.Resolved>(resolver.resolve(context, selector))
++        assertEquals("0.1", resolved.candidate.node.nodeId)
++    }
++
++    @Test
++    fun reportsAmbiguityForEquallyMatchingContainers() {
++        val context = screen(
++            container("0.0", "Pager"),
++            container("0.1", "Pager"),
++        )
++        val selector = SwipeTarget.selectorFromArgs(mapOf(SwipeTarget.TargetTextArg to "Pager"))
++
++        val ambiguous = assertIs<TargetResolutionResult.Ambiguous>(resolver.resolve(context, selector))
++        assertEquals(2, ambiguous.candidates.size)
++    }
++
++    @Test
++    fun reportsNotFoundWithDebugContextWhenNothingMatches() {
++        val context = screen(container("0.0", "Pager"))
++        val selector = SwipeTarget.selectorFromArgs(mapOf(SwipeTarget.TargetTextArg to "Nowhere"))
++
++        val notFound = assertIs<TargetResolutionResult.NotFound>(resolver.resolve(context, selector))
++        assertTrue(notFound.debugContext.isNotBlank())
++    }
++
++    private fun screen(vararg nodes: ScreenNode): ScreenContext {
++        return ScreenContext(appLabel = "Gallery", packageName = "dev.test", nodes = nodes.toList())
++    }
++
++    private fun container(id: String, text: String): ScreenNode {
++        return ScreenNode(
++            nodeId = id,
++            role = NodeRole.CONTAINER,
++            text = ScreenText.of(text),
++            bounds = NodeBounds(0, 0, 600, 600),
++        )
++    }
++}
+diff --git a/app/src/test/java/dev/touchpilot/app/tools/targets/SwipeTargetTest.kt b/app/src/test/java/dev/touchpilot/app/tools/targets/SwipeTargetTest.kt
+new file mode 100644
+index 0000000..fe6e505
+--- /dev/null
++++ b/app/src/test/java/dev/touchpilot/app/tools/targets/SwipeTargetTest.kt
+@@ -0,0 +1,236 @@
++package dev.touchpilot.app.tools.targets
++
++import dev.touchpilot.app.security.DefaultActionPolicy
++import dev.touchpilot.app.security.PolicyDecision
++import dev.touchpilot.app.security.ToolPolicyRequest
++import dev.touchpilot.app.security.ToolSource
++import dev.touchpilot.app.tools.AndroidToolCatalog
++import kotlin.test.Test
++import kotlin.test.assertEquals
++import kotlin.test.assertFalse
++import kotlin.test.assertIs
++import kotlin.test.assertNull
++import kotlin.test.assertTrue
++
++class SwipeTargetTest {
++    @Test
++    fun directionParsingIsCaseInsensitiveAndRejectsUnknownValues() {
++        assertEquals(SwipeDirection.LEFT, SwipeDirection.parse("left"))
++        assertEquals(SwipeDirection.RIGHT, SwipeDirection.parse("RIGHT"))
++        assertEquals(SwipeDirection.UP, SwipeDirection.parse(" Up "))
++        assertEquals(SwipeDirection.DOWN, SwipeDirection.parse("down"))
++        assertNull(SwipeDirection.parse("diagonal"))
++        assertNull(SwipeDirection.parse(null))
++        assertNull(SwipeDirection.parse(""))
++    }
++
++    @Test
++    fun hasTargetAndHasCoordinateDetectPresentArgs() {
++        assertFalse(SwipeTarget.hasTarget(mapOf(SwipeTarget.DirectionArg to "left")))
++        assertTrue(SwipeTarget.hasTarget(mapOf(SwipeTarget.TargetNodeIdArg to "0.1")))
++        assertFalse(SwipeTarget.hasAnyCoordinate(mapOf(SwipeTarget.DirectionArg to "left")))
++        assertTrue(SwipeTarget.hasAnyCoordinate(mapOf(SwipeTarget.StartXArg to "10")))
++    }
++
++    @Test
++    fun selectorFromArgsImposesNoRoleConstraint() {
++        val selector = SwipeTarget.selectorFromArgs(
++            mapOf(
++                SwipeTarget.TargetTextArg to "Carousel",
++                SwipeTarget.TargetNodeIdArg to "0.3",
++                SwipeTarget.TargetViewIdArg to "com.x:id/pager",
++                SwipeTarget.TargetBoundsArg to "0,0,500,500",
++                SwipeTarget.TargetContentDescriptionArg to "Image carousel",
++            )
++        )
++        // Swipe surfaces are not necessarily accessibility-scrollable, so no role
++        // is imposed (unlike ScrollTarget).
++        assertNull(selector.role)
++        assertEquals(SelectorSource.AGENT, selector.source)
++        assertEquals("0.3", selector.nodeId)
++        assertEquals("Carousel", selector.text?.raw)
++        assertTrue(selector.isValid())
++    }
++
++    @Test
++    fun durationFallsBackToDefaultForMissingOrInvalidValues() {
++        assertEquals(SwipeGesture.DefaultDurationMs, SwipeTarget.durationOrDefault(emptyMap()))
++        assertEquals(SwipeGesture.DefaultDurationMs, SwipeTarget.durationOrDefault(mapOf(SwipeTarget.DurationArg to "abc")))
++        assertEquals(750L, SwipeTarget.durationOrDefault(mapOf(SwipeTarget.DurationArg to "750")))
++    }
++
++    @Test
++    fun explicitCoordinatesRequireAllFourValues() {
++        assertNull(
++            SwipeTarget.explicitCoordinates(
++                mapOf(SwipeTarget.StartXArg to "10", SwipeTarget.StartYArg to "20")
++            )
++        )
++        val request = SwipeTarget.explicitCoordinates(
++            mapOf(
++                SwipeTarget.StartXArg to "10",
++                SwipeTarget.StartYArg to "20",
++                SwipeTarget.EndXArg to "300",
++                SwipeTarget.EndYArg to "20",
++                SwipeTarget.DurationArg to "400",
++            )
++        )
++        assertEquals(SwipeRequest(10, 20, 300, 20, 400L), request)
++    }
++
++    @Test
++    fun catalogExposesSwipeAsMediumRiskWithoutRequiredArgs() {
++        val spec = AndroidToolCatalog.find("swipe")
++        assertTrue(spec != null)
++        assertEquals(
++            setOf(
++                "direction",
++                "start_x",
++                "start_y",
++                "end_x",
++                "end_y",
++                "duration_ms",
++                "target_text",
++                "target_node_id",
++                "target_bounds",
++                "target_view_id",
++                "target_content_description",
++            ),
++            spec!!.arguments.keys,
++        )
++        assertTrue(spec.requiredArguments.isEmpty())
++    }
++
++    @Test
++    fun validationRequiresDirectionOrCoordinates() {
++        assertEquals(
++            "swipe requires a direction (left, right, up, down) or explicit start/end coordinates",
++            AndroidToolCatalog.validate("swipe", emptyMap()),
++        )
++    }
++
++    @Test
++    fun validationRejectsInvalidDirection() {
++        assertEquals(
++            "Invalid swipe direction: sideways. Use left, right, up, or down.",
++            AndroidToolCatalog.validate("swipe", mapOf("direction" to "sideways")),
++        )
++    }
++
++    @Test
++    fun validationRejectsPartialCoordinates() {
++        assertEquals(
++            "swipe coordinates require all of start_x, start_y, end_x, end_y",
++            AndroidToolCatalog.validate(
++                "swipe",
++                mapOf(SwipeTarget.StartXArg to "10", SwipeTarget.EndXArg to "200"),
++            ),
++        )
++    }
++
++    @Test
++    fun validationRejectsNonIntegerCoordinates() {
++        assertEquals(
++            "swipe coordinates must be integers",
++            AndroidToolCatalog.validate(
++                "swipe",
++                mapOf(
++                    SwipeTarget.StartXArg to "10",
++                    SwipeTarget.StartYArg to "20",
++                    SwipeTarget.EndXArg to "x",
++                    SwipeTarget.EndYArg to "40",
++                ),
++            ),
++        )
++    }
++
++    @Test
++    fun validationRejectsNegativeCoordinates() {
++        assertEquals(
++            "swipe coordinates must be non-negative",
++            AndroidToolCatalog.validate(
++                "swipe",
++                mapOf(
++                    SwipeTarget.StartXArg to "10",
++                    SwipeTarget.StartYArg to "20",
++                    SwipeTarget.EndXArg to "-5",
++                    SwipeTarget.EndYArg to "40",
++                ),
++            ),
++        )
++    }
++
++    @Test
++    fun validationRejectsZeroLengthSwipe() {
++        assertEquals(
++            "swipe start and end coordinates must differ",
++            AndroidToolCatalog.validate(
++                "swipe",
++                mapOf(
++                    SwipeTarget.StartXArg to "10",
++                    SwipeTarget.StartYArg to "20",
++                    SwipeTarget.EndXArg to "10",
++                    SwipeTarget.EndYArg to "20",
++                ),
++            ),
++        )
++    }
++
++    @Test
++    fun validationRejectsNonPositiveDuration() {
++        assertEquals(
++            "duration_ms must be a positive number",
++            AndroidToolCatalog.validate(
++                "swipe",
++                mapOf("direction" to "left", SwipeTarget.DurationArg to "0"),
++            ),
++        )
++    }
++
++    @Test
++    fun validationRejectsMalformedContainerBounds() {
++        assertEquals(
++            "target_bounds must be left,top,right,bottom",
++            AndroidToolCatalog.validate(
++                "swipe",
++                mapOf("direction" to "left", SwipeTarget.TargetBoundsArg to "bad,bounds"),
++            ),
++        )
++    }
++
++    @Test
++    fun validationAcceptsDirectionAndCompleteCoordinateSets() {
++        assertNull(AndroidToolCatalog.validate("swipe", mapOf("direction" to "up")))
++        assertNull(
++            AndroidToolCatalog.validate(
++                "swipe",
++                mapOf(
++                    SwipeTarget.StartXArg to "10",
++                    SwipeTarget.StartYArg to "20",
++                    SwipeTarget.EndXArg to "300",
++                    SwipeTarget.EndYArg to "20",
++                ),
++            ),
++        )
++    }
++
++    @Test
++    fun validationRejectsUnknownArguments() {
++        val error = AndroidToolCatalog.validate("swipe", mapOf("velocity" to "fast"))
++        assertTrue(error != null && error.startsWith("Unknown argument"))
++    }
++
++    @Test
++    fun mediumRiskRequiresApprovalForModelSource() {
++        val spec = AndroidToolCatalog.find("swipe")!!
++        val decision = DefaultActionPolicy().evaluate(
++            ToolPolicyRequest(
++                tool = spec,
++                args = mapOf("direction" to "left"),
++                source = ToolSource.LOCAL_MODEL,
++            )
++        )
++
++        assertIs<PolicyDecision.RequireApproval>(decision)
++    }
++}
+diff --git a/docs/LIVE_TESTING.md b/docs/LIVE_TESTING.md
+index e275fc9..cb4a875 100644
+--- a/docs/LIVE_TESTING.md
++++ b/docs/LIVE_TESTING.md
+@@ -53,6 +53,12 @@ Launch TouchPilot:
+ - [ ] `Tap Text` followed by `wait_for_idle` settles after the tap transition.
+ - [x] `Type Into Focused Field` enters text into a focused field.
+ - [x] `Scroll Down` and `Scroll Up` work on a scrollable screen.
++- [ ] `Swipe Left` and `Swipe Right` advance a horizontal pager/carousel (e.g.
++      the launcher home screens or a photo viewer). Added in Milestone 4
++      (issue #86); pending a live emulator pass.
++- [ ] `Swipe Up` and `Swipe Down` move a vertical gesture surface (e.g. the
++      notification shade or a bottom sheet). Added in Milestone 4 (issue #86);
++      pending a live emulator pass.
+ - [ ] `Scroll Down` or `Scroll Up` followed by `wait_for_idle` settles after movement.
+ - [ ] Keyboard dismissal followed by `wait_for_idle` settles after IME changes.
+ - [x] `Back` and `Home` work.
+diff --git a/docs/TOOL_SPEC.md b/docs/TOOL_SPEC.md
+index 06e5bce..acd8df5 100644
+--- a/docs/TOOL_SPEC.md
++++ b/docs/TOOL_SPEC.md
+@@ -26,6 +26,9 @@ Tools are the only way an agent may affect the Android device.
+ - `tap`: tap a semantic target by visible text, stable `node_id`, or bounds.
+ - `type_text`: type text into the focused field or selected target.
+ - `scroll`: scroll the current view.
++- `swipe`: swipe a gesture surface (pager, carousel, drawer, map) by direction
++  or between explicit coordinates — distinct from `scroll`, which drives a
++  scrollable container's accessibility scroll action.
+ - `press_back`: send Android back.
+ - `press_home`: return to launcher.
+ - `wait_for_ui`: wait for a screen change or expected text.
+@@ -36,11 +39,21 @@ Tools are the only way an agent may affect the Android device.
+ - `dismiss_keyboard`: hide the soft keyboard if it is visible.
+ 
+ The app implements `observe_screen`, `observe_screen_context`, `open_app`,
+-`open_settings_panel`, `tap`, `type_text`, `scroll`, `press_back`,
+-`press_home`, `wait_for_ui`,
+-`wait_for_idle`, `wait_for_app`, `focus_input`, `clear_text`, and
+-`dismiss_keyboard` from the Android Tools screen and the agent command-provider
+-loop.
++`open_settings_panel`, `tap`, `type_text`, `scroll`, `swipe`, `press_back`,
++`press_home`, `wait_for_ui`, `wait_for_idle`, `wait_for_app`, `focus_input`,
++`clear_text`, and `dismiss_keyboard` from the Android Tools screen and the
++agent command-provider loop.
++
++`swipe` has two input modes. In **direction mode** (the primary path) the caller
++passes `direction` (`left`, `right`, `up`, or `down`, naming the direction the
++finger travels); the gesture is planned within an optional container target
++(same selector/scoring path as `scroll`) or the active window when no container
++is given. In **coordinate mode** the caller passes explicit `start_x`,
++`start_y`, `end_x`, `end_y` (plus an optional `duration_ms`). Unlike `scroll`,
++`swipe` imposes no scrollable-role constraint on its container, dispatches a raw
++drag gesture rather than an accessibility scroll action, and fails explicitly on
++an invalid direction, an incomplete/out-of-range coordinate set, or a missing or
++ambiguous container.
+ 
+ `open_settings_panel` accepts `panel` and only supports the explicit allowlist
+ `wifi`, `bluetooth`, `accessibility`, `app_info`, `notifications`, and
+diff --git a/skills/browser/SKILL.md b/skills/browser/SKILL.md
+index 303ad0e..5659328 100644
+--- a/skills/browser/SKILL.md
++++ b/skills/browser/SKILL.md
+@@ -10,5 +10,6 @@ Allowed initial tools:
+ - `tap`
+ - `type_text`
+ - `scroll`
++- `swipe`
+ - `press_back`
+ - `wait_for_ui`
+diff --git a/skills/messages/SKILL.md b/skills/messages/SKILL.md
+index 4234ed3..8a97ea2 100644
+--- a/skills/messages/SKILL.md
++++ b/skills/messages/SKILL.md
+@@ -10,5 +10,6 @@ Allowed initial tools:
+ - `tap`
+ - `type_text`
+ - `scroll`
++- `swipe`
+ - `press_back`
+ - `wait_for_ui`

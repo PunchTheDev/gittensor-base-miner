@@ -1,0 +1,1345 @@
+diff --git a/apps/gittensory-ui/src/routes/app.analytics.tsx b/apps/gittensory-ui/src/routes/app.analytics.tsx
+index 02df72f..2e3e44d 100644
+--- a/apps/gittensory-ui/src/routes/app.analytics.tsx
++++ b/apps/gittensory-ui/src/routes/app.analytics.tsx
+@@ -12,6 +12,22 @@ export const Route = createFileRoute("/app/analytics")({
+ type OperatorDashboard = {
+   metrics: Array<{ label: string; value: string; delta: string }>;
+   noiseReduction: Array<{ label: string; value: number; spark: number[] }>;
++  usageRollupStatus?: {
++    status: "empty" | "ready" | "partial" | "stale" | "incomplete";
++    latestRollupDay?: string | null;
++    warnings: string[];
++  };
++  usageRollups?: Array<{
++    day: string;
++    status: "complete" | "partial" | "incomplete";
++    totalEvents: number;
++    activeActors: number;
++    activeRepos: number;
++    activation: {
++      fullyActivatedActors: number;
++      githubActivatedRepos: number;
++    };
++  }>;
+ };
+ 
+ function ProductAnalytics() {
+@@ -48,7 +64,18 @@ function ProductAnalytics() {
+               </p>
+             </div>
+             <div className="flex items-center gap-2">
+-              <StatusPill status="ready">Live API</StatusPill>
++              <StatusPill
++                status={
++                  data.usageRollupStatus?.status === "ready" ||
++                  data.usageRollupStatus?.status === "partial"
++                    ? "ready"
++                    : data.usageRollupStatus?.status === "empty"
++                      ? "info"
++                      : "degraded"
++                }
++              >
++                {data.usageRollupStatus?.status ?? "Live API"}
++              </StatusPill>
+               <BoundaryBadge boundary="private-api" />
+             </div>
+           </header>
+@@ -86,6 +113,54 @@ function ProductAnalytics() {
+               ))}
+             </div>
+           </section>
++
++          {data.usageRollups && data.usageRollups.length > 0 ? (
++            <section className="rounded-token border border-border bg-transparent p-5">
++              <div className="flex flex-wrap items-center justify-between gap-3">
++                <div>
++                  <h2 className="font-display text-token-lg font-semibold">
++                    Daily activation rollups
++                  </h2>
++                  <p className="mt-1 text-token-xs text-muted-foreground">
++                    Hashed actor, repo, command, tool, and maintainer-action funnels by UTC day.
++                  </p>
++                </div>
++                <StatusPill status={data.usageRollupStatus?.warnings.length ? "degraded" : "ready"}>
++                  {data.usageRollupStatus?.latestRollupDay ?? "current"}
++                </StatusPill>
++              </div>
++              <div className="mt-4 overflow-x-auto">
++                <table className="w-full min-w-[680px] text-left text-token-sm">
++                  <thead className="border-b border-border text-token-xs uppercase text-muted-foreground">
++                    <tr>
++                      <th className="py-2 pr-4 font-medium">Day</th>
++                      <th className="py-2 pr-4 font-medium">Status</th>
++                      <th className="py-2 pr-4 font-medium">Events</th>
++                      <th className="py-2 pr-4 font-medium">Actors</th>
++                      <th className="py-2 pr-4 font-medium">Repos</th>
++                      <th className="py-2 pr-4 font-medium">Activated</th>
++                      <th className="py-2 font-medium">GitHub activated</th>
++                    </tr>
++                  </thead>
++                  <tbody>
++                    {data.usageRollups.slice(0, 7).map((rollup) => (
++                      <tr key={rollup.day} className="border-b border-border/60 last:border-0">
++                        <td className="py-2 pr-4 font-mono text-token-xs">{rollup.day}</td>
++                        <td className="py-2 pr-4">{rollup.status}</td>
++                        <td className="py-2 pr-4 font-mono">{rollup.totalEvents}</td>
++                        <td className="py-2 pr-4 font-mono">{rollup.activeActors}</td>
++                        <td className="py-2 pr-4 font-mono">{rollup.activeRepos}</td>
++                        <td className="py-2 pr-4 font-mono">
++                          {rollup.activation.fullyActivatedActors}
++                        </td>
++                        <td className="py-2 font-mono">{rollup.activation.githubActivatedRepos}</td>
++                      </tr>
++                    ))}
++                  </tbody>
++                </table>
++              </div>
++            </section>
++          ) : null}
+         </div>
+       ) : null}
+     </StateBoundary>
+diff --git a/migrations/0016_product_usage_daily_rollups.sql b/migrations/0016_product_usage_daily_rollups.sql
+new file mode 100644
+index 0000000..44d3917
+--- /dev/null
++++ b/migrations/0016_product_usage_daily_rollups.sql
+@@ -0,0 +1,25 @@
++CREATE TABLE IF NOT EXISTS product_usage_daily_rollups (
++  day TEXT PRIMARY KEY,
++  status TEXT NOT NULL,
++  total_events INTEGER NOT NULL DEFAULT 0,
++  active_actors INTEGER NOT NULL DEFAULT 0,
++  active_sessions INTEGER NOT NULL DEFAULT 0,
++  active_repos INTEGER NOT NULL DEFAULT 0,
++  source_event_count INTEGER NOT NULL DEFAULT 0,
++  max_event_capacity INTEGER NOT NULL DEFAULT 0,
++  first_event_at TEXT,
++  last_event_at TEXT,
++  surfaces_json TEXT NOT NULL DEFAULT '[]',
++  outcomes_json TEXT NOT NULL DEFAULT '[]',
++  events_json TEXT NOT NULL DEFAULT '[]',
++  repos_json TEXT NOT NULL DEFAULT '[]',
++  commands_json TEXT NOT NULL DEFAULT '[]',
++  tools_json TEXT NOT NULL DEFAULT '[]',
++  route_classes_json TEXT NOT NULL DEFAULT '[]',
++  activation_json TEXT NOT NULL DEFAULT '{}',
++  generated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
++  updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
++);
++
++CREATE INDEX IF NOT EXISTS product_usage_daily_rollups_status_idx
++  ON product_usage_daily_rollups(status, updated_at);
+diff --git a/src/api/routes.ts b/src/api/routes.ts
+index f67eb74..af0164d 100644
+--- a/src/api/routes.ts
++++ b/src/api/routes.ts
+@@ -37,6 +37,7 @@ import {
+   getRepositorySettings,
+   recordAuditEvent,
+   getContributorEvidence,
++  getProductUsageRollupStatus,
+   listAllPullRequestDetailSyncStates,
+   listCheckSummaries,
+   listBounties,
+@@ -53,6 +54,7 @@ import {
+   listIssueSignalSample,
+   listAgentRunsForActor,
+   listDigestSubscriptionsForLogin,
++  listProductUsageDailyRollups,
+   listOpenPullRequests,
+   listPullRequestFiles,
+   listPullRequestReviews,
+@@ -70,6 +72,7 @@ import {
+   persistScorePreview,
+   persistSignalSnapshot,
+   recordProductUsageEvent,
++  rollupProductUsageDaily,
+   summarizeProductUsageEvents,
+   upsertDigestSubscription,
+   upsertBounty,
+@@ -752,7 +755,7 @@ export function createApp() {
+     const forbidden = await requireAppRole(c, ["operator"]);
+     if (forbidden) return forbidden;
+     const usageSince = new Date(Date.now() - 7 * 24 * 60 * 60 * 1000).toISOString();
+-    const [repositories, installations, health, registry, scoring, upstreamDrift, activeSessions, digestSubscriptions, rateLimits, usageSummary] = await Promise.all([
++    const [repositories, installations, health, registry, scoring, upstreamDrift, activeSessions, digestSubscriptions, rateLimits, usageSummary, usageRollups, usageRollupStatus] = await Promise.all([
+       listRepositories(c.env),
+       listInstallations(c.env),
+       listInstallationHealth(c.env),
+@@ -763,6 +766,8 @@ export function createApp() {
+       countActiveDigestSubscriptions(c.env),
+       listLatestGitHubRateLimitObservations(c.env, 20),
+       summarizeProductUsageEvents(c.env, usageSince),
++      listProductUsageDailyRollups(c.env, { limit: 14 }),
++      getProductUsageRollupStatus(c.env),
+     ]);
+     const installedRepos = repositories.filter((repo) => repo.isInstalled).length;
+     const registeredRepos = repositories.filter((repo) => repo.isRegistered).length;
+@@ -775,6 +780,7 @@ export function createApp() {
+         { label: "Digest subscriptions", value: String(digestSubscriptions), delta: "store-only" },
+         { label: "Product events", value: String(usageSummary.totalEvents), delta: "last 7 days" },
+         { label: "Active users", value: String(usageSummary.activeActors), delta: "hashed, last 7 days" },
++        { label: "Activation rollups", value: usageRollupStatus.status, delta: usageRollupStatus.latestRollupDay ?? "not generated" },
+         { label: "Install issues", value: String(health.filter((record) => record.status !== "healthy").length), delta: "current health cache" },
+         { label: "Rate-limit events", value: String(rateLimits.length), delta: "latest observations" },
+       ],
+@@ -785,12 +791,22 @@ export function createApp() {
+       ],
+       weeklyReport: buildOperatorWeeklyReport({ repositories, installations, health, registry, scoring, upstreamDrift }),
+       usageSummary,
++      usageRollups,
++      usageRollupStatus,
+       registry,
+       scoringModel: scoring,
+       upstreamDrift,
+     });
+   });
+ 
++  app.get("/v1/app/analytics/daily-rollups", async (c) => {
++    const forbidden = await requireAppRole(c, ["operator"]);
++    if (forbidden) return forbidden;
++    const limit = Math.max(1, Math.min(90, Number(c.req.query("limit") ?? 14) || 14));
++    const [rollups, status] = await Promise.all([listProductUsageDailyRollups(c.env, { limit }), getProductUsageRollupStatus(c.env)]);
++    return c.json({ generatedAt: nowIso(), status, rollups });
++  });
++
+   app.get("/v1/app/commands", async (c) =>
+     c.json({
+       generatedAt: nowIso(),
+@@ -1705,6 +1721,15 @@ export function createApp() {
+     return c.json({ ok: true, status: "queued", repoFullName }, 202);
+   });
+ 
++  app.post("/v1/internal/jobs/rollup-product-usage", async (c) => {
++    const body = await c.req.json().catch(() => ({}));
++    const day = typeof body?.day === "string" ? body.day : undefined;
++    const days = Number.isFinite(Number(body?.days)) ? Math.max(1, Math.min(31, Math.round(Number(body.days)))) : undefined;
++    const message: JobMessage = { type: "rollup-product-usage", requestedBy: "api", ...(day ? { day } : {}), ...(days === undefined ? {} : { days }) };
++    await c.env.JOBS.send(message);
++    return c.json({ ok: true, status: "queued", day, days }, 202);
++  });
++
+   app.post("/v1/internal/jobs/repair-data-fidelity", async (c) => {
+     const message: JobMessage = { type: "repair-data-fidelity", requestedBy: "api" };
+     await c.env.JOBS.send(message);
+@@ -1718,6 +1743,13 @@ export function createApp() {
+     return c.json({ ok: true, status: "completed", repoFullName });
+   });
+ 
++  app.post("/v1/internal/jobs/rollup-product-usage/run", async (c) => {
++    const body = await c.req.json().catch(() => ({}));
++    const day = typeof body?.day === "string" ? body.day : undefined;
++    const days = Number.isFinite(Number(body?.days)) ? Math.max(1, Math.min(31, Math.round(Number(body.days)))) : undefined;
++    return c.json(await rollupProductUsageDaily(c.env, { ...(day ? { day } : {}), ...(days === undefined ? {} : { days }) }));
++  });
++
+   app.post("/v1/internal/jobs/refresh-installation-health/run", async (c) => {
+     return c.json(await refreshInstallationHealth(c.env));
+   });
+diff --git a/src/db/repositories.ts b/src/db/repositories.ts
+index af55094..1ea9f9c 100644
+--- a/src/db/repositories.ts
++++ b/src/db/repositories.ts
+@@ -28,6 +28,7 @@ import {
+   pullRequestDetailSyncState,
+   pullRequestReviews,
+   pullRequests,
++  productUsageDailyRollups,
+   productUsageEvents,
+   recentMergedPullRequests,
+   repositories,
+@@ -79,7 +80,12 @@ import type {
+   IssueRecord,
+   IssueQualityReportRecord,
+   JsonValue,
++  ProductUsageActivationFunnel,
++  ProductUsageDailyRollupRecord,
++  ProductUsageDailyRollupStatus,
+   ProductUsageEventRecord,
++  ProductUsageRollupRunResult,
++  ProductUsageRollupStatus,
+   ProductUsageOutcome,
+   ProductUsageSummary,
+   ProductUsageSurface,
+@@ -1072,6 +1078,97 @@ export async function summarizeProductUsageEvents(env: Env, sinceIso?: string):
+   };
+ }
+ 
++export async function rollupProductUsageDaily(
++  env: Env,
++  options: { day?: string; days?: number; nowIso?: string } = {},
++): Promise<ProductUsageRollupRunResult> {
++  const generatedAt = options.nowIso ?? nowIso();
++  const requestedDays = options.day ? [normalizeProductUsageRollupDay(options.day, generatedAt)] : productUsageRollupDays(generatedAt, options.days ?? 7);
++  const rollups: ProductUsageDailyRollupRecord[] = [];
++  for (const day of requestedDays) rollups.push(await upsertProductUsageDailyRollup(env, day, generatedAt));
++  return { generatedAt, requestedDays, rollups, status: await getProductUsageRollupStatus(env, { nowIso: generatedAt }) };
++}
++
++export async function listProductUsageDailyRollups(
++  env: Env,
++  options: { limit?: number; fromDay?: string } = {},
++): Promise<ProductUsageDailyRollupRecord[]> {
++  const db = getDb(env.DB);
++  const limit = Math.max(1, Math.min(90, Math.round(options.limit ?? 14)));
++  const rows = options.fromDay
++    ? await db
++        .select()
++        .from(productUsageDailyRollups)
++        .where(gte(productUsageDailyRollups.day, options.fromDay))
++        .orderBy(desc(productUsageDailyRollups.day))
++        .limit(limit)
++    : await db.select().from(productUsageDailyRollups).orderBy(desc(productUsageDailyRollups.day)).limit(limit);
++  return rows.map(toProductUsageDailyRollupRecord);
++}
++
++export async function getProductUsageRollupStatus(
++  env: Env,
++  options: { nowIso?: string; lookbackDays?: number } = {},
++): Promise<ProductUsageRollupStatus> {
++  const db = getDb(env.DB);
++  const generatedAt = options.nowIso ?? nowIso();
++  const lookbackDays = Math.max(1, Math.min(31, Math.round(options.lookbackDays ?? 14)));
++  const sinceDay = addProductUsageUtcDays(productUsageDayFromIso(generatedAt), -(lookbackDays - 1));
++  const [latestEvent] = await db.select().from(productUsageEvents).orderBy(desc(productUsageEvents.occurredAt)).limit(1);
++  const rollups = await listProductUsageDailyRollups(env, { fromDay: sinceDay, limit: lookbackDays + 1 });
++  const rollupByDay = new Map(rollups.map((rollup) => [rollup.day, rollup]));
++  const eventDayExpr = sql<string>`substr(${productUsageEvents.occurredAt}, 1, 10)`;
++  const eventDayRows = await db
++    .select({ day: eventDayExpr, count: sql<number>`count(*)` })
++    .from(productUsageEvents)
++    .where(gte(productUsageEvents.occurredAt, `${sinceDay}T00:00:00.000Z`))
++    .groupBy(eventDayExpr);
++  const eventDayCounts = new Map(eventDayRows.map((row) => [row.day, Number(row.count ?? 0)]));
++  const eventDays = [...eventDayCounts.keys()].sort();
++  const missingDays = eventDays.filter((day) => !rollupByDay.has(day));
++  const incompleteDays = rollups.filter((rollup) => rollup.status === "incomplete").map((rollup) => rollup.day);
++  const partialDays = rollups.filter((rollup) => rollup.status === "partial").map((rollup) => rollup.day);
++  const latestRollup = rollups[0];
++  const latestEventAt = latestEvent?.occurredAt ?? null;
++  const staleDays = [
++    ...new Set([
++      ...eventDays.filter((day) => {
++        const rollup = rollupByDay.get(day);
++        return rollup ? rollup.sourceEventCount !== eventDayCounts.get(day) : false;
++      }),
++      ...(latestEventAt && latestRollup?.generatedAt && latestEventAt > latestRollup.generatedAt ? [productUsageDayFromIso(latestEventAt)] : []),
++    ]),
++  ].sort();
++  const warnings = [
++    ...(missingDays.length > 0 ? [`${missingDays.length} product usage day(s) have events but no rollup.`] : []),
++    ...(incompleteDays.length > 0 ? [`${incompleteDays.length} product usage rollup day(s) hit the worker-safe event scan cap.`] : []),
++    ...(staleDays.length > 0 ? ["Product usage rollups are stale relative to the latest raw event."] : []),
++    ...(partialDays.length > 0 ? ["Current-day product usage rollup is partial until the UTC day closes."] : []),
++  ];
++  const status: ProductUsageRollupStatus["status"] = !latestEvent
++    ? "empty"
++    : staleDays.length > 0
++      ? "stale"
++      : missingDays.length > 0
++        ? "incomplete"
++        : incompleteDays.length > 0
++          ? "incomplete"
++          : partialDays.length > 0
++            ? "partial"
++            : "ready";
++  return {
++    status,
++    generatedAt,
++    latestEventAt,
++    latestRollupDay: latestRollup?.day ?? null,
++    latestRollupGeneratedAt: latestRollup?.generatedAt ?? null,
++    missingDays,
++    staleDays,
++    incompleteDays,
++    warnings,
++  };
++}
++
+ export async function recordAuditEvent(env: Env, event: AuditEventRecord): Promise<void> {
+   const db = getDb(env.DB);
+   await db.insert(auditEvents).values({
+@@ -2774,6 +2871,31 @@ function toProductUsageEventRecord(row: typeof productUsageEvents.$inferSelect):
+   };
+ }
+ 
++function toProductUsageDailyRollupRecord(row: typeof productUsageDailyRollups.$inferSelect): ProductUsageDailyRollupRecord {
++  return {
++    day: row.day,
++    status: normalizeProductUsageDailyRollupStatus(row.status),
++    totalEvents: row.totalEvents,
++    activeActors: row.activeActors,
++    activeSessions: row.activeSessions,
++    activeRepos: row.activeRepos,
++    sourceEventCount: row.sourceEventCount,
++    maxEventCapacity: row.maxEventCapacity,
++    firstEventAt: row.firstEventAt,
++    lastEventAt: row.lastEventAt,
++    bySurface: parseJson<Array<{ surface: ProductUsageSurface; count: number }>>(row.surfacesJson, []),
++    byOutcome: parseJson<Array<{ outcome: ProductUsageOutcome; count: number }>>(row.outcomesJson, []),
++    byEvent: parseJson<Array<{ eventName: string; count: number }>>(row.eventsJson, []),
++    byRepo: parseJson<Array<{ key: string; count: number }>>(row.reposJson, []),
++    byCommand: parseJson<Array<{ key: string; count: number }>>(row.commandsJson, []),
++    byTool: parseJson<Array<{ key: string; count: number }>>(row.toolsJson, []),
++    byRouteClass: parseJson<Array<{ key: string; count: number }>>(row.routeClassesJson, []),
++    activation: parseJson<ProductUsageActivationFunnel>(row.activationJson, emptyProductUsageActivationFunnel()),
++    generatedAt: row.generatedAt,
++    updatedAt: row.updatedAt,
++  };
++}
++
+ function normalizeProductUsageSurface(surface: unknown): ProductUsageSurface {
+   if (typeof surface === "string" && PRODUCT_USAGE_SURFACES.has(surface as ProductUsageSurface)) return surface as ProductUsageSurface;
+   return "api";
+@@ -2784,6 +2906,11 @@ function normalizeProductUsageOutcome(outcome: unknown): ProductUsageOutcome {
+   return "success";
+ }
+ 
++function normalizeProductUsageDailyRollupStatus(status: unknown): ProductUsageDailyRollupStatus {
++  if (status === "complete" || status === "partial" || status === "incomplete") return status;
++  return "incomplete";
++}
++
+ function normalizeProductUsageLatency(latencyMs: unknown): number | null {
+   return typeof latencyMs === "number" && Number.isFinite(latencyMs) ? Math.max(0, Math.round(latencyMs)) : null;
+ }
+@@ -2816,11 +2943,249 @@ function escapeRegExp(value: string): string {
+   return value.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+ }
+ 
++async function upsertProductUsageDailyRollup(env: Env, day: string, generatedAt: string): Promise<ProductUsageDailyRollupRecord> {
++  const db = getDb(env.DB);
++  const startIso = `${day}T00:00:00.000Z`;
++  const endIso = `${addProductUsageUtcDays(day, 1)}T00:00:00.000Z`;
++  const [totalRow] = await db
++    .select({ count: sql<number>`count(*)` })
++    .from(productUsageEvents)
++    .where(and(gte(productUsageEvents.occurredAt, startIso), sql`${productUsageEvents.occurredAt} < ${endIso}`));
++  const sourceEventCount = Number(totalRow?.count ?? 0);
++  const rows = await db
++    .select()
++    .from(productUsageEvents)
++    .where(and(gte(productUsageEvents.occurredAt, startIso), sql`${productUsageEvents.occurredAt} < ${endIso}`))
++    .orderBy(productUsageEvents.occurredAt)
++    .limit(PRODUCT_USAGE_ROLLUP_EVENT_SCAN_LIMIT + 1);
++  const capped = rows.length > PRODUCT_USAGE_ROLLUP_EVENT_SCAN_LIMIT || sourceEventCount > PRODUCT_USAGE_ROLLUP_EVENT_SCAN_LIMIT;
++  const events = rows.slice(0, PRODUCT_USAGE_ROLLUP_EVENT_SCAN_LIMIT).map(toProductUsageEventRecord);
++  const record = buildProductUsageDailyRollupRecord({
++    day,
++    generatedAt,
++    sourceEventCount,
++    capped,
++    events,
++  });
++  await db
++    .insert(productUsageDailyRollups)
++    .values({
++      day: record.day,
++      status: record.status,
++      totalEvents: record.totalEvents,
++      activeActors: record.activeActors,
++      activeSessions: record.activeSessions,
++      activeRepos: record.activeRepos,
++      sourceEventCount: record.sourceEventCount,
++      maxEventCapacity: record.maxEventCapacity,
++      firstEventAt: record.firstEventAt ?? null,
++      lastEventAt: record.lastEventAt ?? null,
++      surfacesJson: jsonString(record.bySurface),
++      outcomesJson: jsonString(record.byOutcome),
++      eventsJson: jsonString(record.byEvent),
++      reposJson: jsonString(record.byRepo),
++      commandsJson: jsonString(record.byCommand),
++      toolsJson: jsonString(record.byTool),
++      routeClassesJson: jsonString(record.byRouteClass),
++      activationJson: jsonString(record.activation),
++      generatedAt: record.generatedAt,
++      updatedAt: record.updatedAt,
++    })
++    .onConflictDoUpdate({
++      target: productUsageDailyRollups.day,
++      set: {
++        status: record.status,
++        totalEvents: record.totalEvents,
++        activeActors: record.activeActors,
++        activeSessions: record.activeSessions,
++        activeRepos: record.activeRepos,
++        sourceEventCount: record.sourceEventCount,
++        maxEventCapacity: record.maxEventCapacity,
++        firstEventAt: record.firstEventAt ?? null,
++        lastEventAt: record.lastEventAt ?? null,
++        surfacesJson: jsonString(record.bySurface),
++        outcomesJson: jsonString(record.byOutcome),
++        eventsJson: jsonString(record.byEvent),
++        reposJson: jsonString(record.byRepo),
++        commandsJson: jsonString(record.byCommand),
++        toolsJson: jsonString(record.byTool),
++        routeClassesJson: jsonString(record.byRouteClass),
++        activationJson: jsonString(record.activation),
++        generatedAt: record.generatedAt,
++        updatedAt: record.updatedAt,
++      },
++    });
++  return record;
++}
++
++function buildProductUsageDailyRollupRecord(args: {
++  day: string;
++  generatedAt: string;
++  sourceEventCount: number;
++  capped: boolean;
++  events: ProductUsageEventRecord[];
++}): ProductUsageDailyRollupRecord {
++  const today = productUsageDayFromIso(args.generatedAt);
++  const actorHashes = new Set(args.events.map((event) => event.actorHash).filter(isNonEmptyString));
++  const sessionHashes = new Set(args.events.map((event) => event.sessionHash).filter(isNonEmptyString));
++  const repoNames = new Set(args.events.map((event) => event.repoFullName).filter(isNonEmptyString));
++  const loginActors = productUsageActorSet(args.events, (event) => event.eventName === "auth_session_created");
++  const doctorPassActors = productUsageActorSet(args.events, isProductUsageDoctorPassEvent);
++  const firstUsefulActionActors = productUsageActorSet(args.events, isProductUsageUsefulActionEvent);
++  const githubInstalledRepos = productUsageRepoSet(args.events, (event) => event.eventName === "github_installation_created");
++  const githubFirstCommandRepos = productUsageRepoSet(args.events, isProductUsageGitHubCommandEvent);
++  const githubUsefulMaintainerRepos = productUsageRepoSet(args.events, isProductUsageUsefulMaintainerEvent);
++  const activation: ProductUsageActivationFunnel = {
++    loginActors: loginActors.size,
++    doctorPassActors: doctorPassActors.size,
++    firstUsefulActionActors: firstUsefulActionActors.size,
++    fullyActivatedActors: intersectionCount(loginActors, doctorPassActors, firstUsefulActionActors),
++    githubInstalledRepos: githubInstalledRepos.size,
++    githubFirstCommandRepos: githubFirstCommandRepos.size,
++    githubUsefulMaintainerRepos: githubUsefulMaintainerRepos.size,
++    githubActivatedRepos: intersectionCount(githubInstalledRepos, githubFirstCommandRepos, githubUsefulMaintainerRepos),
++  };
++  return {
++    day: args.day,
++    status: args.capped ? "incomplete" : args.day === today ? "partial" : "complete",
++    totalEvents: args.sourceEventCount,
++    activeActors: actorHashes.size,
++    activeSessions: sessionHashes.size,
++    activeRepos: repoNames.size,
++    sourceEventCount: args.sourceEventCount,
++    maxEventCapacity: PRODUCT_USAGE_ROLLUP_EVENT_SCAN_LIMIT,
++    firstEventAt: args.events[0]?.occurredAt ?? null,
++    lastEventAt: args.events.at(-1)?.occurredAt ?? null,
++    bySurface: countProductUsageDimensions(args.events.map((event) => event.surface)).map(({ key, count }) => ({ surface: normalizeProductUsageSurface(key), count })),
++    byOutcome: countProductUsageDimensions(args.events.map((event) => event.outcome)).map(({ key, count }) => ({ outcome: normalizeProductUsageOutcome(key), count })),
++    byEvent: countProductUsageDimensions(args.events.map((event) => event.eventName)).map(({ key, count }) => ({ eventName: key, count })),
++    byRepo: countProductUsageDimensions(args.events.map((event) => event.repoFullName)),
++    byCommand: countProductUsageDimensions(args.events.map((event) => productUsageMetadataString(event, "command"))),
++    byTool: countProductUsageDimensions(args.events.map((event) => productUsageMetadataString(event, "toolName"))),
++    byRouteClass: countProductUsageDimensions(args.events.map((event) => productUsageRouteClass(event.route))),
++    activation,
++    generatedAt: args.generatedAt,
++    updatedAt: args.generatedAt,
++  };
++}
++
++function productUsageActorSet(events: ProductUsageEventRecord[], predicate: (event: ProductUsageEventRecord) => boolean): Set<string> {
++  return new Set(events.filter(predicate).map((event) => event.actorHash).filter(isNonEmptyString));
++}
++
++function productUsageRepoSet(events: ProductUsageEventRecord[], predicate: (event: ProductUsageEventRecord) => boolean): Set<string> {
++  return new Set(events.filter(predicate).map((event) => event.repoFullName).filter(isNonEmptyString));
++}
++
++function isProductUsageDoctorPassEvent(event: ProductUsageEventRecord): boolean {
++  return event.outcome === "success" || event.outcome === "completed" ? event.eventName === "mcp_request" || event.eventName === "mcp_tool_called" || event.eventName === "mcp_doctor_passed" : false;
++}
++
++function isProductUsageUsefulActionEvent(event: ProductUsageEventRecord): boolean {
++  if (event.outcome !== "success" && event.outcome !== "completed" && event.outcome !== "queued") return false;
++  return PRODUCT_USAGE_USEFUL_ACTION_EVENTS.has(event.eventName);
++}
++
++function isProductUsageGitHubCommandEvent(event: ProductUsageEventRecord): boolean {
++  return event.eventName === "agent_command_replied" || event.eventName === "agent_command_skipped";
++}
++
++function isProductUsageUsefulMaintainerEvent(event: ProductUsageEventRecord): boolean {
++  return event.eventName === "agent_command_replied" && productUsageMetadataString(event, "actorKind") === "maintainer" && event.outcome === "completed";
++}
++
++function productUsageMetadataString(event: ProductUsageEventRecord, key: string): string | null {
++  const value = event.metadata[key];
++  return typeof value === "string" && value.trim() ? value.trim() : null;
++}
++
++function countProductUsageDimensions(values: Array<string | null | undefined>, limit = 20): Array<{ key: string; count: number }> {
++  const counts = new Map<string, number>();
++  for (const value of values) {
++    if (!value) continue;
++    counts.set(value, (counts.get(value) ?? 0) + 1);
++  }
++  return [...counts.entries()]
++    .map(([key, count]) => ({ key, count }))
++    .sort((a, b) => b.count - a.count || a.key.localeCompare(b.key))
++    .slice(0, limit);
++}
++
++function productUsageRouteClass(route: string | null | undefined): string {
++  if (!route) return "unknown";
++  if (route === "/health") return "health";
++  if (route.startsWith("/v1/auth/")) return "auth";
++  if (route === "/mcp" || route.startsWith("/v1/mcp/")) return "mcp";
++  if (route.startsWith("/v1/app/")) return "control_panel";
++  if (route.startsWith("/v1/agent/")) return "agent";
++  if (route.startsWith("/v1/extension/")) return "browser_extension";
++  if (route.startsWith("/v1/github/")) return "github_app";
++  if (route.startsWith("/v1/internal/")) return "internal";
++  if (route.startsWith("/v1/repos/")) return "repository";
++  return "api";
++}
++
++function intersectionCount(first: Set<string>, ...rest: Array<Set<string>>): number {
++  return [...first].filter((value) => rest.every((set) => set.has(value))).length;
++}
++
++function emptyProductUsageActivationFunnel(): ProductUsageActivationFunnel {
++  return {
++    loginActors: 0,
++    doctorPassActors: 0,
++    firstUsefulActionActors: 0,
++    fullyActivatedActors: 0,
++    githubInstalledRepos: 0,
++    githubFirstCommandRepos: 0,
++    githubUsefulMaintainerRepos: 0,
++    githubActivatedRepos: 0,
++  };
++}
++
++function productUsageRollupDays(nowValue: string, count: number): string[] {
++  const days = Math.max(1, Math.min(31, Math.round(count)));
++  const today = productUsageDayFromIso(nowValue);
++  return Array.from({ length: days }, (_, index) => addProductUsageUtcDays(today, index - (days - 1)));
++}
++
++function normalizeProductUsageRollupDay(value: string, fallbackIso: string): string {
++  return /^\d{4}-\d{2}-\d{2}$/.test(value) && Number.isFinite(Date.parse(`${value}T00:00:00.000Z`)) ? value : productUsageDayFromIso(fallbackIso);
++}
++
++function productUsageDayFromIso(value: string): string {
++  const parsed = Date.parse(value);
++  return Number.isFinite(parsed) ? new Date(parsed).toISOString().slice(0, 10) : nowIso().slice(0, 10);
++}
++
++function addProductUsageUtcDays(day: string, delta: number): string {
++  const date = new Date(`${day}T00:00:00.000Z`);
++  date.setUTCDate(date.getUTCDate() + delta);
++  return date.toISOString().slice(0, 10);
++}
++
++function isNonEmptyString(value: string | null | undefined): value is string {
++  return typeof value === "string" && value.length > 0;
++}
++
+ const PRODUCT_USAGE_METADATA_MAX_DEPTH = 3;
+ const PRODUCT_USAGE_METADATA_MAX_KEYS = 20;
+ const PRODUCT_USAGE_METADATA_MAX_ARRAY_ITEMS = 20;
+ const PRODUCT_USAGE_METADATA_MAX_KEY_CHARS = 64;
+ const PRODUCT_USAGE_METADATA_MAX_STRING_CHARS = 200;
++const PRODUCT_USAGE_ROLLUP_EVENT_SCAN_LIMIT = 5000;
++const PRODUCT_USAGE_USEFUL_ACTION_EVENTS = new Set([
++  "command_previewed",
++  "pull_context_viewed",
++  "local_branch_analysis_completed",
++  "agent_run_started",
++  "agent_plan_next_work_completed",
++  "agent_preflight_branch_completed",
++  "agent_pr_packet_completed",
++  "agent_blockers_completed",
++  "agent_command_replied",
++  "pr_public_surface_published",
++  "mcp_tool_called",
++]);
+ const PRODUCT_USAGE_SURFACES = new Set<ProductUsageSurface>(["api", "mcp", "github_app", "control_panel", "browser_extension", "internal"]);
+ const PRODUCT_USAGE_OUTCOMES = new Set<ProductUsageOutcome>(["success", "denied", "error", "queued", "completed", "skipped"]);
+ const PRODUCT_USAGE_SENSITIVE_KEY =
+diff --git a/src/db/schema.ts b/src/db/schema.ts
+index dec97a1..fcf90f0 100644
+--- a/src/db/schema.ts
++++ b/src/db/schema.ts
+@@ -775,6 +775,35 @@ export const productUsageEvents = sqliteTable(
+   }),
+ );
+ 
++export const productUsageDailyRollups = sqliteTable(
++  "product_usage_daily_rollups",
++  {
++    day: text("day").primaryKey(),
++    status: text("status").notNull(),
++    totalEvents: integer("total_events").notNull().default(0),
++    activeActors: integer("active_actors").notNull().default(0),
++    activeSessions: integer("active_sessions").notNull().default(0),
++    activeRepos: integer("active_repos").notNull().default(0),
++    sourceEventCount: integer("source_event_count").notNull().default(0),
++    maxEventCapacity: integer("max_event_capacity").notNull().default(0),
++    firstEventAt: text("first_event_at"),
++    lastEventAt: text("last_event_at"),
++    surfacesJson: text("surfaces_json").notNull().default("[]"),
++    outcomesJson: text("outcomes_json").notNull().default("[]"),
++    eventsJson: text("events_json").notNull().default("[]"),
++    reposJson: text("repos_json").notNull().default("[]"),
++    commandsJson: text("commands_json").notNull().default("[]"),
++    toolsJson: text("tools_json").notNull().default("[]"),
++    routeClassesJson: text("route_classes_json").notNull().default("[]"),
++    activationJson: text("activation_json").notNull().default("{}"),
++    generatedAt: text("generated_at").notNull().default("CURRENT_TIMESTAMP"),
++    updatedAt: text("updated_at").notNull().default("CURRENT_TIMESTAMP"),
++  },
++  (table) => ({
++    statusUpdated: index("product_usage_daily_rollups_status_idx").on(table.status, table.updatedAt),
++  }),
++);
++
+ export const aiUsageEvents = sqliteTable(
+   "ai_usage_events",
+   {
+diff --git a/src/index.ts b/src/index.ts
+index 55c4609..90d0bd8 100644
+--- a/src/index.ts
++++ b/src/index.ts
+@@ -48,6 +48,7 @@ async function enqueueScheduledJobs(env: Env, controller: ScheduledController):
+     jobs.push({ type: "refresh-registry", requestedBy: "schedule" });
+     jobs.push({ type: "refresh-scoring-model", requestedBy: "schedule" });
+     jobs.push({ type: "refresh-upstream-drift", requestedBy: "schedule" });
++    jobs.push({ type: "rollup-product-usage", requestedBy: "schedule", days: 7 });
+   }
+   if (isFullSyncWindow) {
+     jobs.push({ type: "generate-signal-snapshots", requestedBy: "schedule" });
+diff --git a/src/queue/processors.ts b/src/queue/processors.ts
+index 0bb074e..3d602f3 100644
+--- a/src/queue/processors.ts
++++ b/src/queue/processors.ts
+@@ -32,6 +32,7 @@ import {
+   recordWebhookEvent,
+   replaceCollisionEdges,
+   upsertOfficialMinerDetection,
++  rollupProductUsageDaily,
+   upsertBurdenForecast,
+   upsertContributorEvidence,
+   upsertContributorScoringProfile,
+@@ -207,6 +208,9 @@ export async function processJob(env: Env, message: JobMessage): Promise<void> {
+     case "repair-data-fidelity":
+       await repairDataFidelity(env, message.requestedBy);
+       return;
++    case "rollup-product-usage":
++      await rollupProductUsageDaily(env, { ...(message.day ? { day: message.day } : {}), ...(message.days === undefined ? {} : { days: message.days }) });
++      return;
+     case "run-agent":
+       await executeAgentRun(env, message.runId);
+       return;
+@@ -492,6 +496,20 @@ async function processGitHubWebhook(env: Env, deliveryId: string, eventName: str
+     }
+ 
+     await upsertInstallation(env, payload);
++    if (eventName === "installation" && (payload.action === "created" || payload.action === "added")) {
++      const installedRepos = payload.repositories?.map((repo) => repo.full_name).filter(Boolean) ?? (payload.repository?.full_name ? [payload.repository.full_name] : [undefined]);
++      await Promise.all(
++        installedRepos.slice(0, 50).map((repoFullName) =>
++          recordGithubProductUsage(env, "github_installation_created", {
++            actor: payload.installation?.account?.login,
++            repoFullName,
++            targetKey: payload.installation?.id ? `installation:${payload.installation.id}` : repoFullName,
++            outcome: "completed",
++            metadata: { action: payload.action, repoCount: installedRepos.filter(Boolean).length, truncatedRepos: Math.max(installedRepos.length - 50, 0) },
++          }),
++        ),
++      );
++    }
+ 
+     const installationId = getInstallationId(payload);
+     if (payload.repositories) {
+diff --git a/src/types.ts b/src/types.ts
+index d38c43f..c47bf2c 100644
+--- a/src/types.ts
++++ b/src/types.ts
+@@ -93,6 +93,12 @@ export type JobMessage =
+       type: "repair-data-fidelity";
+       requestedBy: "schedule" | "api" | "test";
+     }
++  | {
++      type: "rollup-product-usage";
++      requestedBy: "schedule" | "api" | "test";
++      day?: string;
++      days?: number;
++    }
+   | {
+       type: "run-agent";
+       requestedBy: "api" | "mcp" | "github_comment" | "test";
+@@ -891,3 +897,63 @@ export type ProductUsageSummary = {
+   byOutcome: Array<{ outcome: ProductUsageOutcome; count: number }>;
+   byEvent: Array<{ eventName: string; count: number }>;
+ };
++
++export type ProductUsageDailyRollupStatus = "complete" | "partial" | "incomplete";
++
++export type ProductUsageDimensionCount = {
++  key: string;
++  count: number;
++};
++
++export type ProductUsageActivationFunnel = {
++  loginActors: number;
++  doctorPassActors: number;
++  firstUsefulActionActors: number;
++  fullyActivatedActors: number;
++  githubInstalledRepos: number;
++  githubFirstCommandRepos: number;
++  githubUsefulMaintainerRepos: number;
++  githubActivatedRepos: number;
++};
++
++export type ProductUsageDailyRollupRecord = {
++  day: string;
++  status: ProductUsageDailyRollupStatus;
++  totalEvents: number;
++  activeActors: number;
++  activeSessions: number;
++  activeRepos: number;
++  sourceEventCount: number;
++  maxEventCapacity: number;
++  firstEventAt?: string | null | undefined;
++  lastEventAt?: string | null | undefined;
++  bySurface: Array<{ surface: ProductUsageSurface; count: number }>;
++  byOutcome: Array<{ outcome: ProductUsageOutcome; count: number }>;
++  byEvent: Array<{ eventName: string; count: number }>;
++  byRepo: ProductUsageDimensionCount[];
++  byCommand: ProductUsageDimensionCount[];
++  byTool: ProductUsageDimensionCount[];
++  byRouteClass: ProductUsageDimensionCount[];
++  activation: ProductUsageActivationFunnel;
++  generatedAt: string;
++  updatedAt: string;
++};
++
++export type ProductUsageRollupRunResult = {
++  generatedAt: string;
++  requestedDays: string[];
++  rollups: ProductUsageDailyRollupRecord[];
++  status: ProductUsageRollupStatus;
++};
++
++export type ProductUsageRollupStatus = {
++  status: "empty" | "ready" | "partial" | "stale" | "incomplete";
++  generatedAt: string;
++  latestEventAt?: string | null | undefined;
++  latestRollupDay?: string | null | undefined;
++  latestRollupGeneratedAt?: string | null | undefined;
++  missingDays: string[];
++  staleDays: string[];
++  incompleteDays: string[];
++  warnings: string[];
++};
+diff --git a/test/integration/api.test.ts b/test/integration/api.test.ts
+index ae6c047..4be42dc 100644
+--- a/test/integration/api.test.ts
++++ b/test/integration/api.test.ts
+@@ -1011,6 +1011,7 @@ describe("api routes", () => {
+ 
+     const { token: browserToken } = await createSessionForGitHubUser(env, { login: "oktofeesh1", id: 12345 });
+     const cookieHeaders = { cookie: `gittensory_session=${browserToken}`, "content-type": "application/json" };
++    const internalHeaders = { authorization: `Bearer ${env.INTERNAL_JOB_TOKEN}`, "content-type": "application/json" };
+ 
+     const overviewPreflight = await app.request("/v1/app/overview", { method: "OPTIONS", headers: { origin: "https://gittensory.aethereal.dev" } }, env);
+     expect(overviewPreflight.status).toBe(204);
+@@ -1094,6 +1095,7 @@ describe("api routes", () => {
+     expect(unknownOverview.status).toBe(200);
+     await expect(unknownOverview.json()).resolves.toMatchObject({ roleSummary: { roles: [], onboarding: { status: "needs_setup" } } });
+     expect((await app.request("/v1/app/operator-dashboard", { headers: unknownHeaders }, unknownEnv)).status).toBe(403);
++    expect((await app.request("/v1/app/analytics/daily-rollups", { headers: unknownHeaders }, unknownEnv)).status).toBe(403);
+     expect((await app.request("/v1/contributors/new-user/decision-pack", { headers: unknownHeaders }, unknownEnv)).status).toBe(403);
+     expect((await app.request("/v1/auth/extension/session", { method: "POST", headers: unknownHeaders }, unknownEnv)).status).toBe(403);
+ 
+@@ -1118,6 +1120,7 @@ describe("api routes", () => {
+     });
+     expect((await app.request("/v1/app/maintainer-dashboard", { headers: ownerHeaders }, ownerEnv)).status).toBe(200);
+     expect((await app.request("/v1/app/operator-dashboard", { headers: ownerHeaders }, ownerEnv)).status).toBe(403);
++    expect((await app.request("/v1/app/analytics/daily-rollups", { headers: ownerHeaders }, ownerEnv)).status).toBe(403);
+     const ownerExtensionSession = await app.request("/v1/auth/extension/session", { method: "POST", headers: ownerHeaders }, ownerEnv);
+     expect(ownerExtensionSession.status).toBe(201);
+     const ownerExtensionSessionBody = (await ownerExtensionSession.json()) as { token: string; login: string; scopes: string[] };
+@@ -1613,16 +1616,48 @@ describe("api routes", () => {
+     );
+     expect(JSON.stringify(productUsageEvents)).not.toMatch(/oktofeesh1|operator@example.com|gittensory_session|\/Users|github_pat|ghp_|source code|raw trust|wallet|hotkey/i);
+ 
++    const usageRollupRun = await app.request(
++      "/v1/internal/jobs/rollup-product-usage/run",
++      { method: "POST", headers: internalHeaders, body: JSON.stringify({ day: "2026-05-28" }) },
++      env,
++    );
++    expect(usageRollupRun.status).toBe(200);
++    await expect(usageRollupRun.json()).resolves.toMatchObject({
++      rollups: [expect.objectContaining({ day: "2026-05-28", status: "partial", totalEvents: productUsageEvents.length })],
++    });
++
++    const dailyRollups = await app.request("/v1/app/analytics/daily-rollups?limit=3", { headers: apiHeaders(env) }, env);
++    expect(dailyRollups.status).toBe(200);
++    await expect(dailyRollups.json()).resolves.toMatchObject({
++      status: expect.objectContaining({ status: "partial", latestRollupDay: "2026-05-28" }),
++      rollups: [expect.objectContaining({ day: "2026-05-28", activation: expect.any(Object) })],
++    });
++    const fallbackLimitRollups = await app.request("/v1/app/analytics/daily-rollups?limit=invalid", { headers: apiHeaders(env) }, env);
++    expect(fallbackLimitRollups.status).toBe(200);
++    await expect(fallbackLimitRollups.json()).resolves.toMatchObject({
++      status: expect.objectContaining({ latestRollupDay: "2026-05-28" }),
++      rollups: [expect.objectContaining({ day: "2026-05-28" })],
++    });
++    const defaultLimitRollups = await app.request("/v1/app/analytics/daily-rollups", { headers: apiHeaders(env) }, env);
++    expect(defaultLimitRollups.status).toBe(200);
++    await expect(defaultLimitRollups.json()).resolves.toMatchObject({
++      status: expect.objectContaining({ latestRollupDay: "2026-05-28" }),
++      rollups: [expect.objectContaining({ day: "2026-05-28" })],
++    });
++
+     const usageOperator = await app.request("/v1/app/operator-dashboard", { headers: apiHeaders(env) }, env);
+     expect(usageOperator.status).toBe(200);
+-    const usageOperatorBody = (await usageOperator.json()) as { metrics: Array<{ label: string; value: string }>; usageSummary: { totalEvents: number } };
++    const usageOperatorBody = (await usageOperator.json()) as { metrics: Array<{ label: string; value: string }>; usageSummary: { totalEvents: number }; usageRollups: Array<{ day: string }>; usageRollupStatus: { status: string } };
+     expect(usageOperatorBody.metrics).toEqual(
+       expect.arrayContaining([
+         expect.objectContaining({ label: "Product events", value: String(productUsageEvents.length) }),
+         expect.objectContaining({ label: "Active users" }),
++        expect.objectContaining({ label: "Activation rollups", value: "partial" }),
+       ]),
+     );
+     expect(usageOperatorBody.usageSummary.totalEvents).toBe(productUsageEvents.length);
++    expect(usageOperatorBody.usageRollups).toEqual([expect.objectContaining({ day: "2026-05-28" })]);
++    expect(usageOperatorBody.usageRollupStatus.status).toBe("partial");
+   });
+ 
+   it("covers live app auth, validation, and internal job queue edge routes", async () => {
+diff --git a/test/integration/routes-errors.test.ts b/test/integration/routes-errors.test.ts
+index 4c92463..befb549 100644
+--- a/test/integration/routes-errors.test.ts
++++ b/test/integration/routes-errors.test.ts
+@@ -500,6 +500,8 @@ describe("api route guards and error branches", () => {
+     expect((await app.request("/v1/internal/jobs/build-burden-forecasts", { method: "POST" }, env)).status).toBe(401);
+     expect((await app.request("/v1/internal/jobs/repair-data-fidelity", { method: "POST" }, env)).status).toBe(401);
+     expect((await app.request("/v1/internal/jobs/generate-signal-snapshots/run", { method: "POST" }, env)).status).toBe(401);
++    expect((await app.request("/v1/internal/jobs/rollup-product-usage", { method: "POST" }, env)).status).toBe(401);
++    expect((await app.request("/v1/internal/jobs/rollup-product-usage/run", { method: "POST" }, env)).status).toBe(401);
+     expect((await app.request("/v1/internal/bounties/import", { method: "POST" }, env)).status).toBe(401);
+     expect(
+       (
+@@ -514,6 +516,24 @@ describe("api route guards and error branches", () => {
+     expect((await app.request("/v1/internal/jobs/repair-data-fidelity", { method: "POST", headers: internalHeaders(env) }, env)).status).toBe(202);
+     expect(queued).toEqual(expect.arrayContaining([expect.objectContaining({ type: "repair-data-fidelity" })]));
+ 
++    const queuedRollup = await app.request(
++      "/v1/internal/jobs/rollup-product-usage",
++      { method: "POST", headers: internalHeaders(env), body: JSON.stringify({ day: "2026-05-28", days: 500 }) },
++      env,
++    );
++    expect(queuedRollup.status).toBe(202);
++    expect(await queuedRollup.json()).toMatchObject({ status: "queued", day: "2026-05-28", days: 31 });
++    expect(queued).toEqual(expect.arrayContaining([expect.objectContaining({ type: "rollup-product-usage", day: "2026-05-28", days: 31 })]));
++
++    const queuedDefaultRollup = await app.request("/v1/internal/jobs/rollup-product-usage", { method: "POST", headers: internalHeaders(env), body: "{}" }, env);
++    expect(queuedDefaultRollup.status).toBe(202);
++    await expect(queuedDefaultRollup.json()).resolves.toMatchObject({ status: "queued" });
++    expect(queued).toEqual(expect.arrayContaining([expect.objectContaining({ type: "rollup-product-usage" })]));
++
++    const immediateRollup = await app.request("/v1/internal/jobs/rollup-product-usage/run", { method: "POST", headers: internalHeaders(env), body: JSON.stringify({ days: -5 }) }, env);
++    expect(immediateRollup.status).toBe(200);
++    await expect(immediateRollup.json()).resolves.toMatchObject({ requestedDays: expect.any(Array), rollups: expect.any(Array) });
++
+     expect(
+       (
+         await app.request("/v1/internal/jobs/backfill-registered-repos", {
+diff --git a/test/unit/index.test.ts b/test/unit/index.test.ts
+index 5073f2c..8f1d262 100644
+--- a/test/unit/index.test.ts
++++ b/test/unit/index.test.ts
+@@ -107,6 +107,7 @@ describe("worker entrypoint", () => {
+       { type: "refresh-registry", requestedBy: "schedule" },
+       { type: "refresh-scoring-model", requestedBy: "schedule" },
+       { type: "refresh-upstream-drift", requestedBy: "schedule" },
++      { type: "rollup-product-usage", requestedBy: "schedule", days: 7 },
+     ]);
+   });
+ 
+@@ -131,6 +132,7 @@ describe("worker entrypoint", () => {
+       { type: "refresh-registry", requestedBy: "schedule" },
+       { type: "refresh-scoring-model", requestedBy: "schedule" },
+       { type: "refresh-upstream-drift", requestedBy: "schedule" },
++      { type: "rollup-product-usage", requestedBy: "schedule", days: 7 },
+       { type: "generate-signal-snapshots", requestedBy: "schedule" },
+       { type: "build-burden-forecasts", requestedBy: "schedule" },
+       { type: "build-contributor-evidence", requestedBy: "schedule" },
+diff --git a/test/unit/product-usage.test.ts b/test/unit/product-usage.test.ts
+index 3a51122..81606f0 100644
+--- a/test/unit/product-usage.test.ts
++++ b/test/unit/product-usage.test.ts
+@@ -2,9 +2,12 @@ import { describe, expect, it } from "vitest";
+ import {
+   getContributorScoringProfile,
+   listDigestSubscriptionsForLogin,
++  listProductUsageDailyRollups,
+   listProductUsageEvents,
+   recordAiUsageEvent,
+   recordProductUsageEvent,
++  rollupProductUsageDaily,
++  getProductUsageRollupStatus,
+   summarizeProductUsageEvents,
+   upsertDigestSubscription,
+ } from "../../src/db/repositories";
+@@ -207,7 +210,7 @@ describe("product usage events", () => {
+     await recordProductUsageEvent(env, {
+       surface: "github_app",
+       eventName: "agent_command_replied",
+-      actor: "maintainer",
++      actor: "repo-owner",
+       outcome: "completed",
+       occurredAt: "2026-05-31T12:00:00.000Z",
+     });
+@@ -240,4 +243,262 @@ describe("product usage events", () => {
+       ]),
+     );
+   });
++
++  it("builds idempotent daily activation rollups and absorbs late events", async () => {
++    const env = createTestEnv({ PRODUCT_USAGE_HASH_SALT: "fixed-test-salt" });
++    const day = "2026-05-30";
++    await recordProductUsageEvent(env, {
++      surface: "control_panel",
++      eventName: "auth_session_created",
++      actor: "oktofeesh1",
++      outcome: "success",
++      occurredAt: `${day}T01:00:00.000Z`,
++    });
++    await recordProductUsageEvent(env, {
++      surface: "mcp",
++      eventName: "mcp_request",
++      actor: "oktofeesh1",
++      outcome: "success",
++      route: "/mcp",
++      metadata: { rpcMethod: "tools/list" },
++      occurredAt: `${day}T01:05:00.000Z`,
++    });
++    await recordProductUsageEvent(env, {
++      surface: "api",
++      eventName: "agent_pr_packet_completed",
++      actor: "oktofeesh1",
++      repoFullName: "JSONbored/gittensory",
++      outcome: "success",
++      route: "/v1/agent/prepare-pr-packet",
++      metadata: { command: "packet" },
++      occurredAt: `${day}T01:10:00.000Z`,
++    });
++    await recordProductUsageEvent(env, {
++      surface: "github_app",
++      eventName: "github_installation_created",
++      actor: "repo-owner",
++      repoFullName: "JSONbored/gittensory",
++      outcome: "completed",
++      metadata: { action: "created" },
++      occurredAt: `${day}T02:00:00.000Z`,
++    });
++    await recordProductUsageEvent(env, {
++      surface: "github_app",
++      eventName: "agent_command_replied",
++      actor: "repo-owner",
++      repoFullName: "JSONbored/gittensory",
++      outcome: "completed",
++      metadata: { command: "blockers", actorKind: "maintainer" },
++      occurredAt: `${day}T02:05:00.000Z`,
++    });
++
++    await expect(getProductUsageRollupStatus(env, { nowIso: "2026-05-31T00:00:00.000Z" })).resolves.toMatchObject({
++      status: "incomplete",
++      missingDays: [day],
++    });
++
++    const firstRun = await rollupProductUsageDaily(env, { day, nowIso: "2026-05-31T00:10:00.000Z" });
++    expect(firstRun.rollups).toHaveLength(1);
++    expect(firstRun.rollups[0]).toMatchObject({
++      day,
++      status: "complete",
++      totalEvents: 5,
++      activeActors: 2,
++      activeRepos: 1,
++      activation: {
++        loginActors: 1,
++        doctorPassActors: 1,
++        firstUsefulActionActors: 2,
++        fullyActivatedActors: 1,
++        githubInstalledRepos: 1,
++        githubFirstCommandRepos: 1,
++        githubUsefulMaintainerRepos: 1,
++        githubActivatedRepos: 1,
++      },
++    });
++    expect(firstRun.rollups[0]?.byCommand).toEqual(expect.arrayContaining([{ key: "blockers", count: 1 }, { key: "packet", count: 1 }]));
++    expect(firstRun.rollups[0]?.byTool).toEqual([]);
++    expect(firstRun.rollups[0]?.byRouteClass).toEqual(expect.arrayContaining([{ key: "agent", count: 1 }, { key: "mcp", count: 1 }]));
++
++    const secondRun = await rollupProductUsageDaily(env, { day, nowIso: "2026-05-31T00:20:00.000Z" });
++    expect(secondRun.rollups[0]?.totalEvents).toBe(5);
++    await expect(listProductUsageDailyRollups(env)).resolves.toHaveLength(1);
++
++    await recordProductUsageEvent(env, {
++      surface: "control_panel",
++      eventName: "command_previewed",
++      actor: "late-user",
++      repoFullName: "JSONbored/gittensory",
++      outcome: "success",
++      metadata: { command: "reviewability" },
++      occurredAt: `${day}T23:55:00.000Z`,
++    });
++    await expect(getProductUsageRollupStatus(env, { nowIso: "2026-05-31T00:25:00.000Z" })).resolves.toMatchObject({
++      status: "stale",
++      staleDays: [day],
++    });
++    const lateRun = await rollupProductUsageDaily(env, { day, nowIso: "2026-05-31T00:30:00.000Z" });
++    expect(lateRun.rollups[0]).toMatchObject({
++      totalEvents: 6,
++      activeActors: 3,
++      sourceEventCount: 6,
++      activation: expect.objectContaining({ firstUsefulActionActors: 3 }),
++    });
++    await expect(listProductUsageDailyRollups(env)).resolves.toEqual([expect.objectContaining({ day, totalEvents: 6 })]);
++    await expect(getProductUsageRollupStatus(env, { nowIso: "2026-05-31T00:40:00.000Z" })).resolves.toMatchObject({ status: "ready", warnings: [] });
++  });
++
++  it("classifies rollup route classes and rejects failed activation signals", async () => {
++    const env = createTestEnv({ PRODUCT_USAGE_HASH_SALT: "fixed-test-salt" });
++    const day = "2026-05-27";
++    const routeFixtures = [
++      { eventName: "health_ping", route: "/health", actor: "health-user", outcome: "success" },
++      { eventName: "auth_session_created", route: "/v1/auth/session", actor: "auth-user", outcome: "success" },
++      { eventName: "mcp_request", route: "/mcp", actor: "mcp-user", outcome: "error" },
++      { eventName: "command_previewed", route: "/v1/app/commands/preview", actor: "panel-user", outcome: "success", metadata: { command: "packet" } },
++      { eventName: "agent_pr_packet_completed", route: "/v1/agent/prepare-pr-packet", actor: "denied-agent", outcome: "denied", metadata: { command: "packet" } },
++      { eventName: "pull_context_viewed", route: "/v1/extension/pull-context", actor: "extension-user", outcome: "success" },
++      { eventName: "github_installation_created", route: "/v1/github/webhook", actor: "github-user", outcome: "completed" },
++      { eventName: "repair_data_fidelity_completed", route: "/v1/internal/jobs/repair-data-fidelity", actor: "internal-user", outcome: "completed" },
++      { eventName: "repo_snapshot_opened", route: "/v1/repos/JSONbored/gittensory", actor: "repo-user", outcome: "success" },
++      { eventName: "api_report_viewed", route: "/v1/reports/summary", actor: "api-user", outcome: "success", metadata: { toolName: "summary" } },
++      { eventName: "route_missing", actor: "unknown-user", outcome: "success" },
++    ] as const;
++    for (const [index, fixture] of routeFixtures.entries()) {
++      await recordProductUsageEvent(env, {
++        surface: "api",
++        eventName: fixture.eventName,
++        actor: fixture.actor,
++        route: "route" in fixture ? fixture.route : undefined,
++        outcome: fixture.outcome,
++        metadata: "metadata" in fixture ? fixture.metadata : undefined,
++        occurredAt: `${day}T00:${String(index).padStart(2, "0")}:00.000Z`,
++      });
++    }
++
++    const result = await rollupProductUsageDaily(env, { day, nowIso: "2026-05-28T00:00:00.000Z" });
++
++    expect(result.rollups[0]).toMatchObject({
++      day,
++      status: "complete",
++      totalEvents: routeFixtures.length,
++      activation: {
++        loginActors: 1,
++        doctorPassActors: 0,
++        firstUsefulActionActors: 2,
++        fullyActivatedActors: 0,
++        githubInstalledRepos: 0,
++        githubFirstCommandRepos: 0,
++        githubUsefulMaintainerRepos: 0,
++        githubActivatedRepos: 0,
++      },
++    });
++    expect(result.rollups[0]?.byRouteClass).toEqual(
++      expect.arrayContaining([
++        { key: "agent", count: 1 },
++        { key: "api", count: 1 },
++        { key: "auth", count: 1 },
++        { key: "browser_extension", count: 1 },
++        { key: "control_panel", count: 1 },
++        { key: "github_app", count: 1 },
++        { key: "health", count: 1 },
++        { key: "internal", count: 1 },
++        { key: "mcp", count: 1 },
++        { key: "repository", count: 1 },
++        { key: "unknown", count: 1 },
++      ]),
++    );
++    expect(result.rollups[0]?.byTool).toEqual([{ key: "summary", count: 1 }]);
++    expect(JSON.stringify(result.rollups[0])).not.toMatch(/health-user|denied-agent|fixed-test-salt/i);
++  });
++
++  it("normalizes rollup windows and corrupted persisted rollup rows", async () => {
++    const env = createTestEnv();
++
++    const clampedLow = await rollupProductUsageDaily(env, { days: 0, nowIso: "2026-05-27T12:00:00.000Z" });
++    expect(clampedLow.rollups.map((rollup) => rollup.day)).toEqual(["2026-05-27"]);
++    expect(clampedLow.rollups[0]?.status).toBe("partial");
++
++    const clampedHigh = await rollupProductUsageDaily(env, { days: 99, nowIso: "2026-05-27T12:00:00.000Z" });
++    expect(clampedHigh.rollups).toHaveLength(31);
++    expect(clampedHigh.rollups[0]?.day).toBe("2026-04-27");
++    expect(clampedHigh.rollups.at(-1)?.day).toBe("2026-05-27");
++
++    const invalidDay = await rollupProductUsageDaily(env, { day: "not-a-day", nowIso: "2026-05-27T12:00:00.000Z" });
++    expect(invalidDay.rollups[0]?.day).toBe("2026-05-27");
++
++    await env.DB.prepare(
++      "insert into product_usage_daily_rollups (day, status, total_events, active_actors, active_sessions, active_repos, source_event_count, max_event_capacity, first_event_at, last_event_at, surfaces_json, outcomes_json, events_json, repos_json, commands_json, tools_json, route_classes_json, activation_json, generated_at, updated_at) values (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
++    )
++      .bind("2026-04-26", "corrupt", 7, 2, 1, 1, 7, 5000, null, null, "{bad-json", "{bad-json", "[]", "[]", "[]", "[]", "[]", "{bad-json", "2026-05-27T00:00:00.000Z", "2026-05-27T00:00:00.000Z")
++      .run();
++
++    const persisted = await listProductUsageDailyRollups(env, { fromDay: "2026-04-26", limit: 40 });
++    expect(persisted).toEqual(
++      expect.arrayContaining([
++        expect.objectContaining({
++          day: "2026-04-26",
++          status: "incomplete",
++          totalEvents: 7,
++          bySurface: [],
++          byOutcome: [],
++          activation: {
++            loginActors: 0,
++            doctorPassActors: 0,
++            firstUsefulActionActors: 0,
++            fullyActivatedActors: 0,
++            githubInstalledRepos: 0,
++            githubFirstCommandRepos: 0,
++            githubUsefulMaintainerRepos: 0,
++            githubActivatedRepos: 0,
++          },
++        }),
++      ]),
++    );
++  });
++
++  it("marks rollup days incomplete when raw usage exceeds the worker event cap", async () => {
++    const env = createTestEnv();
++    const day = "2026-05-29";
++    const startMs = Date.parse(`${day}T00:00:00.000Z`);
++    await env.DB.batch(
++      Array.from({ length: 5001 }, (_, index) =>
++        env.DB.prepare(
++          "insert into product_usage_events (id, surface, event_name, route, actor_hash, session_hash, repo_full_name, target_key, outcome, latency_ms, client_name, client_version, metadata_json, occurred_at) values (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
++        ).bind(
++          `cap-event-${index}`,
++          "api",
++          "agent_pr_packet_completed",
++          "/v1/agent/prepare-pr-packet",
++          null,
++          null,
++          "JSONbored/gittensory",
++          null,
++          "success",
++          null,
++          null,
++          null,
++          "{}",
++          new Date(startMs + index * 1000).toISOString(),
++        ),
++      ),
++    );
++
++    const result = await rollupProductUsageDaily(env, { day, nowIso: "2026-05-30T00:10:00.000Z" });
++
++    expect(result.rollups[0]).toMatchObject({
++      day,
++      status: "incomplete",
++      totalEvents: 5001,
++      sourceEventCount: 5001,
++      maxEventCapacity: 5000,
++      byEvent: [{ eventName: "agent_pr_packet_completed", count: 5000 }],
++      byRepo: [{ key: "JSONbored/gittensory", count: 5000 }],
++      activation: expect.objectContaining({ firstUsefulActionActors: 0 }),
++    });
++    await expect(getProductUsageRollupStatus(env, { nowIso: "2026-05-30T00:20:00.000Z" })).resolves.toMatchObject({
++      status: "incomplete",
++      incompleteDays: [day],
++    });
++  });
+ });
+diff --git a/test/unit/queue.test.ts b/test/unit/queue.test.ts
+index 06430b3..8083f3a 100644
+--- a/test/unit/queue.test.ts
++++ b/test/unit/queue.test.ts
+@@ -9,11 +9,13 @@ import {
+   getLatestUpstreamRulesetSnapshot,
+   listUpstreamDriftReports,
+   listInstallationHealth,
++  listProductUsageDailyRollups,
+   listProductUsageEvents,
+   listPullRequests,
+   listRepoSyncStates,
+   listSignalSnapshots,
+   persistSignalSnapshot,
++  recordProductUsageEvent,
+   upsertRepoSyncSegment,
+   upsertInstallation,
+   upsertPullRequestFromGitHub,
+@@ -105,6 +107,25 @@ describe("queue processors", () => {
+         repositories: [{ name: "gittensory", full_name: "JSONbored/gittensory", private: true, owner: { login: "JSONbored" } }],
+       },
+     });
++    await processJob(env, {
++      type: "github-webhook",
++      deliveryId: "installation-added-single-repo",
++      eventName: "installation",
++      payload: {
++        action: "added",
++        installation: { account: { login: "JSONbored", id: 1, type: "User" } } as never,
++        repository: { name: "gittensory", full_name: "JSONbored/gittensory", private: true, owner: { login: "JSONbored" } },
++      },
++    });
++    await processJob(env, {
++      type: "github-webhook",
++      deliveryId: "installation-added-empty",
++      eventName: "installation",
++      payload: {
++        action: "added",
++        installation: { id: 789, account: { login: "JSONbored", id: 1, type: "User" } },
++      },
++    });
+ 
+     expect(await listRepoSyncStates(env)).toMatchObject([{ repoFullName: "JSONbored/gittensory", status: "success" }]);
+     expect(await listCollisionEdges(env, "JSONbored/gittensory")).not.toHaveLength(0);
+@@ -118,6 +139,12 @@ describe("queue processors", () => {
+     const persistedBurden = await getBurdenForecast(env, "JSONbored/gittensory");
+     expect(persistedBurden).toMatchObject({ repoFullName: "JSONbored/gittensory" });
+     expect(persistedBurden?.payload).toMatchObject({ level: expect.any(String), summary: expect.any(String) });
++    expect(await listProductUsageEvents(env, { limit: 10 })).toEqual(
++      expect.arrayContaining([
++        expect.objectContaining({ eventName: "github_installation_created", repoFullName: "<redacted-actor>/gittensory", metadata: expect.objectContaining({ action: "created" }) }),
++        expect.objectContaining({ eventName: "github_installation_created", repoFullName: "<redacted-actor>/gittensory", metadata: expect.objectContaining({ action: "added" }) }),
++      ]),
++    );
+   });
+ 
+   it("runs queued agent jobs through the queue processor", async () => {
+@@ -148,6 +175,29 @@ describe("queue processors", () => {
+     expect(queued).toContainEqual({ type: "build-contributor-decision-packs", requestedBy: "api", login: "oktofeesh1" });
+   });
+ 
++  it("runs product usage rollups through the queue processor", async () => {
++    const env = createTestEnv({ PRODUCT_USAGE_HASH_SALT: "fixed-test-salt" });
++    await recordProductUsageEvent(env, {
++      surface: "api",
++      eventName: "agent_plan_next_work_completed",
++      actor: "oktofeesh1",
++      repoFullName: "JSONbored/gittensory",
++      outcome: "success",
++      occurredAt: "2026-05-27T12:00:00.000Z",
++    });
++
++    await processJob(env, { type: "rollup-product-usage", requestedBy: "test", day: "2026-05-27" });
++
++    await expect(listProductUsageDailyRollups(env)).resolves.toEqual([
++      expect.objectContaining({
++        day: "2026-05-27",
++        totalEvents: 1,
++        activeActors: 1,
++        activation: expect.objectContaining({ firstUsefulActionActors: 1 }),
++      }),
++    ]);
++  });
++
+   it("routes upstream drift jobs through queue processors", async () => {
+     const env = createTestEnv({ GITHUB_PUBLIC_TOKEN: "public-token" });
+     vi.stubGlobal("fetch", async (input: RequestInfo | URL) => {

@@ -1,0 +1,290 @@
+diff --git a/app/models/provider/binance_public.rb b/app/models/provider/binance_public.rb
+index f335030a9d..cc4a71f7c5 100644
+--- a/app/models/provider/binance_public.rb
++++ b/app/models/provider/binance_public.rb
+@@ -35,6 +35,16 @@ class Provider::BinancePublic < Provider
+   MS_PER_DAY = 24 * 60 * 60 * 1000
+   SEARCH_LIMIT = 25
+ 
++  # USD-pegged stablecoins. Binance has no self-pair (USDTUSDT is invalid) and
++  # the few stablecoin/USDT pairs that do exist (USDCUSDT, etc.) hover at ~1.0
++  # with sub-cent noise — synthesizing a flat 1.0 USD price is both accurate
++  # enough and avoids surfacing transient depeg ticks from market data.
++  USD_STABLECOINS = %w[USDT USDC BUSD DAI FDUSD TUSD USDP PYUSD].freeze
++
++  # Symbol prefix applied by holdings processors (CoinStats, Coinbase, Kraken,
++  # Binance, SimpleFIN, Lunchflow) to distinguish crypto from stock tickers.
++  CRYPTO_PREFIX = "CRYPTO:".freeze
++
+   def initialize
+     # No API key required — public market data only.
+   end
+@@ -58,9 +68,13 @@ def usage
+ 
+   def search_securities(symbol, country_code: nil, exchange_operating_mic: nil)
+     with_provider_response do
+-      query = symbol.to_s.strip.upcase
++      query = symbol.to_s.strip.upcase.delete_prefix(CRYPTO_PREFIX)
+       next [] if query.empty?
+ 
++      if USD_STABLECOINS.include?(query)
++        next [ stablecoin_search_result(query) ]
++      end
++
+       symbols = exchange_info_symbols
+ 
+       matches = symbols.select do |s|
+@@ -128,10 +142,12 @@ def fetch_security_info(symbol:, exchange_operating_mic:)
+       # logo_url is intentionally nil — crypto logos are set at save time by
+       # Security#generate_logo_url_from_brandfetch via the /crypto/{base}
+       # route, not returned from this provider.
++      links = parsed[:binance_pair] ? "https://www.binance.com/en/trade/#{parsed[:binance_pair]}" : nil
++
+       SecurityInfo.new(
+         symbol: symbol,
+         name: parsed[:base],
+-        links: "https://www.binance.com/en/trade/#{parsed[:binance_pair]}",
++        links: links,
+         logo_url: nil,
+         description: nil,
+         kind: "crypto",
+@@ -161,6 +177,10 @@ def fetch_security_prices(symbol:, exchange_operating_mic:, start_date:, end_dat
+       parsed = parse_ticker(symbol)
+       raise InvalidSecurityPriceError, "Unsupported Binance ticker: #{symbol}" if parsed.nil?
+ 
++      if parsed[:stablecoin]
++        next stablecoin_prices(symbol, parsed, start_date, end_date, exchange_operating_mic)
++      end
++
+       binance_pair = parsed[:binance_pair]
+       display_currency = parsed[:display_currency]
+       prices = []
+@@ -220,6 +240,36 @@ def fetch_security_prices(symbol:, exchange_operating_mic:, start_date:, end_dat
+   end
+ 
+   private
++    # Synthetic search hit for a USD-pegged stablecoin. Binance has no self-pair
++    # (USDTUSDT etc. don't exist), so we manufacture a result instead of letting
++    # the resolver fall back to an offline CRYPTO:* row. The downstream price
++    # path short-circuits via parse_ticker -> stablecoin_prices.
++    def stablecoin_search_result(base)
++      Security.new(
++        symbol: "#{base}USD",
++        name: base,
++        logo_url: ::Security.brandfetch_crypto_url(base),
++        exchange_operating_mic: BINANCE_MIC,
++        country_code: nil,
++        currency: "USD"
++      )
++    end
++
++    # Synthesize flat 1.0 USD prices for USD-pegged stablecoins across the
++    # requested range. Avoids a Binance round-trip (there is no self-pair like
++    # USDTUSDT) and produces stable values for portfolio aggregation.
++    def stablecoin_prices(symbol, parsed, start_date, end_date, exchange_operating_mic)
++      (start_date..end_date).map do |date|
++        Price.new(
++          symbol: symbol,
++          date: date,
++          price: 1.0,
++          currency: parsed[:display_currency],
++          exchange_operating_mic: exchange_operating_mic
++        )
++      end
++    end
++
+     def base_url
+       ENV["BINANCE_PUBLIC_URL"] || "https://data-api.binance.vision"
+     end
+@@ -247,11 +297,24 @@ def client
+       end
+     end
+ 
+-    # Maps a user-visible ticker (e.g. "BTCUSD", "ETHEUR") to the Binance pair
+-    # symbol, base asset, and display currency. Returns nil if the ticker does
+-    # not end with a supported quote currency.
++    # Maps a user-visible ticker to the Binance pair symbol, base asset, and
++    # display currency. Accepts:
++    #   - "BTCUSD"/"ETHEUR" — fiat suffix from search_securities output
++    #   - "CRYPTO:BTCUSD" — prefixed form stored by holdings processors
++    #   - "CRYPTO:SOL"/"SOL" — bare base asset; defaults to the USDT pair (USD)
++    #   - "CRYPTO:USDT"/"USDT" — USD-pegged stablecoin; binance_pair is nil and
++    #     callers short-circuit to a synthetic 1.0 USD price
++    # Returns nil only when the input is empty after stripping the prefix.
+     def parse_ticker(ticker)
+-      ticker_up = ticker.to_s.upcase
++      raw = ticker.to_s.upcase
++      prefixed = raw.start_with?(CRYPTO_PREFIX)
++      ticker_up = raw.delete_prefix(CRYPTO_PREFIX)
++      return nil if ticker_up.empty?
++
++      if USD_STABLECOINS.include?(ticker_up)
++        return { binance_pair: nil, base: ticker_up, display_currency: "USD", stablecoin: true }
++      end
++
+       SUPPORTED_QUOTES.each do |quote|
+         display_currency = QUOTE_TO_CURRENCY[quote]
+         next unless ticker_up.end_with?(display_currency)
+@@ -259,9 +322,22 @@ def parse_ticker(ticker)
+         base = ticker_up.delete_suffix(display_currency)
+         next if base.empty?
+ 
++        # "{stablecoin}USD" form (e.g. "USDTUSD" produced by search_securities)
++        # routes to synthetic 1.0 USD pricing — there is no Binance self-pair.
++        if display_currency == "USD" && USD_STABLECOINS.include?(base)
++          return { binance_pair: nil, base: base, display_currency: "USD", stablecoin: true }
++        end
++
+         return { binance_pair: "#{base}#{quote}", base: base, display_currency: display_currency }
+       end
+-      nil
++
++      # No fiat suffix matched. Only treat the input as a bare base asset when
++      # it arrived with the CRYPTO: prefix from a holdings processor — that
++      # tells us it really is a single coin symbol (SOL, TRUMP, KAITO), not a
++      # malformed pair like "BTCBNB" or "BTCGBP" that we want to reject.
++      return nil unless prefixed
++
++      { binance_pair: "#{ticker_up}USDT", base: ticker_up, display_currency: "USD" }
+     end
+ 
+     # Cached for 24h — exchangeInfo returns the full symbol universe (thousands
+diff --git a/test/models/provider/binance_public_test.rb b/test/models/provider/binance_public_test.rb
+index 340e4cc832..bf04760431 100644
+--- a/test/models/provider/binance_public_test.rb
++++ b/test/models/provider/binance_public_test.rb
+@@ -68,6 +68,38 @@ class Provider::BinancePublicTest < ActiveSupport::TestCase
+     assert_equal [ "BTCUSD" ], response.data.map(&:symbol)
+   end
+ 
++  test "search_securities strips CRYPTO: prefix from holdings-processor symbols" do
++    @provider.stubs(:exchange_info_symbols).returns(sample_exchange_info)
++
++    response = @provider.search_securities("CRYPTO:BTC")
++
++    assert response.success?
++    assert_includes response.data.map(&:symbol), "BTCUSD"
++  end
++
++  test "search_securities returns a synthetic stablecoin result without hitting exchangeInfo" do
++    @provider.expects(:exchange_info_symbols).never
++
++    response = @provider.search_securities("CRYPTO:USDT")
++
++    assert response.success?
++    assert_equal 1, response.data.size
++    row = response.data.first
++    assert_equal "USDTUSD", row.symbol
++    assert_equal "USDT", row.name
++    assert_equal "USD", row.currency
++    assert_equal "BNCX", row.exchange_operating_mic
++    assert_nil row.country_code
++  end
++
++  test "parse_ticker treats stablecoin/USD search-result form as stablecoin" do
++    parsed = @provider.send(:parse_ticker, "USDTUSD")
++    assert parsed[:stablecoin]
++    assert_nil parsed[:binance_pair]
++    assert_equal "USDT", parsed[:base]
++    assert_equal "USD", parsed[:display_currency]
++  end
++
+   test "search_securities returns empty array when query does not match" do
+     @provider.stubs(:exchange_info_symbols).returns(sample_exchange_info)
+ 
+@@ -162,6 +194,95 @@ class Provider::BinancePublicTest < ActiveSupport::TestCase
+     assert_nil @provider.send(:parse_ticker, "GIBBERISH")
+   end
+ 
++  test "parse_ticker strips CRYPTO: prefix from holdings processors" do
++    parsed = @provider.send(:parse_ticker, "CRYPTO:BTCUSD")
++    assert_equal "BTCUSDT", parsed[:binance_pair]
++    assert_equal "BTC", parsed[:base]
++    assert_equal "USD", parsed[:display_currency]
++  end
++
++  test "parse_ticker flags USD stablecoins for synthetic pricing" do
++    %w[USDT USDC BUSD DAI FDUSD TUSD USDP PYUSD].each do |stable|
++      parsed = @provider.send(:parse_ticker, "CRYPTO:#{stable}")
++      assert parsed[:stablecoin], "expected #{stable} to be flagged as stablecoin"
++      assert_nil parsed[:binance_pair]
++      assert_equal stable, parsed[:base]
++      assert_equal "USD", parsed[:display_currency]
++    end
++  end
++
++  test "parse_ticker defaults prefixed bare base assets to the USDT pair" do
++    parsed = @provider.send(:parse_ticker, "CRYPTO:SOL")
++    assert_equal "SOLUSDT", parsed[:binance_pair]
++    assert_equal "SOL", parsed[:base]
++    assert_equal "USD", parsed[:display_currency]
++  end
++
++  test "parse_ticker still rejects unprefixed malformed tickers" do
++    # No CRYPTO: prefix → behaves like a Binance-search ticker (must end in a
++    # supported fiat). Protects against false defaults like "BTCBNB" → "BTCBNBUSDT".
++    assert_nil @provider.send(:parse_ticker, "SOL")
++    assert_nil @provider.send(:parse_ticker, "BTCBNB")
++  end
++
++  test "fetch_security_prices returns synthetic 1.0 USD prices for stablecoins" do
++    # No HTTP call expected — short-circuited entirely.
++    @provider.expects(:client).never
++
++    response = @provider.fetch_security_prices(
++      symbol: "CRYPTO:USDT",
++      exchange_operating_mic: "BNCX",
++      start_date: Date.parse("2026-01-01"),
++      end_date: Date.parse("2026-01-03")
++    )
++
++    assert response.success?
++    assert_equal 3, response.data.size
++    assert response.data.all? { |p| p.price == 1.0 && p.currency == "USD" }
++    assert_equal Date.parse("2026-01-01"), response.data.first.date
++    assert_equal Date.parse("2026-01-03"), response.data.last.date
++  end
++
++  test "fetch_security_price returns 1.0 USD for a stablecoin single day" do
++    @provider.expects(:client).never
++
++    response = @provider.fetch_security_price(
++      symbol: "CRYPTO:USDT",
++      exchange_operating_mic: "BNCX",
++      date: Date.parse("2026-01-15")
++    )
++
++    assert response.success?
++    assert_equal 1.0, response.data.price
++    assert_equal "USD", response.data.currency
++  end
++
++  test "fetch_security_info handles stablecoin (no Binance pair link)" do
++    response = @provider.fetch_security_info(symbol: "CRYPTO:USDT", exchange_operating_mic: "BNCX")
++
++    assert response.success?
++    assert_equal "USDT", response.data.name
++    assert_equal "crypto", response.data.kind
++    assert_nil response.data.links
++  end
++
++  test "fetch_security_prices resolves a bare CRYPTO: ticker against the USDT pair" do
++    rows = [ kline_row("2026-01-15", "150.25") ]
++    mock_client_returning_klines(rows)
++
++    response = @provider.fetch_security_prices(
++      symbol: "CRYPTO:SOL",
++      exchange_operating_mic: "BNCX",
++      start_date: Date.parse("2026-01-15"),
++      end_date: Date.parse("2026-01-15")
++    )
++
++    assert response.success?
++    assert_equal 1, response.data.size
++    assert_equal "USD", response.data.first.currency
++    assert_in_delta 150.25, response.data.first.price
++  end
++
+   # ================================
+   #       Single price
+   # ================================

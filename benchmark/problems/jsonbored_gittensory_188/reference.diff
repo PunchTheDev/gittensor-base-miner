@@ -1,0 +1,1370 @@
+diff --git a/apps/gittensory-ui/public/openapi.json b/apps/gittensory-ui/public/openapi.json
+index 66ef961..68c2d57 100644
+--- a/apps/gittensory-ui/public/openapi.json
++++ b/apps/gittensory-ui/public/openapi.json
+@@ -10880,6 +10880,36 @@
+         ]
+       }
+     },
++    "/v1/app/analytics/weekly-value-report": {
++      "get": {
++        "responses": {
++          "200": {
++            "description": "Live app API response",
++            "content": {
++              "application/json": {
++                "schema": {
++                  "type": "object",
++                  "additionalProperties": {
++                    "nullable": true
++                  }
++                }
++              }
++            }
++          },
++          "401": {
++            "description": "Unauthorized"
++          }
++        },
++        "security": [
++          {
++            "GittensoryBearer": []
++          },
++          {
++            "GittensorySessionCookie": []
++          }
++        ]
++      }
++    },
+     "/v1/app/commands/preview": {
+       "post": {
+         "responses": {
+@@ -11269,6 +11299,26 @@
+         ]
+       }
+     },
++    "/v1/internal/jobs/generate-weekly-value-report": {
++      "post": {
++        "responses": {
++          "202": {
++            "description": "Internal job queued"
++          },
++          "401": {
++            "description": "Invalid internal token"
++          }
++        },
++        "security": [
++          {
++            "GittensoryBearer": []
++          },
++          {
++            "GittensorySessionCookie": []
++          }
++        ]
++      }
++    },
+     "/v1/internal/jobs/repair-data-fidelity": {
+       "post": {
+         "responses": {
+diff --git a/apps/gittensory-ui/src/routes/app.operator.tsx b/apps/gittensory-ui/src/routes/app.operator.tsx
+index 51a5feb..5027bc4 100644
+--- a/apps/gittensory-ui/src/routes/app.operator.tsx
++++ b/apps/gittensory-ui/src/routes/app.operator.tsx
+@@ -17,6 +17,11 @@ type OperatorDashboardResponse = {
+   metrics: Array<{ label: string; value: string; delta: string }>;
+   noiseReduction: Array<{ label: string; value: number; spark: number[] }>;
+   weeklyReport: string[];
++  weeklyValueReport?: {
++    freshness: { status: string; latestRollupDay?: string | null };
++    warnings: string[];
++    metrics: Array<{ id: string; label: string; value: number; detail: string }>;
++  };
+   upstreamDrift?: { status?: string } | null;
+ };
+ 
+@@ -88,18 +93,34 @@ function OperatorDashboard() {
+             <div className="rounded-token border border-border bg-transparent p-5">
+               <h2 className="font-display text-token-lg font-semibold">Weekly value report</h2>
+               <p className="mt-1 text-token-xs text-muted-foreground">
+-                Server-generated summary across installations and registry state.
++                Rollup-backed summary across usage, maintenance, and drift signals.
+               </p>
++              {data.weeklyValueReport ? (
++                <div className="mt-3 flex flex-wrap gap-2">
++                  <StatusPill
++                    status={data.weeklyValueReport.warnings.length > 0 ? "degraded" : "ready"}
++                  >
++                    Rollups{" "}
++                    {data.weeklyValueReport.freshness.latestRollupDay ??
++                      data.weeklyValueReport.freshness.status}
++                  </StatusPill>
++                  <StatusPill status={data.upstreamDrift?.status === "current" ? "ready" : "warn"}>
++                    Drift · {data.upstreamDrift?.status ?? "unknown"}
++                  </StatusPill>
++                </div>
++              ) : null}
+               <ul className="mt-4 space-y-2 text-token-sm text-foreground/90">
+                 {data.weeklyReport.map((line) => (
+                   <li key={line}>· {line}</li>
+                 ))}
+               </ul>
+-              <div className="mt-4">
+-                <StatusPill status={data.upstreamDrift?.status === "current" ? "ready" : "warn"}>
+-                  Drift · {data.upstreamDrift?.status ?? "unknown"}
+-                </StatusPill>
+-              </div>
++              {data.weeklyValueReport?.warnings.length ? (
++                <ul className="mt-4 space-y-1 text-token-xs text-muted-foreground">
++                  {data.weeklyValueReport.warnings.slice(0, 3).map((warning) => (
++                    <li key={warning}>· {warning}</li>
++                  ))}
++                </ul>
++              ) : null}
+             </div>
+           </section>
+         </div>
+diff --git a/src/api/routes.ts b/src/api/routes.ts
+index 79dcf2b..921ae4a 100644
+--- a/src/api/routes.ts
++++ b/src/api/routes.ts
+@@ -122,6 +122,7 @@ import {
+   LATEST_RECOMMENDED_MCP_VERSION,
+   MINIMUM_SUPPORTED_MCP_VERSION,
+ } from "../services/mcp-compatibility";
++import { buildWeeklyValueReport, generateWeeklyValueReport, loadWeeklyValueReport } from "../services/weekly-value-report";
+ import { loadOrComputeIssueQualityResponse } from "../services/issue-quality";
+ import { loadOrComputeBurdenForecastResponse } from "../services/burden-forecast";
+ import {
+@@ -161,10 +162,8 @@ import type {
+   JsonValue,
+   ProductUsageOutcome,
+   ProductUsageSurface,
+-  RegistrySnapshot,
+   RepoSyncSegmentRecord,
+   RepositoryRecord,
+-  ScoringModelSnapshotRecord,
+ } from "../types";
+ import { errorMessage, nowIso } from "../utils/json";
+ 
+@@ -787,6 +786,22 @@ export function createApp() {
+       getProductUsageRollupStatus(c.env),
+       summarizeMcpCompatibilityAdoption(c.env, usageSince),
+     ]);
++    const weeklyValueReport = buildWeeklyValueReport({
++      generatedAt: nowIso(),
++      variant: "operator",
++      days: 7,
++      repositories,
++      installations,
++      health,
++      registry,
++      scoring,
++      upstreamDrift,
++      usageSummary,
++      usageRollups,
++      usageRollupStatus,
++      activeSessions,
++      digestSubscriptions,
++    });
+     const installedRepos = repositories.filter((repo) => repo.isInstalled).length;
+     const registeredRepos = repositories.filter((repo) => repo.isRegistered).length;
+     return c.json({
+@@ -808,7 +823,8 @@ export function createApp() {
+         { label: "Registered coverage", value: registeredRepos, spark: sparklineFromCounts(registeredRepos, Math.max(repositories.length, 1)) },
+         { label: "Installed coverage", value: installedRepos, spark: sparklineFromCounts(installedRepos, Math.max(repositories.length, 1)) },
+       ],
+-      weeklyReport: buildOperatorWeeklyReport({ repositories, installations, health, registry, scoring, upstreamDrift }),
++      weeklyReport: weeklyValueReport.summary,
++      weeklyValueReport,
+       usageSummary,
+       usageRollups,
+       usageRollupStatus,
+@@ -835,6 +851,15 @@ export function createApp() {
+     return c.json({ generatedAt: nowIso(), status, rollups });
+   });
+ 
++  app.get("/v1/app/analytics/weekly-value-report", async (c) => {
++    const variant = c.req.query("variant") === "operator" ? "operator" : "public";
++    const allowedRoles: ControlPanelRoleName[] = variant === "operator" ? ["operator"] : ["miner", "maintainer", "owner", "operator"];
++    const forbidden = await requireAppRole(c, allowedRoles);
++    if (forbidden) return forbidden;
++    const days = Math.max(1, Math.min(31, Number(c.req.query("days") ?? 7) || 7));
++    return c.json(await loadWeeklyValueReport(c.env, { variant, days }));
++  });
++
+   app.get("/v1/app/commands", async (c) =>
+     c.json({
+       generatedAt: nowIso(),
+@@ -1758,6 +1783,15 @@ export function createApp() {
+     return c.json({ ok: true, status: "queued", day, days }, 202);
+   });
+ 
++  app.post("/v1/internal/jobs/generate-weekly-value-report", async (c) => {
++    const body = await c.req.json().catch(() => ({}));
++    const days = Number.isFinite(Number(body?.days)) ? Math.max(1, Math.min(31, Math.round(Number(body.days)))) : undefined;
++    const variant = body?.variant === "public" ? "public" : "operator";
++    const message: JobMessage = { type: "generate-weekly-value-report", requestedBy: "api", variant, ...(days === undefined ? {} : { days }) };
++    await c.env.JOBS.send(message);
++    return c.json({ ok: true, status: "queued", variant, days }, 202);
++  });
++
+   app.post("/v1/internal/jobs/repair-data-fidelity", async (c) => {
+     const message: JobMessage = { type: "repair-data-fidelity", requestedBy: "api" };
+     await c.env.JOBS.send(message);
+@@ -1778,6 +1812,13 @@ export function createApp() {
+     return c.json(await rollupProductUsageDaily(c.env, { ...(day ? { day } : {}), ...(days === undefined ? {} : { days }) }));
+   });
+ 
++  app.post("/v1/internal/jobs/generate-weekly-value-report/run", async (c) => {
++    const body = await c.req.json().catch(() => ({}));
++    const days = Number.isFinite(Number(body?.days)) ? Math.max(1, Math.min(31, Math.round(Number(body.days)))) : undefined;
++    const variant = body?.variant === "public" ? "public" : "operator";
++    return c.json(await generateWeeklyValueReport(c.env, { variant, ...(days === undefined ? {} : { days }) }));
++  });
++
+   app.post("/v1/internal/jobs/refresh-installation-health/run", async (c) => {
+     return c.json(await refreshInstallationHealth(c.env));
+   });
+@@ -2053,26 +2094,6 @@ function buildDigestItems(args: {
+   return items;
+ }
+ 
+-function buildOperatorWeeklyReport(args: {
+-  repositories: RepositoryRecord[];
+-  installations: Awaited<ReturnType<typeof listInstallations>>;
+-  health: InstallationHealthRecord[];
+-  registry: RegistrySnapshot | null;
+-  scoring: ScoringModelSnapshotRecord | null;
+-  upstreamDrift: Awaited<ReturnType<typeof loadUpstreamStatus>>;
+-}): string[] {
+-  const registered = args.repositories.filter((repo) => repo.isRegistered).length;
+-  const installed = args.repositories.filter((repo) => repo.isInstalled).length;
+-  const unhealthy = args.health.filter((record) => record.status !== "healthy").length;
+-  return [
+-    `${registered} registered repos tracked; ${installed} have installation coverage in the local cache.`,
+-    `${args.installations.length} GitHub App installation(s), ${unhealthy} needing attention.`,
+-    args.registry ? `Latest registry snapshot has ${args.registry.repoCount} repos and ${args.registry.warnings.length} warning(s).` : "Registry snapshot is missing.",
+-    args.scoring ? `Scoring model ${args.scoring.activeModel} is loaded from ${args.scoring.sourceKind}.` : "Scoring model snapshot is missing.",
+-    `Upstream drift status is ${args.upstreamDrift.status}.`,
+-  ];
+-}
+-
+ async function buildRepoIntelligenceResponse(env: Env, fullName: string) {
+   let burdenForecastError: unknown;
+   const [repo, snapshots, dataQuality, burdenForecast] = await Promise.all([
+diff --git a/src/index.ts b/src/index.ts
+index 90d0bd8..8298f9c 100644
+--- a/src/index.ts
++++ b/src/index.ts
+@@ -50,6 +50,9 @@ async function enqueueScheduledJobs(env: Env, controller: ScheduledController):
+     jobs.push({ type: "refresh-upstream-drift", requestedBy: "schedule" });
+     jobs.push({ type: "rollup-product-usage", requestedBy: "schedule", days: 7 });
+   }
++  if (isHourly && scheduledAt.getUTCDay() === 1 && hour === 12) {
++    jobs.push({ type: "generate-weekly-value-report", requestedBy: "schedule", variant: "operator", days: 7 });
++  }
+   if (isFullSyncWindow) {
+     jobs.push({ type: "generate-signal-snapshots", requestedBy: "schedule" });
+     jobs.push({ type: "build-burden-forecasts", requestedBy: "schedule" });
+diff --git a/src/openapi/spec.ts b/src/openapi/spec.ts
+index 7eaf39b..141a92a 100644
+--- a/src/openapi/spec.ts
++++ b/src/openapi/spec.ts
+@@ -522,7 +522,16 @@ export function buildOpenApiSpec() {
+       401: { description: "Unauthorized" },
+     },
+   });
+-  for (const path of ["/v1/app/roles", "/v1/app/miner-dashboard", "/v1/app/maintainer-dashboard", "/v1/app/operator-dashboard", "/v1/app/commands", "/v1/app/digest", "/v1/app/analytics/mcp-compatibility"]) {
++  for (const path of [
++    "/v1/app/roles",
++    "/v1/app/miner-dashboard",
++    "/v1/app/maintainer-dashboard",
++    "/v1/app/operator-dashboard",
++    "/v1/app/commands",
++    "/v1/app/digest",
++    "/v1/app/analytics/mcp-compatibility",
++    "/v1/app/analytics/weekly-value-report",
++  ]) {
+     registry.registerPath({
+       method: "get",
+       path,
+@@ -603,6 +612,7 @@ export function buildOpenApiSpec() {
+     "/v1/internal/jobs/build-contributor-decision-packs",
+     "/v1/internal/jobs/build-burden-forecasts",
+     "/v1/internal/jobs/generate-signal-snapshots",
++    "/v1/internal/jobs/generate-weekly-value-report",
+     "/v1/internal/jobs/repair-data-fidelity",
+   ]) {
+     registry.registerPath({
+diff --git a/src/queue/processors.ts b/src/queue/processors.ts
+index 3d602f3..c7e3326 100644
+--- a/src/queue/processors.ts
++++ b/src/queue/processors.ts
+@@ -66,6 +66,7 @@ import { getOrCreateScoringModelSnapshot, refreshScoringModelSnapshot } from "..
+ import { buildAndPersistContributorDecisionPack, loadDecisionPackSharedInputs } from "../services/decision-pack";
+ import { executeAgentRun, explainBlockersWithAgent, planNextWork, preflightBranchWithAgent, preparePrPacketWithAgent } from "../services/agent-orchestrator";
+ import { loadIssueQualityReportMap } from "../services/issue-quality";
++import { generateWeeklyValueReport } from "../services/weekly-value-report";
+ import {
+   buildUpstreamRulesetSnapshot,
+   detectAndPersistUpstreamDrift,
+@@ -211,6 +212,9 @@ export async function processJob(env: Env, message: JobMessage): Promise<void> {
+     case "rollup-product-usage":
+       await rollupProductUsageDaily(env, { ...(message.day ? { day: message.day } : {}), ...(message.days === undefined ? {} : { days: message.days }) });
+       return;
++    case "generate-weekly-value-report":
++      await generateWeeklyValueReport(env, { variant: message.variant ?? "operator", ...(message.days === undefined ? {} : { days: message.days }) });
++      return;
+     case "run-agent":
+       await executeAgentRun(env, message.runId);
+       return;
+diff --git a/src/services/weekly-value-report.ts b/src/services/weekly-value-report.ts
+new file mode 100644
+index 0000000..ea38ef1
+--- /dev/null
++++ b/src/services/weekly-value-report.ts
+@@ -0,0 +1,336 @@
++import {
++  countActiveAuthSessions,
++  countActiveDigestSubscriptions,
++  getProductUsageRollupStatus,
++  getLatestScoringModelSnapshot,
++  listInstallationHealth,
++  listInstallations,
++  listProductUsageDailyRollups,
++  listRepositories,
++  recordAuditEvent,
++  summarizeProductUsageEvents,
++} from "../db/repositories";
++import { getLatestRegistrySnapshot } from "../registry/sync";
++import { loadUpstreamStatus, type UpstreamStatus } from "../upstream/ruleset";
++import type {
++  InstallationHealthRecord,
++  InstallationRecord,
++  ProductUsageActivationFunnel,
++  ProductUsageDailyRollupRecord,
++  ProductUsageDimensionCount,
++  ProductUsageRollupStatus,
++  ProductUsageSummary,
++  RegistrySnapshot,
++  RepositoryRecord,
++  ScoringModelSnapshotRecord,
++  WeeklyValueReport,
++  WeeklyValueReportMetric,
++  WeeklyValueReportVariant,
++} from "../types";
++import { nowIso } from "../utils/json";
++
++type WeeklyValueReportInputs = {
++  generatedAt: string;
++  variant?: WeeklyValueReportVariant | null | undefined;
++  days?: number | null | undefined;
++  repositories: RepositoryRecord[];
++  installations: InstallationRecord[];
++  health: InstallationHealthRecord[];
++  registry: RegistrySnapshot | null;
++  scoring: ScoringModelSnapshotRecord | null;
++  upstreamDrift: UpstreamStatus;
++  usageSummary: ProductUsageSummary;
++  usageRollups: ProductUsageDailyRollupRecord[];
++  usageRollupStatus: ProductUsageRollupStatus;
++  activeSessions?: number | null | undefined;
++  digestSubscriptions?: number | null | undefined;
++};
++
++type WeeklyAggregate = {
++  totalEvents: number;
++  activeRepos: number;
++  mcpEvents: number;
++  githubCommandEvents: number;
++  quietSkips: number;
++  prPackets: number;
++  prPreflights: number;
++  maintainerSignals: number;
++  driftDetections: number;
++  activation: ProductUsageActivationFunnel;
++  topRepos: ProductUsageDimensionCount[];
++  topCommands: ProductUsageDimensionCount[];
++  topTools: ProductUsageDimensionCount[];
++  topRouteClasses: ProductUsageDimensionCount[];
++};
++
++export async function generateWeeklyValueReport(
++  env: Env,
++  options: { variant?: WeeklyValueReportVariant; days?: number; nowIso?: string } = {},
++): Promise<WeeklyValueReport> {
++  const report = await loadWeeklyValueReport(env, options);
++  await recordAuditEvent(env, {
++    eventType: "weekly_value_report_generated",
++    actor: options.variant === "public" ? "public-report" : "operator-report",
++    route: "scheduled",
++    targetKey: `weekly-value-report:${report.variant}:${report.period.days}`,
++    outcome: "success",
++    detail: `${report.metrics.length} metric(s), ${report.warnings.length} warning(s)`,
++    metadata: {
++      variant: report.variant,
++      days: report.period.days,
++      totalEvents: report.metrics.find((metric) => metric.id === "product_events")?.value ?? 0,
++      warnings: report.warnings.length,
++    },
++    createdAt: report.generatedAt,
++  });
++  return report;
++}
++
++export async function loadWeeklyValueReport(
++  env: Env,
++  options: { variant?: WeeklyValueReportVariant; days?: number; nowIso?: string } = {},
++): Promise<WeeklyValueReport> {
++  const generatedAt = options.nowIso ?? nowIso();
++  const days = normalizeReportDays(options.days);
++  const sinceIso = new Date(Date.parse(generatedAt) - days * 24 * 60 * 60 * 1000).toISOString();
++  const [repositories, installations, health, registry, scoring, upstreamDrift, usageSummary, usageRollups, usageRollupStatus, activeSessions, digestSubscriptions] = await Promise.all([
++    listRepositories(env),
++    listInstallations(env),
++    listInstallationHealth(env),
++    getLatestRegistrySnapshot(env),
++    getLatestScoringModelSnapshot(env),
++    loadUpstreamStatus(env),
++    summarizeProductUsageEvents(env, sinceIso),
++    listProductUsageDailyRollups(env, { limit: days }),
++    getProductUsageRollupStatus(env, { nowIso: generatedAt, lookbackDays: days }),
++    countActiveAuthSessions(env),
++    countActiveDigestSubscriptions(env),
++  ]);
++  const report = buildWeeklyValueReport({
++    generatedAt,
++    days,
++    variant: options.variant,
++    repositories,
++    installations,
++    health,
++    registry,
++    scoring,
++    upstreamDrift,
++    usageSummary,
++    usageRollups,
++    usageRollupStatus,
++    activeSessions,
++    digestSubscriptions,
++  });
++  return report;
++}
++
++export function buildWeeklyValueReport(args: WeeklyValueReportInputs): WeeklyValueReport {
++  const variant = args.variant === "public" ? "public" : "operator";
++  const days = normalizeReportDays(args.days);
++  const rollups = args.usageRollups.slice(0, days).sort((a, b) => a.day.localeCompare(b.day));
++  const aggregate = { ...aggregateWeeklyRollups(rollups), driftDetections: args.upstreamDrift.openReportCount };
++  const registeredRepos = args.repositories.filter((repo) => repo.isRegistered).length;
++  const installedRepos = args.repositories.filter((repo) => repo.isInstalled).length;
++  const unhealthyInstallations = args.health.filter((record) => record.status !== "healthy").length;
++  const warnings = weeklyValueWarnings(args, rollups, unhealthyInstallations, variant);
++  const metrics = buildWeeklyMetrics({
++    activeActors: args.usageSummary.activeActors,
++    aggregate,
++    registeredRepos,
++    installedRepos,
++    installations: args.installations.length,
++    unhealthyInstallations,
++    activeSessions: args.activeSessions ?? 0,
++    digestSubscriptions: args.digestSubscriptions ?? 0,
++  });
++  const summary = [
++    `Adoption: ${args.usageSummary.activeActors} active user(s), ${aggregate.activeRepos} active repo(s), ${aggregate.totalEvents} product event(s) in the last ${days} day(s).`,
++    `Usage: ${aggregate.mcpEvents} MCP event(s), ${aggregate.githubCommandEvents} GitHub command event(s), ${aggregate.prPreflights} PR preflight event(s), and ${aggregate.prPackets} PR packet event(s).`,
++    `Maintainer value: ${aggregate.quietSkips} quiet skip(s), ${aggregate.maintainerSignals} maintainer-value signal(s), and ${aggregate.driftDetections} open drift report(s).`,
++    `Coverage: ${registeredRepos} registered repo(s), ${installedRepos} installed repo(s), ${args.installations.length} GitHub App installation(s).`,
++  ].map(sanitizeReportText);
++  return {
++    generatedAt: args.generatedAt,
++    variant,
++    publicSafe: variant === "public",
++    period: {
++      days,
++      startDay: rollups[0]?.day ?? null,
++      endDay: rollups.at(-1)?.day ?? null,
++      rollupDays: rollups.map((rollup) => rollup.day),
++    },
++    summary,
++    metrics: variant === "public" ? metrics.filter((metric) => metric.visibility === "public") : metrics,
++    warnings,
++    freshness: {
++      status: args.usageRollupStatus.status,
++      latestEventAt: args.usageRollupStatus.latestEventAt ?? null,
++      latestRollupDay: args.usageRollupStatus.latestRollupDay ?? null,
++      latestRollupGeneratedAt: args.usageRollupStatus.latestRollupGeneratedAt ?? null,
++      warnings: variant === "operator" ? args.usageRollupStatus.warnings.map(sanitizeReportText) : publicFreshnessWarnings(args.usageRollupStatus),
++    },
++    dataQuality: {
++      status: warnings.length > 0 ? "warn" : "ready",
++      warnings,
++    },
++    ...(variant === "operator"
++      ? {
++          operatorDetails: {
++            topRepos: aggregate.topRepos,
++            topCommands: aggregate.topCommands,
++            topTools: aggregate.topTools,
++            topRouteClasses: aggregate.topRouteClasses,
++            daily: rollups.map((rollup) => ({
++              day: rollup.day,
++              status: rollup.status,
++              totalEvents: rollup.totalEvents,
++              activeActors: rollup.activeActors,
++              activeRepos: rollup.activeRepos,
++            })),
++            activation: aggregate.activation,
++          },
++        }
++      : {}),
++  };
++}
++
++function buildWeeklyMetrics(args: {
++  activeActors: number;
++  aggregate: WeeklyAggregate;
++  registeredRepos: number;
++  installedRepos: number;
++  installations: number;
++  unhealthyInstallations: number;
++  activeSessions: number;
++  digestSubscriptions: number;
++}): WeeklyValueReportMetric[] {
++  return [
++    metric("active_users", "Active users", args.activeActors, "distinct hashed actors in the report window", "public"),
++    metric("active_repos", "Active repos", args.aggregate.activeRepos, "unique sanitized repo buckets in rollups", "public"),
++    metric("mcp_usage", "MCP usage", args.aggregate.mcpEvents, "MCP request and tool-call events", "public"),
++    metric("github_commands", "GitHub commands", args.aggregate.githubCommandEvents, "command replies and quiet skips", "public"),
++    metric("quiet_skips", "Quiet skips", args.aggregate.quietSkips, "commands intentionally skipped without public noise", "public"),
++    metric("pr_preflights", "PRs preflighted", args.aggregate.prPreflights, "local branch and agent preflight events", "public"),
++    metric("pr_packets", "PR packets", args.aggregate.prPackets, "maintainer packet generation events", "public"),
++    metric("drift_reports", "Drift detections", args.aggregate.driftDetections, "open upstream drift reports", "public"),
++    metric("maintainer_signals", "Maintainer value signals", args.aggregate.maintainerSignals, "maintainer command and activation signals", "public"),
++    metric("product_events", "Product events", args.aggregate.totalEvents, "events represented by completed daily rollups", "operator"),
++    metric("active_sessions", "Active sessions", args.activeSessions, "browser plus CLI/MCP sessions", "operator"),
++    metric("digest_subscriptions", "Digest subscriptions", args.digestSubscriptions, "stored operator digest subscriptions", "operator"),
++    metric("registered_repos", "Registered repos", args.registeredRepos, "repos tracked from the registry cache", "operator"),
++    metric("installed_repos", "Installed repos", args.installedRepos, "repos with installation coverage in cache", "operator"),
++    metric("installations", "Installations", args.installations, "GitHub App installations in cache", "operator"),
++    metric("install_issues", "Install issues", args.unhealthyInstallations, "installation health records needing attention", "operator"),
++  ];
++}
++
++function metric(id: string, label: string, value: number, detail: string, visibility: WeeklyValueReportMetric["visibility"]): WeeklyValueReportMetric {
++  return { id, label, value, detail, visibility };
++}
++
++function aggregateWeeklyRollups(rollups: ProductUsageDailyRollupRecord[]): WeeklyAggregate {
++  const repoEntries = rollups.flatMap((rollup) => rollup.byRepo);
++  const topRepos = countDimensions(repoEntries);
++  const githubCommandEvents = sumEvent(rollups, "agent_command_replied") + sumEvent(rollups, "agent_command_skipped");
++  const quietSkips = sumEvent(rollups, "agent_command_skipped");
++  const prPackets = sumEvent(rollups, "agent_pr_packet_completed");
++  const prPreflights = sumEvent(rollups, "agent_preflight_branch_completed") + sumEvent(rollups, "local_branch_analysis_completed");
++  return {
++    totalEvents: sum(rollups.map((rollup) => rollup.totalEvents)),
++    activeRepos: new Set(repoEntries.map((entry) => sanitizeReportText(entry.key)).filter(Boolean)).size,
++    mcpEvents: sum(rollups.map((rollup) => rollup.bySurface.find((entry) => entry.surface === "mcp")?.count ?? 0)),
++    githubCommandEvents,
++    quietSkips,
++    prPackets,
++    prPreflights,
++    maintainerSignals: githubCommandEvents + sum(rollups.map((rollup) => rollup.activation.githubUsefulMaintainerRepos)),
++    driftDetections: 0,
++    activation: {
++      loginActors: sum(rollups.map((rollup) => rollup.activation.loginActors)),
++      doctorPassActors: sum(rollups.map((rollup) => rollup.activation.doctorPassActors)),
++      firstUsefulActionActors: sum(rollups.map((rollup) => rollup.activation.firstUsefulActionActors)),
++      fullyActivatedActors: sum(rollups.map((rollup) => rollup.activation.fullyActivatedActors)),
++      githubInstalledRepos: sum(rollups.map((rollup) => rollup.activation.githubInstalledRepos)),
++      githubFirstCommandRepos: sum(rollups.map((rollup) => rollup.activation.githubFirstCommandRepos)),
++      githubUsefulMaintainerRepos: sum(rollups.map((rollup) => rollup.activation.githubUsefulMaintainerRepos)),
++      githubActivatedRepos: sum(rollups.map((rollup) => rollup.activation.githubActivatedRepos)),
++    },
++    topRepos,
++    topCommands: countDimensions(rollups.flatMap((rollup) => rollup.byCommand)),
++    topTools: countDimensions(rollups.flatMap((rollup) => rollup.byTool)),
++    topRouteClasses: countDimensions(rollups.flatMap((rollup) => rollup.byRouteClass)),
++  };
++}
++
++function publicFreshnessWarnings(status: ProductUsageRollupStatus): string[] {
++  return status.warnings.length > 0 ? [`Product usage rollups have ${status.warnings.length} freshness warning(s).`] : [];
++}
++
++function weeklyValueWarnings(args: WeeklyValueReportInputs, rollups: ProductUsageDailyRollupRecord[], unhealthyInstallations: number, variant: WeeklyValueReportVariant): string[] {
++  const detailed = variant === "operator";
++  return [
++    ...(rollups.length === 0 ? ["No daily product usage rollups are available for this report window."] : []),
++    ...(rollups.length > 0 && rollups.length < normalizeReportDays(args.days) ? [`Only ${rollups.length} daily rollup(s) are available for this report window.`] : []),
++    ...(detailed
++      ? args.usageRollupStatus.warnings
++      : args.usageRollupStatus.warnings.length > 0
++        ? [`Product usage rollups have ${args.usageRollupStatus.warnings.length} freshness warning(s).`]
++        : []),
++    ...(args.usageRollupStatus.status === "stale" || args.usageRollupStatus.status === "incomplete" ? [`Product usage rollup status is ${args.usageRollupStatus.status}.`] : []),
++    ...(args.registry
++      ? detailed
++        ? args.registry.warnings.map((warning) => `Registry warning: ${warning}`)
++        : args.registry.warnings.length > 0
++          ? [`Registry data has ${args.registry.warnings.length} warning(s).`]
++          : []
++      : ["Registry snapshot is missing."]),
++    ...(args.scoring
++      ? detailed
++        ? args.scoring.warnings.map((warning) => `Scoring warning: ${warning}`)
++        : args.scoring.warnings.length > 0
++          ? [`Scoring model data has ${args.scoring.warnings.length} warning(s).`]
++          : []
++      : ["Scoring model snapshot is missing."]),
++    ...(args.upstreamDrift.status === "current" ? [] : [`Upstream drift status is ${args.upstreamDrift.status}.`]),
++    ...(unhealthyInstallations > 0 ? [`${unhealthyInstallations} installation health record(s) need attention.`] : []),
++  ].map(sanitizeReportText);
++}
++
++function sumEvent(rollups: ProductUsageDailyRollupRecord[], eventName: string): number {
++  return sum(rollups.map((rollup) => rollup.byEvent.find((entry) => entry.eventName === eventName)?.count ?? 0));
++}
++
++function countDimensions(entries: ProductUsageDimensionCount[], limit = 10): ProductUsageDimensionCount[] {
++  const counts = new Map<string, number>();
++  for (const entry of entries) {
++    const key = sanitizeReportText(entry.key);
++    if (!key) continue;
++    counts.set(key, (counts.get(key) ?? 0) + entry.count);
++  }
++  return [...counts.entries()]
++    .map(([key, count]) => ({ key, count }))
++    .sort((a, b) => b.count - a.count || a.key.localeCompare(b.key))
++    .slice(0, limit);
++}
++
++function sum(values: number[]): number {
++  return values.reduce((total, value) => total + value, 0);
++}
++
++function normalizeReportDays(value: number | null | undefined): number {
++  const numeric = Number(value);
++  if (!Number.isFinite(numeric)) return 7;
++  const rounded = Math.round(numeric);
++  if (rounded === 0) return 7;
++  return Math.max(1, Math.min(31, rounded));
++}
++
++function sanitizeReportText(value: string): string {
++  const redacted = value
++    .replace(/(?:\/Users|\/home|\/tmp)\/[^\s"',;)]*|[A-Za-z]:\\Users\\[^\s"',;)]*/g, "<redacted-path>")
++    .replace(/\b(?:ghp_|github_pat_|gts_|glpat-|sk-)[A-Za-z0-9_=-]{8,}/g, "<redacted-token>")
++    .replace(/\bBearer\s+[A-Za-z0-9._~+/=-]{12,}/gi, "Bearer <redacted-token>");
++  if (/\b(seed phrase|mnemonic|private key|raw trust|trust score|wallet|hotkey|coldkey|payout|reward estimate|farming|private reviewability|public score estimate)\b/i.test(redacted)) return "<redacted>";
++  return redacted.slice(0, 240);
++}
+diff --git a/src/types.ts b/src/types.ts
+index 8ac5daf..c17e7ff 100644
+--- a/src/types.ts
++++ b/src/types.ts
+@@ -99,6 +99,12 @@ export type JobMessage =
+       day?: string;
+       days?: number;
+     }
++  | {
++      type: "generate-weekly-value-report";
++      requestedBy: "schedule" | "api" | "test";
++      variant?: WeeklyValueReportVariant;
++      days?: number;
++    }
+   | {
+       type: "run-agent";
+       requestedBy: "api" | "mcp" | "github_comment" | "test";
+@@ -974,3 +980,53 @@ export type ProductUsageRollupStatus = {
+   incompleteDays: string[];
+   warnings: string[];
+ };
++
++export type WeeklyValueReportVariant = "public" | "operator";
++
++export type WeeklyValueReportMetric = {
++  id: string;
++  label: string;
++  value: number;
++  detail: string;
++  visibility: "public" | "operator";
++};
++
++export type WeeklyValueReport = {
++  generatedAt: string;
++  variant: WeeklyValueReportVariant;
++  publicSafe: boolean;
++  period: {
++    days: number;
++    startDay?: string | null | undefined;
++    endDay?: string | null | undefined;
++    rollupDays: string[];
++  };
++  summary: string[];
++  metrics: WeeklyValueReportMetric[];
++  warnings: string[];
++  freshness: {
++    status: ProductUsageRollupStatus["status"];
++    latestEventAt?: string | null | undefined;
++    latestRollupDay?: string | null | undefined;
++    latestRollupGeneratedAt?: string | null | undefined;
++    warnings: string[];
++  };
++  dataQuality: {
++    status: "ready" | "warn";
++    warnings: string[];
++  };
++  operatorDetails?: {
++    topRepos: ProductUsageDimensionCount[];
++    topCommands: ProductUsageDimensionCount[];
++    topTools: ProductUsageDimensionCount[];
++    topRouteClasses: ProductUsageDimensionCount[];
++    daily: Array<{
++      day: string;
++      status: ProductUsageDailyRollupStatus;
++      totalEvents: number;
++      activeActors: number;
++      activeRepos: number;
++    }>;
++    activation: ProductUsageActivationFunnel;
++  };
++};
+diff --git a/test/integration/api.test.ts b/test/integration/api.test.ts
+index b23acde..e1ae087 100644
+--- a/test/integration/api.test.ts
++++ b/test/integration/api.test.ts
+@@ -25,6 +25,7 @@ import {
+   persistScoringModelSnapshot,
+   upsertRepositoryFromGitHub,
+   upsertRepositorySettings,
++  createAgentRun,
+ } from "../../src/db/repositories";
+ import { createApp } from "../../src/api/routes";
+ import { BURDEN_FORECAST_MAX_AGE_MS } from "../../src/services/burden-forecast";
+@@ -1098,6 +1099,7 @@ describe("api routes", () => {
+     expect((await app.request("/v1/app/operator-dashboard", { headers: unknownHeaders }, unknownEnv)).status).toBe(403);
+     expect((await app.request("/v1/app/analytics/daily-rollups", { headers: unknownHeaders }, unknownEnv)).status).toBe(403);
+     expect((await app.request("/v1/app/analytics/mcp-compatibility", { headers: unknownHeaders }, unknownEnv)).status).toBe(403);
++    expect((await app.request("/v1/app/analytics/weekly-value-report", { headers: unknownHeaders }, unknownEnv)).status).toBe(403);
+     expect((await app.request("/v1/contributors/new-user/decision-pack", { headers: unknownHeaders }, unknownEnv)).status).toBe(403);
+     expect((await app.request("/v1/auth/extension/session", { method: "POST", headers: unknownHeaders }, unknownEnv)).status).toBe(403);
+ 
+@@ -1124,6 +1126,12 @@ describe("api routes", () => {
+     expect((await app.request("/v1/app/operator-dashboard", { headers: ownerHeaders }, ownerEnv)).status).toBe(403);
+     expect((await app.request("/v1/app/analytics/daily-rollups", { headers: ownerHeaders }, ownerEnv)).status).toBe(403);
+     expect((await app.request("/v1/app/analytics/mcp-compatibility", { headers: ownerHeaders }, ownerEnv)).status).toBe(403);
++    const ownerWeeklyReport = await app.request("/v1/app/analytics/weekly-value-report", { headers: ownerHeaders }, ownerEnv);
++    expect(ownerWeeklyReport.status).toBe(200);
++    const ownerWeeklyReportBody = await ownerWeeklyReport.json();
++    expect(ownerWeeklyReportBody).toMatchObject({ variant: "public", publicSafe: true });
++    expect(ownerWeeklyReportBody).not.toHaveProperty("operatorDetails");
++    expect((await app.request("/v1/app/analytics/weekly-value-report?variant=operator", { headers: ownerHeaders }, ownerEnv)).status).toBe(403);
+     const ownerExtensionSession = await app.request("/v1/auth/extension/session", { method: "POST", headers: ownerHeaders }, ownerEnv);
+     expect(ownerExtensionSession.status).toBe(201);
+     const ownerExtensionSessionBody = (await ownerExtensionSession.json()) as { token: string; login: string; scopes: string[] };
+@@ -1288,7 +1296,7 @@ describe("api routes", () => {
+     await expect(operator.json()).resolves.toMatchObject({
+       metrics: expect.arrayContaining([expect.objectContaining({ label: "Active sessions" }), expect.objectContaining({ label: "Digest subscriptions" })]),
+       noiseReduction: expect.any(Array),
+-      weeklyReport: expect.arrayContaining([expect.stringContaining("registered repos")]),
++      weeklyReport: expect.arrayContaining([expect.stringContaining("registered repo")]),
+     });
+ 
+     const commands = await app.request("/v1/app/commands", { headers: apiHeaders(env) }, env);
+@@ -1458,6 +1466,24 @@ describe("api routes", () => {
+       metrics: expect.arrayContaining([expect.objectContaining({ label: "Install issues", delta: "needs attention" })]),
+       rateLimits: expect.arrayContaining([expect.objectContaining({ id: "rate-limit-rest" })]),
+     });
++    await createAgentRun(env, {
++      id: "completed-overview-run",
++      objective: "Show completed overview run",
++      actorLogin: "oktofeesh1",
++      surface: "api",
++      mode: "copilot",
++      status: "completed",
++      dataQualityStatus: "complete",
++      payload: { kind: "plan_next_work" },
++      createdAt: "2026-05-28T00:00:00.000Z",
++      updatedAt: "2026-05-28T00:05:00.000Z",
++    });
++    const overviewWithRuns = await app.request("/v1/app/overview", { headers: cookieHeaders }, env);
++    expect(overviewWithRuns.status).toBe(200);
++    await expect(overviewWithRuns.json()).resolves.toMatchObject({
++      metrics: expect.arrayContaining([expect.objectContaining({ label: "Agent runs", total: 1 })]),
++      recentRuns: expect.arrayContaining([expect.objectContaining({ run: expect.objectContaining({ id: "completed-overview-run", status: "completed" }) })]),
++    });
+ 
+     const forbiddenRuns = await app.request("/v1/agent/runs?actorLogin=oktofeesh1", { headers: { cookie: `gittensory_session=${otherToken}` } }, env);
+     expect(forbiddenRuns.status).toBe(403);
+@@ -1482,10 +1508,10 @@ describe("api routes", () => {
+       env,
+     );
+     expect(queuedIssueAgentRun.status).toBe(202);
+-    const overviewWithRuns = await app.request("/v1/app/overview", { headers: cookieHeaders }, env);
+-    expect(overviewWithRuns.status).toBe(200);
+-    await expect(overviewWithRuns.json()).resolves.toMatchObject({
+-      metrics: expect.arrayContaining([expect.objectContaining({ label: "Agent runs", total: 3 })]),
++    const overviewWithQueuedRuns = await app.request("/v1/app/overview", { headers: cookieHeaders }, env);
++    expect(overviewWithQueuedRuns.status).toBe(200);
++    await expect(overviewWithQueuedRuns.json()).resolves.toMatchObject({
++      metrics: expect.arrayContaining([expect.objectContaining({ label: "Agent runs", total: 4 })]),
+       recentRuns: expect.arrayContaining([expect.objectContaining({ run: expect.objectContaining({ actorLogin: "oktofeesh1" }) })]),
+     });
+ 
+@@ -1725,6 +1751,13 @@ describe("api routes", () => {
+         byProtocolVersion: Array<{ key: string; count: number }>;
+         byCompatibilityStatus: Array<{ status: string; count: number }>;
+       };
++      weeklyValueReport: {
++        variant: string;
++        summary: string[];
++        metrics: Array<{ id: string; value: number; visibility: string }>;
++        operatorDetails?: { daily: Array<{ day: string }>; topRouteClasses: Array<{ key: string; count: number }> };
++        warnings: string[];
++      };
+     };
+     expect(usageOperatorBody.metrics).toEqual(
+       expect.arrayContaining([
+@@ -1775,6 +1808,43 @@ describe("api routes", () => {
+     await expect((await app.request("/v1/app/analytics/mcp-compatibility?days=invalid", { headers: apiHeaders(env) }, env)).json()).resolves.toMatchObject({ days: 7 });
+     await expect((await app.request("/v1/app/analytics/mcp-compatibility?days=999", { headers: apiHeaders(env) }, env)).json()).resolves.toMatchObject({ days: 90 });
+     await expect((await app.request("/v1/app/analytics/mcp-compatibility?days=-5", { headers: apiHeaders(env) }, env)).json()).resolves.toMatchObject({ days: 1 });
++
++    expect(usageOperatorBody.weeklyValueReport).toMatchObject({
++      variant: "operator",
++      summary: expect.arrayContaining([expect.stringContaining("active user"), expect.stringContaining("PR packet")]),
++      metrics: expect.arrayContaining([
++        expect.objectContaining({ id: "active_users", visibility: "public" }),
++        expect.objectContaining({ id: "product_events", value: productUsageEvents.length, visibility: "operator" }),
++      ]),
++      operatorDetails: expect.objectContaining({
++        daily: [expect.objectContaining({ day: "2026-05-28" })],
++        topRouteClasses: expect.any(Array),
++      }),
++    });
++
++    const publicWeeklyReport = await app.request("/v1/app/analytics/weekly-value-report?variant=public&days=999", { headers: apiHeaders(env) }, env);
++    expect(publicWeeklyReport.status).toBe(200);
++    const publicWeeklyReportBody = await publicWeeklyReport.json();
++    expect(publicWeeklyReportBody).toMatchObject({
++      variant: "public",
++      publicSafe: true,
++      period: expect.objectContaining({ days: 31 }),
++      metrics: expect.arrayContaining([expect.objectContaining({ id: "active_users", visibility: "public" })]),
++    });
++    expect(publicWeeklyReportBody).not.toHaveProperty("operatorDetails");
++    expect(JSON.stringify(publicWeeklyReportBody)).not.toMatch(/wallet|hotkey|raw trust|payout|reward estimate|farming|private reviewability|public score estimate|\/Users|github_pat|ghp_/i);
++
++    const defaultWeeklyReport = await app.request("/v1/app/analytics/weekly-value-report", { headers: apiHeaders(env) }, env);
++    expect(defaultWeeklyReport.status).toBe(200);
++    await expect(defaultWeeklyReport.json()).resolves.toMatchObject({ variant: "public", publicSafe: true });
++
++    const operatorWeeklyReport = await app.request("/v1/app/analytics/weekly-value-report?variant=operator&days=invalid", { headers: apiHeaders(env) }, env);
++    expect(operatorWeeklyReport.status).toBe(200);
++    await expect(operatorWeeklyReport.json()).resolves.toMatchObject({
++      variant: "operator",
++      period: expect.objectContaining({ days: 7 }),
++      operatorDetails: expect.any(Object),
++    });
+   });
+ 
+   it("covers live app auth, validation, and internal job queue edge routes", async () => {
+diff --git a/test/integration/routes-errors.test.ts b/test/integration/routes-errors.test.ts
+index befb549..2ecf2e7 100644
+--- a/test/integration/routes-errors.test.ts
++++ b/test/integration/routes-errors.test.ts
+@@ -502,6 +502,8 @@ describe("api route guards and error branches", () => {
+     expect((await app.request("/v1/internal/jobs/generate-signal-snapshots/run", { method: "POST" }, env)).status).toBe(401);
+     expect((await app.request("/v1/internal/jobs/rollup-product-usage", { method: "POST" }, env)).status).toBe(401);
+     expect((await app.request("/v1/internal/jobs/rollup-product-usage/run", { method: "POST" }, env)).status).toBe(401);
++    expect((await app.request("/v1/internal/jobs/generate-weekly-value-report", { method: "POST" }, env)).status).toBe(401);
++    expect((await app.request("/v1/internal/jobs/generate-weekly-value-report/run", { method: "POST" }, env)).status).toBe(401);
+     expect((await app.request("/v1/internal/bounties/import", { method: "POST" }, env)).status).toBe(401);
+     expect(
+       (
+@@ -534,6 +536,27 @@ describe("api route guards and error branches", () => {
+     expect(immediateRollup.status).toBe(200);
+     await expect(immediateRollup.json()).resolves.toMatchObject({ requestedDays: expect.any(Array), rollups: expect.any(Array) });
+ 
++    const queuedWeeklyReport = await app.request(
++      "/v1/internal/jobs/generate-weekly-value-report",
++      { method: "POST", headers: internalHeaders(env), body: JSON.stringify({ variant: "public", days: 500 }) },
++      env,
++    );
++    expect(queuedWeeklyReport.status).toBe(202);
++    await expect(queuedWeeklyReport.json()).resolves.toMatchObject({ status: "queued", variant: "public", days: 31 });
++    expect(queued).toEqual(expect.arrayContaining([expect.objectContaining({ type: "generate-weekly-value-report", variant: "public", days: 31 })]));
++    const queuedDefaultWeeklyReport = await app.request("/v1/internal/jobs/generate-weekly-value-report", { method: "POST", headers: internalHeaders(env), body: "{}" }, env);
++    expect(queuedDefaultWeeklyReport.status).toBe(202);
++    await expect(queuedDefaultWeeklyReport.json()).resolves.toMatchObject({ status: "queued", variant: "operator" });
++    expect(queued).toEqual(expect.arrayContaining([expect.objectContaining({ type: "generate-weekly-value-report", variant: "operator" })]));
++
++    const immediateWeeklyReport = await app.request(
++      "/v1/internal/jobs/generate-weekly-value-report/run",
++      { method: "POST", headers: internalHeaders(env), body: JSON.stringify({ variant: "operator", days: -5 }) },
++      env,
++    );
++    expect(immediateWeeklyReport.status).toBe(200);
++    await expect(immediateWeeklyReport.json()).resolves.toMatchObject({ variant: "operator", period: expect.objectContaining({ days: 1 }) });
++
+     expect(
+       (
+         await app.request("/v1/internal/jobs/backfill-registered-repos", {
+diff --git a/test/unit/index.test.ts b/test/unit/index.test.ts
+index 8f1d262..35231b9 100644
+--- a/test/unit/index.test.ts
++++ b/test/unit/index.test.ts
+@@ -140,6 +140,28 @@ describe("worker entrypoint", () => {
+       { type: "file-upstream-drift-issues", requestedBy: "schedule" },
+     ]);
+   });
++
++  it("enqueues weekly value report generation during the Monday report window", async () => {
++    const sent: Array<import("../../src/types").JobMessage> = [];
++    const env = createTestEnv({
++      JOBS: {
++        async send(message: import("../../src/types").JobMessage) {
++          sent.push(message);
++        },
++      } as unknown as Queue,
++    });
++    const waitUntil: Promise<unknown>[] = [];
++
++    await worker.scheduled(controllerFor("2026-06-01T12:00:00.000Z"), env, executionContext(waitUntil));
++    await Promise.all(waitUntil);
++
++    expect(sent).toEqual(
++      expect.arrayContaining([
++        { type: "rollup-product-usage", requestedBy: "schedule", days: 7 },
++        { type: "generate-weekly-value-report", requestedBy: "schedule", variant: "operator", days: 7 },
++      ]),
++    );
++  });
+ });
+ 
+ function controllerFor(iso: string): ScheduledController {
+diff --git a/test/unit/queue.test.ts b/test/unit/queue.test.ts
+index 8083f3a..7b9928a 100644
+--- a/test/unit/queue.test.ts
++++ b/test/unit/queue.test.ts
+@@ -187,15 +187,32 @@ describe("queue processors", () => {
+     });
+ 
+     await processJob(env, { type: "rollup-product-usage", requestedBy: "test", day: "2026-05-27" });
++    await processJob(env, { type: "rollup-product-usage", requestedBy: "test", days: 1 });
+ 
+-    await expect(listProductUsageDailyRollups(env)).resolves.toEqual([
++    await expect(listProductUsageDailyRollups(env)).resolves.toEqual(expect.arrayContaining([
+       expect.objectContaining({
+         day: "2026-05-27",
+         totalEvents: 1,
+         activeActors: 1,
+         activation: expect.objectContaining({ firstUsefulActionActors: 1 }),
+       }),
+-    ]);
++    ]));
++  });
++
++  it("runs weekly value report generation through the queue processor", async () => {
++    const env = createTestEnv({ PRODUCT_USAGE_HASH_SALT: "fixed-test-salt" });
++
++    await processJob(env, { type: "generate-weekly-value-report", requestedBy: "test", variant: "operator", days: 7 });
++    await processJob(env, { type: "generate-weekly-value-report", requestedBy: "test" });
++
++    const row = await env.DB.prepare("select event_type, target_key, outcome from audit_events where event_type = ? order by created_at limit 1").bind("weekly_value_report_generated").first();
++    expect(row).toMatchObject({
++      event_type: "weekly_value_report_generated",
++      target_key: "weekly-value-report:operator:7",
++      outcome: "success",
++    });
++    const auditCount = await env.DB.prepare("select count(*) as count from audit_events where event_type = ?").bind("weekly_value_report_generated").first<{ count: number }>();
++    expect(auditCount?.count).toBe(2);
+   });
+ 
+   it("routes upstream drift jobs through queue processors", async () => {
+diff --git a/test/unit/weekly-value-report.test.ts b/test/unit/weekly-value-report.test.ts
+new file mode 100644
+index 0000000..a0d9dfe
+--- /dev/null
++++ b/test/unit/weekly-value-report.test.ts
+@@ -0,0 +1,378 @@
++import { describe, expect, it } from "vitest";
++import { buildWeeklyValueReport, generateWeeklyValueReport } from "../../src/services/weekly-value-report";
++import type {
++  InstallationHealthRecord,
++  InstallationRecord,
++  ProductUsageDailyRollupRecord,
++  ProductUsageRollupStatus,
++  ProductUsageSummary,
++  RegistrySnapshot,
++  RepositoryRecord,
++  ScoringModelSnapshotRecord,
++} from "../../src/types";
++import type { UpstreamStatus } from "../../src/upstream/ruleset";
++import { createTestEnv } from "../helpers/d1";
++
++describe("weekly value reports", () => {
++  it("builds public-safe adoption and maintainer-value summaries from daily rollups", () => {
++    const report = buildWeeklyValueReport({
++      generatedAt: "2026-06-01T12:00:00.000Z",
++      variant: "public",
++      days: 7,
++      repositories: [repo("JSONbored/gittensory", true, true), repo("entrius/allways-ui", true, false)],
++      installations: [installation(1)],
++      health: [health(1, "healthy")],
++      registry: registry(["/Users/operator/private-registry.json"]),
++      scoring: scoring(["private reviewability source warning"]),
++      upstreamDrift: upstream({ status: "current", openReportCount: 0 }),
++      usageSummary: usageSummary({ totalEvents: 18, activeActors: 4 }),
++      usageRollups: [
++        rollup("2026-05-30", {
++          totalEvents: 10,
++          activeActors: 3,
++          activeRepos: 2,
++          repos: [
++            { key: "JSONbored/gittensory", count: 6 },
++            { key: "entrius/allways-ui", count: 4 },
++          ],
++          events: [
++            { eventName: "mcp_request", count: 2 },
++            { eventName: "mcp_tool_called", count: 1 },
++            { eventName: "agent_command_replied", count: 2 },
++            { eventName: "agent_command_skipped", count: 1 },
++            { eventName: "agent_preflight_branch_completed", count: 1 },
++            { eventName: "agent_pr_packet_completed", count: 1 },
++          ],
++          surfaces: [{ surface: "mcp", count: 3 }],
++          commands: [{ key: "packet", count: 1 }],
++          tools: [{ key: "gittensory_local_status", count: 1 }],
++        }),
++        rollup("2026-05-31", {
++          totalEvents: 8,
++          activeActors: 2,
++          activeRepos: 1,
++          repos: [{ key: "JSONbored/gittensory", count: 8 }],
++          events: [
++            { eventName: "local_branch_analysis_completed", count: 2 },
++            { eventName: "agent_pr_packet_completed", count: 2 },
++          ],
++          surfaces: [{ surface: "api", count: 8 }],
++          commands: [{ key: "reviewability", count: 2 }],
++          tools: [],
++        }),
++      ],
++      usageRollupStatus: rollupStatus({ status: "ready", warnings: ["github_pat_1234567890abcdef freshness detail"] }),
++    });
++
++    expect(report.publicSafe).toBe(true);
++    expect(report.operatorDetails).toBeUndefined();
++    expect(report.summary).toEqual(
++      expect.arrayContaining([
++        expect.stringContaining("4 active user(s), 2 active repo(s), 18 product event(s)"),
++        expect.stringContaining("3 MCP event(s), 3 GitHub command event(s), 3 PR preflight event(s), and 3 PR packet event(s)"),
++        expect.stringContaining("1 quiet skip(s), 5 maintainer-value signal(s)"),
++      ]),
++    );
++    expect(report.metrics).toEqual(
++      expect.arrayContaining([
++        expect.objectContaining({ id: "active_users", value: 4, visibility: "public" }),
++        expect.objectContaining({ id: "pr_packets", value: 3, visibility: "public" }),
++      ]),
++    );
++    expect(report.metrics.some((metric) => metric.visibility === "operator")).toBe(false);
++    expect(report.warnings).toEqual(
++      expect.arrayContaining(["Product usage rollups have 1 freshness warning(s).", "Registry data has 1 warning(s).", "Scoring model data has 1 warning(s)."]),
++    );
++    expect(report.freshness.warnings).toEqual(["Product usage rollups have 1 freshness warning(s)."]);
++    expect(JSON.stringify(report)).not.toMatch(/wallet|hotkey|raw trust|payout|reward estimate|farming|private reviewability|public score estimate|\/Users|github_pat/i);
++  });
++
++  it("adds operator details, freshness warnings, and redacts unsafe rollup dimensions", () => {
++    const report = buildWeeklyValueReport({
++      generatedAt: "2026-06-01T12:00:00.000Z",
++      variant: "operator",
++      days: 7,
++      repositories: [repo("JSONbored/gittensory", true, true)],
++      installations: [installation(1)],
++      health: [health(1, "needs_attention")],
++      registry: registry(["source mirror stale"]),
++      scoring: scoring(["fallback model"]),
++      upstreamDrift: upstream({ status: "drift_detected", openReportCount: 2 }),
++      usageSummary: usageSummary({ totalEvents: 2, activeActors: 1 }),
++      usageRollups: [
++        rollup("2026-05-31", {
++          totalEvents: 2,
++          activeActors: 1,
++          activeRepos: 1,
++          repos: [{ key: "/Users/example/private github_pat_1234567890abcdef", count: 2 }],
++          events: [{ eventName: "agent_command_skipped", count: 2 }],
++          surfaces: [{ surface: "github_app", count: 2 }],
++          commands: [
++            { key: "Bearer abcdefghijklmnop", count: 1 },
++            { key: "", count: 3 },
++          ],
++          tools: [{ key: "wallet raw trust", count: 1 }],
++        }),
++      ],
++      usageRollupStatus: rollupStatus({ status: "stale", warnings: ["Product usage rollups are stale relative to the latest raw event."] }),
++      activeSessions: 3,
++      digestSubscriptions: 2,
++    });
++
++    expect(report.publicSafe).toBe(false);
++    expect(report.operatorDetails).toMatchObject({
++      topRepos: [{ key: "<redacted-path> <redacted-token>", count: 2 }],
++      topCommands: [{ key: "Bearer <redacted-token>", count: 1 }],
++      topTools: [{ key: "<redacted>", count: 1 }],
++    });
++    expect(report.metrics).toEqual(
++      expect.arrayContaining([
++        expect.objectContaining({ id: "active_sessions", value: 3, visibility: "operator" }),
++        expect.objectContaining({ id: "drift_reports", value: 2, visibility: "public" }),
++      ]),
++    );
++    expect(report.warnings).toEqual(
++      expect.arrayContaining([
++        "Product usage rollups are stale relative to the latest raw event.",
++        "Product usage rollup status is stale.",
++        "Registry warning: source mirror stale",
++        "Scoring warning: fallback model",
++        "Upstream drift status is drift_detected.",
++        "1 installation health record(s) need attention.",
++      ]),
++    );
++    expect(JSON.stringify(report)).not.toMatch(/\/Users|github_pat|wallet|raw trust|abcdef/i);
++  });
++
++  it("keeps clean complete windows marked ready", () => {
++    const report = buildWeeklyValueReport({
++      generatedAt: "2026-06-01T12:00:00.000Z",
++      days: 1,
++      repositories: [repo("JSONbored/gittensory", true, true)],
++      installations: [installation(1)],
++      health: [health(1, "healthy")],
++      registry: registry([]),
++      scoring: scoring([]),
++      upstreamDrift: upstream({ status: "current", openReportCount: 0 }),
++      usageSummary: usageSummary({ totalEvents: 1, activeActors: 1 }),
++      usageRollups: [rollup("2026-05-31", { totalEvents: 1, activeActors: 1, activeRepos: 1, repos: [{ key: "JSONbored/gittensory", count: 1 }], events: [], surfaces: [], commands: [], tools: [] })],
++      usageRollupStatus: rollupStatus({ status: "ready" }),
++    });
++
++    expect(report.period.days).toBe(1);
++    expect(report.dataQuality).toEqual({ status: "ready", warnings: [] });
++  });
++
++  it("normalizes report windows and records public scheduled generations without operator details", async () => {
++    const env = createTestEnv();
++
++    const report = await generateWeeklyValueReport(env, { variant: "public", days: -5, nowIso: "2026-06-01T12:00:00.000Z" });
++
++    expect(report).toMatchObject({
++      variant: "public",
++      publicSafe: true,
++      period: expect.objectContaining({ days: 1 }),
++    });
++    expect(report).not.toHaveProperty("operatorDetails");
++    const audit = await env.DB.prepare("select actor, target_key, metadata_json from audit_events where event_type = ?").bind("weekly_value_report_generated").first();
++    expect(audit).toMatchObject({
++      actor: "public-report",
++      target_key: "weekly-value-report:public:1",
++    });
++    expect(JSON.parse(String(audit?.metadata_json))).toMatchObject({ variant: "public", days: 1, totalEvents: 0 });
++
++    const zeroDefaulted = buildWeeklyValueReport({
++      generatedAt: "2026-06-01T12:00:00.000Z",
++      days: 0,
++      repositories: [],
++      installations: [],
++      health: [],
++      registry: null,
++      scoring: null,
++      upstreamDrift: upstream({ status: "unavailable", openReportCount: 0 }),
++      usageSummary: usageSummary({ totalEvents: 0, activeActors: 0 }),
++      usageRollups: [],
++      usageRollupStatus: rollupStatus({ status: "empty" }),
++    });
++    expect(zeroDefaulted.period.days).toBe(7);
++
++    const defaulted = buildWeeklyValueReport({
++      generatedAt: "2026-06-01T12:00:00.000Z",
++      repositories: [],
++      installations: [],
++      health: [],
++      registry: null,
++      scoring: null,
++      upstreamDrift: upstream({ status: "unavailable", openReportCount: 0 }),
++      usageSummary: usageSummary({ totalEvents: 0, activeActors: 0 }),
++      usageRollups: [],
++      usageRollupStatus: rollupStatus({ status: "empty" }),
++    });
++    expect(defaulted.period.days).toBe(7);
++
++    const clamped = buildWeeklyValueReport({
++      generatedAt: "2026-06-01T12:00:00.000Z",
++      days: 99,
++      repositories: [],
++      installations: [],
++      health: [],
++      registry: null,
++      scoring: null,
++      upstreamDrift: upstream({ status: "unavailable", openReportCount: 0 }),
++      usageSummary: usageSummary({ totalEvents: 0, activeActors: 0 }),
++      usageRollups: [],
++      usageRollupStatus: rollupStatus({ status: "empty" }),
++    });
++    expect(clamped.period.days).toBe(31);
++  });
++});
++
++function repo(fullName: string, isRegistered: boolean, isInstalled: boolean): RepositoryRecord {
++  return {
++    fullName,
++    owner: fullName.split("/")[0] ?? "owner",
++    name: fullName.split("/")[1] ?? "repo",
++    isPrivate: false,
++    defaultBranch: "main",
++    htmlUrl: `https://github.com/${fullName}`,
++    isRegistered,
++    isInstalled,
++  };
++}
++
++function installation(id: number): InstallationRecord {
++  return {
++    id,
++    accountLogin: "repo-owner",
++    accountId: id,
++    targetType: "User",
++    permissions: {},
++    events: [],
++  };
++}
++
++function health(installationId: number, status: InstallationHealthRecord["status"]): InstallationHealthRecord {
++  return {
++    installationId,
++    accountLogin: "repo-owner",
++    installedReposCount: 1,
++    registeredInstalledCount: 1,
++    status,
++    missingPermissions: [],
++    missingEvents: [],
++    permissions: {},
++    events: [],
++    checkedAt: "2026-06-01T00:00:00.000Z",
++  };
++}
++
++function registry(warnings: string[]): RegistrySnapshot {
++  return {
++    id: "registry",
++    generatedAt: "2026-06-01T00:00:00.000Z",
++    fetchedAt: "2026-06-01T00:00:00.000Z",
++    source: { kind: "api", url: "https://example.test/registry.json" },
++    repoCount: 2,
++    totalEmissionShare: 0.1,
++    warnings,
++    repositories: [],
++  };
++}
++
++function scoring(warnings: string[]): ScoringModelSnapshotRecord {
++  return {
++    id: "scoring",
++    sourceKind: "test",
++    sourceUrl: "test",
++    fetchedAt: "2026-06-01T00:00:00.000Z",
++    activeModel: "current_density_model",
++    constants: {},
++    programmingLanguages: {},
++    warnings,
++    payload: {},
++  };
++}
++
++function upstream(input: Pick<UpstreamStatus, "status" | "openReportCount">): UpstreamStatus {
++  return {
++    generatedAt: "2026-06-01T00:00:00.000Z",
++    status: input.status,
++    latestCommitSha: "abc123",
++    latestRulesetId: "ruleset",
++    latestRulesetGeneratedAt: "2026-06-01T00:00:00.000Z",
++    activeModel: "current_density_model",
++    highestSeverity: null,
++    affectedAreas: [],
++    openReportCount: input.openReportCount,
++    reports: [],
++  };
++}
++
++function usageSummary(input: Pick<ProductUsageSummary, "totalEvents" | "activeActors">): ProductUsageSummary {
++  return {
++    since: "2026-05-25T00:00:00.000Z",
++    totalEvents: input.totalEvents,
++    activeActors: input.activeActors,
++    bySurface: [],
++    byOutcome: [],
++    byEvent: [],
++  };
++}
++
++function rollup(
++  day: string,
++  input: {
++    totalEvents: number;
++    activeActors: number;
++    activeRepos: number;
++    repos: ProductUsageDailyRollupRecord["byRepo"];
++    events: ProductUsageDailyRollupRecord["byEvent"];
++    surfaces: ProductUsageDailyRollupRecord["bySurface"];
++    commands: ProductUsageDailyRollupRecord["byCommand"];
++    tools: ProductUsageDailyRollupRecord["byTool"];
++  },
++): ProductUsageDailyRollupRecord {
++  return {
++    day,
++    status: "complete",
++    totalEvents: input.totalEvents,
++    activeActors: input.activeActors,
++    activeSessions: input.activeActors,
++    activeRepos: input.activeRepos,
++    sourceEventCount: input.totalEvents,
++    maxEventCapacity: 5000,
++    bySurface: input.surfaces,
++    byOutcome: [],
++    byEvent: input.events,
++    byRepo: input.repos,
++    byCommand: input.commands,
++    byTool: input.tools,
++    byRouteClass: [{ key: "agent", count: input.totalEvents }],
++    activation: {
++      loginActors: 0,
++      doctorPassActors: 0,
++      firstUsefulActionActors: 0,
++      fullyActivatedActors: 0,
++      githubInstalledRepos: 0,
++      githubFirstCommandRepos: 1,
++      githubUsefulMaintainerRepos: 1,
++      githubActivatedRepos: 1,
++    },
++    generatedAt: `${day}T23:59:00.000Z`,
++    updatedAt: `${day}T23:59:00.000Z`,
++  };
++}
++
++function rollupStatus(input: Pick<ProductUsageRollupStatus, "status"> & { warnings?: string[] }): ProductUsageRollupStatus {
++  return {
++    status: input.status,
++    generatedAt: "2026-06-01T00:00:00.000Z",
++    latestEventAt: "2026-05-31T23:00:00.000Z",
++    latestRollupDay: "2026-05-31",
++    latestRollupGeneratedAt: "2026-06-01T00:00:00.000Z",
++    missingDays: [],
++    staleDays: [],
++    incompleteDays: [],
++    warnings: input.warnings ?? [],
++  };
++}

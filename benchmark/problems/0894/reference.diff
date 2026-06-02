@@ -1,0 +1,199 @@
+diff --git a/gittensor/utils/mirror/client.py b/gittensor/utils/mirror/client.py
+index b5925326..7b792eef 100644
+--- a/gittensor/utils/mirror/client.py
++++ b/gittensor/utils/mirror/client.py
+@@ -30,6 +30,13 @@ class MirrorRequestError(RuntimeError):
+     exhausts all retries on transient failures."""
+ 
+ 
++def _body_preview(response: requests.Response) -> str:
++    text = getattr(response, 'text', '')
++    if not isinstance(text, str):
++        text = str(text)
++    return text[:200]
++
++
+ class MirrorClient:
+     """Client for https://mirror.gittensor.io scoring endpoints."""
+ 
+@@ -66,7 +73,10 @@ def get_miner_pulls(
+         path = f'/api/v1/miners/{github_id}/pulls'
+         params = {'since': since.astimezone(timezone.utc).isoformat()} if since else None
+         data = self._get(path, params=params)
+-        return MirrorPullRequestsResponse.from_dict(data)
++        try:
++            return MirrorPullRequestsResponse.from_dict(data)
++        except Exception as e:
++            raise MirrorRequestError(f'Mirror GET {path} returned invalid mirror response: {e}') from e
+ 
+     def get_miner_issues(
+         self,
+@@ -78,7 +88,10 @@ def get_miner_issues(
+         path = f'/api/v1/miners/{github_id}/issues'
+         params = {'since': since.astimezone(timezone.utc).isoformat()} if since else None
+         data = self._get(path, params=params)
+-        return MirrorIssuesResponse.from_dict(data)
++        try:
++            return MirrorIssuesResponse.from_dict(data)
++        except Exception as e:
++            raise MirrorRequestError(f'Mirror GET {path} returned invalid mirror response: {e}') from e
+ 
+     def get_pr_files(
+         self,
+@@ -92,7 +105,10 @@ def get_pr_files(
+         """
+         path = f'/api/v1/pulls/{repo_full_name}/{pr_number}/files'
+         data = self._get(path)
+-        return MirrorPullRequestFilesResponse.from_dict(data)
++        try:
++            return MirrorPullRequestFilesResponse.from_dict(data)
++        except Exception as e:
++            raise MirrorRequestError(f'Mirror GET {path} returned invalid mirror response: {e}') from e
+ 
+     def _get(self, path: str, params: Optional[dict] = None) -> dict:
+         url = f'{self.base_url}{path}'
+@@ -113,13 +129,26 @@ def _get(self, path: str, params: Optional[dict] = None) -> dict:
+                 continue
+ 
+             if 200 <= response.status_code < 300:
+-                return response.json()
++                try:
++                    return response.json()
++                except ValueError as e:
++                    last_error = f'invalid JSON: {e}; body={_body_preview(response)!r}'
++                    if attempt < self.max_attempts - 1:
++                        backoff = backoff_seconds(attempt)
++                        bt.logging.warning(
++                            f'Mirror GET {path} failed ({last_error}) '
++                            f'(attempt {attempt + 1}/{self.max_attempts}), retrying in {backoff}s...'
++                        )
++                        time.sleep(backoff)
++                    continue
+ 
+             # 4xx except 429 are not retryable — fail fast so callers see the real error.
+             if 400 <= response.status_code < 500 and response.status_code != 429:
+-                raise MirrorRequestError(f'Mirror GET {path} returned {response.status_code}: {response.text[:200]}')
++                raise MirrorRequestError(
++                    f'Mirror GET {path} returned {response.status_code}: {_body_preview(response)}'
++                )
+ 
+-            last_error = f'status {response.status_code}: {response.text[:200]}'
++            last_error = f'status {response.status_code}: {_body_preview(response)}'
+             if attempt < self.max_attempts - 1:
+                 backoff = backoff_seconds(attempt)
+                 bt.logging.warning(
+diff --git a/tests/utils/test_mirror_client.py b/tests/utils/test_mirror_client.py
+index 4b96fee6..ee574ddc 100644
+--- a/tests/utils/test_mirror_client.py
++++ b/tests/utils/test_mirror_client.py
+@@ -46,6 +46,13 @@ def _err(status: int, body: str = 'error') -> Mock:
+     return Mock(status_code=status, text=body)
+ 
+ 
++def _invalid_json(body: str = '<html>bad gateway</html>') -> Mock:
++    """Build a 2xx response mock whose body is not valid JSON."""
++    response = Mock(status_code=200, text=body)
++    response.json.side_effect = ValueError('Expecting value')
++    return response
++
++
+ def _make_client(session: Mock, **kwargs) -> MirrorClient:
+     """Build a client wired to a mock session, defaults suitable for tests."""
+     return MirrorClient(session=session, **kwargs)
+@@ -193,6 +200,22 @@ def test_get_pr_files_returns_parsed_dataclass(self):
+         assert isinstance(result, MirrorPullRequestFilesResponse)
+         assert result.repo_full_name == 'entrius/gittensor-ui'
+ 
++    @pytest.mark.parametrize(
++        ('method_name', 'args'),
++        [
++            ('get_miner_pulls', ('218712309',)),
++            ('get_miner_issues', ('218712309',)),
++            ('get_pr_files', ('entrius/gittensor-ui', 518)),
++        ],
++    )
++    def test_top_level_schema_parse_error_wrapped_as_mirror_request_error(self, method_name, args):
++        session = Mock()
++        session.get.return_value = _ok({'error': 'upstream unavailable'})
++        client = _make_client(session)
++
++        with pytest.raises(MirrorRequestError, match='invalid mirror response'):
++            getattr(client, method_name)(*args)
++
+ 
+ # ============================================================================
+ # Retry behavior
+@@ -257,6 +280,20 @@ def test_connection_error_retries(self, _log, mock_sleep):
+         assert session.get.call_count == 2
+         mock_sleep.assert_called_once_with(5)
+ 
++    def test_invalid_2xx_json_retries_then_succeeds(self, _log, mock_sleep):
++        session = Mock()
++        session.get.side_effect = [
++            _invalid_json(),
++            _ok(_minimal_pulls_payload()),
++        ]
++        client = _make_client(session)
++
++        result = client.get_miner_pulls('218712309')
++
++        assert isinstance(result, MirrorPullRequestsResponse)
++        assert session.get.call_count == 2
++        mock_sleep.assert_called_once_with(5)
++
+     def test_max_attempts_exhausted_raises(self, _log, mock_sleep):
+         session = Mock()
+         session.get.return_value = _err(503, 'unavailable')
+@@ -279,6 +316,20 @@ def test_max_attempts_exhausted_on_connection_errors(self, _log, mock_sleep):
+ 
+         assert session.get.call_count == 3
+ 
++    def test_max_attempts_exhausted_on_invalid_2xx_json(self, _log, mock_sleep):
++        session = Mock()
++        session.get.return_value = _invalid_json('not-json')
++        client = _make_client(session, max_attempts=3)
++
++        with pytest.raises(MirrorRequestError) as exc_info:
++            client.get_miner_pulls('218712309')
++
++        assert 'after 3 attempts' in str(exc_info.value)
++        assert 'invalid JSON' in str(exc_info.value)
++        assert 'not-json' in str(exc_info.value)
++        assert session.get.call_count == 3
++        assert mock_sleep.call_count == 2
++
+ 
+ @patch('gittensor.utils.mirror.client.time.sleep')
+ @patch('gittensor.utils.mirror.client.bt.logging')
+diff --git a/tests/validator/oss_contributions/mirror/test_load.py b/tests/validator/oss_contributions/mirror/test_load.py
+index aac334c3..8c82da72 100644
+--- a/tests/validator/oss_contributions/mirror/test_load.py
++++ b/tests/validator/oss_contributions/mirror/test_load.py
+@@ -24,6 +24,7 @@
+ load_mirror_miner_prs = load_module.load_mirror_miner_prs
+ MirrorMinerEvaluation = mirror_eval_module.MirrorMinerEvaluation
+ MirrorPullRequestsResponse = mirror_models.MirrorPullRequestsResponse
++MirrorClient = mirror_client_mod.MirrorClient
+ MirrorRequestError = mirror_client_mod.MirrorRequestError
+ RepositoryConfig = load_weights.RepositoryConfig
+ 
+@@ -325,6 +326,19 @@ def test_mirror_request_error_sets_fetch_failed(self):
+         assert eval_.fetch_failed is True
+         assert eval_.merged_prs == []
+ 
++    def test_malformed_2xx_json_sets_fetch_failed(self):
++        response = Mock(status_code=200, text='<html>bad gateway</html>')
++        response.json.side_effect = ValueError('Expecting value')
++        session = Mock()
++        session.get.return_value = response
++        client = MirrorClient(session=session, max_attempts=1)
++
++        eval_ = _eval()
++        load_mirror_miner_prs(eval_, _mirror_repos('entrius/gittensor-ui'), client=client)
++
++        assert eval_.fetch_failed is True
++        assert eval_.merged_prs == []
++
+     def test_per_pr_exception_does_not_abort_loop(self, monkeypatch):
+         """A bad PR shouldn't crash the whole load — log warning and continue."""
+         from gittensor.validator.oss_contributions.mirror import load as load_mod

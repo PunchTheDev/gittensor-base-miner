@@ -1,0 +1,289 @@
+diff --git a/src/upstream/ruleset.ts b/src/upstream/ruleset.ts
+index eec94ca..2b4a4d1 100644
+--- a/src/upstream/ruleset.ts
++++ b/src/upstream/ruleset.ts
+@@ -222,20 +222,29 @@ export async function fileUpstreamDriftIssues(env: Env): Promise<Record<string,
+   const token = env.GITTENSORY_DRIFT_ISSUE_TOKEN ?? env.GITHUB_PUBLIC_TOKEN;
+   if (!token) return { status: "skipped", reason: "missing_issue_token", created: 0, updated: 0, skipped: 0 };
+   const repo = env.GITTENSORY_DRIFT_ISSUE_REPO || DEFAULT_DRIFT_ISSUE_REPO;
+-  const reports = (await listUpstreamDriftReports(env, 20)).filter((report) => report.status === "open" && !report.issueUrl);
++  const reports = (await listUpstreamDriftReports(env, 20)).filter((report) => report.status === "open");
+   let created = 0;
+   let updated = 0;
+   let skipped = 0;
+   for (const report of reports) {
+-    const existing = await findGitHubIssueForFingerprint(repo, token, report.fingerprint);
+-    const issue = existing ?? (await createGitHubDriftIssue(repo, token, report));
++    const existing = recordedGitHubIssue(report) ?? (await findGitHubIssueForFingerprint(repo, token, report.fingerprint));
++    if (existing) {
++      const issue = await updateGitHubDriftIssue(repo, token, existing.number, report);
++      if (!issue) {
++        skipped += 1;
++        continue;
++      }
++      await updateUpstreamDriftReportIssue(env, report.fingerprint, issue);
++      updated += 1;
++      continue;
++    }
++    const issue = await createGitHubDriftIssue(repo, token, report);
+     if (!issue) {
+       skipped += 1;
+       continue;
+     }
+     await updateUpstreamDriftReportIssue(env, report.fingerprint, issue);
+-    if (existing) updated += 1;
+-    else created += 1;
++    created += 1;
+   }
+   await recordAuditEvent(env, {
+     eventType: "upstream.drift_issues_filed",
+@@ -614,7 +623,51 @@ async function findGitHubIssueForFingerprint(repo: string, token: string, finger
+ async function createGitHubDriftIssue(repo: string, token: string, report: UpstreamDriftReportRecord): Promise<{ number: number; url: string } | null> {
+   const [owner, name] = repo.split("/");
+   if (!owner || !name) return null;
+-  const body = [
++  const response = await fetch(`https://api.github.com/repos/${owner}/${name}/issues`, {
++    method: "POST",
++    headers: githubHeaders(token, "application/vnd.github+json"),
++    body: jsonString(githubDriftIssuePayload(report)),
++  });
++  if (!response.ok) return null;
++  const payload = (await response.json()) as { number?: number; html_url?: string };
++  return payload.number && payload.html_url ? { number: payload.number, url: payload.html_url } : null;
++}
++
++async function updateGitHubDriftIssue(repo: string, token: string, issueNumber: number, report: UpstreamDriftReportRecord): Promise<{ number: number; url: string } | null> {
++  const [owner, name] = repo.split("/");
++  if (!owner || !name || !Number.isInteger(issueNumber) || issueNumber <= 0) return null;
++  const response = await fetch(`https://api.github.com/repos/${owner}/${name}/issues/${issueNumber}`, {
++    method: "PATCH",
++    headers: githubHeaders(token, "application/vnd.github+json"),
++    body: jsonString(githubDriftIssuePayload(report)),
++  });
++  if (!response.ok) return null;
++  const payload = (await response.json()) as { number?: number; html_url?: string };
++  return payload.number && payload.html_url ? { number: payload.number, url: payload.html_url } : null;
++}
++
++function recordedGitHubIssue(report: UpstreamDriftReportRecord): { number: number; url: string } | null {
++  if (Number.isInteger(report.issueNumber) && report.issueNumber && report.issueNumber > 0 && report.issueUrl) {
++    return { number: report.issueNumber, url: report.issueUrl };
++  }
++  return null;
++}
++
++function githubDriftIssueTitle(report: UpstreamDriftReportRecord): string {
++  return `chore(upstream): reconcile Gittensor drift ${report.fingerprint.slice(0, 8)}`;
++}
++
++function githubDriftIssuePayload(report: UpstreamDriftReportRecord): Record<string, JsonValue> {
++  return {
++    title: githubDriftIssueTitle(report),
++    body: githubDriftIssueBody(report),
++    labels: ["signals", "scoring", "data", report.severity === "high" || report.severity === "blocking" ? "high-impact" : "backend"],
++    assignees: ["jsonbored"],
++  };
++}
++
++function githubDriftIssueBody(report: UpstreamDriftReportRecord): string {
++  return [
+     `<!-- gittensory-upstream-drift:${report.fingerprint} -->`,
+     "",
+     "## Background",
+@@ -624,31 +677,49 @@ async function createGitHubDriftIssue(repo: string, token: string, report: Upstr
+     "## Drift Summary",
+     "",
+     `- Severity: ${report.severity}`,
++    `- Changed upstream source: ${changedUpstreamSourceSummary(report.affectedAreas)}`,
+     `- Affected areas: ${report.affectedAreas.join(", ") || "source"}`,
+     `- Summary: ${report.summary}`,
+     `- Current ruleset: ${report.currentRulesetId ?? "unknown"}`,
+     `- Previous ruleset: ${report.previousRulesetId ?? "unknown"}`,
+     "",
++    "## Suggested Tests",
++    "",
++    "- Add or update regression fixtures for the affected upstream source paths.",
++    "- Run `npx vitest run test/unit/upstream-ruleset.test.ts`.",
++    "- Run `npm run test:ci` and keep coverage at or above 97%.",
++    "",
+     "## Required Follow-Up",
+     "",
+     "- Inspect the upstream ruleset drift report in the private API.",
+     "- Update Gittensory parsing/scoring fixtures if the semantic change is expected.",
+-    "- Keep public GitHub output sanitized and private scoreability details private.",
+-    "- Run `npm run test:ci` and keep coverage at or above 97%.",
++    "- Keep public GitHub output sanitized and avoid private contributor context.",
+   ].join("\n");
+-  const response = await fetch(`https://api.github.com/repos/${owner}/${name}/issues`, {
+-    method: "POST",
+-    headers: githubHeaders(token, "application/vnd.github+json"),
+-    body: jsonString({
+-      title: `chore(upstream): reconcile Gittensor drift ${report.fingerprint.slice(0, 8)}`,
+-      body,
+-      labels: ["signals", "scoring", "data", report.severity === "high" || report.severity === "blocking" ? "high-impact" : "backend"],
+-      assignees: ["jsonbored"],
+-    }),
+-  });
+-  if (!response.ok) return null;
+-  const payload = (await response.json()) as { number?: number; html_url?: string };
+-  return payload.number && payload.html_url ? { number: payload.number, url: payload.html_url } : null;
++}
++
++function changedUpstreamSourceSummary(affectedAreas: UpstreamDriftArea[]): string {
++  const paths = new Set<string>();
++  for (const area of affectedAreas.length > 0 ? affectedAreas : (["source"] as UpstreamDriftArea[])) {
++    for (const path of upstreamSourcePathsForArea(area)) paths.add(path);
++  }
++  return [...paths].join(", ");
++}
++
++function upstreamSourcePathsForArea(area: UpstreamDriftArea): string[] {
++  switch (area) {
++    case "registry":
++      return ["gittensor/validator/weights/master_repositories.json"];
++    case "scoring_model":
++      return ["gittensor/constants.py", "gittensor/validator/oss_contributions/mirror/scoring.py"];
++    case "issue_discovery":
++      return ["gittensor/validator/issue_discovery/scan.py"];
++    case "mirror_linkage":
++      return ["gittensor/validator/oss_contributions/mirror/scoring.py", "gittensor/utils/mirror/models.py"];
++    case "language_weights":
++      return ["gittensor/validator/weights/programming_languages.json"];
++    case "source":
++      return TRACKED_SOURCES.map((source) => source.path);
++  }
+ }
+ 
+ function githubHeaders(token: string | undefined, accept: string): Record<string, string> {
+diff --git a/test/unit/upstream-ruleset.test.ts b/test/unit/upstream-ruleset.test.ts
+index f486645..311ed68 100644
+--- a/test/unit/upstream-ruleset.test.ts
++++ b/test/unit/upstream-ruleset.test.ts
+@@ -406,8 +406,32 @@ describe("upstream ruleset drift tracking", () => {
+ 
+     const updateEnv = createTestEnv({ GITTENSORY_AUTO_FILE_DRIFT_ISSUES: "yes", GITTENSORY_DRIFT_ISSUE_TOKEN: "token" });
+     await upsertUpstreamDriftReport(updateEnv, driftReport("existing-fingerprint"));
+-    vi.stubGlobal("fetch", githubIssueFetch({ existing: { number: 88, url: "https://github.com/JSONbored/gittensory/issues/88", fingerprint: "existing-fingerprint" } }));
++    const updateCalls: GitHubIssueFetchCall[] = [];
++    vi.stubGlobal(
++      "fetch",
++      githubIssueFetch({
++        existing: { number: 88, url: "https://github.com/JSONbored/gittensory/issues/88", fingerprint: "existing-fingerprint" },
++        update: { number: 88, url: "https://github.com/JSONbored/gittensory/issues/88" },
++        calls: updateCalls,
++      }),
++    );
+     await expect(fileUpstreamDriftIssues(updateEnv)).resolves.toMatchObject({ status: "completed", created: 0, updated: 1, skipped: 0 });
++    expect(updateCalls).toEqual(
++      expect.arrayContaining([
++        expect.objectContaining({ method: "GET", url: "https://api.github.com/repos/JSONbored/gittensory/issues?state=open&labels=signals&per_page=50" }),
++        expect.objectContaining({ method: "PATCH", url: "https://api.github.com/repos/JSONbored/gittensory/issues/88" }),
++      ]),
++    );
++    const updateBody = updateCalls.find((call) => call.method === "PATCH")?.body;
++    expect(updateBody).toMatchObject({
++      title: "chore(upstream): reconcile Gittensor drift existing",
++      labels: ["signals", "scoring", "data", "high-impact"],
++      assignees: ["jsonbored"],
++    });
++    expect(String(updateBody?.body)).toContain("<!-- gittensory-upstream-drift:existing-fingerprint -->");
++    expect(String(updateBody?.body)).toContain("## Suggested Tests");
++    expect(String(updateBody?.body)).toContain("gittensor/constants.py");
++    expect(String(updateBody?.body)).not.toMatch(/wallet|hotkey|raw trust score|payout|reward estimate|farming|private reviewability|public score estimate/i);
+ 
+     const failingEnv = createTestEnv({ GITTENSORY_AUTO_FILE_DRIFT_ISSUES: "on", GITHUB_PUBLIC_TOKEN: "token" });
+     await upsertUpstreamDriftReport(failingEnv, driftReport("failing-fingerprint"));
+@@ -421,6 +445,20 @@ describe("upstream ruleset drift tracking", () => {
+     vi.stubGlobal("fetch", githubIssueFetch({ create: { number: 91, url: "https://github.com/JSONbored/gittensory/issues/91" } }));
+     await expect(fileUpstreamDriftIssues(defaultRepoEnv)).resolves.toMatchObject({ status: "completed", created: 1, updated: 0, skipped: 0 });
+ 
++    const areaSourceEnv = createTestEnv({ GITTENSORY_AUTO_FILE_DRIFT_ISSUES: "true", GITTENSORY_DRIFT_ISSUE_TOKEN: "token" });
++    await upsertUpstreamDriftReport(
++      areaSourceEnv,
++      driftReport("area-source-paths", { severity: "medium", affectedAreas: ["registry", "issue_discovery", "mirror_linkage", "language_weights"] }),
++    );
++    const areaSourceCalls: GitHubIssueFetchCall[] = [];
++    vi.stubGlobal("fetch", githubIssueFetch({ create: { number: 95, url: "https://github.com/JSONbored/gittensory/issues/95" }, calls: areaSourceCalls }));
++    await expect(fileUpstreamDriftIssues(areaSourceEnv)).resolves.toMatchObject({ status: "completed", created: 1, updated: 0, skipped: 0 });
++    const areaSourceBody = String(areaSourceCalls.find((call) => call.method === "POST")?.body?.body);
++    expect(areaSourceBody).toContain("gittensor/validator/weights/master_repositories.json");
++    expect(areaSourceBody).toContain("gittensor/validator/issue_discovery/scan.py");
++    expect(areaSourceBody).toContain("gittensor/utils/mirror/models.py");
++    expect(areaSourceBody).toContain("gittensor/validator/weights/programming_languages.json");
++
+     const missingPayloadEnv = createTestEnv({ GITTENSORY_AUTO_FILE_DRIFT_ISSUES: "true", GITTENSORY_DRIFT_ISSUE_TOKEN: "token" });
+     await upsertUpstreamDriftReport(missingPayloadEnv, driftReport("missing-payload", { currentRulesetId: null, previousRulesetId: null }));
+     vi.stubGlobal("fetch", githubIssueFetch({ createPayload: {} }));
+@@ -431,6 +469,23 @@ describe("upstream ruleset drift tracking", () => {
+     vi.stubGlobal("fetch", githubIssueFetch({ throwOnList: true, create: { number: 92, url: "https://github.com/JSONbored/gittensory/issues/92" } }));
+     await expect(fileUpstreamDriftIssues(throwingListEnv)).resolves.toMatchObject({ status: "completed", created: 1, updated: 0, skipped: 0 });
+ 
++    const linkedEnv = createTestEnv({ GITTENSORY_AUTO_FILE_DRIFT_ISSUES: "true", GITTENSORY_DRIFT_ISSUE_TOKEN: "token" });
++    await upsertUpstreamDriftReport(linkedEnv, driftReport("linked-fingerprint", { issueNumber: 93, issueUrl: "https://github.com/JSONbored/gittensory/issues/93" }));
++    const linkedCalls: GitHubIssueFetchCall[] = [];
++    vi.stubGlobal("fetch", githubIssueFetch({ update: { number: 93, url: "https://github.com/JSONbored/gittensory/issues/93" }, calls: linkedCalls }));
++    await expect(fileUpstreamDriftIssues(linkedEnv)).resolves.toMatchObject({ status: "completed", created: 0, updated: 1, skipped: 0 });
++    expect(linkedCalls).toEqual([expect.objectContaining({ method: "PATCH", url: "https://api.github.com/repos/JSONbored/gittensory/issues/93" })]);
++
++    const failingLinkedEnv = createTestEnv({ GITTENSORY_AUTO_FILE_DRIFT_ISSUES: "true", GITTENSORY_DRIFT_ISSUE_TOKEN: "token" });
++    await upsertUpstreamDriftReport(failingLinkedEnv, driftReport("failing-linked", { issueNumber: 94, issueUrl: "https://github.com/JSONbored/gittensory/issues/94" }));
++    vi.stubGlobal("fetch", githubIssueFetch({ updateStatus: 500 }));
++    await expect(fileUpstreamDriftIssues(failingLinkedEnv)).resolves.toMatchObject({ status: "completed", created: 0, updated: 0, skipped: 1 });
++
++    const missingUpdatePayloadEnv = createTestEnv({ GITTENSORY_AUTO_FILE_DRIFT_ISSUES: "true", GITTENSORY_DRIFT_ISSUE_TOKEN: "token" });
++    await upsertUpstreamDriftReport(missingUpdatePayloadEnv, driftReport("missing-update-payload", { issueNumber: 96, issueUrl: "https://github.com/JSONbored/gittensory/issues/96" }));
++    vi.stubGlobal("fetch", githubIssueFetch({ updatePayload: {} }));
++    await expect(fileUpstreamDriftIssues(missingUpdatePayloadEnv)).resolves.toMatchObject({ status: "completed", created: 0, updated: 0, skipped: 1 });
++
+     const disabledEnv = createTestEnv();
+     delete (disabledEnv as Partial<Env>).GITTENSORY_AUTO_FILE_DRIFT_ISSUES;
+     await expect(fileUpstreamDriftIssues(disabledEnv)).resolves.toMatchObject({ status: "disabled" });
+@@ -559,16 +614,32 @@ function upstreamFailedFetch() {
+   };
+ }
+ 
++type GitHubIssueFetchCall = {
++  url: string;
++  method: string;
++  body: Record<string, unknown> | null;
++};
++
+ function githubIssueFetch(options: {
+   existing?: { number: number; url: string; fingerprint: string };
+   create?: { number: number; url: string };
+   createPayload?: Record<string, unknown>;
++  update?: { number: number; url: string };
++  updatePayload?: Record<string, unknown>;
+   listStatus?: number;
+   createStatus?: number;
++  updateStatus?: number;
+   throwOnList?: boolean;
++  calls?: GitHubIssueFetchCall[];
+ }) {
+   return async (input: RequestInfo | URL, init?: RequestInit): Promise<Response> => {
+     const url = input.toString();
++    const method = init?.method ?? "GET";
++    options.calls?.push({
++      url,
++      method,
++      body: typeof init?.body === "string" ? (JSON.parse(init.body) as Record<string, unknown>) : null,
++    });
+     if (url.endsWith("/issues?state=open&labels=signals&per_page=50")) {
+       if (options.throwOnList) throw new Error("list failed");
+       if (options.listStatus) return new Response("list failed", { status: options.listStatus });
+@@ -578,7 +649,14 @@ function githubIssueFetch(options: {
+           : [],
+       );
+     }
+-    if (url.endsWith("/issues") && init?.method === "POST") {
++    const issueMatch = url.match(/\/issues\/(\d+)$/);
++    if (issueMatch && method === "PATCH") {
++      if (options.updateStatus) return new Response("update failed", { status: options.updateStatus });
++      if (options.updatePayload) return Response.json(options.updatePayload);
++      const number = options.update?.number ?? Number(issueMatch[1]);
++      return Response.json({ number, html_url: options.update?.url ?? `https://github.com/JSONbored/gittensory/issues/${number}` });
++    }
++    if (url.endsWith("/issues") && method === "POST") {
+       if (options.createStatus) return new Response("create failed", { status: options.createStatus });
+       if (options.createPayload) return Response.json(options.createPayload);
+       return Response.json({ number: options.create?.number ?? 99, html_url: options.create?.url ?? "https://github.com/JSONbored/gittensory/issues/99" });

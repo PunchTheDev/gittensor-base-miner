@@ -1,0 +1,427 @@
+diff --git a/crates/engine/src/parser/oracle_effect/mod.rs b/crates/engine/src/parser/oracle_effect/mod.rs
+index 82ac627730..ff59a725cf 100644
+--- a/crates/engine/src/parser/oracle_effect/mod.rs
++++ b/crates/engine/src/parser/oracle_effect/mod.rs
+@@ -10012,6 +10012,40 @@ fn is_choose_as_targeting(rest: &str) -> bool {
+     false
+ }
+ 
++/// CR 205.2: Recognize the enumerated form of a "choose a card type" choice.
++/// Older cards (e.g. Cloud Key) spell out the *complete* list of choosable card
++/// types ("artifact, creature, enchantment, instant, or sorcery") instead of
++/// the modern generic phrasing. A *partial* type list (e.g. "artifact, creature,
++/// or land" — Storage Matrix, Turnabout, A Killer Among Us) is a restricted
++/// modal selection, NOT a card-type chooser, and must remain `Labeled`. So this
++/// matches only when `rest` (after an optional trailing period) is exactly the
++/// canonical card-type set, in any order.
++fn is_card_type_enumeration(rest: &str) -> bool {
++    fn card_type_word(input: &str) -> nom::IResult<&str, &str, OracleError<'_>> {
++        alt((
++            tag("artifact"),
++            tag("creature"),
++            tag("enchantment"),
++            tag("instant"),
++            tag("sorcery"),
++        ))
++        .parse(input)
++    }
++    fn separator(input: &str) -> nom::IResult<&str, &str, OracleError<'_>> {
++        alt((tag(", or "), tag(", "), tag(" or "))).parse(input)
++    }
++    let rest = rest.trim_end_matches('.').trim_end();
++    match all_consuming(nom::multi::separated_list1(separator, card_type_word)).parse(rest) {
++        Ok((_, mut items)) => {
++            items.sort_unstable();
++            items.dedup();
++            // The complete canonical card-type set (alphabetical).
++            items == ["artifact", "creature", "enchantment", "instant", "sorcery"]
++        }
++        Err(_) => false,
++    }
++}
++
+ /// Match "choose a creature type", "choose a color", "choose odd or even",
+ /// "choose a basic land type", "choose a card type" from lowercased Oracle text.
+ pub(crate) fn try_parse_named_choice(lower: &str) -> Option<ChoiceType> {
+@@ -10039,6 +10073,14 @@ pub(crate) fn try_parse_named_choice(lower: &str) -> Option<ChoiceType> {
+         Some(ChoiceType::BasicLandType)
+     } else if tag::<_, _, E>("a card type").parse(rest).is_ok() {
+         Some(ChoiceType::CardType)
++    } else if is_card_type_enumeration(rest) {
++        // CR 205.2: Older "choose a card type" cards (Cloud Key) spell out the
++        // options ("artifact, creature, enchantment, instant, or sorcery")
++        // rather than using the modern generic phrasing. Treat the enumeration
++        // as the same CardType choice so the chosen type persists for downstream
++        // `IsChosenCardType` reads (cost reduction, protection from the chosen
++        // type, etc.).
++        Some(ChoiceType::CardType)
+     } else if alt((
+         tag::<_, _, E>("a card name"),
+         tag("a nonland card name"),
+@@ -40010,4 +40052,38 @@ mod snapshot_tests {
+             "interceptor must reject inputs whose inner quantity is not the equalization shape"
+         );
+     }
++
++    #[test]
++    fn named_choice_recognizes_enumerated_card_types() {
++        // Issue #930 — Cloud Key's older templating enumerates the card-type
++        // options ("choose artifact, creature, enchantment, instant, or
++        // sorcery") instead of the modern "choose a card type". Both must map
++        // to ChoiceType::CardType so the chosen type persists for downstream
++        // IsChosenCardType reads (CR 205.2).
++        assert!(matches!(
++            try_parse_named_choice("choose artifact, creature, enchantment, instant, or sorcery"),
++            Some(ChoiceType::CardType)
++        ));
++        assert!(matches!(
++            try_parse_named_choice("choose a card type"),
++            Some(ChoiceType::CardType)
++        ));
++        // Trailing period, as it appears in oracle text.
++        assert!(matches!(
++            try_parse_named_choice("choose artifact, creature, enchantment, instant, or sorcery."),
++            Some(ChoiceType::CardType)
++        ));
++    }
++
++    #[test]
++    fn named_choice_enumeration_does_not_misfire() {
++        // Non-card-type lists and articled / creature-type choices must not be
++        // treated as a card-type enumeration.
++        assert!(!is_card_type_enumeration("one or more creatures"));
++        assert!(!is_card_type_enumeration("a creature"));
++        assert!(!matches!(
++            try_parse_named_choice("choose a creature type"),
++            Some(ChoiceType::CardType)
++        ));
++    }
+ }
+diff --git a/crates/engine/src/parser/oracle_static.rs b/crates/engine/src/parser/oracle_static.rs
+index cb9f1336b4..6924ed0c82 100644
+--- a/crates/engine/src/parser/oracle_static.rs
++++ b/crates/engine/src/parser/oracle_static.rs
+@@ -10539,6 +10539,25 @@ fn try_parse_cost_modification(text: &str, lower: &str) -> Option<StaticDefiniti
+                 Ok((_, (before, _))) => (before, true),
+                 Err(_) => (without_from, false),
+             };
++        // CR 205.2a + CR 601.2f: Strip the "of the chosen type" / "of that type"
++        // qualifier (Cloud Key, Umori, Stenn, Herald's Horn: "Spells you cast of
++        // the chosen type cost {1} less"). A "you cast" infix sits between the
++        // type word and this qualifier, so the trim chain below can't reach the
++        // type word and `parse_type_phrase` never extracts the chosen-type
++        // discriminator. Strip it here and re-attach IsChosenCardType /
++        // IsChosenCreatureType after the base type is parsed — mirrors the
++        // "with the chosen name" handling above.
++        let (without_chosen, has_chosen_type) = if let Ok((_, (before, _))) =
++            nom_primitives::split_once_on(without_chosen, " of the chosen type")
++        {
++            (before, true)
++        } else if let Ok((_, (before, _))) =
++            nom_primitives::split_once_on(without_chosen, " of that type")
++        {
++            (before, true)
++        } else {
++            (without_chosen, false)
++        };
+         let type_desc = without_chosen
+             .trim_end_matches(" you cast")
+             .trim_end_matches(" your opponents cast")
+@@ -10572,6 +10591,32 @@ fn try_parse_cost_modification(text: &str, lower: &str) -> Option<StaticDefiniti
+                 }
+             }
+         };
++        // CR 205.2a: Re-attach the chosen-type discriminator stripped above. A
++        // creature-typed base ("Creature spells ... of the chosen type",
++        // Herald's Horn) pairs with a chosen CREATURE type; a bare-spells base
++        // ("Spells ... of the chosen type", Cloud Key / Umori / Stenn) pairs
++        // with a chosen CARD type. Resolved at cast time against the source
++        // permanent's `ChosenAttribute` (CR 601.2f).
++        let typed_filter = if has_chosen_type {
++            match typed_filter {
++                Some(TargetFilter::Typed(mut tf))
++                    if tf.type_filters.contains(&TypeFilter::Creature) =>
++                {
++                    tf.properties.push(FilterProp::IsChosenCreatureType);
++                    Some(TargetFilter::Typed(tf))
++                }
++                Some(TargetFilter::Typed(mut tf)) => {
++                    tf.properties.push(FilterProp::IsChosenCardType);
++                    Some(TargetFilter::Typed(tf))
++                }
++                None => Some(TargetFilter::Typed(
++                    TypedFilter::card().properties(vec![FilterProp::IsChosenCardType]),
++                )),
++                other => other,
++            }
++        } else {
++            typed_filter
++        };
+         // Compose chosen-name constraint with the typed prefix (if any). Bare
+         // "Spells with the chosen name" → `HasChosenName` alone; typed
+         // "<Type> spells with the chosen name" → `And{Typed, HasChosenName}`.
+@@ -12495,6 +12540,68 @@ mod tests {
+         }
+     }
+ 
++    #[test]
++    fn static_spells_of_chosen_type_cost_less_carries_chosen_card_type() {
++        // Issue #930 — Cloud Key / Umori / Stenn:
++        // "Spells you cast of the chosen type cost {1} less to cast."
++        // CR 205.2a: the "of the chosen type" qualifier must narrow the
++        // reduction to the chosen card type, not every spell. The "you cast"
++        // infix previously prevented the discriminator from being extracted.
++        let def =
++            parse_static_line("Spells you cast of the chosen type cost {1} less to cast.").unwrap();
++        let StaticMode::ReduceCost {
++            spell_filter: Some(TargetFilter::Typed(ref tf)),
++            ..
++        } = def.mode
++        else {
++            panic!(
++                "expected ReduceCost with a Typed spell_filter, got {:?}",
++                def.mode
++            );
++        };
++        assert!(
++            tf.properties
++                .iter()
++                .any(|p| matches!(p, FilterProp::IsChosenCardType)),
++            "chosen-type cost reduction must carry IsChosenCardType, got {:?}",
++            tf.properties
++        );
++    }
++
++    #[test]
++    fn static_creature_spells_of_chosen_type_cost_less_carries_chosen_creature_type() {
++        // Issue #930 — Herald's Horn:
++        // "Creature spells you cast of the chosen type cost {1} less to cast."
++        // CR 205.2a: a creature-typed base pairs with a chosen CREATURE type.
++        let def =
++            parse_static_line("Creature spells you cast of the chosen type cost {1} less to cast.")
++                .unwrap();
++        let StaticMode::ReduceCost {
++            spell_filter: Some(TargetFilter::Typed(ref tf)),
++            ..
++        } = def.mode
++        else {
++            panic!(
++                "expected ReduceCost with a Typed spell_filter, got {:?}",
++                def.mode
++            );
++        };
++        assert!(
++            tf.type_filters
++                .iter()
++                .any(|t| matches!(t, TypeFilter::Creature)),
++            "expected Creature type filter, got {:?}",
++            tf.type_filters
++        );
++        assert!(
++            tf.properties
++                .iter()
++                .any(|p| matches!(p, FilterProp::IsChosenCreatureType)),
++            "creature chosen-type reduction must carry IsChosenCreatureType, got {:?}",
++            tf.properties
++        );
++    }
++
+     #[test]
+     fn static_instant_sorcery_spells_cost_less() {
+         // Goblin Electromancer: "Instant and sorcery spells you cast cost {1} less to cast."
+diff --git a/crates/engine/tests/integration/cloud_key_chosen_type_cost.rs b/crates/engine/tests/integration/cloud_key_chosen_type_cost.rs
+new file mode 100644
+index 0000000000..54f329a582
+--- /dev/null
++++ b/crates/engine/tests/integration/cloud_key_chosen_type_cost.rs
+@@ -0,0 +1,178 @@
++//! Reproduction + regression for issue #930: Cloud Key chosen-type cost reduction.
++//!
++//! Cloud Key: "As this artifact enters, choose artifact, creature, enchantment,
++//! instant, or sorcery. Spells you cast of the chosen type cost {1} less to cast."
++//!
++//! On `main`, two coupled parser bugs make Cloud Key reduce the cost of EVERY
++//! spell you cast, regardless of (or without) a chosen type:
++//!   - The static `ReduceCost` filter parses to `Typed { type_filters: [Card] }`
++//!     with no `FilterProp::IsChosenCardType`, so it matches all spells.
++//!   - The ETB "choose artifact, creature, ..." parses to a `Labeled` choice
++//!     instead of `ChoiceType::CardType`, so no `ChosenAttribute::CardType` is
++//!     ever stored for `IsChosenCardType` to read.
++//!
++//! CR 601.2f: cost reductions apply only to spells matching the effect's filter.
++//! A spell that is not of the chosen type must NOT be reduced.
++
++use std::path::Path;
++use std::sync::OnceLock;
++
++use engine::database::card_db::CardDatabase;
++use engine::game::scenario::{GameScenario, P0};
++use engine::game::scenario_db::GameScenarioDbExt;
++use engine::types::ability::ChoiceType;
++use engine::types::actions::GameAction;
++use engine::types::card_type::CoreType;
++use engine::types::game_state::WaitingFor;
++use engine::types::identifiers::ObjectId;
++use engine::types::mana::{ManaCost, ManaType, ManaUnit};
++use engine::types::phase::Phase;
++use engine::types::zones::Zone;
++
++fn load_db() -> Option<&'static CardDatabase> {
++    let path = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../client/public/card-data.json");
++    if !path.exists() {
++        return None;
++    }
++    static DB: OnceLock<CardDatabase> = OnceLock::new();
++    Some(DB.get_or_init(|| CardDatabase::from_export(&path).expect("export should load")))
++}
++
++/// With Cloud Key on the battlefield and NO card type chosen, a non-artifact
++/// spell (Cultivate, {2}{G}) must not receive any cost reduction.
++///
++/// On `main` this FAILS: Cloud Key's `ReduceCost` filter parses to all-`Card`
++/// (no `IsChosenCardType`), so `display_spell_cost` reduces the generic from
++/// 2 to 1 for every spell the controller casts.
++#[test]
++fn cloud_key_does_not_reduce_non_chosen_type_spell() {
++    let Some(db) = load_db() else {
++        return;
++    };
++
++    let mut scenario = GameScenario::new();
++    scenario.at_phase(Phase::PreCombatMain);
++    // Cloud Key on the battlefield => its cost-reduction static is active.
++    scenario.add_real_card(P0, "Cloud Key", Zone::Battlefield, db);
++    // A {2}{G} non-artifact sorcery in hand.
++    let cultivate = scenario.add_real_card(P0, "Cultivate", Zone::Hand, db);
++
++    let mut runner = scenario.build();
++    engine::game::rehydrate_game_from_card_db(runner.state_mut(), db);
++
++    let cost = engine::game::casting::display_spell_cost(runner.state(), P0, cultivate)
++        .expect("Cultivate should have a displayable cost");
++
++    let ManaCost::Cost { generic, .. } = cost else {
++        panic!("expected ManaCost::Cost, got {cost:?}");
++    };
++
++    // CR 601.2f: Cloud Key reduces only spells of the CHOSEN type. With nothing
++    // chosen — and Cultivate being a non-artifact sorcery regardless — the
++    // generic component must stay 2. A reduced value proves the all-`Card`
++    // filter / missing `IsChosenCardType` bug (issue #930).
++    assert_eq!(
++        generic, 2,
++        "Cloud Key must NOT reduce a non-chosen-type spell (issue #930); \
++         got generic={generic}, expected 2"
++    );
++}
++
++/// End-to-end: casting Cloud Key surfaces a `CardType` ETB choice (issue #930
++/// Bug B — the enumerated "choose artifact, creature, enchantment, instant, or
++/// sorcery" must not fall to a `Labeled` choice). After choosing Artifact, an
++/// artifact spell is reduced by {1} while a non-artifact spell is not (Bug A).
++#[test]
++fn cloud_key_reduces_only_the_chosen_card_type_after_etb_choice() {
++    let Some(db) = load_db() else {
++        return;
++    };
++
++    let mut scenario = GameScenario::new();
++    scenario.at_phase(Phase::PreCombatMain);
++    let cloud_key = scenario.add_real_card(P0, "Cloud Key", Zone::Hand, db);
++    let mind_stone = scenario.add_real_card(P0, "Mind Stone", Zone::Hand, db); // {2} artifact
++    let cultivate = scenario.add_real_card(P0, "Cultivate", Zone::Hand, db); // {2}{G} sorcery
++
++    let mut runner = scenario.build();
++    engine::game::rehydrate_game_from_card_db(runner.state_mut(), db);
++
++    // {3} generic to cast Cloud Key.
++    {
++        let pool = &mut runner.state_mut().players[0].mana_pool;
++        for _ in 0..3 {
++            pool.add(ManaUnit::new(
++                ManaType::Colorless,
++                ObjectId(0),
++                false,
++                vec![],
++            ));
++        }
++    }
++
++    let card_id = runner.state().objects[&cloud_key].card_id;
++    runner
++        .act(GameAction::CastSpell {
++            object_id: cloud_key,
++            card_id,
++            targets: vec![],
++        })
++        .expect("Cloud Key cast should succeed");
++    runner.advance_until_stack_empty();
++
++    // Bug B: the ETB choice must surface as a CardType choice keyed to Cloud Key.
++    match &runner.state().waiting_for {
++        WaitingFor::NamedChoice {
++            choice_type,
++            source_id,
++            ..
++        } => {
++            assert!(
++                matches!(choice_type, ChoiceType::CardType),
++                "Cloud Key ETB must be a CardType choice, got {choice_type:?}"
++            );
++            assert_eq!(*source_id, Some(cloud_key));
++        }
++        other => panic!("expected NamedChoice after Cloud Key ETB, got {other:?}"),
++    }
++    runner
++        .act(GameAction::ChooseOption {
++            choice: "Artifact".to_string(),
++        })
++        .expect("ChooseOption(Artifact) must resolve");
++    assert_eq!(
++        runner.state().objects[&cloud_key].chosen_card_type(),
++        Some(CoreType::Artifact),
++        "the chosen card type must persist on Cloud Key"
++    );
++
++    // Bug A: the artifact spell (chosen type) is reduced {2} -> {1}; the
++    // non-artifact spell ({2}{G} Cultivate) is unchanged.
++    let artifact_cost = engine::game::casting::display_spell_cost(runner.state(), P0, mind_stone)
++        .expect("Mind Stone should have a displayable cost");
++    let ManaCost::Cost {
++        generic: art_generic,
++        ..
++    } = artifact_cost
++    else {
++        panic!("expected ManaCost::Cost, got {artifact_cost:?}");
++    };
++    assert_eq!(
++        art_generic, 1,
++        "an artifact spell of the chosen type must be reduced from {{2}} to {{1}}"
++    );
++
++    let other_cost = engine::game::casting::display_spell_cost(runner.state(), P0, cultivate)
++        .expect("Cultivate should have a displayable cost");
++    let ManaCost::Cost {
++        generic: other_generic,
++        ..
++    } = other_cost
++    else {
++        panic!("expected ManaCost::Cost, got {other_cost:?}");
++    };
++    assert_eq!(
++        other_generic, 2,
++        "a non-chosen-type spell must be unchanged"
++    );
++}
+diff --git a/crates/engine/tests/integration/main.rs b/crates/engine/tests/integration/main.rs
+index c0c23afa13..ce628b6413 100644
+--- a/crates/engine/tests/integration/main.rs
++++ b/crates/engine/tests/integration/main.rs
+@@ -16,6 +16,7 @@ mod bracket_signals;
+ mod braids_arisen_nightmare_decline;
+ mod brigid_mana_ability;
+ mod chain_of_smog_copy;
++mod cloud_key_chosen_type_cost;
+ mod coalition_relic_integration;
+ mod council_of_four_nth_per_turn;
+ mod cr_annotations;

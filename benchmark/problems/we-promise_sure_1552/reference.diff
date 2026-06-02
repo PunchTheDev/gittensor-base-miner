@@ -1,0 +1,138 @@
+diff --git a/app/controllers/transactions_controller.rb b/app/controllers/transactions_controller.rb
+index 1d38397b77..fea921ab4e 100644
+--- a/app/controllers/transactions_controller.rb
++++ b/app/controllers/transactions_controller.rb
+@@ -134,6 +134,8 @@ def update
+       @entry.transaction.lock_attr!(:tag_ids) if @entry.transaction.tags.any?
+       @entry.sync_account_later
+ 
++      notes_changed = @entry.saved_change_to_notes?
++
+       # Reload to ensure fresh state for turbo stream rendering
+       @entry.reload
+ 
+@@ -151,9 +153,14 @@ def update
+               partial: "entries/protection_indicator",
+               locals: { entry: @entry, unlock_path: unlock_transaction_path(@entry.transaction) }
+             ),
++            (turbo_stream.replace(
++              dom_id(@entry, :notes),
++              partial: "transactions/notes",
++              locals: { entry: @entry, can_annotate: can_annotate_entry? }
++            ) if params[:entry]&.key?(:notes) && notes_changed),
+             turbo_stream.replace(@entry),
+             *flash_notification_stream_items
+-          ]
++          ].compact
+         end
+       end
+     else
+diff --git a/app/views/transactions/_notes.html.erb b/app/views/transactions/_notes.html.erb
+new file mode 100644
+index 0000000000..2d6114c0b5
+--- /dev/null
++++ b/app/views/transactions/_notes.html.erb
+@@ -0,0 +1,13 @@
++<%# locals: (entry:, can_annotate:) %>
++<%= turbo_frame_tag dom_id(entry, :notes) do %>
++  <%= styled_form_with model: entry,
++        url: transaction_path(entry),
++        data: { controller: "auto-submit-form" } do |f| %>
++    <%= f.text_area :notes,
++            label: t("transactions.show.note_label"),
++            placeholder: t("transactions.show.note_placeholder"),
++            rows: 5,
++            disabled: !can_annotate,
++            "data-auto-submit-form-target": "auto" %>
++  <% end %>
++<% end %>
+diff --git a/app/views/transactions/show.html.erb b/app/views/transactions/show.html.erb
+index 885b7f8669..25aa000591 100644
+--- a/app/views/transactions/show.html.erb
++++ b/app/views/transactions/show.html.erb
+@@ -117,18 +117,13 @@
+                     include_blank: t(".none"),
+                     multiple: true,
+                     label:    t(".tags_label"),
+-                    disabled: @entry.split_child? || !can_annotate_entry?
++                    disabled: !can_annotate_entry?
+                   },
+                   { "data-controller": "multi-select", "data-auto-submit-form-target": "auto" } %>
+           <% end %>
+         <% end %>
+-        <%= f.text_area :notes,
+-                label: t(".note_label"),
+-                placeholder: t(".note_placeholder"),
+-                rows: 5,
+-                disabled: @entry.split_child? || !can_annotate_entry?,
+-                "data-auto-submit-form-target": "auto" %>
+       <% end %>
++      <%= render "transactions/notes", entry: @entry, can_annotate: can_annotate_entry? %>
+     <% end %>
+ 
+     <% dialog.with_section(title: t(".attachments")) do %>
+diff --git a/test/controllers/transactions_controller_test.rb b/test/controllers/transactions_controller_test.rb
+index 546f58be01..a6c2e2a050 100644
+--- a/test/controllers/transactions_controller_test.rb
++++ b/test/controllers/transactions_controller_test.rb
+@@ -20,7 +20,7 @@ class TransactionsControllerTest < ActionDispatch::IntegrationTest
+           nature: "inflow",
+           entryable_type: @entry.entryable_type,
+           entryable_attributes: {
+-            tag_ids: [ Tag.first.id, Tag.second.id ],
++            tag_ids: [ tags(:one).id, tags(:two).id ],
+             category_id: Category.first.id,
+             merchant_id: Merchant.first.id
+           }
+@@ -49,7 +49,7 @@ class TransactionsControllerTest < ActionDispatch::IntegrationTest
+           excluded: false,
+           entryable_attributes: {
+             id: @entry.entryable_id,
+-            tag_ids: [ Tag.first.id, Tag.second.id ],
++            tag_ids: [ tags(:one).id, tags(:two).id ],
+             category_id: Category.first.id,
+             merchant_id: Merchant.first.id
+           }
+@@ -63,7 +63,7 @@ class TransactionsControllerTest < ActionDispatch::IntegrationTest
+     assert_equal Date.current, @entry.date
+     assert_equal "USD", @entry.currency
+     assert_equal -100, @entry.amount
+-    assert_equal [ Tag.first.id, Tag.second.id ], @entry.entryable.tag_ids.sort
++    assert_equal [ tags(:one).id, tags(:two).id ].sort, @entry.entryable.tag_ids.sort
+     assert_equal Category.first.id, @entry.entryable.category_id
+     assert_equal Merchant.first.id, @entry.entryable.merchant_id
+     assert_equal "test notes", @entry.notes
+@@ -96,6 +96,33 @@ class TransactionsControllerTest < ActionDispatch::IntegrationTest
+     assert_dom "#total-transactions", count: 1, text: "1"
+   end
+ 
++  test "can update notes on split child transaction" do
++    parent = create_transaction(account: accounts(:depository), amount: 100)
++    parent.split!([ { name: "Part 1", amount: 60, category_id: nil }, { name: "Part 2", amount: 40, category_id: nil } ])
++    child = parent.child_entries.first
++
++    patch transaction_url(child), params: {
++      entry: { notes: "split child note", entryable_attributes: { id: child.entryable_id } }
++    }
++
++    assert_response :redirect
++    assert_equal "split child note", child.reload.notes
++  end
++
++  test "can update tags on split child transaction" do
++    parent = create_transaction(account: accounts(:depository), amount: 100)
++    parent.split!([ { name: "Part 1", amount: 60, category_id: nil }, { name: "Part 2", amount: 40, category_id: nil } ])
++    child = parent.child_entries.first
++    tag = tags(:one)
++
++    patch transaction_url(child), params: {
++      entry: { entryable_attributes: { id: child.entryable_id, tag_ids: [ tag.id ] } }
++    }
++
++    assert_response :redirect
++    assert_equal [ tag.id ], child.reload.entryable.tag_ids
++  end
++
+   test "split parent rows mark amount as privacy-sensitive" do
+     entry = create_transaction(account: accounts(:depository), amount: 100, name: "Split parent")
+ 

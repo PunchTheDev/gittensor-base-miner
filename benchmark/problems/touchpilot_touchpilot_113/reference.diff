@@ -1,0 +1,481 @@
+diff --git a/app/src/main/java/dev/touchpilot/app/MainActivity.kt b/app/src/main/java/dev/touchpilot/app/MainActivity.kt
+index 66eeac7..f8d1b0d 100644
+--- a/app/src/main/java/dev/touchpilot/app/MainActivity.kt
++++ b/app/src/main/java/dev/touchpilot/app/MainActivity.kt
+@@ -959,6 +959,23 @@ class MainActivity : Activity() {
+             }.apply { id = R.id.wait_for_text_button }
+         )
+ 
++        contentRoot.addView(
++            secondaryButton("Wait For Idle") {
++                Thread {
++                    val result = toolExecutor.execute(
++                        "wait_for_idle",
++                        emptyMap(),
++                        ToolSource.DIRECT_DEBUG
++                    )
++                    runOnUiThread {
++                        outputText = SensitiveTextRedactor.redact("wait_for_idle -> ${result.ok}: ${result.message}")
++                        refreshExecutionLog()
++                        showSection(Section.TOOLS)
++                    }
++                }.start()
++            }.apply { id = R.id.wait_for_idle_button }
++        )
++
+         contentRoot.addView(latestResultCard())
+ 
+         // Tail spacer so the Focus / Dismiss row can scroll above the soft
+diff --git a/app/src/main/java/dev/touchpilot/app/tools/AndroidToolExecutor.kt b/app/src/main/java/dev/touchpilot/app/tools/AndroidToolExecutor.kt
+index d8f0939..d57b201 100644
+--- a/app/src/main/java/dev/touchpilot/app/tools/AndroidToolExecutor.kt
++++ b/app/src/main/java/dev/touchpilot/app/tools/AndroidToolExecutor.kt
+@@ -177,6 +177,9 @@ class AndroidToolExecutor(
+                 record(name, "text=\"$text\", timeout_ms=$timeout", ok, "waitForText")
+                 ToolResult(ok, "waitForText")
+             }
++            "wait_for_idle" -> {
++                executeWaitForIdle(args)
++            }
+             "wait_for_app" -> {
+                 executeWaitForApp(args)
+             }
+@@ -223,6 +226,22 @@ class AndroidToolExecutor(
+         }
+     }
+ 
++    private fun executeWaitForIdle(args: Map<String, String>): ToolResult {
++        val result = WaitForIdle.waitUntilIdle(
++            args = args,
++            observe = { AccessibilityBridge.observeScreenContext() },
++            sleeper = sleeper
++        )
++        record(
++            "wait_for_idle",
++            "stable_ms=${WaitForIdle.stableMs(args)}, timeout_ms=${WaitForIdle.timeoutMs(args)}, " +
++                "include_bounds=${WaitForIdle.includeBounds(args)}",
++            result.ok,
++            result.message
++        )
++        return result
++    }
++
+     private fun executeWaitForApp(args: Map<String, String>): ToolResult {
+         val timeout = WaitForApp.timeoutMs(args)
+         val deadline = System.currentTimeMillis() + timeout
+diff --git a/app/src/main/java/dev/touchpilot/app/tools/RetryPolicy.kt b/app/src/main/java/dev/touchpilot/app/tools/RetryPolicy.kt
+index 59634cd..d8f6882 100644
+--- a/app/src/main/java/dev/touchpilot/app/tools/RetryPolicy.kt
++++ b/app/src/main/java/dev/touchpilot/app/tools/RetryPolicy.kt
+@@ -92,6 +92,7 @@ class AndroidToolRetryPolicy(
+                 "press_back" to action,
+                 "press_home" to action,
+                 "wait_for_ui" to action.copy(waitForIdleAfterSuccess = false),
++                "wait_for_idle" to ToolRetryConfig(maxAttempts = 1, retryable = false),
+                 "wait_for_app" to ToolRetryConfig(maxAttempts = 1, retryable = false),
+                 "focus_input" to action,
+                 "get_foreground_app" to ToolRetryConfig(maxAttempts = 1, retryable = false),
+diff --git a/app/src/main/java/dev/touchpilot/app/tools/ToolModels.kt b/app/src/main/java/dev/touchpilot/app/tools/ToolModels.kt
+index 7d6a9cd..6d0c575 100644
+--- a/app/src/main/java/dev/touchpilot/app/tools/ToolModels.kt
++++ b/app/src/main/java/dev/touchpilot/app/tools/ToolModels.kt
+@@ -100,6 +100,17 @@ object AndroidToolCatalog {
+             ),
+             requiredArguments = setOf("text")
+         ),
++        ToolSpec(
++            name = "wait_for_idle",
++            description = "Wait until the redacted screen context remains stable for a bounded window.",
++            risk = ToolRisk.LOW,
++            arguments = mapOf(
++                WaitForIdle.StableArg to "Milliseconds the screen context must remain stable.",
++                WaitForIdle.TimeoutArg to "Maximum wait time in milliseconds.",
++                WaitForIdle.IncludeBoundsArg to "true if bounds changes should count as instability."
++            ),
++            requiredArguments = emptySet()
++        ),
+         ToolSpec(
+             name = "wait_for_app",
+             description = "Wait until a package name or launcher label becomes the foreground app.",
+@@ -199,6 +210,10 @@ object AndroidToolCatalog {
+             }
+         }
+ 
++        if (name == "wait_for_idle") {
++            return WaitForIdle.validate(args)
++        }
++
+         if (name == "clear_text") {
+             val selectors = ClearTextTarget.selectorArgs.filter { args[it].isNullOrBlank().not() }
+             if (selectors.size > 1) {
+diff --git a/app/src/main/java/dev/touchpilot/app/tools/ToolVerification.kt b/app/src/main/java/dev/touchpilot/app/tools/ToolVerification.kt
+index f7023e1..065a178 100644
+--- a/app/src/main/java/dev/touchpilot/app/tools/ToolVerification.kt
++++ b/app/src/main/java/dev/touchpilot/app/tools/ToolVerification.kt
+@@ -27,6 +27,13 @@ class ToolVerifier {
+             "press_back" -> verifyChangedOrFocused(before, after, "press_back")
+             "press_home" -> verifyHome(after)
+             "wait_for_ui" -> verifyWaitForUi(args, after)
++            "wait_for_idle" -> ToolVerificationResult.Passed(
++                reason = "screen context stayed stable for requested idle window",
++                data = mapOf(
++                    "stable_ms" to (result.data["stable_ms"] ?: ""),
++                    "required_stable_ms" to (result.data["required_stable_ms"] ?: ""),
++                )
++            )
+             "wait_for_app" -> ToolVerificationResult.Passed(
+                 reason = "foreground app matched requested target",
+                 data = mapOf(
+diff --git a/app/src/main/java/dev/touchpilot/app/tools/WaitForIdle.kt b/app/src/main/java/dev/touchpilot/app/tools/WaitForIdle.kt
+new file mode 100644
+index 0000000..ee71229
+--- /dev/null
++++ b/app/src/main/java/dev/touchpilot/app/tools/WaitForIdle.kt
+@@ -0,0 +1,125 @@
++package dev.touchpilot.app.tools
++
++import dev.touchpilot.app.screen.NodeBounds
++import dev.touchpilot.app.screen.ScreenContext
++
++object WaitForIdle {
++    const val StableArg = "stable_ms"
++    const val TimeoutArg = "timeout_ms"
++    const val IncludeBoundsArg = "include_bounds"
++
++    const val DefaultStableMs = 500L
++    const val DefaultTimeoutMs = 5_000L
++    const val MinStableMs = 0L
++    const val MaxStableMs = 5_000L
++    const val MinTimeoutMs = 100L
++    const val MaxTimeoutMs = 15_000L
++    const val PollIntervalMs = 100L
++
++    fun stableMs(args: Map<String, String>): Long {
++        return args[StableArg]?.toLongOrNull() ?: DefaultStableMs
++    }
++
++    fun timeoutMs(args: Map<String, String>): Long {
++        return args[TimeoutArg]?.toLongOrNull() ?: DefaultTimeoutMs
++    }
++
++    fun includeBounds(args: Map<String, String>): Boolean {
++        return args[IncludeBoundsArg]?.toBooleanStrictOrNull() ?: false
++    }
++
++    fun validate(args: Map<String, String>): String? {
++        val stable = args[StableArg]?.toLongOrNull()
++        if (args[StableArg] != null && stable == null) return "$StableArg must be a number"
++        if (stable != null && stable !in MinStableMs..MaxStableMs) {
++            return "$StableArg must be between $MinStableMs and $MaxStableMs"
++        }
++
++        val timeout = args[TimeoutArg]?.toLongOrNull()
++        if (args[TimeoutArg] != null && timeout == null) return "$TimeoutArg must be a number"
++        if (timeout != null && timeout !in MinTimeoutMs..MaxTimeoutMs) {
++            return "$TimeoutArg must be between $MinTimeoutMs and $MaxTimeoutMs"
++        }
++
++        val includeBounds = args[IncludeBoundsArg]
++        if (includeBounds != null && includeBounds.toBooleanStrictOrNull() == null) {
++            return "$IncludeBoundsArg must be true or false"
++        }
++
++        val effectiveStable = stable ?: DefaultStableMs
++        val effectiveTimeout = timeout ?: DefaultTimeoutMs
++        if (effectiveStable > effectiveTimeout) {
++            return "$StableArg must not exceed $TimeoutArg"
++        }
++
++        return null
++    }
++
++    fun waitUntilIdle(
++        args: Map<String, String>,
++        observe: () -> ScreenContext,
++        nowMs: () -> Long = { System.currentTimeMillis() },
++        sleeper: (Long) -> Unit = { Thread.sleep(it) }
++    ): ToolResult {
++        val stableMs = stableMs(args)
++        val timeoutMs = timeoutMs(args)
++        val includeBounds = includeBounds(args)
++        val startedAt = nowMs()
++        val deadline = startedAt + timeoutMs
++        var sampleCount = 1
++        var lastSignature = signature(observe(), includeBounds)
++        var stableSince = startedAt
++
++        while (nowMs() <= deadline) {
++            val elapsedStableMs = nowMs() - stableSince
++            if (elapsedStableMs >= stableMs) {
++                return ToolResult(
++                    ok = true,
++                    message = "waitForIdle",
++                    data = mapOf(
++                        "stable_ms" to elapsedStableMs.toString(),
++                        "required_stable_ms" to stableMs.toString(),
++                        "timeout_ms" to timeoutMs.toString(),
++                        "include_bounds" to includeBounds.toString(),
++                        "sample_count" to sampleCount.toString(),
++                    )
++                )
++            }
++
++            val remainingMs = deadline - nowMs()
++            if (remainingMs <= 0L) break
++            sleeper(minOf(PollIntervalMs, remainingMs))
++
++            val now = nowMs()
++            val currentSignature = signature(observe(), includeBounds)
++            sampleCount += 1
++            if (currentSignature != lastSignature) {
++                lastSignature = currentSignature
++                stableSince = now
++            }
++        }
++
++        val observedMs = maxOf(0L, nowMs() - stableSince)
++        return ToolResult(
++            ok = false,
++            message = "Timed out waiting for idle screen: stable_ms=$stableMs, timeout_ms=$timeoutMs",
++            data = mapOf(
++                "timed_out" to "true",
++                "stable_ms" to observedMs.toString(),
++                "required_stable_ms" to stableMs.toString(),
++                "timeout_ms" to timeoutMs.toString(),
++                "include_bounds" to includeBounds.toString(),
++                "sample_count" to sampleCount.toString(),
++            )
++        )
++    }
++
++    internal fun signature(context: ScreenContext, includeBounds: Boolean): String {
++        val comparable = if (includeBounds) {
++            context
++        } else {
++            context.copy(nodes = context.nodes.map { it.copy(bounds = NodeBounds.Unknown) })
++        }
++        return comparable.toRedactedJson()
++    }
++}
+diff --git a/app/src/main/res/values/ids.xml b/app/src/main/res/values/ids.xml
+index 4c57ba5..587e195 100644
+--- a/app/src/main/res/values/ids.xml
++++ b/app/src/main/res/values/ids.xml
+@@ -19,6 +19,7 @@
+     <item name="scroll_up_button" type="id" />
+     <item name="wait_for_text_input" type="id" />
+     <item name="wait_for_text_button" type="id" />
++    <item name="wait_for_idle_button" type="id" />
+     <item name="focus_input_input" type="id" />
+     <item name="focus_input_button" type="id" />
+     <item name="clear_text_button" type="id" />
+diff --git a/app/src/test/java/dev/touchpilot/app/tools/WaitForIdleTest.kt b/app/src/test/java/dev/touchpilot/app/tools/WaitForIdleTest.kt
+new file mode 100644
+index 0000000..d7a4c08
+--- /dev/null
++++ b/app/src/test/java/dev/touchpilot/app/tools/WaitForIdleTest.kt
+@@ -0,0 +1,148 @@
++package dev.touchpilot.app.tools
++
++import dev.touchpilot.app.screen.NodeBounds
++import dev.touchpilot.app.screen.NodeRole
++import dev.touchpilot.app.screen.ScreenContext
++import dev.touchpilot.app.screen.ScreenNode
++import dev.touchpilot.app.screen.ScreenText
++import kotlin.test.Test
++import kotlin.test.assertEquals
++import kotlin.test.assertFalse
++import kotlin.test.assertNotEquals
++import kotlin.test.assertNotNull
++import kotlin.test.assertNull
++import kotlin.test.assertTrue
++
++class WaitForIdleTest {
++    @Test
++    fun waitForIdleIsRegisteredAsLowRiskObservationTool() {
++        val spec = assertNotNull(AndroidToolCatalog.find("wait_for_idle"))
++
++        assertEquals(ToolRisk.LOW, spec.risk)
++        assertEquals(setOf("stable_ms", "timeout_ms", "include_bounds"), spec.arguments.keys)
++        assertTrue(spec.requiredArguments.isEmpty())
++        assertNull(AndroidToolCatalog.validate("wait_for_idle", emptyMap()))
++    }
++
++    @Test
++    fun validateRejectsBadDurationsAndBoolean() {
++        assertEquals(
++            "stable_ms must be a number",
++            AndroidToolCatalog.validate("wait_for_idle", mapOf("stable_ms" to "soon"))
++        )
++        assertEquals(
++            "timeout_ms must be between 100 and 15000",
++            AndroidToolCatalog.validate("wait_for_idle", mapOf("timeout_ms" to "99"))
++        )
++        assertEquals(
++            "include_bounds must be true or false",
++            AndroidToolCatalog.validate("wait_for_idle", mapOf("include_bounds" to "yes"))
++        )
++        assertEquals(
++            "stable_ms must not exceed timeout_ms",
++            AndroidToolCatalog.validate("wait_for_idle", mapOf("stable_ms" to "1000", "timeout_ms" to "500"))
++        )
++    }
++
++    @Test
++    fun succeedsWhenScreenIsAlreadyStableForWindow() {
++        val clock = FakeClock()
++
++        val result = WaitForIdle.waitUntilIdle(
++            args = mapOf("stable_ms" to "200", "timeout_ms" to "1000"),
++            observe = { screen("Settings") },
++            nowMs = { clock.now },
++            sleeper = clock::sleep
++        )
++
++        assertTrue(result.ok)
++        assertEquals("waitForIdle", result.message)
++        assertEquals("200", result.data["stable_ms"])
++        assertEquals("3", result.data["sample_count"])
++    }
++
++    @Test
++    fun resetsStableWindowWhileScreenKeepsChanging() {
++        val clock = FakeClock()
++        val snapshots = mutableListOf(screen("Loading"), screen("Settings"), screen("Settings"), screen("Settings"))
++
++        val result = WaitForIdle.waitUntilIdle(
++            args = mapOf("stable_ms" to "200", "timeout_ms" to "1000"),
++            observe = { snapshots.removeFirstOrNull() ?: screen("Settings") },
++            nowMs = { clock.now },
++            sleeper = clock::sleep
++        )
++
++        assertTrue(result.ok)
++        assertEquals("200", result.data["stable_ms"])
++        assertEquals("4", result.data["sample_count"])
++    }
++
++    @Test
++    fun timesOutWhenScreenNeverStaysStableLongEnough() {
++        val clock = FakeClock()
++        var index = 0
++
++        val result = WaitForIdle.waitUntilIdle(
++            args = mapOf("stable_ms" to "200", "timeout_ms" to "250"),
++            observe = { screen("State ${index++}") },
++            nowMs = { clock.now },
++            sleeper = clock::sleep
++        )
++
++        assertFalse(result.ok)
++        assertEquals("Timed out waiting for idle screen: stable_ms=200, timeout_ms=250", result.message)
++        assertEquals("true", result.data["timed_out"])
++    }
++
++    @Test
++    fun boundsOnlyChangesAreOptionalInstability() {
++        val first = screen("Settings", bounds = NodeBounds(0, 0, 100, 40))
++        val second = screen("Settings", bounds = NodeBounds(0, 2, 100, 42))
++
++        assertEquals(
++            WaitForIdle.signature(first, includeBounds = false),
++            WaitForIdle.signature(second, includeBounds = false)
++        )
++        assertNotEquals(
++            WaitForIdle.signature(first, includeBounds = true),
++            WaitForIdle.signature(second, includeBounds = true)
++        )
++    }
++
++    @Test
++    fun retryPolicyTreatsWaitForIdleAsSingleBoundedWait() {
++        val config = AndroidToolRetryPolicy().configFor("wait_for_idle")
++
++        assertEquals(1, config.maxAttempts)
++        assertFalse(config.retryable)
++        assertFalse(config.waitForIdleAfterSuccess)
++    }
++
++    private fun screen(
++        text: String,
++        bounds: NodeBounds = NodeBounds(0, 0, 100, 40)
++    ): ScreenContext {
++        return ScreenContext(
++            appLabel = "Settings",
++            packageName = "com.android.settings",
++            windowTitle = "Settings",
++            nodes = listOf(
++                ScreenNode(
++                    nodeId = "0",
++                    role = NodeRole.TEXT,
++                    text = ScreenText.of(text),
++                    bounds = bounds,
++                )
++            )
++        )
++    }
++
++    private class FakeClock {
++        var now: Long = 0L
++
++        fun sleep(ms: Long) {
++            now += ms
++        }
++    }
++}
+diff --git a/docs/LIVE_TESTING.md b/docs/LIVE_TESTING.md
+index 823a906..1563883 100644
+--- a/docs/LIVE_TESTING.md
++++ b/docs/LIVE_TESTING.md
+@@ -39,11 +39,15 @@ Launch TouchPilot:
+ - [x] Accessibility status shows connected.
+ - [x] `Observe Current Screen` returns a non-empty UI tree.
+ - [x] `Open App` opens Settings by label.
++- [ ] `Open App` followed by `wait_for_idle` settles after launch.
+ - [ ] `Open App` followed by `wait_for_app({label=Settings})` confirms
+   Settings is foreground before follow-up actions.
+ - [x] `Tap Text` taps a visible target.
++- [ ] `Tap Text` followed by `wait_for_idle` settles after the tap transition.
+ - [x] `Type Into Focused Field` enters text into a focused field.
+ - [x] `Scroll Down` and `Scroll Up` work on a scrollable screen.
++- [ ] `Scroll Down` or `Scroll Up` followed by `wait_for_idle` settles after movement.
++- [ ] Keyboard dismissal followed by `wait_for_idle` settles after IME changes.
+ - [x] `Back` and `Home` work.
+ - [ ] `dismiss_keyboard` hides the soft keyboard when it is visible.
+ - [ ] `dismiss_keyboard` is a no-op when the keyboard is not visible and does
+diff --git a/docs/TOOL_SPEC.md b/docs/TOOL_SPEC.md
+index c793584..45f21ff 100644
+--- a/docs/TOOL_SPEC.md
++++ b/docs/TOOL_SPEC.md
+@@ -26,15 +26,16 @@ Tools are the only way an agent may affect the Android device.
+ - `press_back`: send Android back.
+ - `press_home`: return to launcher.
+ - `wait_for_ui`: wait for a screen change or expected text.
++- `wait_for_idle`: wait until the redacted screen context remains stable.
+ - `wait_for_app`: wait until a package name or launcher label is foreground.
+ - `focus_input`: focus a visible editable input field without typing.
+ - `clear_text`: clear the focused or resolved editable input field.
+ - `dismiss_keyboard`: hide the soft keyboard if it is visible.
+ 
+ The app implements `observe_screen`, `open_app`, `tap`, `type_text`, `scroll`,
+-`press_back`, `press_home`, `wait_for_ui`, `wait_for_app`, `focus_input`,
+-`clear_text`, and `dismiss_keyboard` from the Android Tools screen and the
+-agent command-provider loop.
++`press_back`, `press_home`, `wait_for_ui`, `wait_for_idle`, `wait_for_app`,
++`focus_input`, `clear_text`, and `dismiss_keyboard` from the Android Tools
++screen and the agent command-provider loop.
+ 
+ `dismiss_keyboard` is observation-gated: it inspects the accessibility window
+ list for a `TYPE_INPUT_METHOD` window first. If the keyboard is already hidden,
+@@ -59,6 +60,11 @@ accessibility node. Prefer `node_id` for exact taps after `observe_screen`.
+ Bounds use `left,top,right,bottom` format and are intended as a fallback when a
+ semantic selector is not reliable.
+ 
++`wait_for_idle` accepts optional `stable_ms`, `timeout_ms`, and
++`include_bounds` arguments. By default it waits until the redacted screen
++context is stable for 500 ms, with a 5,000 ms timeout. Timeouts are bounded to
++avoid stuck agent loops.
++
+ Final answers use:
+ 
+ ```json

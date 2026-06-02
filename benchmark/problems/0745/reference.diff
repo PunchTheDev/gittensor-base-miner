@@ -1,0 +1,317 @@
+diff --git a/gittensor/classes.py b/gittensor/classes.py
+index c9194033..d030f1e0 100644
+--- a/gittensor/classes.py
++++ b/gittensor/classes.py
+@@ -305,12 +305,8 @@ def from_graphql_response(cls, pr_data: dict, uid: int, hotkey: str, github_id:
+         last_edited_at = parse_github_timestamp_to_cst(raw_edited_at) if isinstance(raw_edited_at, str) else None
+         merged_at = parse_github_timestamp_to_cst(pr_data['mergedAt']) if is_merged else None
+ 
+-        changes_requested_count = 0
+-        if is_merged:
+-            cr_reviews = pr_data.get('changesRequestedReviews', {}).get('nodes', [])
+-            changes_requested_count = sum(
+-                1 for r in cr_reviews if r.get('authorAssociation') in MAINTAINER_ASSOCIATIONS
+-            )
++        cr_reviews = (pr_data.get('changesRequestedReviews') or {}).get('nodes') or []
++        changes_requested_count = sum(1 for r in cr_reviews if r.get('authorAssociation') in MAINTAINER_ASSOCIATIONS)
+ 
+         current = {(n.get('name') or '').lower() for n in (pr_data.get('labels') or {}).get('nodes') or [] if n}
+         label: Optional[str] = None
+diff --git a/gittensor/constants.py b/gittensor/constants.py
+index 3e4159e3..b2acbadd 100644
+--- a/gittensor/constants.py
++++ b/gittensor/constants.py
+@@ -194,6 +194,7 @@
+ 
+ # PR Review Quality Multiplier
+ REVIEW_PENALTY_RATE = 0.15  # 15% deduction per CHANGES_REQUESTED review from a maintainer
++MAX_OPEN_PR_REVIEW_COLLATERAL_MULTIPLIER = 2.0  # Cap open PR collateral growth from review iterations
+ 
+ # Issue multiplier (flat values, no age scaling)
+ STANDARD_ISSUE_MULTIPLIER = 1.33  # Non-maintainer issue author
+diff --git a/gittensor/validator/oss_contributions/mirror/scored_pr.py b/gittensor/validator/oss_contributions/mirror/scored_pr.py
+index 7977a921..84f5cf55 100644
+--- a/gittensor/validator/oss_contributions/mirror/scored_pr.py
++++ b/gittensor/validator/oss_contributions/mirror/scored_pr.py
+@@ -71,6 +71,12 @@ def repository_full_name(self) -> str:
+         attribute name for duck-typing purposes."""
+         return self.pr.repo_full_name
+ 
++    @property
++    def changes_requested_count(self) -> int:
++        """Alias for the maintainer-only CHANGES_REQUESTED count used by
++        source-agnostic scoring helpers."""
++        return self.pr.review_summary.maintainer_changes_requested_count
++
+     @property
+     def merged_at(self) -> Optional[datetime]:
+         """Alias for ``self.pr.merged_at`` — matches legacy PullRequest attribute
+diff --git a/gittensor/validator/oss_contributions/scoring.py b/gittensor/validator/oss_contributions/scoring.py
+index bc2828c4..2b7586fd 100644
+--- a/gittensor/validator/oss_contributions/scoring.py
++++ b/gittensor/validator/oss_contributions/scoring.py
+@@ -21,6 +21,7 @@
+     MAINTAINER_ASSOCIATIONS,
+     MAINTAINER_ISSUE_MULTIPLIER,
+     MAX_ISSUE_CLOSE_WINDOW_DAYS,
++    MAX_OPEN_PR_REVIEW_COLLATERAL_MULTIPLIER,
+     MAX_OPEN_PR_THRESHOLD,
+     OPEN_PR_COLLATERAL_PERCENT,
+     OPEN_PR_THRESHOLD_TOKEN_SCORE,
+@@ -181,6 +182,26 @@ def calculate_review_quality_multiplier(changes_requested_count: int, pr_number:
+     return multiplier
+ 
+ 
++def calculate_review_collateral_multiplier(changes_requested_count: int, pr_number: Optional[int] = None) -> float:
++    """Calculate the open-PR collateral multiplier from maintainer CHANGES_REQUESTED reviews.
++
++    Unlike ``review_quality_multiplier`` for earned scores, this increases
++    collateral so non-merge-ready open PRs reserve more score instead of less.
++    Formula: min(MAX_OPEN_PR_REVIEW_COLLATERAL_MULTIPLIER, 1.0 + REVIEW_PENALTY_RATE × N)
++    """
++    multiplier = min(
++        MAX_OPEN_PR_REVIEW_COLLATERAL_MULTIPLIER,
++        1.0 + REVIEW_PENALTY_RATE * changes_requested_count,
++    )
++    if changes_requested_count > 0:
++        ctx = f' (PR #{pr_number})' if pr_number else ''
++        bt.logging.info(
++            f'{changes_requested_count} maintainer CHANGES_REQUESTED review(s){ctx} → '
++            f'review_collateral_multiplier={multiplier:.2f}'
++        )
++    return multiplier
++
++
+ def calculate_pr_multipliers(
+     pr: PullRequest, miner_eval: MinerEvaluation, master_repositories: Dict[str, RepositoryConfig]
+ ) -> None:
+@@ -495,7 +516,7 @@ def calculate_open_pr_collateral_score(
+ 
+     Collateral = base_score * applicable_multipliers * OPEN_PR_COLLATERAL_PERCENT
+ 
+-    Applicable multipliers: repo_weight, issue, label
++    Applicable multipliers: repo_weight, issue, label, review_collateral
+     NOT applicable: time_decay (merge-based), credibility_multiplier (merge-based),
+                     open_pr_spam (not for collateral)
+     """
+@@ -505,6 +526,7 @@ def calculate_open_pr_collateral_score(
+         'repo_weight': pr.repo_weight_multiplier,
+         'issue': pr.issue_multiplier,
+         'label': pr.label_multiplier,
++        'review_collateral': calculate_review_collateral_multiplier(pr.changes_requested_count, pr.number),
+     }
+ 
+     potential_score = pr.base_score * prod(multipliers.values())
+diff --git a/tests/validator/oss_contributions/mirror/test_scoring.py b/tests/validator/oss_contributions/mirror/test_scoring.py
+index 38648e30..00d78420 100644
+--- a/tests/validator/oss_contributions/mirror/test_scoring.py
++++ b/tests/validator/oss_contributions/mirror/test_scoring.py
+@@ -57,6 +57,7 @@ def _pr(
+     head_repo_full_name: str | None = 'entrius/gittensor-ui',
+     default_branch: str | None = 'main',
+     approved_count: int = 1,
++    maintainer_changes_requested_count: int = 0,
+     labels: list | None = None,
+     linked_issues: list | None = None,
+ ) -> MirrorPullRequest:
+@@ -89,7 +90,7 @@ def _pr(
+             'commits_count': 1,
+             'scoring_data_stored': True,
+             'review_summary': {
+-                'maintainer_changes_requested_count': 0,
++                'maintainer_changes_requested_count': maintainer_changes_requested_count,
+                 'changes_requested_count': 0,
+                 'approved_count': approved_count,
+                 'commented_count': 0,
+@@ -666,6 +667,25 @@ def test_open_pr_skips_merge_only_gates(self):
+         # The issue with state=OPEN/state_reason=None should still pass for an OPEN PR
+         assert _is_valid_linked_issue(li, scored.pr) is True
+ 
++    def test_open_mirror_pr_review_iterations_increase_collateral(self):
++        from gittensor.validator.oss_contributions.scoring import calculate_open_pr_collateral_score
++
++        clean = ScoredMirrorPR(pr=_pr(state='OPEN', maintainer_changes_requested_count=0))
++        clean.base_score = 100.0
++        clean.repo_weight_multiplier = 1.0
++        clean.issue_multiplier = 1.0
++        clean.label_multiplier = 1.0
++
++        reviewed = ScoredMirrorPR(pr=_pr(state='OPEN', maintainer_changes_requested_count=3))
++        reviewed.base_score = 100.0
++        reviewed.repo_weight_multiplier = 1.0
++        reviewed.issue_multiplier = 1.0
++        reviewed.label_multiplier = 1.0
++
++        assert calculate_open_pr_collateral_score(reviewed) == pytest.approx(
++            calculate_open_pr_collateral_score(clean) * 1.45
++        )
++
+ 
+ # ============================================================================
+ # Multiplier composition (smoke test that all multipliers populate)
+@@ -696,7 +716,7 @@ def test_open_pr_only_neutral_multipliers(self):
+         _calculate_pr_multipliers(scored, _config(weight=0.5))
+ 
+         assert scored.repo_weight_multiplier == 0.5
+-        # Time decay / review quality / credibility are merge-only — kept neutral here
++        # Time decay / review quality / credibility are merge-only — kept neutral here.
+         assert scored.time_decay_multiplier == 1.0
+         assert scored.credibility_multiplier == 1.0
+         assert scored.review_quality_multiplier == 1.0
+diff --git a/tests/validator/test_review_quality_multiplier.py b/tests/validator/test_review_quality_multiplier.py
+index cd5ba4d7..43d89b9e 100644
+--- a/tests/validator/test_review_quality_multiplier.py
++++ b/tests/validator/test_review_quality_multiplier.py
+@@ -14,10 +14,20 @@
+ 
+ import pytest
+ 
+-from gittensor.classes import PRState, PullRequest
+-from gittensor.constants import REVIEW_PENALTY_RATE
++from gittensor.classes import MinerEvaluation, PRState, PullRequest
++from gittensor.constants import (
++    MAX_OPEN_PR_REVIEW_COLLATERAL_MULTIPLIER,
++    OPEN_PR_COLLATERAL_PERCENT,
++    REVIEW_PENALTY_RATE,
++)
+ from gittensor.utils.github_api_tools import _MAX_CHANGES_REQUESTED_REVIEWS
+-from gittensor.validator.oss_contributions.scoring import calculate_review_quality_multiplier
++from gittensor.validator.oss_contributions.scoring import (
++    calculate_open_pr_collateral_score,
++    calculate_pr_multipliers,
++    calculate_review_collateral_multiplier,
++    calculate_review_quality_multiplier,
++)
++from gittensor.validator.utils.load_weights import RepositoryConfig
+ from tests.validator.conftest import PRBuilder
+ 
+ # ============================================================================
+@@ -74,6 +84,30 @@ def test_returns_float(self):
+         assert isinstance(calculate_review_quality_multiplier(0), float)
+ 
+ 
++class TestCalculateReviewCollateralMultiplier:
++    """Tests for the collateral-only review multiplier for OPEN PRs."""
++
++    def test_no_reviews_returns_one(self):
++        assert calculate_review_collateral_multiplier(0) == 1.0
++
++    def test_one_review_increases_collateral_multiplier(self):
++        assert calculate_review_collateral_multiplier(1) == pytest.approx(1.0 + REVIEW_PENALTY_RATE)
++
++    def test_table_values(self):
++        expected = {
++            0: 1.00,
++            1: 1.15,
++            2: 1.30,
++            3: 1.45,
++        }
++        for n, mult in expected.items():
++            assert calculate_review_collateral_multiplier(n) == pytest.approx(mult, abs=1e-9), f'n={n}'
++
++    def test_caps_at_two(self):
++        assert calculate_review_collateral_multiplier(7) == pytest.approx(2.0)
++        assert calculate_review_collateral_multiplier(100) == pytest.approx(2.0)
++
++
+ # ============================================================================
+ # TestReviewQualityMultiplierOnPullRequest
+ # ============================================================================
+@@ -171,17 +205,90 @@ def test_merged_pr_counts_only_maintainer_reviews(self):
+         pr = PullRequest.from_graphql_response(pr_data, uid=1, hotkey='hk', github_id='123')
+         assert pr.changes_requested_count == 2
+ 
+-    def test_non_merged_pr_does_not_parse_reviews(self):
+-        pr_data = _make_graphql_pr('OPEN', [{'authorAssociation': 'OWNER'}])
++    def test_open_pr_also_counts_maintainer_reviews(self):
++        pr_data = _make_graphql_pr(
++            'OPEN',
++            [
++                {'authorAssociation': 'OWNER'},
++                {'authorAssociation': 'CONTRIBUTOR'},
++                {'authorAssociation': 'MEMBER'},
++            ],
++        )
+         pr = PullRequest.from_graphql_response(pr_data, uid=1, hotkey='hk', github_id='123')
+-        assert pr.changes_requested_count == 0
++        assert pr.changes_requested_count == 2
++
++
++class TestReviewCollateralMultiplierOnOpenPRCollateral:
++    def _prepare_open_pr(self, builder):
++        pr = builder.create(state=PRState.OPEN)
++        pr.base_score = 100.0
++        pr.repo_weight_multiplier = 1.0
++        pr.issue_multiplier = 1.0
++        pr.label_multiplier = 1.0
++        pr.changes_requested_count = 0
++        return pr
++
++    def test_clean_open_pr_collateral_unchanged(self, builder):
++        pr = self._prepare_open_pr(builder)
++        baseline = calculate_open_pr_collateral_score(pr)
++        pr.changes_requested_count = 0
++        assert calculate_open_pr_collateral_score(pr) == pytest.approx(baseline)
++
++    def test_open_pr_with_changes_requested_increases_collateral(self, builder):
++        pr = self._prepare_open_pr(builder)
++        baseline = calculate_open_pr_collateral_score(pr)
++        pr.changes_requested_count = 3
++        adjusted = calculate_open_pr_collateral_score(pr)
++        assert adjusted == pytest.approx(baseline * 1.45)
++
++    def test_open_pr_review_collateral_multiplier_caps_at_two(self, builder):
++        pr = self._prepare_open_pr(builder)
++        baseline = calculate_open_pr_collateral_score(pr)
++        pr.changes_requested_count = 100
++        assert calculate_open_pr_collateral_score(pr) == pytest.approx(baseline * 2.0)
++
++
++def _make_repo_config() -> dict:
++    return {'test/repo': RepositoryConfig(weight=1.0)}
++
++
++def _make_eval() -> MinerEvaluation:
++    return MinerEvaluation(uid=0, hotkey='hk', github_id='1')
++
++
++class TestReviewCollateralThroughScoringPipeline:
++    def test_open_pr_collateral_uses_collateral_review_multiplier(self, builder):
++        pr = builder.create(state=PRState.OPEN, repo='test/repo')
++        pr.base_score = 80.0
++        pr.label = 'fix'
++        pr.changes_requested_count = 3
++
++        calculate_pr_multipliers(pr, _make_eval(), _make_repo_config())
++
++        assert pr.label_multiplier == pytest.approx(1.25)
++
++        collateral_projection = (
++            pr.base_score
++            * pr.repo_weight_multiplier
++            * pr.issue_multiplier
++            * pr.label_multiplier
++            * calculate_review_collateral_multiplier(pr.changes_requested_count)
++        )
++        expected_collateral = collateral_projection * OPEN_PR_COLLATERAL_PERCENT
++
++        assert calculate_open_pr_collateral_score(pr) == pytest.approx(expected_collateral)
++
+ 
++def test_max_changes_requested_reviews_covers_review_multipliers():
++    # Tripwire: the GraphQL fetch cap must stay aligned with every review-count-based multiplier.
++    penalty_cap = ceil(1 / REVIEW_PENALTY_RATE)
++    collateral_cap = ceil((MAX_OPEN_PR_REVIEW_COLLATERAL_MULTIPLIER - 1.0) / REVIEW_PENALTY_RATE)
+ 
+-def test_max_changes_requested_reviews_matches_penalty_rate():
+-    # Tripwire: the GraphQL fetch cap must stay aligned with REVIEW_PENALTY_RATE so that any
+-    # review beyond the cap is already forced to a 0.0 multiplier by calculate_review_quality_multiplier
+-    assert _MAX_CHANGES_REQUESTED_REVIEWS == ceil(1 / REVIEW_PENALTY_RATE)
++    assert _MAX_CHANGES_REQUESTED_REVIEWS == max(penalty_cap, collateral_cap)
+     assert calculate_review_quality_multiplier(_MAX_CHANGES_REQUESTED_REVIEWS) == 0.0
++    assert calculate_review_collateral_multiplier(_MAX_CHANGES_REQUESTED_REVIEWS) == pytest.approx(
++        MAX_OPEN_PR_REVIEW_COLLATERAL_MULTIPLIER
++    )
+ 
+ 
+ if __name__ == '__main__':

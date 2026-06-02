@@ -1,0 +1,430 @@
+diff --git a/app/src/main/java/dev/touchpilot/app/MainActivity.kt b/app/src/main/java/dev/touchpilot/app/MainActivity.kt
+index 8bffe7a..340afdf 100644
+--- a/app/src/main/java/dev/touchpilot/app/MainActivity.kt
++++ b/app/src/main/java/dev/touchpilot/app/MainActivity.kt
+@@ -638,6 +638,13 @@ class MainActivity : Activity() {
+             }.apply { id = R.id.observe_screen_button }
+         )
+ 
++        contentRoot.addView(
++            secondaryButton("Get Foreground App") {
++                executeAndRender("get_foreground_app", emptyMap())
++                showSection(Section.TOOLS)
++            }.apply { id = R.id.get_foreground_app_button }
++        )
++
+         val appInput = editText("App package or launcher label").apply { id = R.id.open_app_input }
+         contentRoot.addView(appInput)
+         contentRoot.addView(
+diff --git a/app/src/main/java/dev/touchpilot/app/androidcontrol/AccessibilityBridge.kt b/app/src/main/java/dev/touchpilot/app/androidcontrol/AccessibilityBridge.kt
+index be09d92..d9c499d 100644
+--- a/app/src/main/java/dev/touchpilot/app/androidcontrol/AccessibilityBridge.kt
++++ b/app/src/main/java/dev/touchpilot/app/androidcontrol/AccessibilityBridge.kt
+@@ -28,6 +28,10 @@ object AccessibilityBridge {
+         return service?.observeScreenContext() ?: ScreenContext.Empty
+     }
+ 
++    fun getForegroundApp(): ForegroundAppInfo {
++        return service?.getForegroundApp() ?: ForegroundAppInfo.Disconnected
++    }
++
+     fun tapByText(text: String): Boolean {
+         if (text.isBlank()) return false
+         return service?.tapByText(text) ?: false
+diff --git a/app/src/main/java/dev/touchpilot/app/androidcontrol/ForegroundAppInfo.kt b/app/src/main/java/dev/touchpilot/app/androidcontrol/ForegroundAppInfo.kt
+new file mode 100644
+index 0000000..069227f
+--- /dev/null
++++ b/app/src/main/java/dev/touchpilot/app/androidcontrol/ForegroundAppInfo.kt
+@@ -0,0 +1,76 @@
++package dev.touchpilot.app.androidcontrol
++
++import org.json.JSONObject
++
++/**
++ * Snapshot of the foreground Android app, returned by the
++ * `get_foreground_app` tool (issue #87). All fields are nullable because
++ * Android does not always expose them — for example `windowTitle` is often
++ * empty on launcher screens, and `activityClass` is only populated when the
++ * Accessibility service has observed a `TYPE_WINDOW_STATE_CHANGED` event from
++ * the current window.
++ *
++ * The struct is the stable verification signal that the agent runner and
++ * future post-action verifier (#86) consume; downstream code should depend on
++ * this shape, not on raw `AccessibilityNodeInfo` calls.
++ */
++data class ForegroundAppInfo(
++    val packageName: String? = null,
++    val appLabel: String? = null,
++    val windowTitle: String? = null,
++    val activityClass: String? = null,
++    val accessibilityConnected: Boolean = false
++) {
++    /**
++     * True when the snapshot carries at least one identifying signal beyond
++     * the connection bit. Useful for callers that want to distinguish a
++     * "service attached but no foreground info available" case from a real
++     * foreground reading.
++     */
++    val hasContent: Boolean
++        get() = !packageName.isNullOrBlank() ||
++            !appLabel.isNullOrBlank() ||
++            !windowTitle.isNullOrBlank() ||
++            !activityClass.isNullOrBlank()
++
++    fun toJson(): JSONObject {
++        return JSONObject().apply {
++            putOrNull("packageName", packageName)
++            putOrNull("appLabel", appLabel)
++            putOrNull("windowTitle", windowTitle)
++            putOrNull("activityClass", activityClass)
++            put("accessibilityConnected", accessibilityConnected)
++        }
++    }
++
++    private fun JSONObject.putOrNull(key: String, value: String?) {
++        if (value.isNullOrBlank()) put(key, JSONObject.NULL) else put(key, value)
++    }
++
++    /**
++     * Compact one-line summary suitable for the tool result's `message`
++     * field and the action log. Avoids dumping the whole struct so logs stay
++     * short and free of sensitive window titles.
++     */
++    fun summarize(): String {
++        if (!accessibilityConnected) {
++            return "TouchPilot Accessibility service is not connected."
++        }
++        if (!hasContent) {
++            return "Foreground app is unknown."
++        }
++        val identity = appLabel?.takeIf { it.isNotBlank() }
++            ?: packageName?.takeIf { it.isNotBlank() }
++            ?: "current app"
++        val window = windowTitle?.takeIf { it.isNotBlank() }
++        return if (window != null && window != identity) {
++            "Foreground: $identity ($window)"
++        } else {
++            "Foreground: $identity"
++        }
++    }
++
++    companion object {
++        val Disconnected: ForegroundAppInfo = ForegroundAppInfo(accessibilityConnected = false)
++    }
++}
+diff --git a/app/src/main/java/dev/touchpilot/app/androidcontrol/TouchPilotAccessibilityService.kt b/app/src/main/java/dev/touchpilot/app/androidcontrol/TouchPilotAccessibilityService.kt
+index b90a54b..de7a050 100644
+--- a/app/src/main/java/dev/touchpilot/app/androidcontrol/TouchPilotAccessibilityService.kt
++++ b/app/src/main/java/dev/touchpilot/app/androidcontrol/TouchPilotAccessibilityService.kt
+@@ -14,6 +14,12 @@ import java.util.concurrent.TimeUnit
+ import java.util.concurrent.atomic.AtomicBoolean
+ 
+ class TouchPilotAccessibilityService : AccessibilityService() {
++    @Volatile
++    private var lastWindowPackage: String? = null
++
++    @Volatile
++    private var lastWindowActivity: String? = null
++
+     override fun onServiceConnected() {
+         super.onServiceConnected()
+         AccessibilityBridge.attach(this)
+@@ -25,7 +31,16 @@ class TouchPilotAccessibilityService : AccessibilityService() {
+     }
+ 
+     override fun onAccessibilityEvent(event: AccessibilityEvent?) {
+-        // The first spike is pull-based from the debug screen.
++        if (event == null) return
++        if (event.eventType == AccessibilityEvent.TYPE_WINDOW_STATE_CHANGED) {
++            // package + class on TYPE_WINDOW_STATE_CHANGED reflect the
++            // foreground activity. We cache the class because
++            // rootInActiveWindow alone cannot recover it later.
++            val pkg = event.packageName?.toString()
++            val cls = event.className?.toString()
++            if (!pkg.isNullOrBlank()) lastWindowPackage = pkg
++            if (!cls.isNullOrBlank()) lastWindowActivity = cls
++        }
+     }
+ 
+     override fun onInterrupt() {
+@@ -40,6 +55,33 @@ class TouchPilotAccessibilityService : AccessibilityService() {
+         }
+     }
+ 
++    fun getForegroundApp(): ForegroundAppInfo {
++        val root = rootInActiveWindow
++        val rootPackage = root?.packageName?.toString()
++        val packageName = rootPackage?.takeIf { it.isNotBlank() } ?: lastWindowPackage
++        val windowTitle = root?.window?.title?.toString()?.takeIf { it.isNotBlank() }
++        val activityClass = lastWindowActivity
++            ?.takeIf { it.isNotBlank() }
++            ?.takeIf { lastWindowPackage == null || lastWindowPackage == packageName }
++            ?: root?.className?.toString()?.takeIf { it.isNotBlank() }
++        val appLabel = packageName?.let { loadAppLabel(it) }
++        return ForegroundAppInfo(
++            packageName = packageName,
++            appLabel = appLabel,
++            windowTitle = windowTitle,
++            activityClass = activityClass,
++            accessibilityConnected = true,
++        )
++    }
++
++    private fun loadAppLabel(packageName: String): String? {
++        return runCatching {
++            val pm = applicationContext.packageManager
++            val info = pm.getApplicationInfo(packageName, 0)
++            pm.getApplicationLabel(info).toString().takeIf { it.isNotBlank() }
++        }.getOrNull()
++    }
++
+     fun observeScreenContext(): ScreenContext {
+         val root = rootInActiveWindow ?: return ScreenContext.Empty
+         val snapshot = AccessibilityNodeSnapshotAdapter.from(root)
+diff --git a/app/src/main/java/dev/touchpilot/app/tools/AndroidToolExecutor.kt b/app/src/main/java/dev/touchpilot/app/tools/AndroidToolExecutor.kt
+index eefaf8f..1ffe08b 100644
+--- a/app/src/main/java/dev/touchpilot/app/tools/AndroidToolExecutor.kt
++++ b/app/src/main/java/dev/touchpilot/app/tools/AndroidToolExecutor.kt
+@@ -4,6 +4,7 @@ import android.content.Context
+ import android.content.Intent
+ import android.content.pm.ResolveInfo
+ import dev.touchpilot.app.androidcontrol.AccessibilityBridge
++import dev.touchpilot.app.androidcontrol.ForegroundAppInfo
+ import dev.touchpilot.app.security.DefaultActionPolicy
+ import dev.touchpilot.app.security.PolicyDecision
+ import dev.touchpilot.app.security.SensitiveTextRedactor
+@@ -189,6 +190,21 @@ class AndroidToolExecutor(
+                 record(name, selectorLog, result.ok, result.message)
+                 ToolResult(result.ok, result.message)
+             }
++            "get_foreground_app" -> {
++                val info = AccessibilityBridge.getForegroundApp()
++                val ok = info.accessibilityConnected
++                record(
++                    name,
++                    "package=\"${info.packageName.orEmpty()}\", connected=${info.accessibilityConnected}",
++                    ok,
++                    info.summarize()
++                )
++                ToolResult(
++                    ok = ok,
++                    message = info.summarize(),
++                    data = foregroundAppData(info)
++                )
++            }
+             else -> {
+                 record(name, args.toString(), false, "unhandled tool")
+                 ToolResult(false, "Unhandled tool: $name")
+@@ -391,6 +407,17 @@ class AndroidToolExecutor(
+ 
+     private data class ScrollVerification(val changed: Boolean)
+ 
++    private fun foregroundAppData(info: ForegroundAppInfo): Map<String, String> {
++        return buildMap {
++            put("accessibility_connected", info.accessibilityConnected.toString())
++            info.packageName?.takeIf { it.isNotBlank() }?.let { put("package_name", it) }
++            info.appLabel?.takeIf { it.isNotBlank() }?.let { put("app_label", it) }
++            info.windowTitle?.takeIf { it.isNotBlank() }?.let { put("window_title", it) }
++            info.activityClass?.takeIf { it.isNotBlank() }?.let { put("activity_class", it) }
++            put("json", info.toJson().toString())
++        }
++    }
++
+     private fun typeTextLogArgs(text: String, selector: TargetSelector): String {
+         val label = selector.text?.displaySafe
+             ?: selector.contentDescription?.displaySafe
+diff --git a/app/src/main/java/dev/touchpilot/app/tools/RetryPolicy.kt b/app/src/main/java/dev/touchpilot/app/tools/RetryPolicy.kt
+index 0b0bf0e..8048c09 100644
+--- a/app/src/main/java/dev/touchpilot/app/tools/RetryPolicy.kt
++++ b/app/src/main/java/dev/touchpilot/app/tools/RetryPolicy.kt
+@@ -93,6 +93,7 @@ class AndroidToolRetryPolicy(
+                 "press_home" to action,
+                 "wait_for_ui" to action.copy(waitForIdleAfterSuccess = false),
+                 "focus_input" to action,
++                "get_foreground_app" to ToolRetryConfig(maxAttempts = 1, retryable = false),
+             )
+         }
+     }
+diff --git a/app/src/main/java/dev/touchpilot/app/tools/ToolModels.kt b/app/src/main/java/dev/touchpilot/app/tools/ToolModels.kt
+index 8ea0379..543c5cf 100644
+--- a/app/src/main/java/dev/touchpilot/app/tools/ToolModels.kt
++++ b/app/src/main/java/dev/touchpilot/app/tools/ToolModels.kt
+@@ -110,6 +110,12 @@ object AndroidToolCatalog {
+                 "view_id" to "Resource ID of the view (e.g., dev.example.app:id/search_input)."
+             ),
+             requiredArguments = emptySet()
++        ),
++        ToolSpec(
++            name = "get_foreground_app",
++            description = "Return the foreground app's package, label, window title, and activity for post-action verification.",
++            risk = ToolRisk.LOW,
++            arguments = emptyMap()
+         )
+     )
+ 
+diff --git a/app/src/main/java/dev/touchpilot/app/tools/ToolVerification.kt b/app/src/main/java/dev/touchpilot/app/tools/ToolVerification.kt
+index 5ea8f7d..b5f4bc2 100644
+--- a/app/src/main/java/dev/touchpilot/app/tools/ToolVerification.kt
++++ b/app/src/main/java/dev/touchpilot/app/tools/ToolVerification.kt
+@@ -27,6 +27,13 @@ class ToolVerifier {
+             "press_back" -> verifyChangedOrFocused(before, after, "press_back")
+             "press_home" -> verifyHome(after)
+             "wait_for_ui" -> verifyWaitForUi(args, after)
++            "get_foreground_app" -> ToolVerificationResult.Passed(
++                reason = "foreground app inspection is read-only",
++                data = mapOf(
++                    "accessibility_connected" to (result.data["accessibility_connected"] ?: "false"),
++                    "package_name" to (result.data["package_name"] ?: ""),
++                )
++            )
+             else -> ToolVerificationResult.Skipped("no verifier for $toolName")
+         }
+     }
+diff --git a/app/src/main/res/values/ids.xml b/app/src/main/res/values/ids.xml
+index b96a90a..c8e573e 100644
+--- a/app/src/main/res/values/ids.xml
++++ b/app/src/main/res/values/ids.xml
+@@ -3,6 +3,7 @@
+     <item name="touchpilot_status" type="id" />
+     <item name="open_accessibility_settings_button" type="id" />
+     <item name="observe_screen_button" type="id" />
++    <item name="get_foreground_app_button" type="id" />
+     <item name="open_app_input" type="id" />
+     <item name="open_app_button" type="id" />
+     <item name="tap_text_input" type="id" />
+diff --git a/app/src/test/java/dev/touchpilot/app/androidcontrol/ForegroundAppInfoTest.kt b/app/src/test/java/dev/touchpilot/app/androidcontrol/ForegroundAppInfoTest.kt
+new file mode 100644
+index 0000000..87a1085
+--- /dev/null
++++ b/app/src/test/java/dev/touchpilot/app/androidcontrol/ForegroundAppInfoTest.kt
+@@ -0,0 +1,87 @@
++package dev.touchpilot.app.androidcontrol
++
++import org.json.JSONObject
++import kotlin.test.Test
++import kotlin.test.assertEquals
++import kotlin.test.assertFalse
++import kotlin.test.assertTrue
++
++class ForegroundAppInfoTest {
++    @Test
++    fun disconnectedSummaryFlagsTheServiceState() {
++        val info = ForegroundAppInfo.Disconnected
++        assertFalse(info.accessibilityConnected)
++        assertFalse(info.hasContent)
++        assertEquals("TouchPilot Accessibility service is not connected.", info.summarize())
++    }
++
++    @Test
++    fun connectedButEmptyInfoReportsUnknownForeground() {
++        val info = ForegroundAppInfo(accessibilityConnected = true)
++        assertTrue(info.accessibilityConnected)
++        assertFalse(info.hasContent)
++        assertEquals("Foreground app is unknown.", info.summarize())
++    }
++
++    @Test
++    fun summarizeUsesAppLabelWhenAvailable() {
++        val info = ForegroundAppInfo(
++            packageName = "com.android.settings",
++            appLabel = "Settings",
++            windowTitle = "Settings",
++            accessibilityConnected = true,
++        )
++        assertEquals("Foreground: Settings", info.summarize())
++    }
++
++    @Test
++    fun summarizeAppendsWindowTitleWhenItDiffersFromAppLabel() {
++        val info = ForegroundAppInfo(
++            packageName = "com.android.settings",
++            appLabel = "Settings",
++            windowTitle = "Network & internet",
++            accessibilityConnected = true,
++        )
++        assertEquals("Foreground: Settings (Network & internet)", info.summarize())
++    }
++
++    @Test
++    fun summarizeFallsBackToPackageNameWithoutLabel() {
++        val info = ForegroundAppInfo(
++            packageName = "dev.touchpilot.app",
++            accessibilityConnected = true,
++        )
++        assertEquals("Foreground: dev.touchpilot.app", info.summarize())
++    }
++
++    @Test
++    fun jsonRendersNullForBlankFields() {
++        val info = ForegroundAppInfo(
++            packageName = "com.android.settings",
++            appLabel = "Settings",
++            accessibilityConnected = true,
++        )
++        val json: JSONObject = info.toJson()
++        assertEquals("com.android.settings", json.getString("packageName"))
++        assertEquals("Settings", json.getString("appLabel"))
++        assertTrue(json.isNull("windowTitle"))
++        assertTrue(json.isNull("activityClass"))
++        assertTrue(json.getBoolean("accessibilityConnected"))
++    }
++
++    @Test
++    fun jsonRendersDisconnectedBitWhenNotConnected() {
++        val json = ForegroundAppInfo.Disconnected.toJson()
++        assertFalse(json.getBoolean("accessibilityConnected"))
++        assertTrue(json.isNull("packageName"))
++    }
++
++    @Test
++    fun hasContentDistinguishesEachIdentifyingField() {
++        assertTrue(ForegroundAppInfo(packageName = "pkg").hasContent)
++        assertTrue(ForegroundAppInfo(appLabel = "Label").hasContent)
++        assertTrue(ForegroundAppInfo(windowTitle = "Title").hasContent)
++        assertTrue(ForegroundAppInfo(activityClass = "Class").hasContent)
++        assertFalse(ForegroundAppInfo(packageName = " ").hasContent)
++    }
++}
+diff --git a/app/src/test/java/dev/touchpilot/app/tools/GetForegroundAppCatalogTest.kt b/app/src/test/java/dev/touchpilot/app/tools/GetForegroundAppCatalogTest.kt
+new file mode 100644
+index 0000000..86f8e50
+--- /dev/null
++++ b/app/src/test/java/dev/touchpilot/app/tools/GetForegroundAppCatalogTest.kt
+@@ -0,0 +1,36 @@
++package dev.touchpilot.app.tools
++
++import kotlin.test.Test
++import kotlin.test.assertEquals
++import kotlin.test.assertNotNull
++import kotlin.test.assertNull
++import kotlin.test.assertTrue
++
++class GetForegroundAppCatalogTest {
++    @Test
++    fun getForegroundAppIsRegisteredAsLowRiskWithNoArgs() {
++        val spec = assertNotNull(AndroidToolCatalog.find("get_foreground_app"))
++        assertEquals(ToolRisk.LOW, spec.risk)
++        assertTrue(spec.arguments.isEmpty())
++        assertTrue(spec.requiredArguments.isEmpty())
++    }
++
++    @Test
++    fun validateAcceptsEmptyArgs() {
++        assertNull(AndroidToolCatalog.validate("get_foreground_app", emptyMap()))
++    }
++
++    @Test
++    fun validateRejectsUnknownArgs() {
++        val error = AndroidToolCatalog.validate("get_foreground_app", mapOf("foo" to "bar"))
++        assertNotNull(error)
++        assertTrue(error.startsWith("Unknown argument(s) for get_foreground_app"))
++    }
++
++    @Test
++    fun retryPolicyTreatsGetForegroundAppAsReadOnly() {
++        val config = AndroidToolRetryPolicy().configFor("get_foreground_app")
++        assertEquals(1, config.maxAttempts)
++        assertEquals(false, config.retryable)
++    }
++}

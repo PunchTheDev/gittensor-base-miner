@@ -1,0 +1,144 @@
+diff --git a/gittensor/classes.py b/gittensor/classes.py
+index 205a2b11..c9194033 100644
+--- a/gittensor/classes.py
++++ b/gittensor/classes.py
+@@ -370,6 +370,10 @@ class MinerEvaluation:
+     total_leaf_score: float = 0.0
+     failed_reason: Optional[str] = None
+     github_pr_fetch_failed: bool = False
++    # Mirror-source-specific fetch flag set by mirror.combine.combine alongside
++    # the OR into github_pr_fetch_failed. Lets the validator tell a complete
++    # mirror outage apart from a legacy partial-pagination failure.
++    mirror_pr_fetch_failed: bool = False
+     evaluation_timestamp: Optional[datetime] = None
+     merged_pull_requests: List[PullRequest] = field(default_factory=list)
+     open_pull_requests: List[PullRequest] = field(default_factory=list)
+diff --git a/gittensor/validator/oss_contributions/mirror/combine.py b/gittensor/validator/oss_contributions/mirror/combine.py
+index 5b08b665..477b732f 100644
+--- a/gittensor/validator/oss_contributions/mirror/combine.py
++++ b/gittensor/validator/oss_contributions/mirror/combine.py
+@@ -4,6 +4,9 @@
+ - Mirror PR lists land in the ``mirror_*`` slots on the MinerEvaluation
+ - ``unique_repos_contributed_to`` is unioned
+ - ``github_pr_fetch_failed`` is OR'd
++- ``mirror_pr_fetch_failed`` is materialized so the validator can tell
++  a complete mirror outage apart from a legacy partial-pagination failure
++  when deciding cache fallback strategy
+ 
+ Per-PR scoring breakdowns (token_score, nodes_scored, base_score, earned_score,
+ collateral_score) live on each ScoredMirrorPR — they get aggregated into
+@@ -27,4 +30,5 @@ def combine(legacy_eval: MinerEvaluation, mirror_eval: MirrorMinerEvaluation) ->
+ 
+     legacy_eval.unique_repos_contributed_to |= mirror_eval.unique_repos_contributed_to
+ 
++    legacy_eval.mirror_pr_fetch_failed = mirror_eval.fetch_failed
+     legacy_eval.github_pr_fetch_failed = legacy_eval.github_pr_fetch_failed or mirror_eval.fetch_failed
+diff --git a/neurons/validator.py b/neurons/validator.py
+index 69577473..1b2c8c1e 100644
+--- a/neurons/validator.py
++++ b/neurons/validator.py
+@@ -144,6 +144,9 @@ def store_or_use_cached_evaluation(self, miner_evaluations: Dict[int, MinerEvalu
+         Handle evaluation cache: store successful evals, fallback to cache for GitHub failures.
+ 
+         Mutates the passed dict, replacing failed evaluations with cached ones if available.
++        A mirror-only fetch failure also routes through the cache-fallback path so the miner
++        is evaluated against a coherent one-round-stale snapshot instead of a fresh-legacy +
++        zeroed-mirror view where cross-PR multipliers would recompute over a partial state.
+ 
+         Returns:
+             Set of UIDs that were restored from cache (should be skipped during DB storage
+@@ -161,7 +164,9 @@ def store_or_use_cached_evaluation(self, miner_evaluations: Dict[int, MinerEvalu
+                     self.evaluation_cache.store(miner_eval)
+                 continue
+ 
+-            if not miner_eval.should_use_cache_fallback:
++            # Legacy partial-pagination failure with no mirror outage: the current eval
++            # holds a truncated legacy PR list that would be misleading to cache or swap out.
++            if not miner_eval.should_use_cache_fallback and not miner_eval.mirror_pr_fetch_failed:
+                 bt.logging.warning(
+                     f'UID {uid}: GitHub fetch failed after partial PR load; skipping cache store/fallback this round'
+                 )
+diff --git a/tests/validator/oss_contributions/mirror/test_combine.py b/tests/validator/oss_contributions/mirror/test_combine.py
+index 8471d65d..27d41145 100644
+--- a/tests/validator/oss_contributions/mirror/test_combine.py
++++ b/tests/validator/oss_contributions/mirror/test_combine.py
+@@ -133,12 +133,14 @@ def test_legacy_failed_only(self):
+         mirror_eval = MirrorMinerEvaluation(uid=1, hotkey='hk')
+         combine(legacy, mirror_eval)
+         assert legacy.github_pr_fetch_failed is True
++        assert legacy.mirror_pr_fetch_failed is False
+ 
+     def test_mirror_failed_only(self):
+         legacy = MinerEvaluation(uid=1, hotkey='hk')
+         mirror_eval = MirrorMinerEvaluation(uid=1, hotkey='hk', fetch_failed=True)
+         combine(legacy, mirror_eval)
+         assert legacy.github_pr_fetch_failed is True
++        assert legacy.mirror_pr_fetch_failed is True
+ 
+     def test_both_failed(self):
+         legacy = MinerEvaluation(uid=1, hotkey='hk')
+@@ -146,9 +148,11 @@ def test_both_failed(self):
+         mirror_eval = MirrorMinerEvaluation(uid=1, hotkey='hk', fetch_failed=True)
+         combine(legacy, mirror_eval)
+         assert legacy.github_pr_fetch_failed is True
++        assert legacy.mirror_pr_fetch_failed is True
+ 
+     def test_neither_failed(self):
+         legacy = MinerEvaluation(uid=1, hotkey='hk')
+         mirror_eval = MirrorMinerEvaluation(uid=1, hotkey='hk')
+         combine(legacy, mirror_eval)
+         assert legacy.github_pr_fetch_failed is False
++        assert legacy.mirror_pr_fetch_failed is False
+diff --git a/tests/validator/test_validator_cache_fallback.py b/tests/validator/test_validator_cache_fallback.py
+index 16e45ab0..efab5fc5 100644
+--- a/tests/validator/test_validator_cache_fallback.py
++++ b/tests/validator/test_validator_cache_fallback.py
+@@ -31,10 +31,16 @@ def _make_pr(uid: int) -> PullRequest:
+     )
+ 
+ 
+-def _build_eval(uid: int, merged_prs: int, fetch_failed: bool) -> MinerEvaluation:
++def _build_eval(
++    uid: int,
++    merged_prs: int,
++    fetch_failed: bool,
++    mirror_pr_fetch_failed: bool = False,
++) -> MinerEvaluation:
+     eval_ = MinerEvaluation(uid=uid, hotkey='hotkey_1', github_id='12345')
+     eval_.merged_pull_requests = [_make_pr(uid) for _ in range(merged_prs)]
+     eval_.github_pr_fetch_failed = fetch_failed
++    eval_.mirror_pr_fetch_failed = mirror_pr_fetch_failed
+     return eval_
+ 
+ 
+@@ -83,6 +89,30 @@ def test_fetch_failure_after_partial_load_skips_cache_store_and_fallback(self):
+         assert cached_eval.total_prs == 2
+ 
+ 
++class TestMirrorFailureCacheFallback:
++    """A mirror outage routes the miner through the cache-fallback path so the
++    evaluation is a coherent one-round-stale snapshot rather than a fresh-legacy +
++    zeroed-mirror hybrid where cross-PR multipliers recompute over a partial view."""
++
++    def test_mirror_failure_with_legacy_success_swaps_to_cached_eval(self):
++        validator = _DummyValidator()
++        validator.evaluation_cache.store(_build_eval(uid=1, merged_prs=2, fetch_failed=False))
++
++        current_eval = _build_eval(
++            uid=1,
++            merged_prs=1,
++            fetch_failed=True,
++            mirror_pr_fetch_failed=True,
++        )
++        miner_evaluations = {1: current_eval}
++
++        cached_uids = Validator.store_or_use_cached_evaluation(cast(Validator, validator), miner_evaluations)
++
++        assert cached_uids == {1}
++        assert miner_evaluations[1] is not current_eval
++        assert miner_evaluations[1].total_prs == 2
++
++
+ class TestCacheIsolation:
+     """Lock down the invariants required by the non-deepcopy copy strategy:
+     caller mutations must not leak into the cache, and heavy file_changes

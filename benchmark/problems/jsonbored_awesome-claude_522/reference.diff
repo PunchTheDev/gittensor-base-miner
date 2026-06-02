@@ -1,0 +1,438 @@
+diff --git a/packages/mcp/src/submissions.js b/packages/mcp/src/submissions.js
+index 09672d385..107c74a69 100644
+--- a/packages/mcp/src/submissions.js
++++ b/packages/mcp/src/submissions.js
+@@ -78,28 +78,31 @@ function isHttpsUrl(value) {
+   }
+ }
+ 
++const TRACKING_QUERY_KEYS = new Set([
++  "aff",
++  "affiliate",
++  "affiliate_id",
++  "campaign",
++  "coupon",
++  "irclickid",
++  "partner",
++  "referral",
++  "referral_code",
++  "via",
++]);
++
++function isTrackingQueryKey(key) {
++  const normalized = key.trim().toLowerCase();
++  return normalized.startsWith("utm_") || TRACKING_QUERY_KEYS.has(normalized);
++}
++
+ function isLikelyAffiliateUrl(value) {
+   const trimmed = normalizeText(value);
+   if (!trimmed) return false;
+   try {
+     const url = new URL(trimmed);
+-    const affiliateParams = new Set([
+-      "aff",
+-      "affiliate",
+-      "affiliate_id",
+-      "campaign",
+-      "coupon",
+-      "irclickid",
+-      "partner",
+-      "referral",
+-      "referral_code",
+-      "via",
+-    ]);
+     for (const key of url.searchParams.keys()) {
+-      const normalized = key.trim().toLowerCase();
+-      if (normalized.startsWith("utm_") || affiliateParams.has(normalized)) {
+-        return true;
+-      }
++      if (isTrackingQueryKey(key)) return true;
+     }
+   } catch {
+     return false;
+@@ -752,10 +755,17 @@ export function reviewSubmissionDraftFromSpec(spec, args = {}, entries = []) {
+     slug: validation.normalized.slug,
+     title: validation.normalized.title || validation.normalized.name,
+     name: validation.normalized.name,
+-    sourceUrl:
+-      validation.normalized.github_url ||
+-      validation.normalized.docs_url ||
++    // Forward every candidate URL the submission carries rather than picking a
++    // single winner via `||` — see `collectSubmissionCandidateUrls`. A
++    // submission with both `github_url` and `docs_url` was previously dropping
++    // the second candidate from duplicate detection.
++    sourceUrls: [
++      validation.normalized.github_url,
++      validation.normalized.docs_url,
+       validation.normalized.source_url,
++      validation.normalized.download_url,
++      validation.normalized.website_url,
++    ].filter(Boolean),
+     brandDomain: validation.normalized.brand_domain,
+     limit: args.duplicateLimit || 5,
+   };
+@@ -794,17 +804,104 @@ export function reviewSubmissionDraftFromSpec(spec, args = {}, entries = []) {
+   };
+ }
+ 
+-function entrySourceUrls(entry) {
+-  return [
++// Normalize a URL for duplicate-detection matching. Lowercases scheme + host,
++// strips `www.`, drops `#hash`, drops `utm_*` and known affiliate/tracking
++// query params (so links shared with marketing parameters still match the
++// canonical form), and strips a trailing `/` on non-root paths. Returns "" for
++// unparseable input — unparseable URLs simply don't match anything, which is
++// safe (the slug/title/brand_domain matches still run).
++function normalizeSubmissionUrlForMatch(value) {
++  const trimmed = normalizeText(value);
++  if (!trimmed) return "";
++  let url;
++  try {
++    url = new URL(trimmed);
++  } catch {
++    return "";
++  }
++  url.protocol = url.protocol.toLowerCase();
++  url.hostname = url.hostname.toLowerCase().replace(/^www\./, "");
++  url.hash = "";
++  const droppedKeys = [];
++  for (const key of url.searchParams.keys()) {
++    if (isTrackingQueryKey(key)) droppedKeys.push(key);
++  }
++  for (const key of droppedKeys) url.searchParams.delete(key);
++  // Normalize the pathname before serializing so a trailing `/` is stripped on
++  // non-root paths regardless of any query string. Checking the serialized
++  // string's `endsWith("/")` misses cases like
++  // `https://example.com/foo/?ref=x`, where the slash sits before the query and
++  // is never the last character — leaving it would break the match against the
++  // canonical `https://example.com/foo?ref=x`.
++  if (url.pathname !== "/" && url.pathname.endsWith("/")) {
++    url.pathname = url.pathname.slice(0, -1);
++  }
++  return url.toString();
++}
++
++// Every external-publisher URL field the indexed entry may carry. Includes
++// `downloadUrl`, `websiteUrl`, `githubUrl`, and `trustSignals.sourceUrls` —
++// each is a real entry field today and a duplicate that lives only on one of
++// them must still match a submitter's URL. Internal `url`/`canonicalUrl`/
++// `llmsUrl`/`apiUrl` stay in the list because a submitter who pastes the
++// HeyClaude canonical URL of an existing entry is still describing the same
++// resource and should be flagged as a duplicate.
++function collectEntrySourceUrls(entry) {
++  const candidates = [
+     entry.documentationUrl,
+     entry.repoUrl,
++    entry.githubUrl,
++    entry.websiteUrl,
++    entry.downloadUrl,
+     entry.url,
+     entry.canonicalUrl,
+     entry.llmsUrl,
+     entry.apiUrl,
+-  ]
+-    .map(normalizeText)
+-    .filter(Boolean);
++  ];
++  const trustSourceUrls = entry?.trustSignals?.sourceUrls;
++  if (Array.isArray(trustSourceUrls)) {
++    for (const value of trustSourceUrls) candidates.push(value);
++  }
++  const normalized = new Set();
++  for (const candidate of candidates) {
++    const value = normalizeSubmissionUrlForMatch(candidate);
++    if (value) normalized.add(value);
++  }
++  return normalized;
++}
++
++// Collect every URL the caller has offered as a duplicate-search candidate.
++// Accepts the legacy scalar `sourceUrl`, the new `sourceUrls` array, and the
++// fielded `githubUrl`/`docsUrl`/`downloadUrl`/`websiteUrl` keys so callers
++// don't have to `||`-chain a single winner and silently drop the rest.
++function collectSubmissionCandidateUrls(args = {}) {
++  const candidates = [
++    args.sourceUrl,
++    args.githubUrl,
++    args.docsUrl,
++    args.downloadUrl,
++    args.websiteUrl,
++  ];
++  if (Array.isArray(args.sourceUrls)) {
++    for (const value of args.sourceUrls) candidates.push(value);
++  }
++  const normalized = new Set();
++  for (const candidate of candidates) {
++    const value = normalizeSubmissionUrlForMatch(candidate);
++    if (value) normalized.add(value);
++  }
++  return normalized;
++}
++
++// First URL that appears in both Sets, or "" if none. Returning the matched
++// URL (rather than just a boolean) lets callers surface which URL hit if they
++// ever want to extend the `reasons` payload — today the predicate path is
++// boolean-only, but the value is free.
++function findOverlappingSourceUrl(entryUrls, candidateUrls) {
++  for (const value of candidateUrls) {
++    if (entryUrls.has(value)) return value;
++  }
++  return "";
+ }
+ 
+ export function searchDuplicateEntries(entries = [], args = {}) {
+@@ -813,7 +910,7 @@ export function searchDuplicateEntries(entries = [], args = {}) {
+   const slug = normalizeLower(args.slug);
+   const title = normalizeLower(args.title || args.name);
+   const brandDomain = normalizeDomain(args.brandDomain);
+-  const sourceUrl = normalizeText(args.sourceUrl);
++  const candidateUrls = collectSubmissionCandidateUrls(args);
+ 
+   const matches = [];
+   for (const entry of entries) {
+@@ -824,7 +921,10 @@ export function searchDuplicateEntries(entries = [], args = {}) {
+     if (brandDomain && normalizeDomain(entry.brandDomain) === brandDomain) {
+       reasons.push("brand_domain");
+     }
+-    if (sourceUrl && entrySourceUrls(entry).includes(sourceUrl)) {
++    if (
++      candidateUrls.size > 0 &&
++      findOverlappingSourceUrl(collectEntrySourceUrls(entry), candidateUrls)
++    ) {
+       reasons.push("source_url");
+     }
+ 
+diff --git a/tests/mcp-submission-duplicate-urls.test.ts b/tests/mcp-submission-duplicate-urls.test.ts
+new file mode 100644
+index 000000000..e51fa736d
+--- /dev/null
++++ b/tests/mcp-submission-duplicate-urls.test.ts
+@@ -0,0 +1,228 @@
++import { describe, expect, it } from "vitest";
++
++import { searchDuplicateEntries } from "../packages/mcp/src/submissions.js";
++
++type RegistryEntry = Record<string, unknown>;
++
++function entry(overrides: RegistryEntry = {}): RegistryEntry {
++  return {
++    category: "mcp",
++    slug: "airtable-mcp-server",
++    title: "Airtable MCP",
++    brandDomain: "",
++    documentationUrl: "https://github.com/domdomegg/airtable-mcp-server",
++    repoUrl: "https://github.com/domdomegg/airtable-mcp-server",
++    ...overrides,
++  };
++}
++
++describe("searchDuplicateEntries source-URL matching", () => {
++  it("matches a trailing-slash variant against an indexed entry's repoUrl", () => {
++    const result = searchDuplicateEntries([entry()], {
++      sourceUrl: "https://github.com/domdomegg/airtable-mcp-server/",
++    });
++    expect(result.count).toBe(1);
++    expect(
++      (result.matches as Array<{ reasons: string[] }>)[0].reasons,
++    ).toContain("source_url");
++  });
++
++  it("matches a www-prefix + uppercase-host variant", () => {
++    const result = searchDuplicateEntries([entry()], {
++      sourceUrl: "https://www.GitHub.com/domdomegg/airtable-mcp-server",
++    });
++    expect(result.count).toBe(1);
++  });
++
++  it("matches a variant with utm_* and other tracking query params", () => {
++    const result = searchDuplicateEntries([entry()], {
++      sourceUrl:
++        "https://github.com/domdomegg/airtable-mcp-server?utm_source=hn&campaign=launch&affiliate_id=42",
++    });
++    expect(result.count).toBe(1);
++  });
++
++  it("matches a variant with a #hash fragment", () => {
++    const result = searchDuplicateEntries([entry()], {
++      sourceUrl: "https://github.com/domdomegg/airtable-mcp-server#readme",
++    });
++    expect(result.count).toBe(1);
++  });
++
++  it("still matches the exact same URL (no regression)", () => {
++    const result = searchDuplicateEntries([entry()], {
++      sourceUrl: "https://github.com/domdomegg/airtable-mcp-server",
++    });
++    expect(result.count).toBe(1);
++  });
++
++  it("does not match an unrelated URL", () => {
++    const result = searchDuplicateEntries([entry()], {
++      sourceUrl: "https://github.com/some-other/repo",
++    });
++    expect(result.count).toBe(0);
++  });
++
++  it("does not match an unparseable URL (returns no match, doesn't throw)", () => {
++    const result = searchDuplicateEntries([entry()], {
++      sourceUrl: "not a url at all",
++    });
++    expect(result.count).toBe(0);
++  });
++
++  it("matches when the entry's matching URL lives only on downloadUrl", () => {
++    const result = searchDuplicateEntries(
++      [
++        entry({
++          documentationUrl: "",
++          repoUrl: "",
++          downloadUrl: "https://example.com/downloads/airtable.zip",
++        }),
++      ],
++      { sourceUrl: "https://example.com/downloads/airtable.zip/" },
++    );
++    expect(result.count).toBe(1);
++  });
++
++  it("matches when the entry's matching URL lives only on websiteUrl", () => {
++    const result = searchDuplicateEntries(
++      [
++        entry({
++          documentationUrl: "",
++          repoUrl: "",
++          websiteUrl: "https://airtable-mcp.example",
++        }),
++      ],
++      { sourceUrl: "https://www.airtable-mcp.example" },
++    );
++    expect(result.count).toBe(1);
++  });
++
++  it("matches when the entry's matching URL lives only in trustSignals.sourceUrls", () => {
++    const result = searchDuplicateEntries(
++      [
++        entry({
++          documentationUrl: "",
++          repoUrl: "",
++          trustSignals: {
++            sourceUrls: [
++              "https://docs.example.com/airtable",
++              "https://blog.example.com/airtable-launch",
++            ],
++          },
++        }),
++      ],
++      { sourceUrl: "https://docs.example.com/airtable/" },
++    );
++    expect(result.count).toBe(1);
++  });
++
++  it("accepts the new `sourceUrls` array and matches any candidate", () => {
++    // First candidate is an unrelated repo; second normalizes (trailing slash
++    // + utm_) to the indexed entry's `repoUrl`. Should match on the second
++    // candidate. URL paths are case-sensitive per RFC 3986; only scheme/host
++    // are case-insensitive, so the normalizer correctly does not fold case on
++    // the path component.
++    const result = searchDuplicateEntries([entry()], {
++      sourceUrls: [
++        "https://github.com/unrelated/repo",
++        "https://github.com/domdomegg/airtable-mcp-server/?utm_source=test",
++      ],
++    });
++    expect(result.count).toBe(1);
++  });
++
++  it("normalizes a trailing slash that sits before a surviving query string", () => {
++    // `?ref=x` is a non-tracking param, so it is kept. The trailing slash on the
++    // path must still be stripped (it sits before the `?`, so it is never the
++    // last character of the serialized URL). Without pathname-level
++    // normalization this would serialize as `.../airtable-mcp-server/?ref=x` and
++    // fail to match the canonical entry URL.
++    const result = searchDuplicateEntries(
++      [
++        entry({
++          documentationUrl:
++            "https://github.com/domdomegg/airtable-mcp-server?ref=x",
++          repoUrl: "https://github.com/domdomegg/airtable-mcp-server?ref=x",
++        }),
++      ],
++      {
++        sourceUrl: "https://github.com/domdomegg/airtable-mcp-server/?ref=x",
++      },
++    );
++    expect(result.count).toBe(1);
++    expect(
++      (result.matches as Array<{ reasons: string[] }>)[0].reasons,
++    ).toContain("source_url");
++  });
++
++  it("checks every advertised fielded URL arg against its matching entry field", () => {
++    // Each fielded submission arg must be matched against the corresponding
++    // indexed entry field — the previous test only proved `githubUrl`/`docsUrl`.
++    // Trailing-slash variants are used so each case also exercises path
++    // normalization, not just exact equality.
++    const githubResult = searchDuplicateEntries(
++      [
++        entry({
++          documentationUrl: "",
++          repoUrl: "",
++          githubUrl: "https://github.com/domdomegg/airtable-mcp-server",
++        }),
++      ],
++      { githubUrl: "https://github.com/domdomegg/airtable-mcp-server/" },
++    );
++    expect(githubResult.count).toBe(1);
++    expect(
++      (githubResult.matches as Array<{ reasons: string[] }>)[0].reasons,
++    ).toContain("source_url");
++
++    const docsResult = searchDuplicateEntries(
++      [
++        entry({
++          documentationUrl: "https://docs.example.com/airtable",
++          repoUrl: "",
++        }),
++      ],
++      { docsUrl: "https://docs.example.com/airtable/" },
++    );
++    expect(docsResult.count).toBe(1);
++    expect(
++      (docsResult.matches as Array<{ reasons: string[] }>)[0].reasons,
++    ).toContain("source_url");
++
++    const downloadResult = searchDuplicateEntries(
++      [
++        entry({
++          documentationUrl: "",
++          repoUrl: "",
++          downloadUrl: "https://example.com/downloads/airtable.zip",
++        }),
++      ],
++      { downloadUrl: "https://example.com/downloads/airtable.zip/" },
++    );
++    expect(downloadResult.count).toBe(1);
++    expect(
++      (downloadResult.matches as Array<{ reasons: string[] }>)[0].reasons,
++    ).toContain("source_url");
++
++    const websiteResult = searchDuplicateEntries(
++      [
++        entry({
++          documentationUrl: "",
++          repoUrl: "",
++          websiteUrl: "https://airtable-mcp.example",
++        }),
++      ],
++      { websiteUrl: "https://www.airtable-mcp.example/" },
++    );
++    expect(websiteResult.count).toBe(1);
++    expect(
++      (websiteResult.matches as Array<{ reasons: string[] }>)[0].reasons,
++    ).toContain("source_url");
++  });
++
++  it("returns count: 0 when no URL candidates are supplied", () => {
++    const result = searchDuplicateEntries([entry()], {});
++    expect(result.count).toBe(0);
++  });
++});

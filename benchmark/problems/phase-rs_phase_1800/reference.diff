@@ -1,0 +1,397 @@
+diff --git a/crates/engine/src/game/effects/counters.rs b/crates/engine/src/game/effects/counters.rs
+index 57ad26684..f3fbe9eb8 100644
+--- a/crates/engine/src/game/effects/counters.rs
++++ b/crates/engine/src/game/effects/counters.rs
+@@ -604,13 +604,10 @@ pub fn resolve_add_all(
+     };
+     // CR 608.2c: Bind the `TrackedSetId(0)` sentinel emitted by the parser for
+     // "put a counter on each [card] this way" continuations to the active
+-    // chain tracked set — the set the immediately preceding effect in this
+-    // chain published. Empty sets are *not* skipped here (unlike
+-    // `targeting::resolve_tracked_set_sentinel`): a chained counter effect
+-    // refers to the preceding effect's set even when it ended up empty. When
+-    // no chain set exists, combat-damage trigger context may provide the
+-    // filtered "those creatures" source set; otherwise fall back to the legacy
+-    // latest tracked set behavior.
++    // chain tracked set. Empty sets are *not* skipped here: a chained counter
++    // effect refers to the preceding effect's set even when it affected no
++    // objects. Preserve that counter-specific fallback while supporting the
++    // filtered "each of those <type>" intersection.
+     let target_filter = match crate::game::effects::resolved_object_filter(ability, &target_filter)
+     {
+         TargetFilter::TrackedSet {
+@@ -629,6 +626,29 @@ pub fn resolve_add_all(
+             .unwrap_or(TargetFilter::TrackedSet {
+                 id: crate::types::identifiers::TrackedSetId(0),
+             }),
++        TargetFilter::TrackedSetFiltered {
++            id: crate::types::identifiers::TrackedSetId(0),
++            filter,
++        } => {
++            if let Some(id) = state.chain_tracked_set_id {
++                TargetFilter::TrackedSetFiltered { id, filter }
++            } else if let Some(source_filter) =
++                crate::game::targeting::current_combat_damage_source_filter(state)
++            {
++                TargetFilter::And {
++                    filters: vec![source_filter, *filter],
++                }
++            } else if let Some((&id, _)) =
++                state.tracked_object_sets.iter().max_by_key(|(id, _)| id.0)
++            {
++                TargetFilter::TrackedSetFiltered { id, filter }
++            } else {
++                TargetFilter::TrackedSetFiltered {
++                    id: crate::types::identifiers::TrackedSetId(0),
++                    filter,
++                }
++            }
++        }
+         filter => filter,
+     };
+ 
+diff --git a/crates/engine/src/game/effects/mod.rs b/crates/engine/src/game/effects/mod.rs
+index 879542c10..19b1561d8 100644
+--- a/crates/engine/src/game/effects/mod.rs
++++ b/crates/engine/src/game/effects/mod.rs
+@@ -2062,6 +2062,29 @@ fn affected_objects_from_events(
+                 _ => None,
+             })
+             .collect(),
++        // CR 701.26a + CR 608.2c: Tap publishes the tapped set for downstream
++        // "each of those <type>" continuations (Urge to Feed class).
++        Effect::Tap { .. } | Effect::Untap { .. } => {
++            let from_events: Vec<ObjectId> = events
++                .iter()
++                .filter_map(|event| match event {
++                    GameEvent::PermanentTapped { object_id, .. }
++                    | GameEvent::PermanentUntapped { object_id, .. } => Some(*object_id),
++                    _ => None,
++                })
++                .collect();
++            if !from_events.is_empty() {
++                from_events
++            } else {
++                fallback_targets
++                    .iter()
++                    .filter_map(|target| match target {
++                        TargetRef::Object(id) => Some(*id),
++                        TargetRef::Player(_) => None,
++                    })
++                    .collect()
++            }
++        }
+         _ => {
+             let dest_zone = match effect {
+                 Effect::ChangeZone { destination, .. }
+@@ -7676,6 +7699,104 @@ mod tests {
+             .is_some_and(|objects| objects.is_empty()));
+     }
+ 
++    /// CR 608.2c + CR 701.26a: a tapped-object set published by `Tap` must
++    /// bind a downstream filtered "each of those <type>" counter effect.
++    #[test]
++    fn tap_chain_publishes_filtered_tracked_set_for_counter_followup() {
++        let mut state = GameState::new_two_player(42);
++        let source = create_object(
++            &mut state,
++            CardId(100),
++            PlayerId(0),
++            "Urge to Feed".to_string(),
++            Zone::Graveyard,
++        );
++        let vampire = create_object(
++            &mut state,
++            CardId(1),
++            PlayerId(0),
++            "Vampire".to_string(),
++            Zone::Battlefield,
++        );
++        let other_creature = create_object(
++            &mut state,
++            CardId(2),
++            PlayerId(0),
++            "Soldier".to_string(),
++            Zone::Battlefield,
++        );
++        let land = create_object(
++            &mut state,
++            CardId(3),
++            PlayerId(0),
++            "Swamp".to_string(),
++            Zone::Battlefield,
++        );
++
++        state
++            .objects
++            .get_mut(&vampire)
++            .unwrap()
++            .card_types
++            .core_types = vec![CoreType::Creature];
++        state.objects.get_mut(&vampire).unwrap().card_types.subtypes = vec!["Vampire".to_string()];
++        state
++            .objects
++            .get_mut(&other_creature)
++            .unwrap()
++            .card_types
++            .core_types = vec![CoreType::Creature];
++        state.objects.get_mut(&land).unwrap().card_types.core_types = vec![CoreType::Land];
++        state.objects.get_mut(&land).unwrap().card_types.subtypes = vec!["Swamp".to_string()];
++
++        let counter = ResolvedAbility::new(
++            Effect::PutCounterAll {
++                counter_type: CounterType::Plus1Plus1,
++                count: QuantityExpr::Fixed { value: 1 },
++                target: TargetFilter::TrackedSetFiltered {
++                    id: TrackedSetId(0),
++                    filter: Box::new(TargetFilter::Typed(
++                        TypedFilter::creature().subtype("Vampire".to_string()),
++                    )),
++                },
++            },
++            vec![],
++            source,
++            PlayerId(0),
++        );
++        let ability = ResolvedAbility::new(
++            Effect::Tap {
++                target: TargetFilter::Typed(TypedFilter::creature().subtype("Vampire".to_string())),
++            },
++            vec![TargetRef::Object(vampire)],
++            source,
++            PlayerId(0),
++        )
++        .sub_ability(counter);
++
++        let mut events = Vec::new();
++        resolve_ability_chain(&mut state, &ability, &mut events, 0).unwrap();
++
++        assert!(state.objects[&vampire].tapped);
++        assert_eq!(
++            state.objects[&vampire]
++                .counters
++                .get(&CounterType::Plus1Plus1)
++                .copied(),
++            Some(1)
++        );
++        for id in [other_creature, land] {
++            assert_eq!(
++                state.objects[&id]
++                    .counters
++                    .get(&CounterType::Plus1Plus1)
++                    .copied(),
++                None,
++                "only the tapped Vampire should receive the counter"
++            );
++        }
++    }
++
+     #[test]
+     fn airbend_chain_exiles_all_creatures_when_no_target_is_chosen() {
+         let mut state = GameState::new_two_player(42);
+diff --git a/crates/engine/src/parser/oracle_target.rs b/crates/engine/src/parser/oracle_target.rs
+index 971ee1e94..0876455d1 100644
+--- a/crates/engine/src/parser/oracle_target.rs
++++ b/crates/engine/src/parser/oracle_target.rs
+@@ -963,21 +963,45 @@ pub fn parse_target_with_syntax<'a>(
+         );
+     }
+ 
+-    // "each of those creatures/permanents/cards" → TrackedSet reference
+-    if let Ok((rest, _)) = alt((
+-        tag::<_, _, OracleError<'_>>("each of those creatures"),
+-        tag("each of those permanents"),
+-        tag("each of those cards"),
+-    ))
+-    .parse(lower.as_str())
++    // CR 608.2c: "each of those <type>" — anaphoric reference to objects
++    // affected by a preceding instruction in the same ability (Urge to Feed:
++    // vampires tapped for the optional cost; Zimone-class "revealed this way"
++    // uses the bare creatures/permanents/cards arms). A typed tail ("Vampires",
++    // "Zombies you control") intersects the tracked set with the type filter;
++    // without this arm, "each of those Vampires" fell through to `each ` +
++    // `parse_type_phrase("of those Vampires")`, producing an empty TypedFilter
++    // that matched every permanent on the battlefield.
++    if let Ok((rest_lower, _)) =
++        tag::<_, _, OracleError<'_>>("each of those ").parse(lower.as_str())
+     {
+-        return (
+-            TargetFilter::TrackedSet {
+-                id: TrackedSetId(0),
+-            },
+-            &text[lower.len() - rest.len()..],
+-            syntax,
+-        );
++        let phrase_start = lower.len() - rest_lower.len();
++        let phrase = &text[phrase_start..];
++        if let Ok((rest_lower, _)) = alt((
++            tag::<_, _, OracleError<'_>>("creatures"),
++            tag("permanents"),
++            tag("cards"),
++        ))
++        .parse(rest_lower)
++        {
++            return (
++                TargetFilter::TrackedSet {
++                    id: TrackedSetId(0),
++                },
++                &text[lower.len() - rest_lower.len()..],
++                syntax,
++            );
++        }
++        let (filter, remainder) = parse_type_phrase_with_ctx(phrase, ctx);
++        if target_filter_has_meaningful_content(&filter) {
++            return (
++                TargetFilter::TrackedSetFiltered {
++                    id: TrackedSetId(0),
++                    filter: Box::new(filter),
++                },
++                remainder,
++                syntax,
++            );
++        }
+     }
+ 
+     // "each " + type phrase
+@@ -6718,6 +6742,41 @@ mod tests {
+         assert_eq!(rest, "");
+     }
+ 
++    /// Issue #1338: "each of those Vampires" must intersect the tracked tap set,
++    /// not degenerate to an empty TypedFilter over the whole battlefield.
++    #[test]
++    fn each_of_those_vampires_is_tracked_set_filtered() {
++        use crate::types::TypeFilter;
++        let (filter, rest) = parse_target("each of those Vampires");
++        match filter {
++            TargetFilter::TrackedSetFiltered { id, filter } => {
++                assert_eq!(id, TrackedSetId(0));
++                match *filter {
++                    TargetFilter::Typed(tf) => {
++                        assert!(tf
++                            .type_filters
++                            .contains(&TypeFilter::Subtype("Vampire".into())));
++                    }
++                    other => panic!("expected Typed Vampire filter, got {other:?}"),
++                }
++            }
++            other => panic!("expected TrackedSetFiltered, got {other:?}"),
++        }
++        assert_eq!(rest, "");
++    }
++
++    #[test]
++    fn each_of_those_creatures_is_tracked_set() {
++        let (filter, rest) = parse_target("each of those creatures");
++        assert!(matches!(
++            filter,
++            TargetFilter::TrackedSet {
++                id: TrackedSetId(0)
++            }
++        ));
++        assert_eq!(rest, "");
++    }
++
+     #[test]
+     fn definite_artifact_reference_binds_first_parent_target_slot() {
+         let (filter, rest) = parse_target("the artifact and returns it");
+diff --git a/crates/engine/tests/integration/main.rs b/crates/engine/tests/integration/main.rs
+index 712bead74..ab5102256 100644
+--- a/crates/engine/tests/integration/main.rs
++++ b/crates/engine/tests/integration/main.rs
+@@ -125,6 +125,7 @@ mod twice_instead_repeat_for;
+ mod tyvar_activate_as_though_haste;
+ mod unstoppable_slasher_half_life;
+ mod ureni_attack_trigger;
++mod urge_to_feed_regression;
+ mod urzas_saga_chapter_two;
+ mod urzas_tower_conditional_mana;
+ mod vigor_regression;
+diff --git a/crates/engine/tests/integration/urge_to_feed_regression.rs b/crates/engine/tests/integration/urge_to_feed_regression.rs
+new file mode 100644
+index 000000000..92123e1ab
+--- /dev/null
++++ b/crates/engine/tests/integration/urge_to_feed_regression.rs
+@@ -0,0 +1,82 @@
++//! Issue #1338 — Urge to Feed: "each of those Vampires" must not put +1/+1
++//! counters on every permanent (empty TypedFilter fallback).
++
++use engine::parser::parse_oracle_text;
++use engine::types::ability::{
++    AbilityCondition, Effect, EffectOutcomeSignal, TargetFilter, TypeFilter,
++};
++use engine::types::counter::CounterType;
++use engine::types::identifiers::TrackedSetId;
++
++const URGE_TO_FEED: &str = "Target creature gets -3/-3 until end of turn. You may tap any \
++number of untapped Vampire creatures you control. If you do, put a +1/+1 counter on each \
++of those Vampires.";
++
++fn parsed_spell() -> engine::types::ability::AbilityDefinition {
++    let parsed = parse_oracle_text(
++        URGE_TO_FEED,
++        "Urge to Feed",
++        &[],
++        &["Instant".to_string()],
++        &[],
++    );
++    parsed
++        .abilities
++        .into_iter()
++        .next()
++        .expect("Urge to Feed should parse as a spell ability")
++}
++
++#[test]
++fn urge_to_feed_each_of_those_vampires_is_tracked_set_filtered() {
++    let def = parsed_spell();
++    let tap = def
++        .sub_ability
++        .as_ref()
++        .expect("tap clause should be sub_ability after -3/-3");
++    assert!(
++        matches!(tap.effect.as_ref(), Effect::Tap { .. }),
++        "expected Tap after PT layer, got {:?}",
++        tap.effect
++    );
++
++    let counter = tap
++        .sub_ability
++        .as_ref()
++        .expect("counter clause should follow tap");
++    assert!(
++        matches!(
++            counter.condition,
++            Some(AbilityCondition::EffectOutcome {
++                signal: EffectOutcomeSignal::OptionalEffectPerformed,
++            })
++        ),
++        "counter should be gated on accepting the tap, got {:?}",
++        counter.condition
++    );
++
++    match counter.effect.as_ref() {
++        Effect::PutCounterAll {
++            target,
++            counter_type,
++            ..
++        } => {
++            assert_eq!(*counter_type, CounterType::Plus1Plus1);
++            match target {
++                TargetFilter::TrackedSetFiltered { id, filter } => {
++                    assert_eq!(*id, TrackedSetId(0));
++                    match filter.as_ref() {
++                        TargetFilter::Typed(tf) => {
++                            assert!(tf
++                                .type_filters
++                                .contains(&TypeFilter::Subtype("Vampire".into())));
++                        }
++                        other => panic!("expected Typed Vampire filter, got {other:?}"),
++                    }
++                }
++                other => panic!("expected TrackedSetFiltered target, got {other:?}"),
++            }
++        }
++        other => panic!("expected PutCounterAll, got {other:?}"),
++    }
++}

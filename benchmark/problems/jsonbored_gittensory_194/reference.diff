@@ -1,0 +1,1845 @@
+diff --git a/apps/gittensory-ui/public/openapi.json b/apps/gittensory-ui/public/openapi.json
+index ed28ec3..2bfa244 100644
+--- a/apps/gittensory-ui/public/openapi.json
++++ b/apps/gittensory-ui/public/openapi.json
+@@ -11301,6 +11301,36 @@
+         ]
+       }
+     },
++    "/v1/app/commands/usefulness": {
++      "get": {
++        "responses": {
++          "200": {
++            "description": "Live app API response",
++            "content": {
++              "application/json": {
++                "schema": {
++                  "type": "object",
++                  "additionalProperties": {
++                    "nullable": true
++                  }
++                }
++              }
++            }
++          },
++          "401": {
++            "description": "Unauthorized"
++          }
++        },
++        "security": [
++          {
++            "GittensoryBearer": []
++          },
++          {
++            "GittensorySessionCookie": []
++          }
++        ]
++      }
++    },
+     "/v1/app/digest": {
+       "get": {
+         "responses": {
+@@ -11331,6 +11361,36 @@
+         ]
+       }
+     },
++    "/v1/app/analytics/daily-rollups": {
++      "get": {
++        "responses": {
++          "200": {
++            "description": "Live app API response",
++            "content": {
++              "application/json": {
++                "schema": {
++                  "type": "object",
++                  "additionalProperties": {
++                    "nullable": true
++                  }
++                }
++              }
++            }
++          },
++          "401": {
++            "description": "Unauthorized"
++          }
++        },
++        "security": [
++          {
++            "GittensoryBearer": []
++          },
++          {
++            "GittensorySessionCookie": []
++          }
++        ]
++      }
++    },
+     "/v1/app/analytics/mcp-compatibility": {
+       "get": {
+         "responses": {
+@@ -11437,6 +11497,52 @@
+         ]
+       }
+     },
++    "/v1/app/commands/feedback": {
++      "post": {
++        "responses": {
++          "200": {
++            "description": "Live app mutation or preview response",
++            "content": {
++              "application/json": {
++                "schema": {
++                  "type": "object",
++                  "additionalProperties": {
++                    "nullable": true
++                  }
++                }
++              }
++            }
++          },
++          "201": {
++            "description": "Created",
++            "content": {
++              "application/json": {
++                "schema": {
++                  "type": "object",
++                  "additionalProperties": {
++                    "nullable": true
++                  }
++                }
++              }
++            }
++          },
++          "400": {
++            "description": "Invalid request"
++          },
++          "401": {
++            "description": "Unauthorized"
++          }
++        },
++        "security": [
++          {
++            "GittensoryBearer": []
++          },
++          {
++            "GittensorySessionCookie": []
++          }
++        ]
++      }
++    },
+     "/v1/app/digest/subscriptions": {
+       "post": {
+         "responses": {
+diff --git a/migrations/0015_github_agent_command_feedback.sql b/migrations/0015_github_agent_command_feedback.sql
+new file mode 100644
+index 0000000..d5a8f5c
+--- /dev/null
++++ b/migrations/0015_github_agent_command_feedback.sql
+@@ -0,0 +1,44 @@
++CREATE TABLE IF NOT EXISTS github_agent_command_answers (
++  id TEXT PRIMARY KEY,
++  repo_full_name TEXT NOT NULL,
++  issue_number INTEGER NOT NULL,
++  command TEXT NOT NULL,
++  request_comment_id INTEGER,
++  response_comment_id INTEGER,
++  response_url TEXT,
++  actor_kind TEXT NOT NULL,
++  created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
++  updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
++  metadata_json TEXT NOT NULL DEFAULT '{}'
++);
++
++CREATE INDEX IF NOT EXISTS github_agent_command_answers_repo_issue_idx
++  ON github_agent_command_answers(repo_full_name, issue_number);
++
++CREATE INDEX IF NOT EXISTS github_agent_command_answers_command_updated_idx
++  ON github_agent_command_answers(command, updated_at);
++
++CREATE TABLE IF NOT EXISTS github_agent_command_feedback (
++  id TEXT PRIMARY KEY,
++  answer_id TEXT NOT NULL,
++  repo_full_name TEXT NOT NULL,
++  issue_number INTEGER NOT NULL,
++  command TEXT NOT NULL,
++  actor_hash TEXT NOT NULL,
++  vote TEXT NOT NULL,
++  source TEXT NOT NULL,
++  actor_kind TEXT NOT NULL,
++  created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
++  updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
++  metadata_json TEXT NOT NULL DEFAULT '{}',
++  FOREIGN KEY(answer_id) REFERENCES github_agent_command_answers(id)
++);
++
++CREATE UNIQUE INDEX IF NOT EXISTS github_agent_command_feedback_actor_answer_unique
++  ON github_agent_command_feedback(answer_id, actor_hash);
++
++CREATE INDEX IF NOT EXISTS github_agent_command_feedback_command_updated_idx
++  ON github_agent_command_feedback(command, updated_at);
++
++CREATE INDEX IF NOT EXISTS github_agent_command_feedback_repo_issue_idx
++  ON github_agent_command_feedback(repo_full_name, issue_number);
+diff --git a/src/api/routes.ts b/src/api/routes.ts
+index efbc6a6..2909f8e 100644
+--- a/src/api/routes.ts
++++ b/src/api/routes.ts
+@@ -28,6 +28,9 @@ import {
+   countActiveAuthSessions,
+   countActiveDigestSubscriptions,
+   getBounty,
++  getAgentCommandAnswer,
++  getCommandUsefulnessSummary,
++  getFreshOfficialMinerDetection,
+   getIssue,
+   getInstallationHealth,
+   getLatestRepoGithubTotalsSnapshot,
+@@ -71,6 +74,7 @@ import {
+   persistBountyLifecycleEvent,
+   persistScorePreview,
+   persistSignalSnapshot,
++  recordAgentCommandFeedback,
+   recordProductUsageEvent,
+   rollupProductUsageDaily,
+   summarizeMcpCompatibilityAdoption,
+@@ -398,6 +402,13 @@ const commandPreviewSchema = z
+   })
+   .strict();
+ 
++const commandFeedbackSchema = z
++  .object({
++    answerId: z.string().min(8).max(120).regex(/^[A-Za-z0-9_.:-]+$/),
++    vote: z.enum(["useful", "not_useful"]),
++  })
++  .strict();
++
+ const digestSubscriptionSchema = z
+   .object({
+     email: z.string().email().max(320),
+@@ -774,6 +785,7 @@ export function createApp() {
+       usageRollups,
+       usageRollupStatus,
+       mcpCompatibilityAdoption,
++      commandUsefulness,
+     ] = await Promise.all([
+       listRepositories(c.env),
+       listInstallations(c.env),
+@@ -788,6 +800,7 @@ export function createApp() {
+       listProductUsageDailyRollups(c.env, { limit: 14 }),
+       getProductUsageRollupStatus(c.env),
+       summarizeMcpCompatibilityAdoption(c.env, usageSince),
++      getCommandUsefulnessSummary(c.env),
+     ]);
+     const weeklyValueReport = buildWeeklyValueReport({
+       generatedAt: nowIso(),
+@@ -818,6 +831,7 @@ export function createApp() {
+         { label: "Active users", value: String(usageSummary.activeActors), delta: "hashed, last 7 days" },
+         { label: "Activation rollups", value: usageRollupStatus.status, delta: usageRollupStatus.latestRollupDay ?? "not generated" },
+         { label: "MCP stale clients", value: String(mcpCompatibilityAdoption.staleEvents + mcpCompatibilityAdoption.incompatibleEvents), delta: `${mcpCompatibilityAdoption.totalEvents} MCP event(s)` },
++        { label: "Command usefulness", value: `${commandUsefulness.totals.usefulCount}/${commandUsefulness.totals.feedbackCount}`, delta: usefulnessDelta(commandUsefulness.totals.usefulnessRate) },
+         { label: "Install issues", value: String(health.filter((record) => record.status !== "healthy").length), delta: "current health cache" },
+         { label: "Rate-limit events", value: String(rateLimits.length), delta: "latest observations" },
+       ],
+@@ -832,6 +846,7 @@ export function createApp() {
+       usageRollups,
+       usageRollupStatus,
+       mcpCompatibilityAdoption,
++      commandUsefulness,
+       registry,
+       scoringModel: scoring,
+       upstreamDrift,
+@@ -938,6 +953,53 @@ export function createApp() {
+     });
+   });
+ 
++  app.get("/v1/app/commands/usefulness", async (c) => {
++    const identity = await authenticateRequestIdentity(c);
++    if (!identity) return c.json({ error: "unauthorized" }, 401);
++    const days = Number(c.req.query("days") ?? 30);
++    return c.json(await getCommandUsefulnessSummary(c.env, { windowDays: clampInteger(days, 1, 180) }));
++  });
++
++  app.post("/v1/app/commands/feedback", async (c) => {
++    const identity = await authenticateRequestIdentity(c);
++    if (!identity) return c.json({ error: "unauthorized" }, 401);
++    const body = await c.req.json().catch(() => null);
++    const parsed = commandFeedbackSchema.safeParse(body);
++    if (!parsed.success) return c.json({ error: "invalid_command_feedback", issues: parsed.error.issues }, 400);
++    const answer = await getAgentCommandAnswer(c.env, parsed.data.answerId);
++    if (!answer) return c.json({ error: "command_answer_not_found" }, 404);
++    const actorLogin = identity.actor;
++    await recordAgentCommandFeedback(c.env, {
++      answerId: answer.id,
++      repoFullName: answer.repoFullName,
++      issueNumber: answer.issueNumber,
++      command: answer.command,
++      actorLogin,
++      vote: parsed.data.vote,
++      source: "app",
++      actorKind: "maintainer",
++      metadata: { surface: "app", identityKind: identity.kind },
++    });
++    await recordAuditEvent(c.env, {
++      eventType: "github_app.agent_command_feedback_recorded",
++      actor: actorLogin,
++      targetKey: `${answer.repoFullName}#${answer.issueNumber}`,
++      outcome: "completed",
++      metadata: { answerId: answer.id, command: answer.command, vote: parsed.data.vote, source: "app", identityKind: identity.kind },
++    });
++    return c.json({
++      ok: true,
++      generatedAt: nowIso(),
++      answer: {
++        id: answer.id,
++        repoFullName: answer.repoFullName,
++        issueNumber: answer.issueNumber,
++        command: answer.command,
++      },
++      vote: parsed.data.vote,
++    });
++  });
++
+   app.get("/v1/app/digest", async (c) => {
+     const forbidden = await requireAppRole(c, ["maintainer", "owner", "operator"]);
+     if (forbidden) return forbidden;
+@@ -2152,6 +2214,15 @@ function buildCommandPreview(command: (typeof APP_COMMANDS)[number], request: z.
+   };
+ }
+ 
++function usefulnessDelta(rate: number | null): string {
++  return rate === null ? "no feedback yet" : `${Math.round(rate * 100)}% useful over 30 days`;
++}
++
++function clampInteger(value: number, min: number, max: number): number {
++  if (!Number.isFinite(value)) return min;
++  return Math.min(max, Math.max(min, Math.round(value)));
++}
++
+ function buildDigestItems(args: {
+   repositories: RepositoryRecord[];
+   health: InstallationHealthRecord[];
+diff --git a/src/db/repositories.ts b/src/db/repositories.ts
+index e98aa34..80edf62 100644
+--- a/src/db/repositories.ts
++++ b/src/db/repositories.ts
+@@ -18,6 +18,8 @@ import {
+   contributorScoringProfiles,
+   contributors,
+   digestSubscriptions,
++  githubAgentCommandAnswers,
++  githubAgentCommandFeedback,
+   installationHealth,
+   installations,
+   issueQualityReports,
+@@ -52,6 +54,8 @@ import type {
+   AgentActionRecord,
+   AgentActionStatus,
+   AgentActionType,
++  AgentCommandAnswerRecord,
++  AgentCommandFeedbackRecord,
+   AgentContextSnapshotRecord,
+   AgentMode,
+   AgentRunRecord,
+@@ -65,6 +69,7 @@ import type {
+   BurdenForecastRecord,
+   CheckSummaryRecord,
+   CollisionEdgeRecord,
++  CommandUsefulnessSummary,
+   ContributorEvidenceRecord,
+   ContributorRecord,
+   ContributorRepoStatRecord,
+@@ -1080,6 +1085,132 @@ export async function summarizeProductUsageEvents(env: Env, sinceIso?: string):
+   };
+ }
+ 
++export async function upsertAgentCommandAnswer(env: Env, answer: AgentCommandAnswerRecord): Promise<AgentCommandAnswerRecord> {
++  const now = answer.updatedAt ?? nowIso();
++  const createdAt = answer.createdAt ?? now;
++  const values = {
++    id: answer.id,
++    repoFullName: boundedString(answer.repoFullName, 200),
++    issueNumber: Math.max(0, Math.round(answer.issueNumber)),
++    command: boundedString(answer.command, 64),
++    requestCommentId: optionalNumber(answer.requestCommentId),
++    responseCommentId: optionalNumber(answer.responseCommentId),
++    responseUrl: answer.responseUrl ? boundedString(answer.responseUrl, 500) : null,
++    actorKind: answer.actorKind,
++    createdAt,
++    updatedAt: now,
++    metadataJson: jsonString(answer.metadata),
++  };
++  await getDb(env.DB)
++    .insert(githubAgentCommandAnswers)
++    .values(values)
++    .onConflictDoUpdate({
++      target: githubAgentCommandAnswers.id,
++      set: {
++        repoFullName: values.repoFullName,
++        issueNumber: values.issueNumber,
++        command: values.command,
++        requestCommentId: values.requestCommentId,
++        responseCommentId: values.responseCommentId,
++        responseUrl: values.responseUrl,
++        actorKind: values.actorKind,
++        updatedAt: values.updatedAt,
++        metadataJson: values.metadataJson,
++      },
++    });
++  return (await getAgentCommandAnswer(env, answer.id))!;
++}
++
++export async function getAgentCommandAnswer(env: Env, answerId: string): Promise<AgentCommandAnswerRecord | null> {
++  const [row] = await getDb(env.DB).select().from(githubAgentCommandAnswers).where(eq(githubAgentCommandAnswers.id, answerId)).limit(1);
++  return row ? toAgentCommandAnswer(row) : null;
++}
++
++export async function recordAgentCommandFeedback(env: Env, feedback: AgentCommandFeedbackRecord): Promise<void> {
++  const actorHash = await hashCommandFeedbackActor(feedback.repoFullName, feedback.actorLogin);
++  const now = feedback.updatedAt ?? nowIso();
++  const values = {
++    id: feedback.id ?? crypto.randomUUID(),
++    answerId: feedback.answerId,
++    repoFullName: boundedString(feedback.repoFullName, 200),
++    issueNumber: Math.max(0, Math.round(feedback.issueNumber)),
++    command: boundedString(feedback.command, 64),
++    actorHash,
++    vote: feedback.vote,
++    source: feedback.source,
++    actorKind: feedback.actorKind,
++    createdAt: feedback.createdAt ?? now,
++    updatedAt: now,
++    metadataJson: jsonString(feedback.metadata ?? {}),
++  };
++  await getDb(env.DB)
++    .insert(githubAgentCommandFeedback)
++    .values(values)
++    .onConflictDoUpdate({
++      target: [githubAgentCommandFeedback.answerId, githubAgentCommandFeedback.actorHash],
++      set: {
++        vote: values.vote,
++        source: values.source,
++        actorKind: values.actorKind,
++        updatedAt: values.updatedAt,
++        metadataJson: values.metadataJson,
++      },
++    });
++}
++
++export async function getCommandUsefulnessSummary(env: Env, options: { windowDays?: number; now?: string } = {}): Promise<CommandUsefulnessSummary> {
++  const windowDays = clampInteger(options.windowDays ?? 30, 1, 180);
++  const now = options.now ?? nowIso();
++  const sinceIso = new Date(Date.parse(now) - windowDays * 24 * 60 * 60 * 1000).toISOString();
++  const rows = await getDb(env.DB)
++    .select({
++      command: githubAgentCommandFeedback.command,
++      feedbackCount: sql<number>`count(*)`,
++      usefulCount: sql<number>`coalesce(sum(case when ${githubAgentCommandFeedback.vote} = 'useful' then 1 else 0 end), 0)`,
++      notUsefulCount: sql<number>`coalesce(sum(case when ${githubAgentCommandFeedback.vote} = 'not_useful' then 1 else 0 end), 0)`,
++      answerCount: sql<number>`count(distinct ${githubAgentCommandFeedback.answerId})`,
++      latestFeedbackAt: sql<string | null>`max(${githubAgentCommandFeedback.updatedAt})`,
++    })
++    .from(githubAgentCommandFeedback)
++    .where(gte(githubAgentCommandFeedback.updatedAt, sinceIso))
++    .groupBy(githubAgentCommandFeedback.command);
++  const commands = rows
++    .map((row) => {
++      const feedbackCount = Number(row.feedbackCount);
++      const usefulCount = Number(row.usefulCount);
++      const notUsefulCount = Number(row.notUsefulCount);
++      return {
++        command: row.command,
++        feedbackCount,
++        usefulCount,
++        notUsefulCount,
++        answerCount: Number(row.answerCount),
++        usefulnessRate: usefulCount / feedbackCount,
++        latestFeedbackAt: row.latestFeedbackAt,
++      };
++    })
++    .sort((left, right) => right.feedbackCount - left.feedbackCount || left.command.localeCompare(right.command));
++  const totals = commands.reduce(
++    (acc, row) => ({
++      feedbackCount: acc.feedbackCount + row.feedbackCount,
++      usefulCount: acc.usefulCount + row.usefulCount,
++      notUsefulCount: acc.notUsefulCount + row.notUsefulCount,
++      answerCount: acc.answerCount + row.answerCount,
++      latestFeedbackAt: maxIso(acc.latestFeedbackAt, row.latestFeedbackAt),
++    }),
++    { feedbackCount: 0, usefulCount: 0, notUsefulCount: 0, answerCount: 0, latestFeedbackAt: null as string | null },
++  );
++  return {
++    windowDays,
++    generatedAt: now,
++    totals: {
++      ...totals,
++      usefulnessRate: totals.feedbackCount > 0 ? totals.usefulCount / totals.feedbackCount : null,
++    },
++    commands,
++  };
++}
++
+ export async function summarizeMcpCompatibilityAdoption(
+   env: Env,
+   sinceIso?: string,
+@@ -1315,6 +1446,21 @@ function boundedString(value: unknown, maxLength: number): string {
+   return String(value ?? "").slice(0, maxLength);
+ }
+ 
++async function hashCommandFeedbackActor(repoFullName: string, actorLogin: string): Promise<string> {
++  return `sha256:${await sha256Hex(`gittensory-command-feedback:v1:${repoFullName.toLowerCase()}:${actorLogin.toLowerCase()}`)}`;
++}
++
++function clampInteger(value: number, min: number, max: number): number {
++  if (!Number.isFinite(value)) return min;
++  return Math.min(max, Math.max(min, Math.round(value)));
++}
++
++function maxIso(left: string | null | undefined, right: string | null | undefined): string | null {
++  if (!left) return right ?? null;
++  if (!right) return left;
++  return right > left ? right : left;
++}
++
+ function finiteNumber(value: unknown): number {
+   return typeof value === "number" && Number.isFinite(value) ? value : 0;
+ }
+@@ -3312,6 +3458,22 @@ function sanitizeProductUsageString(value: string, maxLength: number): string {
+   return redacted.slice(0, maxLength);
+ }
+ 
++function toAgentCommandAnswer(row: typeof githubAgentCommandAnswers.$inferSelect): AgentCommandAnswerRecord {
++  return {
++    id: row.id,
++    repoFullName: row.repoFullName,
++    issueNumber: row.issueNumber,
++    command: row.command,
++    requestCommentId: row.requestCommentId,
++    responseCommentId: row.responseCommentId,
++    responseUrl: row.responseUrl,
++    actorKind: row.actorKind === "maintainer" ? "maintainer" : "author",
++    createdAt: row.createdAt,
++    updatedAt: row.updatedAt,
++    metadata: parseJson<Record<string, JsonValue>>(row.metadataJson, {}),
++  };
++}
++
+ function parseAgentSurface(value: string): AgentSurface {
+   if (value === "mcp" || value === "github_comment") return value;
+   return "api";
+diff --git a/src/db/schema.ts b/src/db/schema.ts
+index fcf90f0..45d37fe 100644
+--- a/src/db/schema.ts
++++ b/src/db/schema.ts
+@@ -729,6 +729,52 @@ export const digestSubscriptions = sqliteTable(
+   }),
+ );
+ 
++export const githubAgentCommandAnswers = sqliteTable(
++  "github_agent_command_answers",
++  {
++    id: text("id").primaryKey(),
++    repoFullName: text("repo_full_name").notNull(),
++    issueNumber: integer("issue_number").notNull(),
++    command: text("command").notNull(),
++    requestCommentId: integer("request_comment_id"),
++    responseCommentId: integer("response_comment_id"),
++    responseUrl: text("response_url"),
++    actorKind: text("actor_kind").notNull(),
++    createdAt: text("created_at").notNull().default("CURRENT_TIMESTAMP"),
++    updatedAt: text("updated_at").notNull().default("CURRENT_TIMESTAMP"),
++    metadataJson: text("metadata_json").notNull().default("{}"),
++  },
++  (table) => ({
++    repoIssue: index("github_agent_command_answers_repo_issue_idx").on(table.repoFullName, table.issueNumber),
++    commandUpdated: index("github_agent_command_answers_command_updated_idx").on(table.command, table.updatedAt),
++  }),
++);
++
++export const githubAgentCommandFeedback = sqliteTable(
++  "github_agent_command_feedback",
++  {
++    id: text("id").primaryKey(),
++    answerId: text("answer_id")
++      .notNull()
++      .references(() => githubAgentCommandAnswers.id),
++    repoFullName: text("repo_full_name").notNull(),
++    issueNumber: integer("issue_number").notNull(),
++    command: text("command").notNull(),
++    actorHash: text("actor_hash").notNull(),
++    vote: text("vote").notNull(),
++    source: text("source").notNull(),
++    actorKind: text("actor_kind").notNull(),
++    createdAt: text("created_at").notNull().default("CURRENT_TIMESTAMP"),
++    updatedAt: text("updated_at").notNull().default("CURRENT_TIMESTAMP"),
++    metadataJson: text("metadata_json").notNull().default("{}"),
++  },
++  (table) => ({
++    actorAnswer: uniqueIndex("github_agent_command_feedback_actor_answer_unique").on(table.answerId, table.actorHash),
++    commandUpdated: index("github_agent_command_feedback_command_updated_idx").on(table.command, table.updatedAt),
++    repoIssue: index("github_agent_command_feedback_repo_issue_idx").on(table.repoFullName, table.issueNumber),
++  }),
++);
++
+ export const auditEvents = sqliteTable(
+   "audit_events",
+   {
+diff --git a/src/github/commands.ts b/src/github/commands.ts
+index 620dc31..4a554f5 100644
+--- a/src/github/commands.ts
++++ b/src/github/commands.ts
+@@ -46,9 +46,15 @@ type PublicAnswerCard = {
+   safeDetails?: string[] | undefined;
+ };
+ 
++export type AgentCommandFeedbackContext = {
++  answerId: string;
++  command: GittensoryMentionCommandName | null;
++};
++
+ const COMMANDS = new Set<GittensoryMentionCommandName>(GITTENSORY_MENTION_COMMAND_CATALOG.map((command) => command.id));
+ const MAINTAINER_QUEUE_DIGEST_COMMANDS = new Set<MaintainerQueueDigestCommandName>(MAINTAINER_QUEUE_DIGEST_COMMAND_CATALOG.map((command) => command.id));
+ const MAINTAINER_ASSOCIATIONS = new Set(["OWNER", "MEMBER", "COLLABORATOR"]);
++const AGENT_COMMAND_FEEDBACK_MARKER = "gittensory-agent-command-answer";
+ 
+ const COMMAND_TITLES = Object.fromEntries(GITTENSORY_MENTION_COMMAND_CATALOG.map((command) => [command.id, command.title])) as Record<GittensoryMentionCommandName, string>;
+ 
+@@ -132,6 +138,20 @@ export function isMaintainerAssociation(association: string | null | undefined):
+   return Boolean(association && MAINTAINER_ASSOCIATIONS.has(association));
+ }
+ 
++export function buildAgentCommandFeedbackMarker(answerId: string): string {
++  return `<!-- ${AGENT_COMMAND_FEEDBACK_MARKER}:${sanitizeFeedbackAnswerId(answerId)} -->`;
++}
++
++export function parseAgentCommandFeedbackContext(body: string | null | undefined): AgentCommandFeedbackContext | null {
++  if (!body) return null;
++  const answerMatch = body.match(/<!--\s*gittensory-agent-command-answer:([A-Za-z0-9_.:-]{8,120})\s*-->/);
++  if (!answerMatch?.[1]) return null;
++  const commandMatch = body.match(/Command:\s*`@gittensory\s+([a-z-]+)`/i);
++  const requestedCommand = commandMatch?.[1]?.toLowerCase() as GittensoryMentionCommandName | undefined;
++  const command = requestedCommand && COMMANDS.has(requestedCommand) ? requestedCommand : null;
++  return { answerId: answerMatch[1], command };
++}
++
+ export function isMaintainerQueueDigestCommand(command: GittensoryMentionCommandName): command is MaintainerQueueDigestCommandName {
+   return MAINTAINER_QUEUE_DIGEST_COMMANDS.has(command as MaintainerQueueDigestCommandName);
+ }
+@@ -169,6 +189,7 @@ export function buildPublicAgentCommandComment(args: {
+   issue: GitHubIssuePayload;
+   pullRequest: PullRequestRecord | null;
+   actorKind: "maintainer" | "author";
++  answerId?: string | null | undefined;
+   officialMiner?: GittensorContributorSnapshot | null | undefined;
+   bundle?: AgentRunBundle | null | undefined;
+   maintainerDigest?: MaintainerQueueDigest | null | undefined;
+@@ -190,6 +211,7 @@ export function buildPublicAgentCommandComment(args: {
+     `Scope: ${repoFullName}#${args.issue.number}`,
+     "",
+     ...renderPublicAnswerCard(card),
++    ...feedbackPromptSections(args.answerId),
+     "",
+     "_Advisory context only. Public comments exclude non-public contributor signals and private planning internals._",
+   ].join("\n");
+@@ -377,6 +399,17 @@ function stripEmphasis(value: string): string {
+   return value.replace(/^\*\*/, "").replace(/\*\*$/, "").trim();
+ }
+ 
++function feedbackPromptSections(answerId: string | null | undefined): string[] {
++  if (!answerId) return [];
++  return [
++    "",
++    buildAgentCommandFeedbackMarker(answerId),
++    "**Feedback**",
++    "",
++    "- Use a thumbs-up or thumbs-down reaction to mark whether this answer helped. Feedback is aggregate-only and never changes deterministic results.",
++  ];
++}
++
+ function commandSections(
+   command: GittensoryMentionCommandName,
+   bundle: AgentRunBundle | null | undefined,
+@@ -896,6 +929,10 @@ function dedupeBulletLines(lines: string[]): string[] {
+   });
+ }
+ 
++function sanitizeFeedbackAnswerId(answerId: string): string {
++  return answerId.replace(/[^A-Za-z0-9_.:-]/g, "").slice(0, 120);
++}
++
+ export function sanitizePublicComment(value: string): string {
+   const sanitized = value
+     .replace(/\b(raw trust score|trust score|wallet|hotkey|coldkey|seed phrase|mnemonic)\b/gi, "private context")
+diff --git a/src/openapi/spec.ts b/src/openapi/spec.ts
+index b95bd1a..ff0929a 100644
+--- a/src/openapi/spec.ts
++++ b/src/openapi/spec.ts
+@@ -579,7 +579,9 @@ export function buildOpenApiSpec() {
+     "/v1/app/maintainer-dashboard",
+     "/v1/app/operator-dashboard",
+     "/v1/app/commands",
++    "/v1/app/commands/usefulness",
+     "/v1/app/digest",
++    "/v1/app/analytics/daily-rollups",
+     "/v1/app/analytics/mcp-compatibility",
+     "/v1/app/analytics/weekly-value-report",
+   ]) {
+@@ -592,7 +594,7 @@ export function buildOpenApiSpec() {
+       },
+     });
+   }
+-  for (const path of ["/v1/app/commands/preview", "/v1/app/digest/subscriptions"]) {
++  for (const path of ["/v1/app/commands/preview", "/v1/app/commands/feedback", "/v1/app/digest/subscriptions"]) {
+     registry.registerPath({
+       method: "post",
+       path,
+diff --git a/src/queue/processors.ts b/src/queue/processors.ts
+index 98ae3e8..0ce0849 100644
+--- a/src/queue/processors.ts
++++ b/src/queue/processors.ts
+@@ -1,6 +1,7 @@
+ import {
+   countOpenIssues,
+   countOpenPullRequests,
++  getAgentCommandAnswer,
+   getLatestRepoGithubTotalsSnapshot,
+   getFreshOfficialMinerDetection,
+   getPullRequest,
+@@ -27,11 +28,13 @@ import {
+   listRepositories,
+   markInstallationDeleted,
+   persistAdvisory,
++  recordAgentCommandFeedback,
+   recordAuditEvent,
+   recordProductUsageEvent,
+   persistSignalSnapshot,
+   recordWebhookEvent,
+   replaceCollisionEdges,
++  upsertAgentCommandAnswer,
+   upsertOfficialMinerDetection,
+   rollupProductUsageDaily,
+   upsertBurdenForecast,
+@@ -61,6 +64,7 @@ import {
+   isMaintainerAssociation,
+   isMaintainerOnlyCommand,
+   isMaintainerQueueDigestCommand,
++  parseAgentCommandFeedbackContext,
+   parseGittensoryMentionCommand,
+ } from "../github/commands";
+ import { ensurePullRequestLabel } from "../github/labels";
+@@ -70,6 +74,7 @@ import { buildIssueAdvisory, buildPullRequestAdvisory } from "../rules/advisory"
+ import { getOrCreateScoringModelSnapshot, refreshScoringModelSnapshot } from "../scoring/model";
+ import { buildAndPersistContributorDecisionPack, loadDecisionPackSharedInputs } from "../services/decision-pack";
+ import { executeAgentRun, explainBlockersWithAgent, planNextWork, preflightBranchWithAgent, preparePrPacketWithAgent } from "../services/agent-orchestrator";
++import { isAuthorizedGitHubSessionLogin } from "../auth/security";
+ import { loadIssueQualityReportMap } from "../services/issue-quality";
+ import { generateWeeklyValueReport } from "../services/weekly-value-report";
+ import { REPO_OUTCOME_PATTERNS_SIGNAL, computeRepoOutcomePatterns } from "../services/repo-outcome-patterns";
+@@ -536,6 +541,19 @@ async function processGitHubWebhook(env: Env, deliveryId: string, eventName: str
+     }
+     if (payload.repository) await upsertRepositoryFromGitHub(env, payload.repository, installationId ?? undefined);
+ 
++    if (eventName === "reaction" && (await maybeProcessAgentCommandFeedbackReaction(env, deliveryId, payload))) {
++      await recordWebhookEvent(env, {
++        deliveryId,
++        eventName,
++        action: payload.action,
++        installationId: payload.installation?.id,
++        repositoryFullName: payload.repository?.full_name,
++        payloadHash: "processed",
++        status: "processed",
++      });
++      return;
++    }
++
+     if (eventName === "issue_comment" && (await maybeProcessGittensoryMentionCommand(env, deliveryId, payload))) {
+       await recordWebhookEvent(env, {
+         deliveryId,
+@@ -905,6 +923,7 @@ async function maybeProcessGittensoryMentionCommand(env: Env, deliveryId: string
+     return true;
+   }
+ 
++  const answerId = crypto.randomUUID();
+   const login = pullRequestAuthor ?? commenter;
+   const maintainerDigest = isMaintainerQueueDigestCommand(command.name)
+     ? await buildMaintainerQueueDigestForCommand(env, repo, repoFullName)
+@@ -923,17 +942,32 @@ async function maybeProcessGittensoryMentionCommand(env: Env, deliveryId: string
+     issue,
+     pullRequest: cachedPullRequest,
+     actorKind: authorization.actorKind === "maintainer" ? "maintainer" : "author",
++    answerId,
+     officialMiner: official?.status === "confirmed" ? official.snapshot : null,
+     bundle,
+     maintainerDigest,
+   });
+-  await createOrUpdateAgentCommandComment(env, installationId, repoFullName, issue.number, body);
++  const responseComment = await createOrUpdateAgentCommandComment(env, installationId, repoFullName, issue.number, body);
++  await upsertAgentCommandAnswer(env, {
++    id: answerId,
++    repoFullName,
++    issueNumber: issue.number,
++    command: command.name,
++    requestCommentId: payload.comment?.id ?? null,
++    responseCommentId: responseComment?.id ?? null,
++    responseUrl: responseComment?.html_url ?? null,
++    actorKind: authorization.actorKind === "maintainer" ? "maintainer" : "author",
++    metadata: {
++      publicSurface: "github_comment",
++      responseCommentStored: Boolean(responseComment?.id),
++    },
++  });
+   await recordAuditEvent(env, {
+     eventType: "github_app.agent_command_replied",
+     actor: commenter,
+     targetKey: `${repoFullName}#${issue.number}`,
+     outcome: "completed",
+-    metadata: { deliveryId, command: command.name, actorKind: authorization.actorKind, runId: bundle?.run.id ?? null },
++    metadata: { deliveryId, command: command.name, actorKind: authorization.actorKind, runId: bundle?.run.id ?? null, answerId },
+   });
+   await recordAgentCommandUsage(env, {
+     repoFullName,
+@@ -1129,6 +1163,157 @@ async function recordAgentCommandFeedbackPrompt(
+   });
+ }
+ 
++async function maybeProcessAgentCommandFeedbackReaction(env: Env, deliveryId: string, payload: GitHubWebhookPayload): Promise<boolean> {
++  const repoFullName = payload.repository?.full_name;
++  const issue = payload.issue;
++  const actor = payload.reaction?.user?.login ?? payload.sender?.login;
++  const vote = reactionVote(payload.reaction?.content);
++  const feedback = parseAgentCommandFeedbackContext(payload.comment?.body);
++  if (!repoFullName || !issue || !actor || !feedback || !vote) return false;
++
++  const targetKey = `${repoFullName}#${issue.number}`;
++  if (payload.action !== "created") {
++    await recordAuditEvent(env, {
++      eventType: "github_app.agent_command_feedback_skipped",
++      actor,
++      targetKey,
++      outcome: "completed",
++      detail: "unsupported_reaction_action",
++      metadata: { deliveryId, action: payload.action ?? null, answerId: feedback.answerId },
++    });
++    return true;
++  }
++  if (payload.reaction?.user?.type === "Bot" || /\[bot\]$/i.test(actor)) {
++    await recordAuditEvent(env, {
++      eventType: "github_app.agent_command_feedback_skipped",
++      actor,
++      targetKey,
++      outcome: "completed",
++      detail: "bot_reaction",
++      metadata: { deliveryId, answerId: feedback.answerId },
++    });
++    return true;
++  }
++  const [answer, cachedPullRequest] = await Promise.all([
++    getAgentCommandAnswer(env, feedback.answerId),
++    getPullRequest(env, repoFullName, issue.number),
++  ]);
++  const command = answer?.command ?? feedback.command ?? "unknown";
++  if (!answer) {
++    await recordAuditEvent(env, {
++      eventType: "github_app.agent_command_feedback_skipped",
++      actor,
++      targetKey,
++      outcome: "completed",
++      detail: "unknown_answer",
++      metadata: { deliveryId, answerId: feedback.answerId, command, vote },
++    });
++    return true;
++  }
++  const contextMismatch = answer.repoFullName.toLowerCase() !== repoFullName.toLowerCase() || answer.issueNumber !== issue.number;
++  if (contextMismatch) {
++    await recordAuditEvent(env, {
++      eventType: "github_app.agent_command_feedback_skipped",
++      actor,
++      targetKey,
++      outcome: "completed",
++      detail: "answer_context_mismatch",
++      metadata: { deliveryId, answerId: feedback.answerId, command, vote },
++    });
++    return true;
++  }
++  if (!answer.responseCommentId || answer.responseCommentId !== payload.comment?.id) {
++    await recordAuditEvent(env, {
++      eventType: "github_app.agent_command_feedback_skipped",
++      actor,
++      targetKey,
++      outcome: "completed",
++      detail: "answer_comment_mismatch",
++      metadata: { deliveryId, answerId: feedback.answerId, command, vote, commentId: payload.comment?.id ?? null },
++    });
++    return true;
++  }
++  const pullRequestAuthor = cachedPullRequest?.authorLogin ?? issue.user?.login ?? null;
++  const official = pullRequestAuthor && actor.toLowerCase() === pullRequestAuthor.toLowerCase()
++    ? await getCachedOfficialMinerDetection(env, actor, { targetKey, deliveryId })
++    : undefined;
++  const authorization = authorizeFeedbackActor(env, {
++    actor,
++    repoFullName,
++    pullRequestAuthor,
++    officialAuthorDetection: official,
++  });
++  if (!authorization.authorized) {
++    await recordAuditEvent(env, {
++      eventType: "github_app.agent_command_feedback_denied",
++      actor,
++      targetKey,
++      outcome: "denied",
++      detail: authorization.reason,
++      metadata: { deliveryId, answerId: feedback.answerId, command, vote },
++    });
++    return true;
++  }
++
++  await recordAgentCommandFeedback(env, {
++    answerId: feedback.answerId,
++    repoFullName,
++    issueNumber: issue.number,
++    command,
++    actorLogin: actor,
++    vote,
++    source: "github_reaction",
++    actorKind: authorization.actorKind,
++    metadata: {
++      deliveryId,
++      reactionId: payload.reaction?.id ?? null,
++    },
++  });
++  await recordAuditEvent(env, {
++    eventType: "github_app.agent_command_feedback_recorded",
++    actor,
++    targetKey,
++    outcome: "completed",
++    metadata: { deliveryId, answerId: feedback.answerId, command, vote, source: "github_reaction", actorKind: authorization.actorKind },
++  });
++  return true;
++}
++
++function reactionVote(content: string | null | undefined): "useful" | "not_useful" | null {
++  if (content === "+1") return "useful";
++  if (content === "-1") return "not_useful";
++  return null;
++}
++
++function authorizeFeedbackActor(
++  env: Env,
++  args: {
++    actor: string;
++    repoFullName: string;
++    pullRequestAuthor?: string | null | undefined;
++    officialAuthorDetection?: OfficialGittensorMinerDetection | undefined;
++  },
++): { authorized: boolean; reason: string; actorKind: "maintainer" | "author" } {
++  const [owner] = args.repoFullName.split("/");
++  if (owner && owner.toLowerCase() === args.actor.toLowerCase()) {
++    return { authorized: true, reason: "repo_owner_feedback", actorKind: "maintainer" };
++  }
++  if (isAuthorizedGitHubSessionLogin(env, args.actor)) {
++    return { authorized: true, reason: "operator_feedback", actorKind: "maintainer" };
++  }
++  const authorAuthorization = isAuthorizedCommandActor({
++    commenterLogin: args.actor,
++    commenterAssociation: null,
++    pullRequestAuthorLogin: args.pullRequestAuthor,
++    officialAuthorDetection: args.officialAuthorDetection,
++  });
++  return {
++    authorized: authorAuthorization.authorized,
++    reason: authorAuthorization.reason,
++    actorKind: "author",
++  };
++}
++
+ async function auditPrVisibilitySkip(
+   env: Env,
+   repoFullName: string,
+diff --git a/src/types.ts b/src/types.ts
+index c17e7ff..afcde54 100644
+--- a/src/types.ts
++++ b/src/types.ts
+@@ -131,11 +131,19 @@ export type GitHubWebhookPayload = {
+   pull_request?: GitHubPullRequestPayload;
+   issue?: GitHubIssuePayload;
+   comment?: GitHubIssueCommentPayload;
++  reaction?: GitHubReactionPayload;
++  sender?: GitHubWebhookUserPayload;
+   label?: {
+     name?: string;
+   };
+ };
+ 
++export type GitHubWebhookUserPayload = {
++  login?: string;
++  type?: string;
++  id?: number;
++};
++
+ export type GitHubRepositoryPayload = {
+   id?: number;
+   name: string;
+@@ -194,6 +202,13 @@ export type GitHubIssuePayload = {
+   pull_request?: unknown;
+ };
+ 
++export type GitHubReactionPayload = {
++  id?: number;
++  content?: string;
++  user?: GitHubWebhookUserPayload;
++  created_at?: string | null;
++};
++
+ export type GitHubIssueCommentPayload = {
+   id: number;
+   body?: string | null;
+@@ -862,6 +877,55 @@ export type DigestSubscriptionRecord = {
+   updatedAt: string;
+ };
+ 
++export type CommandFeedbackVote = "useful" | "not_useful";
++export type CommandFeedbackSource = "github_reaction" | "app";
++
++export type AgentCommandAnswerRecord = {
++  id: string;
++  repoFullName: string;
++  issueNumber: number;
++  command: string;
++  requestCommentId?: number | null | undefined;
++  responseCommentId?: number | null | undefined;
++  responseUrl?: string | null | undefined;
++  actorKind: "maintainer" | "author";
++  createdAt?: string | null | undefined;
++  updatedAt?: string | null | undefined;
++  metadata: Record<string, JsonValue>;
++};
++
++export type AgentCommandFeedbackRecord = {
++  id?: string | undefined;
++  answerId: string;
++  repoFullName: string;
++  issueNumber: number;
++  command: string;
++  actorLogin: string;
++  vote: CommandFeedbackVote;
++  source: CommandFeedbackSource;
++  actorKind: "maintainer" | "author";
++  createdAt?: string | null | undefined;
++  updatedAt?: string | null | undefined;
++  metadata?: Record<string, JsonValue> | undefined;
++};
++
++export type CommandUsefulnessBucket = {
++  command: string;
++  feedbackCount: number;
++  usefulCount: number;
++  notUsefulCount: number;
++  answerCount: number;
++  usefulnessRate: number | null;
++  latestFeedbackAt?: string | null | undefined;
++};
++
++export type CommandUsefulnessSummary = {
++  windowDays: number;
++  generatedAt: string;
++  totals: Omit<CommandUsefulnessBucket, "command">;
++  commands: CommandUsefulnessBucket[];
++};
++
+ export type AuditEventRecord = {
+   id?: string | undefined;
+   eventType: string;
+diff --git a/test/integration/api.test.ts b/test/integration/api.test.ts
+index c8bd9c9..1abe784 100644
+--- a/test/integration/api.test.ts
++++ b/test/integration/api.test.ts
+@@ -2,6 +2,7 @@ import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+ import { createSessionForGitHubUser, hashToken } from "../../src/auth/security";
+ import {
+   upsertBounty,
++  upsertAgentCommandAnswer,
+   upsertBurdenForecast,
+   upsertCheckSummary,
+   upsertInstallation,
+@@ -1442,12 +1443,72 @@ describe("api routes", () => {
+       settingsPreview: { added: expect.any(Array), removed: expect.any(Array) },
+     });
+ 
++    await upsertAgentCommandAnswer(env, {
++      id: "api-answer-feedback",
++      repoFullName: "entrius/allways-ui",
++      issueNumber: 14,
++      command: "preflight",
++      requestCommentId: 100,
++      responseCommentId: 101,
++      responseUrl: "https://github.com/entrius/allways-ui/pull/14#issuecomment-101",
++      actorKind: "maintainer",
++      createdAt: "2026-05-28T00:00:00.000Z",
++      updatedAt: "2026-05-28T00:00:00.000Z",
++      metadata: {},
++    });
++    const unauthenticatedFeedback = await app.request(
++      "/v1/app/commands/feedback",
++      { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ answerId: "api-answer-feedback", vote: "useful" }) },
++      env,
++    );
++    expect(unauthenticatedFeedback.status).toBe(401);
++    const invalidFeedback = await app.request(
++      "/v1/app/commands/feedback",
++      { method: "POST", headers: cookieHeaders, body: JSON.stringify({ answerId: "bad<script>", vote: "useful" }) },
++      env,
++    );
++    expect(invalidFeedback.status).toBe(400);
++    const missingFeedback = await app.request(
++      "/v1/app/commands/feedback",
++      { method: "POST", headers: cookieHeaders, body: JSON.stringify({ answerId: "missing-answer", vote: "useful" }) },
++      env,
++    );
++    expect(missingFeedback.status).toBe(404);
++    const firstFeedback = await app.request(
++      "/v1/app/commands/feedback",
++      { method: "POST", headers: cookieHeaders, body: JSON.stringify({ answerId: "api-answer-feedback", vote: "useful" }) },
++      env,
++    );
++    expect(firstFeedback.status).toBe(200);
++    const updatedFeedback = await app.request(
++      "/v1/app/commands/feedback",
++      { method: "POST", headers: cookieHeaders, body: JSON.stringify({ answerId: "api-answer-feedback", vote: "not_useful" }) },
++      env,
++    );
++    expect(updatedFeedback.status).toBe(200);
++    const unauthenticatedUsefulness = await app.request("/v1/app/commands/usefulness?days=14", {}, env);
++    expect(unauthenticatedUsefulness.status).toBe(401);
++    const usefulness = await app.request("/v1/app/commands/usefulness?days=14", { headers: apiHeaders(env) }, env);
++    expect(usefulness.status).toBe(200);
++    await expect(usefulness.json()).resolves.toMatchObject({
++      windowDays: 14,
++      totals: { feedbackCount: 1, usefulCount: 0, notUsefulCount: 1, usefulnessRate: 0 },
++      commands: [expect.objectContaining({ command: "preflight", feedbackCount: 1 })],
++    });
++    const clampedUsefulness = await app.request("/v1/app/commands/usefulness?days=not-a-number", { headers: apiHeaders(env) }, env);
++    expect(clampedUsefulness.status).toBe(200);
++    await expect(clampedUsefulness.json()).resolves.toMatchObject({ windowDays: 1 });
++    const defaultUsefulness = await app.request("/v1/app/commands/usefulness", { headers: apiHeaders(env) }, env);
++    expect(defaultUsefulness.status).toBe(200);
++    await expect(defaultUsefulness.json()).resolves.toMatchObject({ windowDays: 30 });
++
+     const operator = await app.request("/v1/app/operator-dashboard", { headers: apiHeaders(env) }, env);
+     expect(operator.status).toBe(200);
+     await expect(operator.json()).resolves.toMatchObject({
+-      metrics: expect.arrayContaining([expect.objectContaining({ label: "Active sessions" }), expect.objectContaining({ label: "Digest subscriptions" })]),
++      metrics: expect.arrayContaining([expect.objectContaining({ label: "Active sessions" }), expect.objectContaining({ label: "Digest subscriptions" }), expect.objectContaining({ label: "Command usefulness", value: "0/1" })]),
+       noiseReduction: expect.any(Array),
+       weeklyReport: expect.arrayContaining([expect.stringContaining("registered repo")]),
++      commandUsefulness: expect.objectContaining({ totals: expect.objectContaining({ feedbackCount: 1 }) }),
+     });
+ 
+     const notificationModel = await app.request("/v1/app/notification-model", { headers: apiHeaders(env) }, env);
+diff --git a/test/unit/command-feedback.test.ts b/test/unit/command-feedback.test.ts
+new file mode 100644
+index 0000000..2ac8ffb
+--- /dev/null
++++ b/test/unit/command-feedback.test.ts
+@@ -0,0 +1,141 @@
++import { describe, expect, it } from "vitest";
++import {
++  getAgentCommandAnswer,
++  getCommandUsefulnessSummary,
++  recordAgentCommandFeedback,
++  upsertAgentCommandAnswer,
++} from "../../src/db/repositories";
++import { createTestEnv } from "../helpers/d1";
++
++describe("command usefulness feedback storage", () => {
++  it("deduplicates actor feedback by answer and stores only actor hashes", async () => {
++    const env = createTestEnv();
++    await upsertAgentCommandAnswer(env, answer({ id: "answer-preflight", command: "preflight" }));
++
++    await recordAgentCommandFeedback(env, {
++      id: "feedback-initial",
++      answerId: "answer-preflight",
++      repoFullName: "JSONbored/gittensory",
++      issueNumber: 77,
++      command: "preflight",
++      actorLogin: "Oktofeesh1",
++      vote: "useful",
++      source: "github_reaction",
++      actorKind: "author",
++      createdAt: "2026-05-28T00:00:00.000Z",
++      updatedAt: "2026-05-28T00:00:00.000Z",
++      metadata: { deliveryId: "delivery-1" },
++    });
++    await recordAgentCommandFeedback(env, {
++      answerId: "answer-preflight",
++      repoFullName: "JSONbored/gittensory",
++      issueNumber: 77,
++      command: "preflight",
++      actorLogin: "oktofeesh1",
++      vote: "not_useful",
++      source: "github_reaction",
++      actorKind: "author",
++      updatedAt: "2026-05-28T00:05:00.000Z",
++      metadata: { deliveryId: "delivery-2" },
++    });
++    await recordAgentCommandFeedback(env, {
++      answerId: "answer-preflight",
++      repoFullName: "JSONbored/gittensory",
++      issueNumber: 77,
++      command: "preflight",
++      actorLogin: "maintainer",
++      vote: "useful",
++      source: "app",
++      actorKind: "maintainer",
++      updatedAt: "2026-05-28T00:06:00.000Z",
++      metadata: { surface: "app" },
++    });
++
++    const rows = await env.DB.prepare("select actor_hash, vote, source, actor_kind, metadata_json from github_agent_command_feedback order by updated_at")
++      .all<{ actor_hash: string; vote: string; source: string; actor_kind: string; metadata_json: string }>();
++    expect(rows.results).toHaveLength(2);
++    expect(rows.results.map((row) => row.vote).sort()).toEqual(["not_useful", "useful"]);
++    expect(rows.results.every((row) => row.actor_hash.startsWith("sha256:"))).toBe(true);
++    expect(rows.results.map((row) => row.actor_hash).join("\n")).not.toMatch(/Oktofeesh1|oktofeesh1|maintainer/);
++    expect(rows.results.find((row) => row.vote === "not_useful")).toMatchObject({
++      source: "github_reaction",
++      actor_kind: "author",
++    });
++
++    const summary = await getCommandUsefulnessSummary(env, { now: "2026-05-29T00:00:00.000Z", windowDays: 30 });
++    expect(summary.totals).toMatchObject({
++      feedbackCount: 2,
++      usefulCount: 1,
++      notUsefulCount: 1,
++      answerCount: 1,
++      usefulnessRate: 0.5,
++    });
++    expect(summary.commands).toEqual([
++      expect.objectContaining({
++        command: "preflight",
++        feedbackCount: 2,
++        usefulCount: 1,
++        notUsefulCount: 1,
++        answerCount: 1,
++        usefulnessRate: 0.5,
++      }),
++    ]);
++  });
++
++  it("upserts answer metadata and filters usefulness windows deterministically", async () => {
++    const env = createTestEnv();
++    await upsertAgentCommandAnswer(env, answer({ id: "answer-new", command: "blockers", responseCommentId: 10 }));
++    await upsertAgentCommandAnswer(env, answer({ id: "answer-new", command: "blockers", responseCommentId: 11, responseUrl: "https://github.com/JSONbored/gittensory/pull/1#issuecomment-11" }));
++    await upsertAgentCommandAnswer(env, answer({ id: "answer-old", command: "next-action" }));
++
++    await expect(getAgentCommandAnswer(env, "answer-new")).resolves.toMatchObject({
++      id: "answer-new",
++      responseCommentId: 11,
++      responseUrl: "https://github.com/JSONbored/gittensory/pull/1#issuecomment-11",
++    });
++
++    await recordAgentCommandFeedback(env, feedback({ answerId: "answer-new", command: "blockers", actorLogin: "reviewer", updatedAt: "2026-05-28T00:00:00.000Z" }));
++    await recordAgentCommandFeedback(env, feedback({ answerId: "answer-old", command: "next-action", actorLogin: "old", updatedAt: "2026-04-01T00:00:00.000Z" }));
++
++    const summary = await getCommandUsefulnessSummary(env, { now: "2026-05-29T00:00:00.000Z", windowDays: 14 });
++    expect(summary.windowDays).toBe(14);
++    expect(summary.commands.map((row) => row.command)).toEqual(["blockers"]);
++    expect(summary.totals.feedbackCount).toBe(1);
++
++    const clamped = await getCommandUsefulnessSummary(env, { now: "2026-05-29T00:00:00.000Z", windowDays: 999 });
++    expect(clamped.windowDays).toBe(180);
++  });
++});
++
++function answer(overrides: Partial<Parameters<typeof upsertAgentCommandAnswer>[1]> = {}): Parameters<typeof upsertAgentCommandAnswer>[1] {
++  return {
++    id: "answer",
++    repoFullName: "JSONbored/gittensory",
++    issueNumber: 77,
++    command: "preflight",
++    requestCommentId: 1,
++    responseCommentId: 2,
++    responseUrl: null,
++    actorKind: "author",
++    createdAt: "2026-05-28T00:00:00.000Z",
++    updatedAt: "2026-05-28T00:00:00.000Z",
++    metadata: {},
++    ...overrides,
++  };
++}
++
++function feedback(overrides: Partial<Parameters<typeof recordAgentCommandFeedback>[1]> = {}): Parameters<typeof recordAgentCommandFeedback>[1] {
++  return {
++    answerId: "answer",
++    repoFullName: "JSONbored/gittensory",
++    issueNumber: 77,
++    command: "preflight",
++    actorLogin: "reviewer",
++    vote: "useful",
++    source: "github_reaction",
++    actorKind: "maintainer",
++    updatedAt: "2026-05-28T00:00:00.000Z",
++    metadata: {},
++    ...overrides,
++  };
++}
+diff --git a/test/unit/github-commands.test.ts b/test/unit/github-commands.test.ts
+index fc96102..9f6a5fd 100644
+--- a/test/unit/github-commands.test.ts
++++ b/test/unit/github-commands.test.ts
+@@ -1,9 +1,11 @@
+ import { describe, expect, it } from "vitest";
+ import {
++  buildAgentCommandFeedbackMarker,
+   buildMaintainerQueueDigest,
+   buildPublicAgentCommandComment,
+   isAuthorizedCommandActor,
+   isMaintainerOnlyCommand,
++  parseAgentCommandFeedbackContext,
+   parseGittensoryMentionCommand,
+   sanitizePublicComment,
+ } from "../../src/github/commands";
+@@ -143,6 +145,28 @@ describe("GitHub mention commands", () => {
+     expect(sanitizePublicComment("private ranking, wallet, payout")).toBe("private context");
+   });
+ 
++  it("adds parseable aggregate-only feedback context without public leak terms", () => {
++    const body = buildPublicAgentCommandComment({
++      command: parseGittensoryMentionCommand("@gittensory preflight")!,
++      repo: { fullName: "owner/repo" } as any,
++      issue: { number: 12, title: "PR", state: "open", pull_request: {} },
++      pullRequest: null,
++      actorKind: "author",
++      answerId: "answer_1234",
++      bundle: sampleBundle(),
++    });
++
++    expect(body).toContain(buildAgentCommandFeedbackMarker("answer_1234"));
++    expect(body).toContain("thumbs-up or thumbs-down reaction");
++    expect(parseAgentCommandFeedbackContext(body)).toEqual({ answerId: "answer_1234", command: "preflight" });
++    expect(parseAgentCommandFeedbackContext(null)).toBeNull();
++    expect(parseAgentCommandFeedbackContext("<!-- gittensory-agent-command-answer:answer_1234 -->")).toEqual({ answerId: "answer_1234", command: null });
++    expect(parseAgentCommandFeedbackContext("<!-- gittensory-agent-command-answer:answer_1234 -->\nCommand: `@gittensory UNKNOWN`")).toEqual({ answerId: "answer_1234", command: null });
++    expect(parseAgentCommandFeedbackContext("missing marker")).toBeNull();
++    expect(parseAgentCommandFeedbackContext("<!-- gittensory-agent-command-answer:bad<script> -->")).toBeNull();
++    expect(body).not.toMatch(/wallet|hotkey|raw trust score|payout|reward estimate|farming|private reviewability|public score estimate/i);
++  });
++
+   it("renders command-specific sections for preflight, blockers, duplicate-check, and next-action", () => {
+     const bundle = sampleBundle();
+ 
+@@ -471,6 +495,7 @@ describe("GitHub mention commands", () => {
+     });
+     expect(withPrFallbackScope).toContain("Scope: owner/from-pr#5");
+     expect(withPrFallbackScope).toContain("After tests pass.");
++
+   });
+ 
+   it("covers blocker label fallbacks, rerun bullets, and duplicate-risk heuristics", () => {
+@@ -533,6 +558,64 @@ describe("GitHub mention commands", () => {
+     });
+     expect(blockersWithDuplicateCodes.match(/Open pull request queue pressure/g)).toHaveLength(1);
+ 
++    const blockersFromStatus = buildPublicAgentCommandComment({
++      command: parseGittensoryMentionCommand("@gittensory blockers")!,
++      repo: null,
++      issue: { number: 25, title: "PR", state: "open", pull_request: {} },
++      pullRequest: null,
++      actorKind: "maintainer",
++      bundle: {
++        run: completedRun("run-blockers-status"),
++        actions: [
++          {
++            id: "blocker-status",
++            runId: "run-blockers-status",
++            actionType: "monitor_existing_pr",
++            status: "blocked",
++            recommendation: "Wait for review capacity",
++            why: [],
++            blockedBy: ["open_pr_pressure", "open_pr_pressure"],
++            publicSafeSummary: "Reduce concurrent review load.",
++            approvalRequired: true,
++            safetyClass: "private",
++            payload: {},
++          },
++        ],
++        contextSnapshots: [],
++        summary: "blockers",
++      },
++    });
++    expect(blockersFromStatus.match(/Open pull request queue pressure/g)).toHaveLength(1);
++
++    const statusOnlyBlocker = buildPublicAgentCommandComment({
++      command: parseGittensoryMentionCommand("@gittensory blockers")!,
++      repo: null,
++      issue: { number: 26, title: "PR", state: "open", pull_request: {} },
++      pullRequest: null,
++      actorKind: "maintainer",
++      bundle: {
++        run: completedRun("run-blockers-status-only"),
++        actions: [
++          {
++            id: "blocker-status-only",
++            runId: "run-blockers-status-only",
++            actionType: "monitor_existing_pr",
++            status: "blocked",
++            recommendation: "Wait",
++            why: [],
++            blockedBy: [],
++            publicSafeSummary: "Wait for maintainer review capacity.",
++            approvalRequired: true,
++            safetyClass: "private",
++            payload: {},
++          },
++        ],
++        contextSnapshots: [],
++        summary: "blockers",
++      },
++    });
++    expect(statusOnlyBlocker).toContain("Wait for maintainer review capacity.");
++
+     const duplicateViaRecommendation = buildPublicAgentCommandComment({
+       command: parseGittensoryMentionCommand("@gittensory duplicate-check")!,
+       repo: null,
+diff --git a/test/unit/openapi.test.ts b/test/unit/openapi.test.ts
+index 406ec28..fae1b18 100644
+--- a/test/unit/openapi.test.ts
++++ b/test/unit/openapi.test.ts
+@@ -43,6 +43,8 @@ describe("OpenAPI contract", () => {
+     expect(spec.paths["/v1/app/operator-dashboard"]).toBeDefined();
+     expect(spec.paths["/v1/app/commands"]).toBeDefined();
+     expect(spec.paths["/v1/app/commands/preview"]).toBeDefined();
++    expect(spec.paths["/v1/app/commands/usefulness"]).toBeDefined();
++    expect(spec.paths["/v1/app/commands/feedback"]).toBeDefined();
+     expect(spec.paths["/v1/app/digest"]).toBeDefined();
+     expect(spec.paths["/v1/app/digest/subscriptions"]).toBeDefined();
+     expect(spec.paths["/v1/auth/github/start"]).toBeDefined();
+diff --git a/test/unit/queue.test.ts b/test/unit/queue.test.ts
+index ffcdb84..4df3c92 100644
+--- a/test/unit/queue.test.ts
++++ b/test/unit/queue.test.ts
+@@ -2,6 +2,7 @@ import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+ import {
+   listCollisionEdges,
+   createAgentRun,
++  getCommandUsefulnessSummary,
+   getBurdenForecast,
+   getContributorEvidence,
+   getAgentRun,
+@@ -16,10 +17,11 @@ import {
+   listSignalSnapshots,
+   persistSignalSnapshot,
+   recordProductUsageEvent,
+-  upsertOfficialMinerDetection,
++  upsertAgentCommandAnswer,
+   upsertIssueFromGitHub,
+   upsertRepoSyncSegment,
+   upsertInstallation,
++  upsertOfficialMinerDetection,
+   upsertPullRequestFromGitHub,
+   upsertRepositorySettings,
+   upsertRepositoryFromGitHub,
+@@ -1646,6 +1648,279 @@ describe("queue processors", () => {
+     );
+   });
+ 
++  it("records deduped @gittensory answer usefulness from authorized reactions only", async () => {
++    const env = createTestEnv({ ADMIN_GITHUB_LOGINS: "maintainer" });
++    await upsertPullRequestFromGitHub(env, "JSONbored/gittensory", {
++      number: 77,
++      title: "Miner command context",
++      state: "open",
++      user: { login: "oktofeesh1" },
++      author_association: "NONE",
++    });
++    await upsertOfficialMinerDetection(env, "oktofeesh1", { status: "confirmed", snapshot: queueMinerSnapshot("oktofeesh1") }, 60 * 60 * 1000);
++    await upsertAgentCommandAnswer(env, commandAnswer("answer-maintainer", "preflight", { responseCommentId: 9001 }));
++    await upsertAgentCommandAnswer(env, commandAnswer("answer-author", "next-action", { responseCommentId: 9002 }));
++    await upsertAgentCommandAnswer(env, { ...commandAnswer("answer-no-author", "preflight", { responseCommentId: 9003 }), issueNumber: 78 });
++    const basePayload = {
++      action: "created",
++      installation: { id: 123, account: { login: "JSONbored", id: 1, type: "User" } },
++      repository: { name: "gittensory", full_name: "JSONbored/gittensory", private: false, owner: { login: "JSONbored" } },
++      issue: { number: 77, title: "Miner command context", state: "open", pull_request: {}, user: { login: "oktofeesh1" }, author_association: "NONE" },
++    };
++
++    await processJob(env, {
++      type: "github-webhook",
++      deliveryId: "feedback-1",
++      eventName: "reaction",
++      payload: {
++        ...basePayload,
++        comment: { id: 9001, body: commandAnswerBody("answer-maintainer", "preflight"), user: { login: "gittensory[bot]", type: "Bot" } },
++        reaction: { id: 1, content: "+1", user: { login: "maintainer", type: "User" } },
++      },
++    });
++    await processJob(env, {
++      type: "github-webhook",
++      deliveryId: "feedback-2",
++      eventName: "reaction",
++      payload: {
++        ...basePayload,
++        comment: { id: 9001, body: commandAnswerBody("answer-maintainer", "preflight"), user: { login: "gittensory[bot]", type: "Bot" } },
++        reaction: { id: 2, content: "-1", user: { login: "maintainer", type: "User" } },
++      },
++    });
++    await processJob(env, {
++      type: "github-webhook",
++      deliveryId: "feedback-3",
++      eventName: "reaction",
++      payload: {
++        ...basePayload,
++        comment: { id: 9002, body: commandAnswerBody("answer-author", "next-action"), user: { login: "gittensory[bot]", type: "Bot" } },
++        reaction: { id: 3, content: "+1", user: { login: "oktofeesh1", type: "User" } },
++      },
++    });
++    await processJob(env, {
++      type: "github-webhook",
++      deliveryId: "feedback-4",
++      eventName: "reaction",
++      payload: {
++        ...basePayload,
++        comment: { id: 9002, body: commandAnswerBody("answer-author", "next-action"), user: { login: "gittensory[bot]", type: "Bot" } },
++        reaction: { id: 4, content: "+1", user: { login: "random", type: "User" } },
++      },
++    });
++    await processJob(env, {
++      type: "github-webhook",
++      deliveryId: "feedback-5",
++      eventName: "reaction",
++      payload: {
++        action: "created",
++        installation: { id: 123, account: { login: "JSONbored", id: 1, type: "User" } },
++        repository: { name: "gittensory", full_name: "JSONbored/gittensory", private: false, owner: { login: "JSONbored" } },
++        issue: { number: 78, title: "No author", state: "open", pull_request: {}, author_association: "NONE" },
++        comment: { id: 9003, body: commandAnswerBody("answer-no-author", "preflight"), user: { login: "gittensory[bot]", type: "Bot" } },
++        reaction: { id: 5, content: "+1", user: { login: "random", type: "User" } },
++      },
++    });
++
++    const summary = await getCommandUsefulnessSummary(env, { now: "2026-05-29T00:00:00.000Z", windowDays: 30 });
++    expect(summary.totals).toMatchObject({ feedbackCount: 2, usefulCount: 1, notUsefulCount: 1, answerCount: 2, usefulnessRate: 0.5 });
++    expect(summary.commands).toEqual([
++      expect.objectContaining({ command: "next-action", feedbackCount: 1, usefulCount: 1 }),
++      expect.objectContaining({ command: "preflight", feedbackCount: 1, notUsefulCount: 1 }),
++    ]);
++    const audit = await env.DB.prepare("select event_type, detail from audit_events where event_type like ? order by created_at")
++      .bind("github_app.agent_command_feedback_%")
++      .all<{ event_type: string; detail: string | null }>();
++    expect(audit.results).toEqual(
++      expect.arrayContaining([
++        expect.objectContaining({ event_type: "github_app.agent_command_feedback_recorded" }),
++        expect.objectContaining({ event_type: "github_app.agent_command_feedback_denied", detail: "not_maintainer_or_pr_author" }),
++      ]),
++    );
++    const stored = await env.DB.prepare("select actor_hash, metadata_json from github_agent_command_feedback").all<{ actor_hash: string; metadata_json: string }>();
++    expect(stored.results.map((row) => row.actor_hash).join("\n")).not.toMatch(/maintainer|oktofeesh1|random/);
++    expect(stored.results.every((row) => row.actor_hash.startsWith("sha256:"))).toBe(true);
++  });
++
++  it("skips unsupported @gittensory feedback reactions without storing votes", async () => {
++    const env = createTestEnv({ ADMIN_GITHUB_LOGINS: "maintainer" });
++    await upsertAgentCommandAnswer(env, commandAnswer("answer-skip", "preflight", { responseCommentId: 9001 }));
++    const basePayload = {
++      installation: { id: 123, account: { login: "JSONbored", id: 1, type: "User" } },
++      repository: { name: "gittensory", full_name: "JSONbored/gittensory", private: false, owner: { login: "JSONbored" } },
++      issue: { number: 77, title: "Miner command context", state: "open", pull_request: {}, user: { login: "oktofeesh1" }, author_association: "NONE" },
++    };
++
++    await processJob(env, {
++      type: "github-webhook",
++      deliveryId: "feedback-skip-1",
++      eventName: "reaction",
++      payload: {
++        ...basePayload,
++        action: "deleted",
++        comment: { id: 9001, body: commandAnswerBody("answer-skip", "preflight"), user: { login: "gittensory[bot]", type: "Bot" } },
++        reaction: { id: 1, content: "+1", user: { login: "maintainer", type: "User" } },
++      },
++    });
++    await processJob(env, {
++      type: "github-webhook",
++      deliveryId: "feedback-skip-1b",
++      eventName: "reaction",
++      payload: {
++        ...basePayload,
++        comment: { id: 9001, body: commandAnswerBody("answer-skip", "preflight"), user: { login: "gittensory[bot]", type: "Bot" } },
++        reaction: { id: 11, content: "+1", user: { login: "maintainer", type: "User" } },
++      },
++    });
++    await processJob(env, {
++      type: "github-webhook",
++      deliveryId: "feedback-skip-2",
++      eventName: "reaction",
++      payload: {
++        ...basePayload,
++        action: "created",
++        comment: { id: 9001, body: commandAnswerBody("answer-skip", "preflight"), user: { login: "gittensory[bot]", type: "Bot" } },
++        reaction: { id: 2, content: "+1", user: { login: "helper[bot]", type: "Bot" } },
++      },
++    });
++    await processJob(env, {
++      type: "github-webhook",
++      deliveryId: "feedback-skip-3",
++      eventName: "reaction",
++      payload: {
++        ...basePayload,
++        action: "created",
++        comment: { id: 9001, body: commandAnswerBody("answer-missing", "preflight"), user: { login: "gittensory[bot]", type: "Bot" } },
++        reaction: { id: 3, content: "-1", user: { login: "maintainer", type: "User" } },
++      },
++    });
++
++    await expect(getCommandUsefulnessSummary(env, { now: "2026-05-29T00:00:00.000Z", windowDays: 30 })).resolves.toMatchObject({
++      totals: { feedbackCount: 0 },
++      commands: [],
++    });
++    const skips = await env.DB.prepare("select detail from audit_events where event_type = ? order by detail")
++      .bind("github_app.agent_command_feedback_skipped")
++      .all<{ detail: string }>();
++    expect(skips.results.map((row) => row.detail)).toEqual(["bot_reaction", "unknown_answer", "unsupported_reaction_action", "unsupported_reaction_action"]);
++  });
++
++  it("accepts repo-owner feedback through sender fallback and ignores non-vote reactions", async () => {
++    const env = createTestEnv();
++    await upsertAgentCommandAnswer(env, commandAnswer("answer-owner", "blockers"));
++    const basePayload = {
++      action: "created",
++      installation: { id: 123, account: { login: "JSONbored", id: 1, type: "User" } },
++      repository: { name: "gittensory", full_name: "JSONbored/gittensory", private: false, owner: { login: "JSONbored" } },
++      issue: { number: 77, title: "Miner command context", state: "open", pull_request: {}, user: { login: "oktofeesh1" }, author_association: "NONE" },
++      comment: { id: 9001, body: commandAnswerBody("answer-owner", "blockers"), user: { login: "gittensory[bot]", type: "Bot" } },
++    };
++
++    await processJob(env, {
++      type: "github-webhook",
++      deliveryId: "feedback-owner-1",
++      eventName: "reaction",
++      payload: {
++        ...basePayload,
++        reaction: { content: "+1" },
++        sender: { login: "JSONbored", type: "User" },
++      },
++    });
++    await processJob(env, {
++      type: "github-webhook",
++      deliveryId: "feedback-owner-2",
++      eventName: "reaction",
++      payload: {
++        ...basePayload,
++        reaction: { id: 2, content: "heart" },
++        sender: { login: "JSONbored", type: "User" },
++      },
++    });
++
++    const summary = await getCommandUsefulnessSummary(env, { now: "2026-05-29T00:00:00.000Z", windowDays: 30 });
++    expect(summary.totals).toMatchObject({ feedbackCount: 1, usefulCount: 1, answerCount: 1 });
++    expect(summary.commands).toEqual([expect.objectContaining({ command: "blockers", usefulnessRate: 1 })]);
++  });
++
++  it("rejects copied feedback markers that do not match the stored answer context", async () => {
++    const env = createTestEnv({ ADMIN_GITHUB_LOGINS: "maintainer" });
++    await upsertAgentCommandAnswer(env, commandAnswer("answer-bound", "preflight", { responseCommentId: 9001 }));
++    const basePayload = {
++      action: "created",
++      installation: { id: 123, account: { login: "JSONbored", id: 1, type: "User" } },
++      repository: { name: "gittensory", full_name: "JSONbored/gittensory", private: false, owner: { login: "JSONbored" } },
++      issue: { number: 77, title: "Miner command context", state: "open", pull_request: {}, user: { login: "oktofeesh1" }, author_association: "NONE" },
++      reaction: { id: 1, content: "+1", user: { login: "maintainer", type: "User" } },
++    };
++
++    await processJob(env, {
++      type: "github-webhook",
++      deliveryId: "feedback-bound-1",
++      eventName: "reaction",
++      payload: {
++        ...basePayload,
++        comment: { id: 9002, body: commandAnswerBody("answer-bound", "preflight"), user: { login: "gittensory[bot]", type: "Bot" } },
++      },
++    });
++    await processJob(env, {
++      type: "github-webhook",
++      deliveryId: "feedback-bound-2",
++      eventName: "reaction",
++      payload: {
++        ...basePayload,
++        repository: { name: "other", full_name: "JSONbored/other", private: false, owner: { login: "JSONbored" } },
++        comment: { id: 9001, body: commandAnswerBody("answer-bound", "preflight"), user: { login: "gittensory[bot]", type: "Bot" } },
++      },
++    });
++    await processJob(env, {
++      type: "github-webhook",
++      deliveryId: "feedback-bound-3",
++      eventName: "reaction",
++      payload: {
++        ...basePayload,
++        issue: { ...basePayload.issue, number: 78 },
++        comment: { id: 9001, body: commandAnswerBody("answer-bound", "preflight"), user: { login: "gittensory[bot]", type: "Bot" } },
++      },
++    });
++
++    await expect(getCommandUsefulnessSummary(env, { now: "2026-05-29T00:00:00.000Z", windowDays: 30 })).resolves.toMatchObject({
++      totals: { feedbackCount: 0 },
++      commands: [],
++    });
++    const skips = await env.DB.prepare("select detail from audit_events where event_type = ? order by detail")
++      .bind("github_app.agent_command_feedback_skipped")
++      .all<{ detail: string }>();
++    expect(skips.results.map((row) => row.detail)).toEqual(["answer_comment_mismatch", "answer_context_mismatch", "answer_context_mismatch"]);
++  });
++
++  it("records webhook errors when command replies fail before mutation", async () => {
++    const env = createTestEnv();
++    await expect(
++      processJob(env, {
++        type: "github-webhook",
++        deliveryId: "agent-command-error",
++        eventName: "issue_comment",
++        payload: {
++          action: "created",
++          installation: { id: 123, account: { login: "JSONbored", id: 1, type: "User" } },
++          repository: { name: "broken", full_name: "broken", private: false, owner: { login: "JSONbored" } },
++          issue: { number: 77, title: "Broken command context", state: "open", pull_request: {}, user: { login: "oktofeesh1" }, author_association: "NONE" },
++          comment: {
++            id: 9,
++            body: "@gittensory help",
++            user: { login: "maintainer", type: "User" },
++            author_association: "OWNER",
++          },
++        },
++      }),
++    ).rejects.toThrow("Invalid repository full name");
++
++    const event = await env.DB.prepare("select status, error_summary from webhook_events where delivery_id = ?")
++      .bind("agent-command-error")
++      .first<{ status: string; error_summary: string }>();
++    expect(event).toMatchObject({ status: "error", error_summary: expect.stringContaining("Invalid repository full name") });
++  });
++
+   it("skips unauthorized, bot, and non-PR @gittensory mention commands without public output", async () => {
+     const env = createTestEnv({ GITHUB_APP_PRIVATE_KEY: await generatePrivateKeyPem() });
+     let commentCalls = 0;
+@@ -1795,6 +2070,32 @@ describe("queue processors", () => {
+       .all<{ event_type: string; detail: string }>();
+     expect(audit.results).toEqual([expect.objectContaining({ event_type: "github_app.agent_command_skipped", detail: "not_a_pull_request_thread" })]);
+   });
++
++  it("audits command authorization errors when miner detection is unavailable", async () => {
++    const env = createTestEnv();
++    vi.stubGlobal("fetch", async (input: RequestInfo | URL) => {
++      if (input.toString() === "https://api.gittensor.io/miners") return new Response("unavailable", { status: 503 });
++      return new Response("not found", { status: 404 });
++    });
++
++    await processJob(env, {
++      type: "github-webhook",
++      deliveryId: "agent-command-miner-unavailable",
++      eventName: "issue_comment",
++      payload: {
++        action: "created",
++        installation: { id: 123, account: { login: "JSONbored", id: 1, type: "User" } },
++        repository: { name: "gittensory", full_name: "JSONbored/gittensory", private: false, owner: { login: "JSONbored" } },
++        issue: { number: 84, title: "Unavailable miner check", state: "open", pull_request: {}, user: { login: "oktofeesh1" }, author_association: "NONE" },
++        comment: { id: 5, body: "@gittensory preflight", user: { login: "oktofeesh1", type: "User" }, author_association: "NONE" },
++      },
++    });
++
++    const event = await env.DB.prepare("select outcome, detail from audit_events where event_type = ? and target_key = ?")
++      .bind("github_app.agent_command_skipped", "JSONbored/gittensory#84")
++      .first<{ outcome: string; detail: string }>();
++    expect(event).toMatchObject({ outcome: "error", detail: "miner_detection_unavailable" });
++  });
+ });
+ 
+ function completeSegment(repoFullName: string, segment: "labels" | "open_issues" | "open_pull_requests") {
+@@ -1812,30 +2113,38 @@ function completeSegment(repoFullName: string, segment: "labels" | "open_issues"
+   };
+ }
+ 
+-function b64(value: string): string {
+-  return Buffer.from(value, "utf8").toString("base64");
+-}
++type CommandAnswerFixture = Parameters<typeof upsertAgentCommandAnswer>[1];
+ 
+-function withProductUsageInsertFailure(env: Env): Env {
+-  const db = env.DB as unknown as { prepare(sql: string): unknown; batch(statements: unknown[]): Promise<unknown> };
++function commandAnswer(id: string, command: string, overrides: Partial<CommandAnswerFixture> = {}): CommandAnswerFixture {
+   return {
+-    ...env,
+-    DB: {
+-      prepare(sql: string) {
+-        if (sql.includes("product_usage_events")) throw new Error("product usage insert failed");
+-        return db.prepare.call(db, sql);
+-      },
+-      batch(statements: unknown[]) {
+-        return db.batch.call(db, statements);
+-      },
+-    } as unknown as D1Database,
++    id,
++    repoFullName: "JSONbored/gittensory",
++    issueNumber: 77,
++    command,
++    requestCommentId: 7,
++    responseCommentId: 9001,
++    responseUrl: "https://github.com/JSONbored/gittensory/pull/77#issuecomment-9001",
++    actorKind: "maintainer" as const,
++    createdAt: "2026-05-28T00:00:00.000Z",
++    updatedAt: "2026-05-28T00:00:00.000Z",
++    metadata: {},
++    ...overrides,
+   };
+ }
+ 
++function commandAnswerBody(answerId: string, command: string): string {
++  return [
++    "<!-- gittensory-agent-command -->",
++    `<!-- gittensory-agent-command-answer:${answerId} -->`,
++    `Command: \`@gittensory ${command}\``,
++    "Feedback is aggregate-only.",
++  ].join("\n");
++}
++
+ function queueMinerSnapshot(login: string) {
+   return {
+     source: "gittensor_api" as const,
+-    githubId: `id-${login}`,
++    githubId: "123",
+     githubUsername: login,
+     isEligible: true,
+     credibility: 1,
+@@ -1849,8 +2158,8 @@ function queueMinerSnapshot(login: string) {
+     taoPerDay: 0,
+     usdPerDay: 0,
+     totals: {
+-      pullRequests: 1,
+-      mergedPullRequests: 1,
++      pullRequests: 3,
++      mergedPullRequests: 2,
+       openPullRequests: 1,
+       closedPullRequests: 0,
+       openIssues: 0,
+@@ -1864,6 +2173,26 @@ function queueMinerSnapshot(login: string) {
+   };
+ }
+ 
++function b64(value: string): string {
++  return Buffer.from(value, "utf8").toString("base64");
++}
++
++function withProductUsageInsertFailure(env: Env): Env {
++  const db = env.DB as unknown as { prepare(sql: string): unknown; batch(statements: unknown[]): Promise<unknown> };
++  return {
++    ...env,
++    DB: {
++      prepare(sql: string) {
++        if (sql.includes("product_usage_events")) throw new Error("product usage insert failed");
++        return db.prepare.call(db, sql);
++      },
++      batch(statements: unknown[]) {
++        return db.batch.call(db, statements);
++      },
++    } as unknown as D1Database,
++  };
++}
++
+ async function generatePrivateKeyPem(): Promise<string> {
+   const key = (await crypto.subtle.generateKey(
+     {

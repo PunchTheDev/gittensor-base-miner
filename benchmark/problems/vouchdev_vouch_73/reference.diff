@@ -1,0 +1,79 @@
+diff --git a/CHANGELOG.md b/CHANGELOG.md
+index b36d069..c62e92e 100644
+--- a/CHANGELOG.md
++++ b/CHANGELOG.md
+@@ -15,6 +15,14 @@ All notable changes to vouch are documented here. Format follows
+   the same tarball. `import_apply`, `import_check`, and `export_check`
+   now validate every member path and raise on unsafe names.
+ - Fix `vouch search` CLI: assign backend label per code path so substring fallback results are no longer mislabelled as `fts5`; update stale docstring to reflect multi-backend search surface (#52).
++- Bundle export uses POSIX `/` separators in `manifest.json` and tar member
++  names on every platform. Previously on Windows the manifest stored
++  `sources\<sha>\meta.yaml` while the tarball stored `sources/<sha>/meta.yaml`,
++  so `vouch export-check` returned `ok: false` on the bundle vouch had just
++  produced, `manifest.counts` was always zero, and `vouch import-apply` was
++  a silent no-op. Existing Linux/macOS bundles are unchanged (their paths
++  were already POSIX); Windows bundles produced before this fix should be
++  re-exported.
+ 
+ ## [0.0.1] — 2026-05-17
+ 
+diff --git a/src/vouch/bundle.py b/src/vouch/bundle.py
+index 1faefd9..45e7b1d 100644
+--- a/src/vouch/bundle.py
++++ b/src/vouch/bundle.py
+@@ -73,7 +73,10 @@ def build_manifest(kb_dir: Path) -> dict[str, Any]:
+     for rel, abs_path in _iter_export_files(kb_dir):
+         data = abs_path.read_bytes()
+         files.append({
+-            "path": str(rel),
++            # tarfile member names use POSIX `/` on every platform; the
++            # manifest path must match so set lookups and the per-subdir
++            # counter below work on Windows too.
++            "path": rel.as_posix(),
+             "size": len(data),
+             "sha256": sha256_hex(data),
+         })
+@@ -103,7 +106,7 @@ def export(kb_dir: Path, *, dest: Path, actor: str = "vouch-export") -> dict[str
+     dest.parent.mkdir(parents=True, exist_ok=True)
+     with tarfile.open(dest, "w:gz") as tar:
+         for rel, abs_path in _iter_export_files(kb_dir):
+-            tar.add(abs_path, arcname=str(rel))
++            tar.add(abs_path, arcname=rel.as_posix())
+         manifest_bytes = json.dumps(manifest, indent=2, sort_keys=True).encode()
+         info = tarfile.TarInfo(MANIFEST_NAME)
+         info.size = len(manifest_bytes)
+diff --git a/tests/test_bundle.py b/tests/test_bundle.py
+index 47e6a2a..4b1e486 100644
+--- a/tests/test_bundle.py
++++ b/tests/test_bundle.py
+@@ -45,6 +45,30 @@ def test_export_import_round_trip(store: KBStore, tmp_path: Path) -> None:
+     assert dest.get_claim("c1").text == "alpha"
+ 
+ 
++def test_manifest_paths_match_tar_member_names(store: KBStore, tmp_path: Path) -> None:
++    # Regression for the Windows path-separator bug: when build_manifest used
++    # str(rel) the manifest stored "sources\<sha>\meta.yaml" while the tar
++    # member name was "sources/<sha>/meta.yaml", silently breaking both
++    # export_check and import_apply on every Windows host.
++    src = store.put_source(b"e", title="doc")
++    store.put_claim(Claim(id="c1", text="alpha", evidence=[src.id]))
++    store.put_page(Page(id="p1", title="Page one"))
++    bundle_path = tmp_path / "out.tar.gz"
++    manifest = bundle.export(store.kb_dir, dest=bundle_path)
++
++    for f in manifest["files"]:
++        assert "\\" not in f["path"], f"manifest path uses native separator: {f['path']!r}"
++
++    with tarfile.open(bundle_path, "r:gz") as tar:
++        member_names = {m.name for m in tar.getmembers() if m.isfile()} - {bundle.MANIFEST_NAME}
++    manifest_paths = {f["path"] for f in manifest["files"]}
++    assert member_names == manifest_paths
++
++    assert manifest["counts"]["claims"] == 1
++    assert manifest["counts"]["pages"] == 1
++    assert manifest["counts"]["sources"] == 2
++
++
+ def test_import_apply_skips_conflicts_by_default(store: KBStore, tmp_path: Path) -> None:
+     src = store.put_source(b"e")
+     store.put_claim(Claim(id="c1", text="first", evidence=[src.id]))

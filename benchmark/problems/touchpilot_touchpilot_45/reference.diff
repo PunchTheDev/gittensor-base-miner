@@ -1,0 +1,464 @@
+diff --git a/app/src/main/java/dev/touchpilot/app/MainActivity.kt b/app/src/main/java/dev/touchpilot/app/MainActivity.kt
+index 510c7e0..a36c0d4 100644
+--- a/app/src/main/java/dev/touchpilot/app/MainActivity.kt
++++ b/app/src/main/java/dev/touchpilot/app/MainActivity.kt
+@@ -25,14 +25,14 @@ import com.google.android.material.button.MaterialButton
+ import com.google.android.material.card.MaterialCardView
+ import com.google.android.material.tabs.TabLayout
+ import dev.touchpilot.app.agent.AgentProviderMode
+-import dev.touchpilot.app.agent.AgentRunner
+ import dev.touchpilot.app.agent.ConversationalGate
+-import dev.touchpilot.app.agent.LocalRouterCommandProvider
+-import dev.touchpilot.app.agent.OpenAiAgentCommandProvider
++import dev.touchpilot.app.agent.DefaultLocalReasoningCore
++import dev.touchpilot.app.agent.LocalReasoningContext
++import dev.touchpilot.app.agent.LocalReasoningCore
+ import dev.touchpilot.app.agent.ProviderConfig
++import dev.touchpilot.app.agent.defaultAgentRunInvocation
+ import dev.touchpilot.app.androidcontrol.AccessibilityBridge
+ import dev.touchpilot.app.localinference.LiteRtCommandModelRuntime
+-import dev.touchpilot.app.localinference.LocalModelCommandProvider
+ import dev.touchpilot.app.localinference.LocalModelStatus
+ import dev.touchpilot.app.mcp.McpHttpClient
+ import dev.touchpilot.app.memory.Skill
+@@ -59,6 +59,7 @@ class MainActivity : Activity() {
+     private lateinit var skills: List<Skill>
+     private lateinit var toolExecutor: AndroidToolExecutor
+     private lateinit var localModelRuntime: LiteRtCommandModelRuntime
++    private lateinit var reasoningCore: LocalReasoningCore
+     private lateinit var contentRoot: LinearLayout
+     private lateinit var statusView: TextView
+     private lateinit var executionLogView: TextView
+@@ -78,6 +79,17 @@ class MainActivity : Activity() {
+         localModelRuntime = LiteRtCommandModelRuntime(this)
+         selectedSkillId = preferences.getString("active_skill", null)
+ 
++        reasoningCore = DefaultLocalReasoningCore(
++            invocation = defaultAgentRunInvocation(
++                toolExecutor = toolExecutor,
++                approvalProvider = ToolApprovalProvider { request ->
++                    approveAgentTool(request)
++                },
++                localModelRuntime = localModelRuntime
++            ),
++            sessionContext = { currentReasoningContext() }
++        )
++
+         if (conversation.isEmpty()) {
+             conversation += ChatEvent.Agent(
+                 "What would you like me to do?",
+@@ -394,42 +406,8 @@ class MainActivity : Activity() {
+         showSection(Section.CHAT)
+ 
+         Thread {
+-            val providerMode = currentProviderMode()
+-            val selectedSkill = selectedSkill()
+-            val providerConfig = ProviderConfig(
+-                baseUrl = preferences.getString("provider_url", DefaultProviderUrl).orEmpty(),
+-                apiKey = if (providerMode == AgentProviderMode.CLOUD) {
+-                    runCatching { secretStore.loadApiKey().orEmpty() }.getOrDefault("")
+-                } else {
+-                    ""
+-                },
+-                model = preferences.getString("provider_model", DefaultModel).orEmpty()
+-            )
+-
+             val transcript = runCatching {
+-                val localRouter = LocalRouterCommandProvider(task, selectedSkill)
+-                AgentRunner(
+-                    toolExecutor = toolExecutor,
+-                    approvalProvider = ToolApprovalProvider { request ->
+-                        approveAgentTool(request)
+-                    },
+-                    commandProvider = when (providerMode) {
+-                        AgentProviderMode.CLOUD -> OpenAiAgentCommandProvider(providerConfig)
+-                        AgentProviderMode.LOCAL_MODEL -> LocalModelCommandProvider(
+-                            runtime = localModelRuntime,
+-                            fallback = localRouter,
+-                            task = task,
+-                            skill = selectedSkill
+-                        )
+-                        AgentProviderMode.LOCAL_ROUTER -> localRouter
+-                    },
+-                    skill = selectedSkill,
+-                    source = when (providerMode) {
+-                        AgentProviderMode.CLOUD -> ToolSource.CLOUD_FALLBACK
+-                        AgentProviderMode.LOCAL_MODEL -> ToolSource.LOCAL_MODEL
+-                        AgentProviderMode.LOCAL_ROUTER -> ToolSource.LOCAL_ROUTER
+-                    }
+-                ).run(task).transcript
++                reasoningCore.run(task).transcript
+             }.getOrElse { error ->
+                 "Agent failed: ${error.message}"
+             }
+@@ -444,6 +422,24 @@ class MainActivity : Activity() {
+         }.start()
+     }
+ 
++    private fun currentReasoningContext(): LocalReasoningContext {
++        val providerMode = currentProviderMode()
++        val providerConfig = ProviderConfig(
++            baseUrl = preferences.getString("provider_url", DefaultProviderUrl).orEmpty(),
++            apiKey = if (providerMode == AgentProviderMode.CLOUD) {
++                runCatching { secretStore.loadApiKey().orEmpty() }.getOrDefault("")
++            } else {
++                ""
++            },
++            model = preferences.getString("provider_model", DefaultModel).orEmpty()
++        )
++        return LocalReasoningContext(
++            skill = selectedSkill(),
++            providerMode = providerMode,
++            providerConfig = providerConfig
++        )
++    }
++
+     private fun renderSkillsScreen() {
+         contentRoot.addView(sectionTitle("Skills"))
+         contentRoot.addView(agentBubble("Active skill", selectedSkill()?.title ?: "No skill"))
+diff --git a/app/src/main/java/dev/touchpilot/app/agent/ConversationalGate.kt b/app/src/main/java/dev/touchpilot/app/agent/ConversationalGate.kt
+index 3a4a89b..66e438c 100644
+--- a/app/src/main/java/dev/touchpilot/app/agent/ConversationalGate.kt
++++ b/app/src/main/java/dev/touchpilot/app/agent/ConversationalGate.kt
+@@ -2,7 +2,11 @@ package dev.touchpilot.app.agent
+ 
+ data class ConversationalResponse(val message: String)
+ 
+-object ConversationalGate {
++fun interface ConversationalIntents {
++    fun respond(input: String): ConversationalResponse?
++}
++
++object ConversationalGate : ConversationalIntents {
+     private const val GreetingReply = "Hello, I am TouchPilot, how can I help you?"
+     private const val HelpReply =
+         "I can help you control Android apps, open settings, tap visible text, scroll, " +
+@@ -25,7 +29,7 @@ object ConversationalGate {
+         )
+     )
+ 
+-    fun respond(input: String): ConversationalResponse? {
++    override fun respond(input: String): ConversationalResponse? {
+         val normalized = input.trim()
+         if (normalized.isEmpty()) return null
+         return Conversations
+diff --git a/app/src/main/java/dev/touchpilot/app/agent/LocalReasoningCore.kt b/app/src/main/java/dev/touchpilot/app/agent/LocalReasoningCore.kt
+new file mode 100644
+index 0000000..65c99de
+--- /dev/null
++++ b/app/src/main/java/dev/touchpilot/app/agent/LocalReasoningCore.kt
+@@ -0,0 +1,132 @@
++package dev.touchpilot.app.agent
++
++import dev.touchpilot.app.localinference.LocalCommandModelRuntime
++import dev.touchpilot.app.localinference.LocalModelCommandProvider
++import dev.touchpilot.app.memory.Skill
++import dev.touchpilot.app.security.ActionPolicy
++import dev.touchpilot.app.security.DefaultActionPolicy
++import dev.touchpilot.app.security.ToolApprovalProvider
++import dev.touchpilot.app.security.ToolSource
++import dev.touchpilot.app.tools.AndroidToolExecutor
++
++/**
++ * Single entry point the UI uses to ask the local-first runtime to handle a
++ * user request. The UI does not own command production or tool execution — it
++ * only renders the resulting AgentEvent stream and supplies an approval
++ * channel.
++ */
++interface LocalReasoningCore {
++    fun run(task: String, listener: AgentEventListener = AgentEventListener {}): AgentRunResult
++}
++
++fun interface AgentEventListener {
++    fun onEvent(event: AgentEvent)
++}
++
++data class LocalReasoningContext(
++    val skill: Skill?,
++    val providerMode: AgentProviderMode,
++    val providerConfig: ProviderConfig
++)
++
++/**
++ * Runs the agent for a given task and context. Extracted so the core can be
++ * unit-tested without an Android tool executor; production code uses
++ * [defaultAgentRunInvocation] which builds and runs a real [AgentRunner].
++ */
++fun interface AgentRunInvocation {
++    fun invoke(task: String, context: LocalReasoningContext): AgentRunResult
++}
++
++class DefaultLocalReasoningCore(
++    private val invocation: AgentRunInvocation,
++    private val sessionContext: () -> LocalReasoningContext,
++    private val intents: ConversationalIntents = ConversationalGate
++) : LocalReasoningCore {
++
++    override fun run(task: String, listener: AgentEventListener): AgentRunResult {
++        intents.respond(task)?.let { canned ->
++            val userEvent = AgentEvent.UserMessage(task)
++            val finalEvent = AgentEvent.FinalAnswer(canned.message)
++            listener.onEvent(userEvent)
++            listener.onEvent(finalEvent)
++            return AgentRunResult(
++                transcript = "Conversational reply",
++                finalAnswer = canned.message,
++                events = listOf(userEvent, finalEvent)
++            )
++        }
++
++        val ctx = sessionContext()
++        val result = invocation.invoke(task, ctx)
++        result.events.forEach(listener::onEvent)
++        return result
++    }
++}
++
++/**
++ * Production invocation: build the default [AgentRunner] and execute it.
++ */
++fun defaultAgentRunInvocation(
++    toolExecutor: AndroidToolExecutor,
++    approvalProvider: ToolApprovalProvider,
++    localModelRuntime: LocalCommandModelRuntime,
++    policy: ActionPolicy = DefaultActionPolicy()
++): AgentRunInvocation = AgentRunInvocation { task, context ->
++    buildDefaultAgentRunner(
++        task = task,
++        context = context,
++        toolExecutor = toolExecutor,
++        approvalProvider = approvalProvider,
++        localModelRuntime = localModelRuntime,
++        policy = policy
++    ).run(task)
++}
++
++/**
++ * Builds the default AgentRunner: chooses the command provider based on the
++ * session's provider mode, threads the same approval/policy/skill plumbing the
++ * UI used to wire up directly, and returns a ready-to-run AgentRunner.
++ */
++fun buildDefaultAgentRunner(
++    task: String,
++    context: LocalReasoningContext,
++    toolExecutor: AndroidToolExecutor,
++    approvalProvider: ToolApprovalProvider,
++    localModelRuntime: LocalCommandModelRuntime,
++    policy: ActionPolicy = DefaultActionPolicy()
++): AgentRunner {
++    val commandProvider = buildCommandProvider(task, context, localModelRuntime)
++    return AgentRunner(
++        toolExecutor = toolExecutor,
++        approvalProvider = approvalProvider,
++        commandProvider = commandProvider,
++        skill = context.skill,
++        source = context.providerMode.toToolSource(),
++        policy = policy
++    )
++}
++
++fun buildCommandProvider(
++    task: String,
++    context: LocalReasoningContext,
++    localModelRuntime: LocalCommandModelRuntime
++): AgentCommandProvider {
++    val localRouter = LocalRouterCommandProvider(task, context.skill)
++    return when (context.providerMode) {
++        AgentProviderMode.CLOUD -> OpenAiAgentCommandProvider(context.providerConfig)
++        AgentProviderMode.LOCAL_MODEL -> LocalModelCommandProvider(
++            runtime = localModelRuntime,
++            fallback = localRouter,
++            task = task,
++            skill = context.skill
++        )
++        AgentProviderMode.LOCAL_ROUTER -> localRouter
++    }
++}
++
++private fun AgentProviderMode.toToolSource(): ToolSource = when (this) {
++    AgentProviderMode.CLOUD -> ToolSource.CLOUD_FALLBACK
++    AgentProviderMode.LOCAL_MODEL -> ToolSource.LOCAL_MODEL
++    AgentProviderMode.LOCAL_ROUTER -> ToolSource.LOCAL_ROUTER
++}
+diff --git a/app/src/test/java/dev/touchpilot/app/agent/LocalReasoningCoreTest.kt b/app/src/test/java/dev/touchpilot/app/agent/LocalReasoningCoreTest.kt
+new file mode 100644
+index 0000000..a5aee57
+--- /dev/null
++++ b/app/src/test/java/dev/touchpilot/app/agent/LocalReasoningCoreTest.kt
+@@ -0,0 +1,176 @@
++package dev.touchpilot.app.agent
++
++import dev.touchpilot.app.localinference.LocalCommandModelRuntime
++import dev.touchpilot.app.localinference.LocalModelCommandProvider
++import dev.touchpilot.app.localinference.LocalModelStatus
++import dev.touchpilot.app.memory.Skill
++import kotlin.test.Test
++import kotlin.test.assertEquals
++import kotlin.test.assertFalse
++import kotlin.test.assertIs
++import kotlin.test.assertNull
++import kotlin.test.assertTrue
++
++class LocalReasoningCoreTest {
++    private val defaultContext = LocalReasoningContext(
++        skill = null,
++        providerMode = AgentProviderMode.LOCAL_ROUTER,
++        providerConfig = ProviderConfig(baseUrl = "", apiKey = "", model = "")
++    )
++
++    @Test
++    fun conversationalInputShortCircuitsBeforeInvocation() {
++        val invocations = mutableListOf<String>()
++        val collected = mutableListOf<AgentEvent>()
++        val core = DefaultLocalReasoningCore(
++            invocation = { task, _ ->
++                invocations += task
++                error("invocation must not run for conversational input")
++            },
++            sessionContext = { defaultContext }
++        )
++
++        val result = core.run("Hello") { collected += it }
++
++        assertEquals("Hello, I am TouchPilot, how can I help you?", result.finalAnswer)
++        assertTrue(invocations.isEmpty())
++        assertEquals(2, collected.size)
++        assertIs<AgentEvent.UserMessage>(collected[0])
++        assertIs<AgentEvent.FinalAnswer>(collected[1])
++    }
++
++    @Test
++    fun nonConversationalInputDelegatesAndForwardsEvents() {
++        val runnerEvents = listOf<AgentEvent>(
++            AgentEvent.UserMessage("open Settings"),
++            AgentEvent.AssistantMessage("ack", "router")
++        )
++        val sentinelResult = AgentRunResult(
++            transcript = "Step 1\nFinal: stubbed",
++            finalAnswer = "stubbed",
++            events = runnerEvents
++        )
++        val recordedContexts = mutableListOf<LocalReasoningContext>()
++        val collected = mutableListOf<AgentEvent>()
++        val core = DefaultLocalReasoningCore(
++            invocation = { _, ctx ->
++                recordedContexts += ctx
++                sentinelResult
++            },
++            sessionContext = { defaultContext }
++        )
++
++        val result = core.run("open Settings") { collected += it }
++
++        assertEquals("stubbed", result.finalAnswer)
++        assertEquals(runnerEvents, result.events)
++        assertEquals(runnerEvents, collected)
++        assertEquals(1, recordedContexts.size)
++        assertEquals(AgentProviderMode.LOCAL_ROUTER, recordedContexts[0].providerMode)
++    }
++
++    @Test
++    fun nullListenerIsTolerated() {
++        val core = DefaultLocalReasoningCore(
++            invocation = { _, _ -> error("should not be called") },
++            sessionContext = { defaultContext }
++        )
++        val result = core.run("help")
++        assertEquals(
++            "I can help you control Android apps, open settings, tap visible text, scroll, " +
++                "go back or home, and use approved skills. What would you like to do?",
++            result.finalAnswer
++        )
++    }
++
++    @Test
++    fun customIntentsCanOverrideTheDefaultGate() {
++        val core = DefaultLocalReasoningCore(
++            invocation = { _, _ -> error("should not be called") },
++            sessionContext = { defaultContext },
++            intents = { input ->
++                if (input == "ping") ConversationalResponse("pong") else null
++            }
++        )
++        val result = core.run("ping")
++        assertEquals("pong", result.finalAnswer)
++    }
++
++    @Test
++    fun mixedHelpPhraseFallsThroughToInvocation() {
++        var sawInvocation = false
++        val core = DefaultLocalReasoningCore(
++            invocation = { task, _ ->
++                sawInvocation = true
++                AgentRunResult(
++                    transcript = "stub",
++                    finalAnswer = null,
++                    events = listOf(AgentEvent.UserMessage(task))
++                )
++            },
++            sessionContext = { defaultContext }
++        )
++
++        val result = core.run("help me open Settings")
++        assertTrue(sawInvocation)
++        assertNull(result.finalAnswer)
++        assertFalse(result.events.any { it is AgentEvent.FinalAnswer })
++    }
++
++    @Test
++    fun providerFactoryPicksLocalRouterByDefault() {
++        val provider = buildCommandProvider(
++            task = "open Settings",
++            context = defaultContext,
++            localModelRuntime = NeverCalledRuntime
++        )
++        assertIs<LocalRouterCommandProvider>(provider)
++    }
++
++    @Test
++    fun providerFactoryPicksLocalModelWhenModeIsLocalModel() {
++        val ctx = defaultContext.copy(providerMode = AgentProviderMode.LOCAL_MODEL)
++        val provider = buildCommandProvider(
++            task = "open Settings",
++            context = ctx,
++            localModelRuntime = StubRuntime("""{"tool":"open_app","args":{"target":"Settings"}}""")
++        )
++        assertIs<LocalModelCommandProvider>(provider)
++    }
++
++    @Test
++    fun providerFactoryPicksCloudWhenModeIsCloud() {
++        val ctx = defaultContext.copy(
++            providerMode = AgentProviderMode.CLOUD,
++            providerConfig = ProviderConfig(
++                baseUrl = "https://example.com/v1/chat/completions",
++                apiKey = "k",
++                model = "m"
++            )
++        )
++        val provider = buildCommandProvider(
++            task = "open Settings",
++            context = ctx,
++            localModelRuntime = NeverCalledRuntime
++        )
++        assertIs<OpenAiAgentCommandProvider>(provider)
++    }
++
++    private class StubRuntime(private val output: String) : LocalCommandModelRuntime {
++        override fun status(): LocalModelStatus = LocalModelStatus(
++            available = true,
++            runtime = "Stub",
++            modelAsset = "stub.tflite",
++            version = "test",
++            message = "stub"
++        )
++
++        override fun route(task: String, context: String, skill: Skill?): String = output
++    }
++
++    private object NeverCalledRuntime : LocalCommandModelRuntime {
++        override fun status(): LocalModelStatus = error("runtime must not be queried")
++        override fun route(task: String, context: String, skill: Skill?): String =
++            error("runtime must not be invoked")
++    }
++}

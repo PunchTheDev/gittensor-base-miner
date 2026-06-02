@@ -1,0 +1,85 @@
+diff --git a/app/models/mobile_device.rb b/app/models/mobile_device.rb
+index 18f0c93a3b..035643ce37 100644
+--- a/app/models/mobile_device.rb
++++ b/app/models/mobile_device.rb
+@@ -19,7 +19,15 @@ class MobileDevice < ApplicationRecord
+   scope :active, -> { where("last_seen_at > ?", 90.days.ago) }
+ 
+   def self.shared_oauth_application
+-    @shared_oauth_application ||= Doorkeeper::Application.find_by!(name: "Sure Mobile")
++    @shared_oauth_application ||= begin
++      Doorkeeper::Application.find_or_create_by!(name: "Sure Mobile") do |app|
++        app.redirect_uri = CALLBACK_URL
++        app.scopes = "read_write"
++        app.confidential = false
++      end
++    rescue ActiveRecord::RecordNotUnique
++      Doorkeeper::Application.find_by!(name: "Sure Mobile")
++    end
+   end
+ 
+   def self.upsert_device!(user, attrs)
+diff --git a/test/controllers/api/v1/auth_controller_test.rb b/test/controllers/api/v1/auth_controller_test.rb
+index 272534f538..043f180987 100644
+--- a/test/controllers/api/v1/auth_controller_test.rb
++++ b/test/controllers/api/v1/auth_controller_test.rb
+@@ -342,6 +342,28 @@ class Api::V1::AuthControllerTest < ActionDispatch::IntegrationTest
+     assert_equal "Invalid email or password", response_data["error"]
+   end
+ 
++  test "should login even when OAuth application is missing" do
++    user = users(:family_admin)
++    password = user_password_test
++
++    # Simulate a fresh instance where seeds were never run
++    Doorkeeper::Application.where(name: "Sure Mobile").destroy_all
++    MobileDevice.instance_variable_set(:@shared_oauth_application, nil)
++
++    assert_difference("Doorkeeper::Application.count", 1) do
++      post "/api/v1/auth/login", params: {
++        email: user.email,
++        password: password,
++        device: @device_info
++      }
++    end
++
++    assert_response :success
++    response_data = JSON.parse(response.body)
++    assert response_data["access_token"].present?
++    assert response_data["refresh_token"].present?
++  end
++
+   test "should not login without device info" do
+     user = users(:family_admin)
+ 
+diff --git a/test/models/mobile_device_test.rb b/test/models/mobile_device_test.rb
+index 79bb8f62c7..4e2d777bd4 100644
+--- a/test/models/mobile_device_test.rb
++++ b/test/models/mobile_device_test.rb
+@@ -1,7 +1,23 @@
+ require "test_helper"
+ 
+ class MobileDeviceTest < ActiveSupport::TestCase
+-  # test "the truth" do
+-  #   assert true
+-  # end
++  setup do
++    MobileDevice.instance_variable_set(:@shared_oauth_application, nil)
++  end
++
++  teardown do
++    MobileDevice.instance_variable_set(:@shared_oauth_application, nil)
++  end
++
++  test "shared_oauth_application auto-creates application when missing" do
++    Doorkeeper::Application.where(name: "Sure Mobile").destroy_all
++
++    assert_difference("Doorkeeper::Application.count", 1) do
++      app = MobileDevice.shared_oauth_application
++      assert_equal "Sure Mobile", app.name
++      assert_equal MobileDevice::CALLBACK_URL, app.redirect_uri
++      assert_equal "read_write", app.scopes.to_s
++      assert_not app.confidential
++    end
++  end
+ end

@@ -1,0 +1,1229 @@
+diff --git a/apps/gittensory-ui/public/openapi.json b/apps/gittensory-ui/public/openapi.json
+index cf0351a..cda631c 100644
+--- a/apps/gittensory-ui/public/openapi.json
++++ b/apps/gittensory-ui/public/openapi.json
+@@ -10670,6 +10670,36 @@
+         ]
+       }
+     },
++    "/v1/app/roles": {
++      "get": {
++        "responses": {
++          "200": {
++            "description": "Live app API response",
++            "content": {
++              "application/json": {
++                "schema": {
++                  "type": "object",
++                  "additionalProperties": {
++                    "nullable": true
++                  }
++                }
++              }
++            }
++          },
++          "401": {
++            "description": "Unauthorized"
++          }
++        },
++        "security": [
++          {
++            "GittensoryBearer": []
++          },
++          {
++            "GittensorySessionCookie": []
++          }
++        ]
++      }
++    },
+     "/v1/app/miner-dashboard": {
+       "get": {
+         "responses": {
+diff --git a/apps/gittensory-ui/src/components/site/app-shell.tsx b/apps/gittensory-ui/src/components/site/app-shell.tsx
+index 5191b40..7c9ff84 100644
+--- a/apps/gittensory-ui/src/components/site/app-shell.tsx
++++ b/apps/gittensory-ui/src/components/site/app-shell.tsx
+@@ -50,9 +50,24 @@ const GROUPS: NavGroup[] = [
+     label: "Workspace",
+     items: [
+       { to: "/app", label: "Overview", icon: LayoutGrid },
+-      { to: "/app/workbench", label: "Workbench", icon: Workflow },
+-      { to: "/app/repos", label: "Repositories", icon: FolderGit2 },
+-      { to: "/app/runs", label: "Agent runs", icon: Activity },
++      {
++        to: "/app/workbench",
++        label: "Workbench",
++        icon: Workflow,
++        roles: ["miner", "maintainer", "owner", "operator"],
++      },
++      {
++        to: "/app/repos",
++        label: "Repositories",
++        icon: FolderGit2,
++        roles: ["maintainer", "owner", "operator"],
++      },
++      {
++        to: "/app/runs",
++        label: "Agent runs",
++        icon: Activity,
++        roles: ["miner", "maintainer", "owner", "operator"],
++      },
+     ],
+   },
+   {
+@@ -216,7 +231,12 @@ export function AppShell() {
+             </div>
+             <div className="truncate font-display text-token-sm font-semibold">{session.login}</div>
+             <div className="flex flex-wrap gap-1">
+-              {session.confirmed_miner && <StatusPill status="ready">Confirmed</StatusPill>}
++              {session.roles.slice(0, 3).map((role) => (
++                <StatusPill key={role} status="ready">
++                  {role}
++                </StatusPill>
++              ))}
++              {session.roles.length === 0 && <StatusPill status="warn">setup</StatusPill>}
+               <ApiStatusButton />
+             </div>
+             <button
+diff --git a/apps/gittensory-ui/src/lib/api/session.ts b/apps/gittensory-ui/src/lib/api/session.ts
+index 711bc50..ed395af 100644
+--- a/apps/gittensory-ui/src/lib/api/session.ts
++++ b/apps/gittensory-ui/src/lib/api/session.ts
+@@ -11,6 +11,24 @@ export interface AppSession {
+   github_id?: number | null;
+   githubId?: number | null;
+   roles: AppRole[];
++  roleSummary?: {
++    roles: AppRole[];
++    onboarding: {
++      status: "ready" | "needs_setup";
++      primaryRole?: AppRole;
++      nextActions: string[];
++    };
++    roleCards: Array<{
++      role: AppRole;
++      status: "active" | "available" | "needs_setup";
++      title: string;
++      detail: string;
++      href: string;
++      evidenceCount: number;
++      sampleRepos: string[];
++      nextActions: string[];
++    }>;
++  };
+   confirmed_miner: boolean;
+   confirmedMiner?: boolean;
+   expiresAt?: string;
+diff --git a/apps/gittensory-ui/src/routes/app.index.tsx b/apps/gittensory-ui/src/routes/app.index.tsx
+index c1f53a0..f903c91 100644
+--- a/apps/gittensory-ui/src/routes/app.index.tsx
++++ b/apps/gittensory-ui/src/routes/app.index.tsx
+@@ -20,7 +20,7 @@ import { Tooltip, TooltipContent, TooltipProvider, TooltipTrigger } from "@/comp
+ import { StatusPill } from "@/components/site/control-primitives";
+ import { PageHeader } from "@/components/site/primitives";
+ import { TrendChart } from "@/components/site/trend-chart";
+-import { useSession } from "@/lib/api/session";
++import { type AppRole, useSession } from "@/lib/api/session";
+ import { useApiResource } from "@/lib/api/use-api-resource";
+ import { describeApiStatus, pingHealth, useApiStatus } from "@/lib/api/status";
+ import { useLocalStorage } from "@/lib/use-local-storage";
+@@ -36,30 +36,35 @@ const CARDS = [
+     title: "Workbench",
+     desc: "Plan next work, preflight branches, preview maintainer commands, and inspect digests.",
+     icon: Workflow,
++    roles: ["miner", "maintainer", "owner", "operator"],
+   },
+   {
+     to: "/app/repos",
+     title: "Repositories",
+     desc: "Maintainer console, install health, and registration readiness for repo owners.",
+     icon: FolderGit2,
++    roles: ["maintainer", "owner", "operator"],
+   },
+   {
+     to: "/app/runs",
+     title: "Agent runs",
+     desc: "Unified feed of MCP, API, and @gittensory runs with evidence and boundary tags.",
+     icon: Activity,
++    roles: ["miner", "maintainer", "owner", "operator"],
+   },
+   {
+     to: "/app/analytics",
+     title: "Analytics",
+     desc: "Adoption, command usage, and noise-reduction trends across deployments.",
+     icon: BarChart3,
++    roles: ["maintainer", "operator"],
+   },
+   {
+     to: "/app/operator",
+     title: "Operator dashboard",
+     desc: "Active users, installs, noise reduction, and drift incidents.",
+     icon: Wrench,
++    roles: ["operator"],
+   },
+ ] as const;
+ 
+@@ -137,9 +142,11 @@ function AppOverview() {
+         description="Live control-panel metrics from the Gittensory API. Missing backend data renders as empty states instead of demo records."
+       />
+ 
++      <RoleSummaryPanel session={session} />
++
+       <OnboardingChecklist />
+ 
+-      <QuickActions lastRunId={lastRun?.id} />
++      <QuickActions lastRunId={lastRun?.id} roles={session.roles} />
+ 
+       <TooltipProvider delayDuration={150}>
+         <section
+@@ -177,7 +184,9 @@ function AppOverview() {
+       <RecentActivity runs={recentRuns} />
+ 
+       <section className="grid gap-3 sm:grid-cols-2 lg:grid-cols-3">
+-        {CARDS.map((c) => (
++        {CARDS.filter((card) =>
++          card.roles.some((role) => session.roles.includes(role as AppRole)),
++        ).map((c) => (
+           <Link
+             key={c.to}
+             to={c.to}
+@@ -219,25 +228,104 @@ function mapOverviewRun(bundle: AppOverviewResponse["recentRuns"][number]): Rece
+   };
+ }
+ 
+-function QuickActions({ lastRunId }: { lastRunId?: string }) {
++function RoleSummaryPanel({
++  session,
++}: {
++  session: NonNullable<ReturnType<typeof useSession>["session"]>;
++}) {
++  const summary = session.roleSummary;
++  if (!summary) return null;
++  const activeCards = summary.roleCards.filter((card) => card.status === "active");
++  const visibleCards =
++    activeCards.length > 0
++      ? activeCards
++      : summary.roleCards.filter((card) => card.status === "needs_setup").slice(0, 3);
++  return (
++    <section aria-label="Role summary" className="rounded-token border-hairline bg-card/40 p-4">
++      <div className="flex flex-wrap items-start justify-between gap-3">
++        <div>
++          <div className="font-mono text-token-2xs uppercase tracking-wider text-muted-foreground">
++            Role routing
++          </div>
++          <h2 className="mt-1 font-display text-token-base font-semibold">
++            {summary.onboarding.status === "ready" ? "Active workspace paths" : "Setup needed"}
++          </h2>
++        </div>
++        <StatusPill status={summary.onboarding.status === "ready" ? "ready" : "warn"}>
++          {summary.roles.length > 0 ? summary.roles.join(" · ") : "no active role"}
++        </StatusPill>
++      </div>
++      <div className="mt-4 grid gap-3 md:grid-cols-2 xl:grid-cols-4">
++        {visibleCards.map((card) => (
++          <Link
++            key={card.role}
++            to={card.href as never}
++            className={cn(
++              "rounded-token border p-3 transition-colors focus-ring",
++              card.status === "active"
++                ? "border-mint/30 bg-mint/[0.04] hover:bg-mint/[0.07]"
++                : "border-border bg-background/30 hover:bg-accent/50",
++            )}
++          >
++            <div className="flex items-center justify-between gap-2">
++              <div className="font-display text-token-sm font-semibold">{card.title}</div>
++              <StatusPill status={card.status === "active" ? "ready" : "warn"}>
++                {card.status === "active" ? "active" : "setup"}
++              </StatusPill>
++            </div>
++            <p className="mt-2 text-token-xs leading-token-relaxed text-muted-foreground">
++              {card.detail}
++            </p>
++            {card.sampleRepos.length > 0 && (
++              <div className="mt-2 truncate font-mono text-token-2xs text-muted-foreground">
++                {card.sampleRepos.join(" · ")}
++              </div>
++            )}
++          </Link>
++        ))}
++      </div>
++      {summary.onboarding.nextActions.length > 0 && (
++        <ul className="mt-3 grid gap-1.5 text-token-xs text-muted-foreground md:grid-cols-2">
++          {summary.onboarding.nextActions.slice(0, 4).map((action) => (
++            <li key={action} className="flex gap-2">
++              <Check className="mt-0.5 size-3 shrink-0 text-mint" aria-hidden />
++              <span>{action}</span>
++            </li>
++          ))}
++        </ul>
++      )}
++    </section>
++  );
++}
++
++function QuickActions({ lastRunId, roles }: { lastRunId?: string; roles: AppRole[] }) {
+   const items: Array<{
+     to: string;
+     search?: Record<string, string>;
+     label: string;
+     icon: typeof Sparkles;
++    roles: AppRole[];
+   }> = [
+-    { to: "/app/workbench", search: { tab: "miner" }, label: "Plan next work", icon: Sparkles },
++    {
++      to: "/app/workbench",
++      search: { tab: "miner" },
++      label: "Plan next work",
++      icon: Sparkles,
++      roles: ["miner", "operator"],
++    },
+     {
+       to: "/app/workbench",
+       search: { tab: "playground" },
+       label: "Run preflight",
+       icon: PlayCircle,
++      roles: ["miner", "maintainer", "owner", "operator"],
+     },
+     {
+       to: "/app/workbench",
+       search: { tab: "commands" },
+       label: "@gittensory commands",
+       icon: TerminalSquare,
++      roles: ["maintainer", "owner", "operator"],
+     },
+     ...(lastRunId
+       ? [
+@@ -246,13 +334,16 @@ function QuickActions({ lastRunId }: { lastRunId?: string }) {
+             search: { selected: lastRunId },
+             label: "Open last run",
+             icon: Activity,
++            roles: ["miner", "maintainer", "owner", "operator"] as AppRole[],
+           },
+         ]
+       : []),
+   ];
++  const visibleItems = items.filter((item) => item.roles.some((role) => roles.includes(role)));
++  if (visibleItems.length === 0) return null;
+   return (
+     <section aria-label="Quick actions" className="flex flex-wrap gap-2">
+-      {items.map((i) => {
++      {visibleItems.map((i) => {
+         const Icon = i.icon;
+         return (
+           <Link
+diff --git a/src/api/routes.ts b/src/api/routes.ts
+index 1973835..97017a7 100644
+--- a/src/api/routes.ts
++++ b/src/api/routes.ts
+@@ -28,7 +28,6 @@ import {
+   countActiveAuthSessions,
+   countActiveDigestSubscriptions,
+   getBounty,
+-  getFreshOfficialMinerDetection,
+   getIssue,
+   getInstallationHealth,
+   getLatestRepoGithubTotalsSnapshot,
+@@ -106,6 +105,10 @@ import {
+   loadContributorDecisionPackForServing,
+   repoDecisionFromPack,
+ } from "../services/decision-pack";
++import {
++  buildStaticControlPanelRoleSummary,
++  loadControlPanelRoleSummary,
++} from "../services/control-panel-roles";
+ import {
+   buildMcpCompatibilityMetadata,
+   LATEST_RECOMMENDED_MCP_VERSION,
+@@ -140,7 +143,7 @@ import { buildLocalBranchAnalysis, findCurrentBranchPullRequest } from "../signa
+ import { buildRepoSettingsPreview } from "../signals/settings-preview";
+ import { buildGittensorConfigRecommendation, buildRegistrationReadiness, type InstallationHealthSummary } from "../signals/registration-readiness";
+ import { fileUpstreamDriftIssues, loadUpstreamStatus, refreshUpstreamDrift } from "../upstream/ruleset";
+-import type { BountyLifecycleEventRecord, ContributorEvidenceRecord, DataQuality, InstallationHealthRecord, JobMessage, JsonValue, RegistrySnapshot, RepoSyncSegmentRecord, RepositoryRecord, ScoringModelSnapshotRecord } from "../types";
++import type { BountyLifecycleEventRecord, ControlPanelRoleName, ContributorEvidenceRecord, DataQuality, InstallationHealthRecord, JobMessage, JsonValue, RegistrySnapshot, RepoSyncSegmentRecord, RepositoryRecord, ScoringModelSnapshotRecord } from "../types";
+ import { errorMessage, nowIso } from "../utils/json";
+ 
+ type AppBindings = { Bindings: Env };
+@@ -375,6 +378,7 @@ export function createApp() {
+     if (!requiresApiToken(c.req.path)) return next();
+     const identity = await authenticateRequestIdentity(c);
+     if (!identity) return c.json({ error: "unauthorized" }, 401);
++    if (identity.kind === "session" && !canSessionAccessPath(c.env, identity, c.req.path)) return c.json({ error: "insufficient_role" }, 403);
+     if (isExtensionScopedSession(identity) && c.req.path !== EXTENSION_PULL_CONTEXT_PATH) return c.json({ error: "insufficient_scope" }, 403);
+     return next();
+   });
+@@ -505,6 +509,8 @@ export function createApp() {
+     const identity = await authenticateRequestIdentity(c);
+     if (!identity || identity.kind !== "session") return c.json({ error: "browser_session_required" }, 403);
+     if (isExtensionScopedSession(identity)) return c.json({ error: "browser_session_required" }, 403);
++    const roleSummary = await loadControlPanelRoleSummary(c.env, identity.actor);
++    if (!roleSummary.roles.some((role) => role === "maintainer" || role === "owner" || role === "operator")) return c.json({ error: "insufficient_role" }, 403);
+     const githubUser = identity.session.githubUserId === undefined ? { login: identity.session.login } : { login: identity.session.login, id: identity.session.githubUserId };
+     const { token, session } = await createSessionForGitHubUser(
+       c.env,
+@@ -532,7 +538,7 @@ export function createApp() {
+   app.get("/v1/app/overview", async (c) => {
+     const identity = await authenticateRequestIdentity(c);
+     const login = identity?.kind === "session" ? identity.actor : undefined;
+-    const [repositories, installations, health, registry, scoring, upstreamDrift, rateLimits, runs] = await Promise.all([
++    const [repositories, installations, health, registry, scoring, upstreamDrift, rateLimits, runs, roleSummary] = await Promise.all([
+       listRepositories(c.env),
+       listInstallations(c.env),
+       listInstallationHealth(c.env),
+@@ -541,6 +547,7 @@ export function createApp() {
+       loadUpstreamStatus(c.env),
+       listLatestGitHubRateLimitObservations(c.env, 20),
+       login ? listAgentRunsForActor(c.env, login, 8) : Promise.resolve([]),
++      identity ? getRoleSummaryForIdentity(c.env, identity) : Promise.resolve(null),
+     ]);
+     const runBundles = await Promise.all(runs.map((run) => getAgentRunBundle(c.env, run.id)));
+     const installedRepos = repositories.filter((repo) => repo.isInstalled).length;
+@@ -549,6 +556,7 @@ export function createApp() {
+     return c.json({
+       generatedAt: nowIso(),
+       actor: identity ? { kind: identity.kind, login: login ?? identity.actor } : null,
++      roleSummary,
+       metrics: [
+         {
+           label: "Registered repos",
+@@ -587,6 +595,12 @@ export function createApp() {
+     });
+   });
+ 
++  app.get("/v1/app/roles", async (c) => {
++    const identity = await authenticateRequestIdentity(c);
++    if (!identity) return c.json({ error: "unauthorized" }, 401);
++    return c.json(await getRoleSummaryForIdentity(c.env, identity));
++  });
++
+   app.get("/v1/app/miner-dashboard", async (c) => {
+     const identity = await authenticateRequestIdentity(c);
+     const login = c.req.query("login") ?? (identity?.kind === "session" ? identity.actor : "");
+@@ -634,6 +648,8 @@ export function createApp() {
+   });
+ 
+   app.get("/v1/app/maintainer-dashboard", async (c) => {
++    const forbidden = await requireAppRole(c, ["maintainer", "owner", "operator"]);
++    if (forbidden) return forbidden;
+     const [repositories, installations, health, rateLimits] = await Promise.all([
+       listRepositories(c.env),
+       listInstallations(c.env),
+@@ -665,6 +681,8 @@ export function createApp() {
+   });
+ 
+   app.get("/v1/app/operator-dashboard", async (c) => {
++    const forbidden = await requireAppRole(c, ["operator"]);
++    if (forbidden) return forbidden;
+     const [repositories, installations, health, registry, scoring, upstreamDrift, activeSessions, digestSubscriptions, rateLimits] = await Promise.all([
+       listRepositories(c.env),
+       listInstallations(c.env),
+@@ -722,6 +740,8 @@ export function createApp() {
+   });
+ 
+   app.get("/v1/app/digest", async (c) => {
++    const forbidden = await requireAppRole(c, ["maintainer", "owner", "operator"]);
++    if (forbidden) return forbidden;
+     const identity = await authenticateRequestIdentity(c);
+     const login = identity?.kind === "session" ? identity.actor : null;
+     const [repositories, health, upstreamDrift, rateLimits, subscriptions] = await Promise.all([
+@@ -743,6 +763,8 @@ export function createApp() {
+   });
+ 
+   app.post("/v1/app/digest/subscriptions", async (c) => {
++    const forbidden = await requireAppRole(c, ["maintainer", "owner", "operator"]);
++    if (forbidden) return forbidden;
+     const identity = await authenticateRequestIdentity(c);
+     if (!identity || identity.kind !== "session") return c.json({ error: "browser_session_required" }, 403);
+     const body = await c.req.json().catch(() => null);
+@@ -1680,24 +1702,21 @@ function authRedirectWithError(env: Env, reason: string): string {
+ }
+ 
+ async function buildSessionResponse(env: Env, identity: Extract<AuthIdentity, { kind: "session" }>) {
+-  /* v8 ignore start -- Browser-session role shaping is covered through auth/session route tests; non-admin fallback is policy-defensive. */
+-  const miner = await getFreshOfficialMinerDetection(env, identity.actor).catch(() => null);
+-  const admin = isAuthorizedGitHubSessionLogin(env, identity.actor);
+-  const roles = admin ? ["miner", "maintainer", "owner", "operator"] : ["miner"];
++  const roleSummary = await loadControlPanelRoleSummary(env, identity.actor);
+   return {
+     status: "authenticated",
+     login: identity.session.login,
+     githubId: identity.session.githubUserId ?? null,
+     github_id: identity.session.githubUserId ?? null,
+-    roles,
+-    confirmedMiner: miner?.status === "confirmed",
+-    confirmed_miner: miner?.status === "confirmed",
++    roles: roleSummary.roles,
++    roleSummary,
++    confirmedMiner: roleSummary.confirmedMiner,
++    confirmed_miner: roleSummary.confirmedMiner,
+     expiresAt: identity.session.expiresAt,
+     scopes: identity.session.scopes,
+     createdAt: identity.session.createdAt,
+     lastSeenAt: identity.session.lastSeenAt,
+   };
+-  /* v8 ignore stop */
+ }
+ 
+ function sparklineFromCounts(value: number, total: number): number[] {
+@@ -2116,6 +2135,13 @@ function isExtensionScopedSession(identity: AuthIdentity): boolean {
+   return identity.kind === "session" && identity.session.scopes.includes(EXTENSION_PULL_CONTEXT_SCOPE);
+ }
+ 
++function canSessionAccessPath(env: Env, identity: Extract<AuthIdentity, { kind: "session" }>, path: string): boolean {
++  if (isAuthorizedGitHubSessionLogin(env, identity.actor)) return true;
++  if (path.startsWith("/v1/app/")) return true;
++  if (path === EXTENSION_PULL_CONTEXT_PATH && isExtensionScopedSession(identity)) return true;
++  return false;
++}
++
+ async function authenticateRequestIdentity(c: ProtectedRouteContext): Promise<AuthIdentity | null> {
+   const bearer = await authenticatePrivateToken(c.env, extractBearerToken(c.req.header("authorization")));
+   if (bearer) return bearer;
+@@ -2123,6 +2149,19 @@ async function authenticateRequestIdentity(c: ProtectedRouteContext): Promise<Au
+   return authenticateSessionToken(c.env, browserSessionToken);
+ }
+ 
++async function getRoleSummaryForIdentity(env: Env, identity: AuthIdentity) {
++  if (identity.kind === "session") return loadControlPanelRoleSummary(env, identity.actor);
++  return buildStaticControlPanelRoleSummary(identity.actor);
++}
++
++async function requireAppRole(c: ProtectedRouteContext, allowedRoles: ControlPanelRoleName[]): Promise<Response | null> {
++  const identity = await authenticateRequestIdentity(c);
++  if (!identity) return c.json({ error: "unauthorized" }, 401);
++  if (identity.kind !== "session") return null;
++  const summary = await loadControlPanelRoleSummary(c.env, identity.actor);
++  return summary.roles.some((role) => allowedRoles.includes(role)) ? null : c.json({ error: "insufficient_role" }, 403);
++}
++
+ async function requireStaticProtectedApiToken(c: ProtectedRouteContext): Promise<Response | null> {
+   const identity = await authenticateRequestIdentity(c);
+   /* v8 ignore next -- Protected middleware rejects unauthenticated private routes before static-token-only route guards. */
+diff --git a/src/auth/github-oauth.ts b/src/auth/github-oauth.ts
+index 1d48c78..a3acf31 100644
+--- a/src/auth/github-oauth.ts
++++ b/src/auth/github-oauth.ts
+@@ -2,7 +2,6 @@ import {
+   GITHUB_OAUTH_STATE_TTL_SECONDS,
+   createOpaqueToken,
+   createSessionForGitHubUser,
+-  isAuthorizedGitHubSessionLogin,
+   timingSafeEqual,
+ } from "./security";
+ import { recordAuditEvent } from "../db/repositories";
+@@ -180,15 +179,6 @@ export async function createSessionFromGitHubToken(
+     });
+     throw new Error("github_user_validation_failed");
+   }
+-  if (!isAuthorizedGitHubSessionLogin(env, user.login)) {
+-    await recordAuditEvent(env, {
+-      eventType: "auth.github_session",
+-      actor: user.login,
+-      outcome: "denied",
+-      detail: "github_user_not_authorized",
+-    });
+-    throw new Error("github_user_not_authorized");
+-  }
+   const scopes = Array.isArray(metadata.scopes) ? metadata.scopes.filter((scope): scope is string => typeof scope === "string") : [];
+   const githubUser = user.id === undefined ? { login: user.login } : { login: user.login, id: user.id };
+   const { token, session } = await createSessionForGitHubUser(env, githubUser, { scopes, metadata });
+diff --git a/src/auth/security.ts b/src/auth/security.ts
+index d9cb460..a4cbd59 100644
+--- a/src/auth/security.ts
++++ b/src/auth/security.ts
+@@ -117,7 +117,6 @@ export async function authenticateSessionToken(env: Env, token: string | undefin
+   const session = await getAuthSessionByTokenHash(env, await hashToken(token));
+   if (!session) return null;
+   if (session.revokedAt || Date.parse(session.expiresAt) <= Date.now()) return null;
+-  if (!isAuthorizedGitHubSessionLogin(env, session.login)) return null;
+   await touchAuthSession(env, session.id);
+   return { kind: "session", actor: session.login, session };
+ }
+diff --git a/src/mcp/server.ts b/src/mcp/server.ts
+index c3b3474..d4b2f05 100644
+--- a/src/mcp/server.ts
++++ b/src/mcp/server.ts
+@@ -3,6 +3,7 @@ import type { Context } from "hono";
+ import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
+ import { z } from "zod";
+ import { authenticatePrivateToken, extractBearerToken, type AuthIdentity } from "../auth/security";
++import { loadControlPanelRoleSummary } from "../services/control-panel-roles";
+ import {
+   countOpenIssues,
+   countOpenPullRequests,
+@@ -1010,7 +1011,10 @@ function authoritativeContributorRepoStats(
+ }
+ 
+ async function authenticateMcpRequest(c: AppContext): Promise<AuthIdentity | null> {
+-  return authenticatePrivateToken(c.env, extractBearerToken(c.req.header("authorization")));
++  const identity = await authenticatePrivateToken(c.env, extractBearerToken(c.req.header("authorization")));
++  if (!identity || identity.kind !== "session") return identity;
++  const summary = await loadControlPanelRoleSummary(c.env, identity.actor);
++  return summary.roles.length > 0 ? identity : null;
+ }
+ 
+ function getExecutionContext(c: AppContext): ExecutionContext<unknown> {
+diff --git a/src/openapi/spec.ts b/src/openapi/spec.ts
+index b358cc1..86754a7 100644
+--- a/src/openapi/spec.ts
++++ b/src/openapi/spec.ts
+@@ -522,7 +522,7 @@ export function buildOpenApiSpec() {
+       401: { description: "Unauthorized" },
+     },
+   });
+-  for (const path of ["/v1/app/miner-dashboard", "/v1/app/maintainer-dashboard", "/v1/app/operator-dashboard", "/v1/app/commands", "/v1/app/digest"]) {
++  for (const path of ["/v1/app/roles", "/v1/app/miner-dashboard", "/v1/app/maintainer-dashboard", "/v1/app/operator-dashboard", "/v1/app/commands", "/v1/app/digest"]) {
+     registry.registerPath({
+       method: "get",
+       path,
+diff --git a/src/services/control-panel-roles.ts b/src/services/control-panel-roles.ts
+new file mode 100644
+index 0000000..311ee9c
+--- /dev/null
++++ b/src/services/control-panel-roles.ts
+@@ -0,0 +1,206 @@
++import { isAuthorizedGitHubSessionLogin } from "../auth/security";
++import { getFreshOfficialMinerDetection, listAllPullRequests, listInstallations, listRepositories } from "../db/repositories";
++import type { ControlPanelRoleCard, ControlPanelRoleName, ControlPanelRoleSummary, InstallationRecord, PullRequestRecord, RepositoryRecord } from "../types";
++import { nowIso } from "../utils/json";
++
++type RoleSummaryInputs = {
++  login: string;
++  generatedAt: string;
++  confirmedMiner: boolean;
++  operator: boolean;
++  repositories: RepositoryRecord[];
++  installations: InstallationRecord[];
++  pullRequests: PullRequestRecord[];
++};
++
++export async function loadControlPanelRoleSummary(env: Env, login: string): Promise<ControlPanelRoleSummary> {
++  const [miner, repositories, installations, pullRequests] = await Promise.all([
++    getFreshOfficialMinerDetection(env, login).catch(() => null),
++    listRepositories(env),
++    listInstallations(env),
++    listAllPullRequests(env),
++  ]);
++  return buildControlPanelRoleSummary({
++    login,
++    generatedAt: nowIso(),
++    confirmedMiner: miner?.status === "confirmed",
++    operator: isAuthorizedGitHubSessionLogin(env, login),
++    repositories,
++    installations,
++    pullRequests,
++  });
++}
++
++export function buildControlPanelRoleSummary(args: RoleSummaryInputs): ControlPanelRoleSummary {
++  const installedRepos = args.repositories.filter((repo) => repo.isInstalled);
++  const accountInstallations = args.installations.filter((installation) => !installation.suspendedAt && sameLogin(installation.accountLogin, args.login));
++  const accountInstallationIds = new Set(accountInstallations.map((installation) => installation.id));
++  const ownedInstalledRepos = installedRepos.filter((repo) => sameLogin(repo.owner, args.login) || (repo.installationId !== undefined && repo.installationId !== null && accountInstallationIds.has(repo.installationId)));
++  const maintainerRepos = uniqueRepos(
++    args.pullRequests
++      .filter((pull) => sameLogin(pull.authorLogin, args.login) && isMaintainerAssociation(pull.authorAssociation))
++      .map((pull) => pull.repoFullName)
++      .filter((repoFullName) => installedRepos.some((repo) => sameRepo(repo.fullName, repoFullName))),
++  );
++  const roles: ControlPanelRoleName[] = [];
++  if (args.confirmedMiner) roles.push("miner");
++  if (maintainerRepos.length > 0 || ownedInstalledRepos.length > 0) roles.push("maintainer");
++  if (ownedInstalledRepos.length > 0 || accountInstallations.length > 0) roles.push("owner");
++  if (args.operator) roles.push("operator");
++
++  const roleCards = buildRoleCards({
++    confirmedMiner: args.confirmedMiner,
++    operator: args.operator,
++    ownedInstalledRepos: ownedInstalledRepos.map((repo) => repo.fullName),
++    maintainerRepos,
++    accountInstallations,
++  });
++  const activeCards = roleCards.filter((card) => card.status === "active");
++  return {
++    login: args.login,
++    generatedAt: args.generatedAt,
++    roles,
++    confirmedMiner: args.confirmedMiner,
++    roleCards,
++    onboarding: {
++      status: roles.length > 0 ? "ready" : "needs_setup",
++      ...(activeCards[0]?.role ? { primaryRole: activeCards[0].role } : {}),
++      nextActions:
++        roles.length > 0
++          ? activeCards.flatMap((card) => card.nextActions).slice(0, 4)
++          : [
++              "Confirm this GitHub login as a miner before using contributor planning.",
++              "Install the GitHub App on a repository you own to unlock maintainer and owner workflows.",
++              "Ask an operator to add this login only if you need deployment-level controls.",
++            ],
++    },
++    evidence: {
++      ownedInstalledRepos: ownedInstalledRepos.length,
++      maintainerRepos: maintainerRepos.length,
++      accountInstallations: accountInstallations.length,
++      operator: args.operator,
++    },
++    publicSafe: true,
++  };
++}
++
++export function buildStaticControlPanelRoleSummary(actor: "api" | "mcp" | "internal"): ControlPanelRoleSummary {
++  return {
++    login: actor,
++    generatedAt: nowIso(),
++    roles: ["miner", "maintainer", "owner", "operator"],
++    confirmedMiner: false,
++    roleCards: [
++      roleCard("operator", "active", "Static operator access", "Static service credentials retain deployment-level access.", "/app/operator", 1, [], ["Use a browser session for per-user role routing."]),
++    ],
++    onboarding: {
++      status: "ready",
++      primaryRole: "operator",
++      nextActions: ["Use a browser session for per-user role routing."],
++    },
++    evidence: {
++      ownedInstalledRepos: 0,
++      maintainerRepos: 0,
++      accountInstallations: 0,
++      operator: true,
++    },
++    publicSafe: true,
++  };
++}
++
++function buildRoleCards(args: {
++  confirmedMiner: boolean;
++  operator: boolean;
++  ownedInstalledRepos: string[];
++  maintainerRepos: string[];
++  accountInstallations: InstallationRecord[];
++}): ControlPanelRoleCard[] {
++  return [
++    roleCard(
++      "miner",
++      args.confirmedMiner ? "active" : "needs_setup",
++      "Miner",
++      args.confirmedMiner ? "Confirmed miner identity is available for contributor planning." : "No confirmed miner record is cached for this GitHub login.",
++      "/app/miner",
++      args.confirmedMiner ? 1 : 0,
++      [],
++      args.confirmedMiner ? ["Open the miner dashboard for contributor planning."] : ["Confirm this GitHub login as a miner before using contributor planning."],
++    ),
++    roleCard(
++      "maintainer",
++      args.maintainerRepos.length > 0 || args.ownedInstalledRepos.length > 0 ? "active" : "needs_setup",
++      "Maintainer",
++      args.maintainerRepos.length > 0
++        ? "Cached PR association shows maintainer access on installed repositories."
++        : args.ownedInstalledRepos.length > 0
++          ? "Installed repositories owned by this login can use maintainer workflows."
++          : "No installed maintainer repository is visible for this login.",
++      "/app/maintainer",
++      args.maintainerRepos.length + args.ownedInstalledRepos.length,
++      uniqueRepos([...args.maintainerRepos, ...args.ownedInstalledRepos]).slice(0, 4),
++      args.maintainerRepos.length > 0 || args.ownedInstalledRepos.length > 0 ? ["Review maintainer queue and installation health."] : ["Install the GitHub App on a repository you maintain."],
++    ),
++    roleCard(
++      "owner",
++      args.ownedInstalledRepos.length > 0 || args.accountInstallations.length > 0 ? "active" : "needs_setup",
++      "Owner",
++      args.ownedInstalledRepos.length > 0
++        ? "Installed repositories owned by this login are ready for owner workflows."
++        : args.accountInstallations.length > 0
++          ? "GitHub App account installation is linked to this login."
++          : "No owned GitHub App installation is linked to this login.",
++      "/app/owner",
++      args.ownedInstalledRepos.length + args.accountInstallations.length,
++      args.ownedInstalledRepos.slice(0, 4),
++      args.ownedInstalledRepos.length > 0 || args.accountInstallations.length > 0 ? ["Open owner readiness for installed repositories."] : ["Install the GitHub App on a repository you own."],
++    ),
++    roleCard(
++      "operator",
++      args.operator ? "active" : "needs_setup",
++      "Operator",
++      args.operator ? "Configured operator login has deployment-level controls." : "This login is not configured for operator controls.",
++      "/app/operator",
++      args.operator ? 1 : 0,
++      [],
++      args.operator ? ["Open the operator dashboard."] : ["Ask an operator to add this login only if deployment controls are needed."],
++    ),
++  ];
++}
++
++function roleCard(role: ControlPanelRoleName, status: ControlPanelRoleCard["status"], title: string, detail: string, href: string, evidenceCount: number, sampleRepos: string[], nextActions: string[]): ControlPanelRoleCard {
++  return {
++    role,
++    status,
++    title,
++    detail: sanitizeRoleText(detail),
++    href,
++    evidenceCount,
++    sampleRepos: sampleRepos.map(sanitizeRoleText),
++    nextActions: nextActions.map(sanitizeRoleText),
++  };
++}
++
++function uniqueRepos(values: string[]): string[] {
++  return [...new Set(values.filter(Boolean).map(sanitizeRoleText))].sort((a, b) => a.localeCompare(b));
++}
++
++function sameLogin(value: string | null | undefined, login: string): boolean {
++  return value?.toLowerCase() === login.toLowerCase();
++}
++
++function sameRepo(left: string | null | undefined, right: string | null | undefined): boolean {
++  return Boolean(left && right && left.toLowerCase() === right.toLowerCase());
++}
++
++function isMaintainerAssociation(value: string | null | undefined): boolean {
++  return value === "OWNER" || value === "MEMBER" || value === "COLLABORATOR";
++}
++
++function sanitizeRoleText(value: string): string {
++  const redacted = value
++    .replace(/(?:\/Users|\/home|\/tmp)\/[^\s"',;)]*|[A-Za-z]:\\Users\\[^\s"',;)]*/g, "<redacted-path>")
++    .replace(/\b(?:ghp_|github_pat_|gts_|glpat-|sk-)[A-Za-z0-9_=-]{8,}/g, "<redacted-token>")
++    .replace(/\bBearer\s+[A-Za-z0-9._~+/=-]{12,}/gi, "Bearer <redacted-token>");
++  if (/\b(seed phrase|mnemonic|private key|raw trust|trust score|wallet|hotkey|coldkey|payout|reward estimate|farming|private reviewability|public score estimate)\b/i.test(redacted)) return "<redacted>";
++  return redacted.slice(0, 200);
++}
+diff --git a/src/types.ts b/src/types.ts
+index 8c6a866..806eb5e 100644
+--- a/src/types.ts
++++ b/src/types.ts
+@@ -805,6 +805,41 @@ export type AuthSessionRecord = {
+   metadata: Record<string, JsonValue>;
+ };
+ 
++export type ControlPanelRoleName = "miner" | "maintainer" | "owner" | "operator";
++
++export type ControlPanelRoleStatus = "active" | "available" | "needs_setup";
++
++export type ControlPanelRoleCard = {
++  role: ControlPanelRoleName;
++  status: ControlPanelRoleStatus;
++  title: string;
++  detail: string;
++  href: string;
++  evidenceCount: number;
++  sampleRepos: string[];
++  nextActions: string[];
++};
++
++export type ControlPanelRoleSummary = {
++  login: string;
++  generatedAt: string;
++  roles: ControlPanelRoleName[];
++  confirmedMiner: boolean;
++  roleCards: ControlPanelRoleCard[];
++  onboarding: {
++    status: "ready" | "needs_setup";
++    primaryRole?: ControlPanelRoleName | undefined;
++    nextActions: string[];
++  };
++  evidence: {
++    ownedInstalledRepos: number;
++    maintainerRepos: number;
++    accountInstallations: number;
++    operator: boolean;
++  };
++  publicSafe: true;
++};
++
+ export type DigestSubscriptionRecord = {
+   id: string;
+   login: string;
+diff --git a/test/integration/api.test.ts b/test/integration/api.test.ts
+index 6a581ee..49d301e 100644
+--- a/test/integration/api.test.ts
++++ b/test/integration/api.test.ts
+@@ -1020,9 +1020,21 @@ describe("api routes", () => {
+     expect(overview.status).toBe(200);
+     await expect(overview.json()).resolves.toMatchObject({
+       actor: { kind: "session", login: "oktofeesh1" },
++      roleSummary: {
++        roles: ["operator"],
++        onboarding: { status: "ready", primaryRole: "operator" },
++      },
+       metrics: expect.arrayContaining([expect.objectContaining({ label: "Registered repos" })]),
+       upstreamDrift: expect.any(Object),
+     });
++    const roleSummary = await app.request("/v1/app/roles", { headers: cookieHeaders }, env);
++    expect(roleSummary.status).toBe(200);
++    await expect(roleSummary.json()).resolves.toMatchObject({
++      login: "oktofeesh1",
++      roles: ["operator"],
++      roleCards: expect.arrayContaining([expect.objectContaining({ role: "operator", status: "active" })]),
++      publicSafe: true,
++    });
+ 
+     const emptyEnv = createTestEnv();
+     const emptyOverview = await app.request("/v1/app/overview", { headers: apiHeaders(emptyEnv) }, emptyEnv);
+@@ -1050,6 +1062,12 @@ describe("api routes", () => {
+       signal: "warn",
+       items: expect.arrayContaining([expect.objectContaining({ kind: "drift", meta: "watch" })]),
+     });
++    const emptyMinerDashboard = await app.request("/v1/app/miner-dashboard?login=empty-user", { headers: apiHeaders(emptyEnv) }, emptyEnv);
++    expect(emptyMinerDashboard.status).toBe(200);
++    await expect(emptyMinerDashboard.json()).resolves.toMatchObject({
++      status: "needs_refresh",
++      mcp: { snapshot: null, lastRun: null },
++    });
+ 
+     const missingMinerLogin = await app.request("/v1/app/miner-dashboard", { headers: apiHeaders(env) }, env);
+     expect(missingMinerLogin.status).toBe(400);
+@@ -1058,6 +1076,58 @@ describe("api routes", () => {
+     const forbiddenMiner = await app.request("/v1/app/miner-dashboard?login=oktofeesh1", { headers: { cookie: `gittensory_session=${otherToken}` } }, env);
+     expect(forbiddenMiner.status).toBe(403);
+ 
++    const unknownEnv = createTestEnv({ ADMIN_GITHUB_LOGINS: "jsonbored" });
++    const { token: unknownToken } = await createSessionForGitHubUser(unknownEnv, { login: "new-user", id: 2468 });
++    const unknownHeaders = { cookie: `gittensory_session=${unknownToken}`, "content-type": "application/json" };
++    const unknownSession = await app.request("/v1/auth/session", { headers: unknownHeaders }, unknownEnv);
++    expect(unknownSession.status).toBe(200);
++    const unknownSessionBody = await unknownSession.json();
++    expect(unknownSessionBody).toMatchObject({
++      status: "authenticated",
++      login: "new-user",
++      roles: [],
++      roleSummary: { onboarding: { status: "needs_setup" } },
++    });
++    expect(JSON.stringify(unknownSessionBody)).not.toMatch(/wallet|hotkey|raw trust|payout|reward estimate|farming|private reviewability|public score estimate|\/Users|github_pat|ghp_/i);
++    const unknownOverview = await app.request("/v1/app/overview", { headers: unknownHeaders }, unknownEnv);
++    expect(unknownOverview.status).toBe(200);
++    await expect(unknownOverview.json()).resolves.toMatchObject({ roleSummary: { roles: [], onboarding: { status: "needs_setup" } } });
++    expect((await app.request("/v1/app/operator-dashboard", { headers: unknownHeaders }, unknownEnv)).status).toBe(403);
++    expect((await app.request("/v1/contributors/new-user/decision-pack", { headers: unknownHeaders }, unknownEnv)).status).toBe(403);
++    expect((await app.request("/v1/auth/extension/session", { method: "POST", headers: unknownHeaders }, unknownEnv)).status).toBe(403);
++
++    const ownerEnv = createTestEnv({ ADMIN_GITHUB_LOGINS: "jsonbored" });
++    await upsertInstallation(ownerEnv, {
++      installation: {
++        id: 777,
++        account: { login: "repo-owner", id: 777, type: "User" },
++        repository_selection: "selected",
++        permissions: { metadata: "read", pull_requests: "read", issues: "write" },
++        events: ["issues", "pull_request", "repository"],
++      },
++    });
++    await upsertRepositoryFromGitHub(ownerEnv, { name: "owned-repo", full_name: "repo-owner/owned-repo", private: false, default_branch: "main", owner: { login: "repo-owner" } }, 777);
++    const { token: ownerToken } = await createSessionForGitHubUser(ownerEnv, { login: "repo-owner", id: 777 });
++    const ownerHeaders = { cookie: `gittensory_session=${ownerToken}`, "content-type": "application/json" };
++    const ownerRoles = await app.request("/v1/app/roles", { headers: ownerHeaders }, ownerEnv);
++    expect(ownerRoles.status).toBe(200);
++    await expect(ownerRoles.json()).resolves.toMatchObject({
++      roles: ["maintainer", "owner"],
++      evidence: { ownedInstalledRepos: 1, accountInstallations: 1, operator: false },
++    });
++    expect((await app.request("/v1/app/maintainer-dashboard", { headers: ownerHeaders }, ownerEnv)).status).toBe(200);
++    expect((await app.request("/v1/app/operator-dashboard", { headers: ownerHeaders }, ownerEnv)).status).toBe(403);
++    const ownerExtensionSession = await app.request("/v1/auth/extension/session", { method: "POST", headers: ownerHeaders }, ownerEnv);
++    expect(ownerExtensionSession.status).toBe(201);
++    const ownerExtensionSessionBody = (await ownerExtensionSession.json()) as { token: string; login: string; scopes: string[] };
++    expect(ownerExtensionSessionBody).toMatchObject({ login: "repo-owner", scopes: ["extension:pull_context"] });
++    const ownerExtensionMissingPull = await app.request(
++      "/v1/extension/pull-context?owner=repo-owner&repo=owned-repo",
++      { headers: { authorization: `Bearer ${ownerExtensionSessionBody.token}` } },
++      ownerEnv,
++    );
++    expect(ownerExtensionMissingPull.status).toBe(400);
++
+     const minerNeedsRefresh = await app.request("/v1/app/miner-dashboard?login=oktofeesh1", { headers: apiHeaders(env) }, env);
+     expect(minerNeedsRefresh.status).toBe(200);
+     await expect(minerNeedsRefresh.json()).resolves.toMatchObject({
+@@ -1102,10 +1172,10 @@ describe("api routes", () => {
+         scoringModelSnapshotId: "scoring-1",
+         repoDecisions: [{ recommendation: "fallback" }, { priorityScore: 250 }, {}],
+         topActions: undefined,
+-        cleanupFirst: undefined,
+-        pursueRepos: undefined,
+-        avoidRepos: undefined,
+-        maintainerLaneRepos: undefined,
++        cleanupFirst: [{ repoFullName: "entrius/allways-ui", reason: "cached queue needs cleanup before new work" }],
++        pursueRepos: [{ repoFullName: "owner/stable", reason: "fresh low-risk queue" }],
++        avoidRepos: [{ repoFullName: "owner/removed", reason: "removed from registry" }],
++        maintainerLaneRepos: [{ repoFullName: "repo-owner/owned-repo", reason: "owner-maintained repo" }],
+         scoreBlockers: ["legacy blocker", { code: "open_pr_pressure", detail: "Too many open PRs" }],
+         dataQuality: { signalFidelity: { status: "degraded" } },
+       } as never,
+@@ -1117,7 +1187,40 @@ describe("api routes", () => {
+       status: "ready",
+       blockers: expect.arrayContaining([expect.objectContaining({ group: "scoreability" })]),
+       projections: expect.arrayContaining([expect.objectContaining({ name: "fallback" }), expect.objectContaining({ name: "repo" })]),
++      repoFit: expect.arrayContaining([
++        expect.objectContaining({ repoFullName: "owner/stable", lane: "pursue" }),
++        expect.objectContaining({ repoFullName: "entrius/allways-ui", lane: "cleanup-first" }),
++        expect.objectContaining({ repoFullName: "repo-owner/owned-repo", lane: "maintainer-lane" }),
++        expect.objectContaining({ repoFullName: "owner/removed", lane: "avoid" }),
++      ]),
++    });
++
++    await persistSignalSnapshot(env, {
++      id: "sparse-pack",
++      signalType: "contributor-decision-pack",
++      targetKey: "sparse-user",
++      payload: {
++        status: "ready",
++        source: "computed",
++        login: "sparse-user",
++        generatedAt: new Date().toISOString(),
++        stale: false,
++        freshness: "fresh",
++        rebuildEnqueued: false,
++        scoringModelSnapshotId: "scoring-1",
++        repoDecisions: [],
++      } as never,
++      generatedAt: new Date().toISOString(),
++    });
++    const sparseMiner = await app.request("/v1/app/miner-dashboard?login=sparse-user", { headers: apiHeaders(env) }, env);
++    expect(sparseMiner.status).toBe(200);
++    await expect(sparseMiner.json()).resolves.toMatchObject({
++      status: "ready",
++      nextActions: [],
++      blockers: [],
++      projections: [],
+       repoFit: [],
++      mcp: { snapshot: "scoring-1", lastRun: null },
+     });
+ 
+     await recordGitHubRateLimitObservation(env, {
+@@ -1417,7 +1520,8 @@ describe("api routes", () => {
+       login: "jsonbored",
+       githubId: null,
+       github_id: null,
+-      roles: ["miner", "maintainer", "owner", "operator"],
++      roles: ["operator"],
++      roleSummary: { onboarding: { status: "ready", primaryRole: "operator" } },
+     });
+ 
+     for (const [path, error] of [
+@@ -1891,6 +1995,35 @@ describe("api routes", () => {
+       env,
+     );
+     expect(unauthorized.status).toBe(401);
++    const { token: noRoleMcpToken } = await createSessionForGitHubUser(env, { login: "new-user", id: 222 });
++    const noRoleMcp = await app.request(
++      "/mcp",
++      {
++        method: "POST",
++        headers: { authorization: `Bearer ${noRoleMcpToken}`, "content-type": "application/json" },
++        body: JSON.stringify({ jsonrpc: "2.0", id: "no-role", method: "tools/list" }),
++      },
++      env,
++    );
++    expect(noRoleMcp.status).toBe(401);
++
++    const { token: operatorMcpToken } = await createSessionForGitHubUser(env, { login: "jsonbored", id: 12345 });
++    const forbiddenContributorMcp = await app.request(
++      "/mcp",
++      {
++        method: "POST",
++        headers: { ...mcpHeaders(env), authorization: `Bearer ${operatorMcpToken}` },
++        body: JSON.stringify({ jsonrpc: "2.0", id: "wrong-login", method: "tools/call", params: { name: "gittensory_get_decision_pack", arguments: { login: "other-user" } } }),
++      },
++      env,
++    );
++    expect(forbiddenContributorMcp.status).toBe(200);
++    await expect(mcpJson(forbiddenContributorMcp)).resolves.toMatchObject({
++      result: {
++        isError: true,
++        content: [expect.objectContaining({ text: expect.stringContaining("authenticated GitHub login") })],
++      },
++    });
+ 
+     const tools = await app.request(
+       "/mcp",
+diff --git a/test/integration/routes-errors.test.ts b/test/integration/routes-errors.test.ts
+index 9b6db3d..89a35c8 100644
+--- a/test/integration/routes-errors.test.ts
++++ b/test/integration/routes-errors.test.ts
+@@ -82,7 +82,8 @@ describe("api route guards and error branches", () => {
+     await expect(session.json()).resolves.toMatchObject({
+       status: "authenticated",
+       login: "jsonbored",
+-      roles: ["miner", "maintainer", "owner", "operator"],
++      roles: ["operator"],
++      roleSummary: { onboarding: { status: "ready", primaryRole: "operator" } },
+     });
+ 
+     const reposWithCookie = await app.request("/v1/repos", { headers: { cookie: sessionCookie } }, env);
+diff --git a/test/unit/auth.test.ts b/test/unit/auth.test.ts
+index e093ae5..4aa8628 100644
+--- a/test/unit/auth.test.ts
++++ b/test/unit/auth.test.ts
+@@ -437,14 +437,15 @@ describe("private-beta auth and rate limiting", () => {
+     await expect(createSessionFromGitHubToken(createTestEnv({ ADMIN_GITHUB_LOGINS: "no-id-user" }), "valid-token")).resolves.toMatchObject({ login: "no-id-user", scopes: [] });
+   });
+ 
+-  it("requires GitHub OAuth sessions to come from configured admin logins", async () => {
++  it("creates GitHub OAuth sessions without granting operator authorization", async () => {
+     vi.stubGlobal("fetch", async () => Response.json({ login: "external-attacker", id: 99 }));
+-    await expect(createSessionFromGitHubToken(createTestEnv(), "attacker-token")).rejects.toThrow(/github_user_not_authorized/);
+-    await expect(createSessionFromGitHubToken(createTestEnv({ ADMIN_GITHUB_LOGINS: "" }), "attacker-token")).rejects.toThrow(/github_user_not_authorized/);
++    await expect(createSessionFromGitHubToken(createTestEnv(), "attacker-token")).resolves.toMatchObject({ login: "external-attacker" });
++    await expect(createSessionFromGitHubToken(createTestEnv({ ADMIN_GITHUB_LOGINS: "" }), "attacker-token")).resolves.toMatchObject({ login: "external-attacker" });
+ 
+     const env = createTestEnv({ ADMIN_GITHUB_LOGINS: "jsonbored" });
+     const { token } = await createSessionForGitHubUser(env, { login: "external-attacker", id: 99 });
+-    await expect(authenticatePrivateToken(env, token)).resolves.toBeNull();
++    await expect(authenticatePrivateToken(env, token)).resolves.toMatchObject({ kind: "session", actor: "external-attacker" });
++    expect(isAuthorizedGitHubSessionLogin(env, "external-attacker")).toBe(false);
+   });
+ });
+ 
+diff --git a/test/unit/control-panel-roles.test.ts b/test/unit/control-panel-roles.test.ts
+new file mode 100644
+index 0000000..6f71179
+--- /dev/null
++++ b/test/unit/control-panel-roles.test.ts
+@@ -0,0 +1,149 @@
++import { describe, expect, it } from "vitest";
++import { buildControlPanelRoleSummary, loadControlPanelRoleSummary } from "../../src/services/control-panel-roles";
++import type { InstallationRecord, PullRequestRecord, RepositoryRecord } from "../../src/types";
++import { createTestEnv } from "../helpers/d1";
++
++describe("control panel role summaries", () => {
++  it("classifies miner, maintainer, owner, and operator roles from real repo state", () => {
++    const summary = buildControlPanelRoleSummary({
++      login: "oktofeesh1",
++      generatedAt: "2026-06-01T12:00:00.000Z",
++      confirmedMiner: true,
++      operator: true,
++      repositories: [
++        repo("oktofeesh1/example", "oktofeesh1", 10),
++        repo("entrius/allways-ui", "entrius", 11),
++      ],
++      installations: [installation(10, "oktofeesh1"), installation(11, "entrius")],
++      pullRequests: [pull("entrius/allways-ui", "oktofeesh1", "COLLABORATOR")],
++    });
++
++    expect(summary.roles).toEqual(["miner", "maintainer", "owner", "operator"]);
++    expect(summary.confirmedMiner).toBe(true);
++    expect(summary.evidence).toMatchObject({
++      ownedInstalledRepos: 1,
++      maintainerRepos: 1,
++      accountInstallations: 1,
++      operator: true,
++    });
++    expect(summary.roleCards).toEqual(
++      expect.arrayContaining([
++        expect.objectContaining({ role: "miner", status: "active" }),
++        expect.objectContaining({ role: "maintainer", status: "active", sampleRepos: expect.arrayContaining(["entrius/allways-ui", "oktofeesh1/example"]) }),
++        expect.objectContaining({ role: "owner", status: "active", sampleRepos: ["oktofeesh1/example"] }),
++        expect.objectContaining({ role: "operator", status: "active" }),
++      ]),
++    );
++    expect(JSON.stringify(summary)).not.toMatch(/wallet|hotkey|raw trust|reward estimate|payout|farming|private reviewability|public score estimate/i);
++  });
++
++  it("keeps unknown users in onboarding without role fallbacks or sensitive details", () => {
++    const summary = buildControlPanelRoleSummary({
++      login: "new-user",
++      generatedAt: "2026-06-01T12:00:00.000Z",
++      confirmedMiner: false,
++      operator: false,
++      repositories: [repo("entrius/allways-ui", "entrius", 11)],
++      installations: [installation(11, "entrius")],
++      pullRequests: [pull("entrius/allways-ui", "new-user", "CONTRIBUTOR")],
++    });
++
++    expect(summary.roles).toEqual([]);
++    expect(summary.onboarding.status).toBe("needs_setup");
++    expect(summary.roleCards.every((card) => card.status === "needs_setup")).toBe(true);
++    expect(JSON.stringify(summary)).not.toMatch(/wallet|hotkey|raw trust|reward estimate|payout|farming|private reviewability|public score estimate/i);
++  });
++
++  it("redacts unsafe repository evidence strings before returning role cards", () => {
++    const summary = buildControlPanelRoleSummary({
++      login: "maintainer",
++      generatedAt: "2026-06-01T12:00:00.000Z",
++      confirmedMiner: false,
++      operator: false,
++      repositories: [repo("/Users/private github_pat_1234567890abcdef wallet hotkey", "maintainer", 12)],
++      installations: [installation(12, "maintainer")],
++      pullRequests: [],
++    });
++
++    expect(summary.roles).toEqual(["maintainer", "owner"]);
++    expect(JSON.stringify(summary)).not.toMatch(/\/Users|github_pat|1234567890abcdef|wallet|hotkey/);
++  });
++
++  it("recognizes account installations even before an owned repo is cached", () => {
++    const summary = buildControlPanelRoleSummary({
++      login: "repo-owner",
++      generatedAt: "2026-06-01T12:00:00.000Z",
++      confirmedMiner: false,
++      operator: false,
++      repositories: [],
++      installations: [installation(21, "repo-owner")],
++      pullRequests: [],
++    });
++
++    expect(summary.roles).toEqual(["owner"]);
++    expect(summary.roleCards).toEqual(
++      expect.arrayContaining([
++        expect.objectContaining({
++          role: "owner",
++          status: "active",
++          detail: "GitHub App account installation is linked to this login.",
++          evidenceCount: 1,
++        }),
++      ]),
++    );
++  });
++
++  it("keeps onboarding available when cached miner lookup fails", async () => {
++    const env = createTestEnv({ ADMIN_GITHUB_LOGINS: "" });
++    const originalPrepare = env.DB.prepare.bind(env.DB);
++    (env.DB as unknown as { prepare: D1Database["prepare"] }).prepare = ((sql: string) => {
++      if (sql.includes("official_miner_detections")) throw new Error("miner cache unavailable");
++      return originalPrepare(sql);
++    }) as D1Database["prepare"];
++
++    await expect(loadControlPanelRoleSummary(env, "new-user")).resolves.toMatchObject({
++      login: "new-user",
++      roles: [],
++      confirmedMiner: false,
++      onboarding: { status: "needs_setup" },
++      publicSafe: true,
++    });
++  });
++});
++
++function repo(fullName: string, owner: string, installationId: number): RepositoryRecord {
++  return {
++    fullName,
++    owner,
++    name: fullName.split("/").at(-1) ?? "repo",
++    installationId,
++    isInstalled: true,
++    isRegistered: true,
++    isPrivate: false,
++  };
++}
++
++function installation(id: number, accountLogin: string): InstallationRecord {
++  return {
++    id,
++    accountLogin,
++    accountId: id,
++    targetType: "User",
++    repositorySelection: "selected",
++    permissions: {},
++    events: [],
++  };
++}
++
++function pull(repoFullName: string, authorLogin: string, authorAssociation: string): PullRequestRecord {
++  return {
++    repoFullName,
++    number: 1,
++    title: "Test PR",
++    state: "open",
++    authorLogin,
++    authorAssociation,
++    labels: [],
++    linkedIssues: [],
++  };
++}

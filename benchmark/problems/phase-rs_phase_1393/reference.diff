@@ -1,0 +1,405 @@
+diff --git a/crates/engine/src/game/coverage.rs b/crates/engine/src/game/coverage.rs
+index b908bbfdea..3f07d4afd0 100644
+--- a/crates/engine/src/game/coverage.rs
++++ b/crates/engine/src/game/coverage.rs
+@@ -494,6 +494,7 @@ fn fmt_typed_filter(tf: &TypedFilter) -> String {
+                 let stat_str = match stat {
+                     PtStat::Power => "power",
+                     PtStat::Toughness => "toughness",
++                    PtStat::TotalPowerToughness => "total power and toughness",
+                 };
+                 let scope_str = match scope {
+                     PtValueScope::Current => "",
+@@ -1746,6 +1747,7 @@ fn effect_details(effect: &Effect) -> Vec<(String, String)> {
+                 match stat {
+                     PtStat::Power => "power".into(),
+                     PtStat::Toughness => "toughness".into(),
++                    PtStat::TotalPowerToughness => "total power and toughness".into(),
+                 },
+             ));
+         }
+diff --git a/crates/engine/src/game/effects/exchange_life.rs b/crates/engine/src/game/effects/exchange_life.rs
+index 43d35ea801..30a726139f 100644
+--- a/crates/engine/src/game/effects/exchange_life.rs
++++ b/crates/engine/src/game/effects/exchange_life.rs
+@@ -58,6 +58,11 @@ pub fn resolve(
+     let stat_value = match stat {
+         PtStat::Power => source.power,
+         PtStat::Toughness => source.toughness,
++        PtStat::TotalPowerToughness => {
++            return Err(EffectError::InvalidParam(
++                "total power and toughness is not exchangeable as a single stat".to_string(),
++            ));
++        }
+     };
+     let Some(stat_value) = stat_value else {
+         // Source has no power/toughness (not a creature) — can't complete.
+@@ -96,6 +101,11 @@ pub fn resolve(
+     let modification = match stat {
+         PtStat::Power => ContinuousModification::SetPower { value: old_life },
+         PtStat::Toughness => ContinuousModification::SetToughness { value: old_life },
++        PtStat::TotalPowerToughness => {
++            return Err(EffectError::InvalidParam(
++                "total power and toughness is not exchangeable as a single stat".to_string(),
++            ));
++        }
+     };
+     state.add_transient_continuous_effect(
+         ability.source_id,
+diff --git a/crates/engine/src/game/filter.rs b/crates/engine/src/game/filter.rs
+index b66e4a79c6..b22d02dc05 100644
+--- a/crates/engine/src/game/filter.rs
++++ b/crates/engine/src/game/filter.rs
+@@ -1838,6 +1838,28 @@ fn resolve_filter_threshold(
+     }
+ }
+ 
++fn pt_value_from_pair(stat: PtStat, power: Option<i32>, toughness: Option<i32>) -> i32 {
++    match stat {
++        PtStat::Power => power.unwrap_or(0),
++        PtStat::Toughness => toughness.unwrap_or(0),
++        PtStat::TotalPowerToughness => power.unwrap_or(0) + toughness.unwrap_or(0),
++    }
++}
++
++fn object_pt_value(obj: &GameObject, stat: PtStat, scope: PtValueScope) -> i32 {
++    match scope {
++        PtValueScope::Current => pt_value_from_pair(stat, obj.power, obj.toughness),
++        PtValueScope::Base => pt_value_from_pair(stat, obj.base_power, obj.base_toughness),
++    }
++}
++
++fn zone_change_pt_value(record: &ZoneChangeRecord, stat: PtStat, scope: PtValueScope) -> i32 {
++    match scope {
++        PtValueScope::Current => pt_value_from_pair(stat, record.power, record.toughness),
++        PtValueScope::Base => pt_value_from_pair(stat, record.base_power, record.base_toughness),
++    }
++}
++
+ fn matches_last_chosen_land_or_nonland_kind(
+     choice: &Option<ChoiceValue>,
+     core_types: &[CoreType],
+@@ -2193,10 +2215,11 @@ fn matches_filter_prop(
+         // every object from individual match checks.
+         FilterProp::OtherThanTriggerObject => true,
+         FilterProp::HasColor { color } => obj.color.contains(color),
+-        // CR 208 + CR 208.4b: Power/toughness comparison against a dynamic
+-        // threshold. `scope = Base` reads `base_power`/`base_toughness` (the
+-        // value after layer 7b, ignoring counters/modifiers per CR 208.4b);
+-        // `scope = Current` reads the fully-modified `power`/`toughness`.
++        // CR 208 + CR 208.4b: Power/toughness metric comparison against a
++        // dynamic threshold. `scope = Base` reads `base_power`/`base_toughness`
++        // (the value after layer 7b, ignoring counters/modifiers per
++        // CR 208.4b); `scope = Current` reads the fully-modified
++        // `power`/`toughness`.
+         // Dynamic thresholds (`QuantityRef::Variable { "X" }`) resolve against
+         // the ability's `chosen_x` via `FilterContext::from_ability`.
+         FilterProp::PtComparison {
+@@ -2204,16 +2227,10 @@ fn matches_filter_prop(
+             scope,
+             comparator,
+             value,
+-        } => {
+-            let lhs = match (stat, scope) {
+-                (PtStat::Power, PtValueScope::Current) => obj.power,
+-                (PtStat::Power, PtValueScope::Base) => obj.base_power,
+-                (PtStat::Toughness, PtValueScope::Current) => obj.toughness,
+-                (PtStat::Toughness, PtValueScope::Base) => obj.base_toughness,
+-            }
+-            .unwrap_or(0);
+-            comparator.evaluate(lhs, resolve_filter_threshold(state, value, source))
+-        }
++        } => comparator.evaluate(
++            object_pt_value(obj, *stat, *scope),
++            resolve_filter_threshold(state, value, source),
++        ),
+         // Disjunctive composite: any inner prop matches.
+         FilterProp::AnyOf { props } => props
+             .iter()
+@@ -2474,11 +2491,11 @@ fn zone_change_record_matches_property(
+         }
+         // CR 201.2: Name match (case-insensitive) on the event-time object.
+         FilterProp::Named { name } => record.name.eq_ignore_ascii_case(name),
+-        // CR 208 + CR 208.4b: Power/toughness threshold on the event-time
+-        // object. A `None` value (non-creature in some zones) treats as 0,
+-        // matching live-state behavior. The zone-change snapshot captures both
+-        // the current (post-layer-7) and base (layer-7b, per CR 613.4b) values
+-        // at move-time, so `scope = Base` reads `record.base_power`/
++        // CR 208 + CR 208.4b: Power/toughness metric threshold on the
++        // event-time object. A `None` value (non-creature in some zones) treats
++        // as 0, matching live-state behavior. The zone-change snapshot captures
++        // both the current (post-layer-7) and base (layer-7b, per CR 613.4b)
++        // values at move-time, so `scope = Base` reads `record.base_power`/
+         // `record.base_toughness` while `scope = Current` reads
+         // `record.power`/`record.toughness`. This makes the look-back
+         // (leaves-the-battlefield / dies) path as precise as live-object
+@@ -2489,16 +2506,10 @@ fn zone_change_record_matches_property(
+             scope,
+             comparator,
+             value,
+-        } => {
+-            let lhs = match (stat, scope) {
+-                (PtStat::Power, PtValueScope::Current) => record.power,
+-                (PtStat::Power, PtValueScope::Base) => record.base_power,
+-                (PtStat::Toughness, PtValueScope::Current) => record.toughness,
+-                (PtStat::Toughness, PtValueScope::Base) => record.base_toughness,
+-            }
+-            .unwrap_or(0);
+-            comparator.evaluate(lhs, resolve_filter_threshold(state, value, source))
+-        }
++        } => comparator.evaluate(
++            zone_change_pt_value(record, *stat, *scope),
++            resolve_filter_threshold(state, value, source),
++        ),
+         // CR 202.3: Mana value threshold on the event-time object.
+         FilterProp::Cmc { comparator, value } => comparator.evaluate(
+             record.mana_value as i32,
+@@ -3341,6 +3352,49 @@ mod tests {
+         assert!(matches_target_filter(&state, id, &TargetFilter::Any, id));
+     }
+ 
++    #[test]
++    fn pt_comparison_total_power_toughness_matches_sum() {
++        use crate::types::ability::{PtStat, PtValueScope, TypedFilter};
++
++        let mut state = setup();
++        let id = add_creature(&mut state, PlayerId(0), "Summed Bear");
++        let obj = state.objects.get_mut(&id).unwrap();
++        obj.power = Some(3);
++        obj.toughness = Some(3);
++        obj.base_power = Some(2);
++        obj.base_toughness = Some(2);
++
++        let total_filter = |scope, comparator, value| {
++            TargetFilter::Typed(TypedFilter::creature().properties(vec![
++                FilterProp::PtComparison {
++                    stat: PtStat::TotalPowerToughness,
++                    scope,
++                    comparator,
++                    value: QuantityExpr::Fixed { value },
++                },
++            ]))
++        };
++
++        assert!(!matches_target_filter(
++            &state,
++            id,
++            &total_filter(PtValueScope::Current, Comparator::LE, 5),
++            id,
++        ));
++        assert!(matches_target_filter(
++            &state,
++            id,
++            &total_filter(PtValueScope::Current, Comparator::GE, 6),
++            id,
++        ));
++        assert!(matches_target_filter(
++            &state,
++            id,
++            &total_filter(PtValueScope::Base, Comparator::LE, 4),
++            id,
++        ));
++    }
++
+     #[test]
+     fn type_filter_matches_correct_type() {
+         let mut state = setup();
+diff --git a/crates/engine/src/parser/oracle.rs b/crates/engine/src/parser/oracle.rs
+index 78f0e0b6e3..cc127fc46e 100644
+--- a/crates/engine/src/parser/oracle.rs
++++ b/crates/engine/src/parser/oracle.rs
+@@ -4043,9 +4043,10 @@ mod tests {
+     use crate::types::ability::{
+         AbilityCondition, AggregateFunction, Comparator, ContinuousModification, ControllerRef,
+         FilterProp, ManaProduction, ManaSpendRestriction, ModalSelectionConstraint, ObjectScope,
+-        ParsedCondition, PlayerFilter, PlayerScope, PreventionAmount, PtValue, QuantityExpr,
+-        QuantityRef, ReplacementCondition, RoundingMode, SharedQuality, SharedQualityRelation,
+-        ShieldKind, StaticCondition, TargetFilter, TriggerCondition, TypeFilter, TypedFilter,
++        ParsedCondition, PlayerFilter, PlayerScope, PreventionAmount, PtStat, PtValue,
++        PtValueScope, QuantityExpr, QuantityRef, ReplacementCondition, RoundingMode, SharedQuality,
++        SharedQualityRelation, ShieldKind, StaticCondition, TargetFilter, TriggerCondition,
++        TypeFilter, TypedFilter,
+     };
+     use crate::types::keywords::{FlashbackCost, KeywordKind, WardCost};
+     use crate::types::mana::{ManaColor, ManaCost, ManaCostShard};
+@@ -4825,6 +4826,31 @@ mod tests {
+         assert_eq!(r.abilities[0].kind, AbilityKind::Spell);
+     }
+ 
++    #[test]
++    fn cut_down_destroy_target_uses_total_power_toughness_filter() {
++        let r = parse(
++            "Destroy target creature with total power and toughness 5 or less.",
++            "Cut Down",
++            &[],
++            &["Instant"],
++            &[],
++        );
++        assert_eq!(r.abilities.len(), 1);
++        let Effect::Destroy { target, .. } = &*r.abilities[0].effect else {
++            panic!("expected Destroy effect");
++        };
++        let TargetFilter::Typed(tf) = target else {
++            panic!("expected typed target, got {target:?}");
++        };
++        assert!(tf.type_filters.contains(&TypeFilter::Creature));
++        assert!(tf.properties.contains(&FilterProp::PtComparison {
++            stat: PtStat::TotalPowerToughness,
++            scope: PtValueScope::Current,
++            comparator: Comparator::LE,
++            value: QuantityExpr::Fixed { value: 5 },
++        }));
++    }
++
+     #[test]
+     fn counterspell_spell_counter() {
+         let r = parse(
+diff --git a/crates/engine/src/parser/oracle_nom/filter.rs b/crates/engine/src/parser/oracle_nom/filter.rs
+index 300173f9d8..0a947a2ece 100644
+--- a/crates/engine/src/parser/oracle_nom/filter.rs
++++ b/crates/engine/src/parser/oracle_nom/filter.rs
+@@ -144,9 +144,9 @@ fn parse_with_inner(input: &str) -> OracleResult<'_, FilterProp> {
+ 
+ /// CR 208 + CR 208.4b + CR 613.4b: the single, shared power/toughness comparison
+ /// combinator. This is the canonical home for the
+-/// `[base ][each ](power|toughness|power or toughness) <comparison> N` grammar;
+-/// every context (target suffixes, "with" clauses, sacrifice filters) delegates
+-/// here so the grammar lives in exactly one place.
++/// `[base ][each ](power|toughness|power or toughness|total power and toughness)
++/// <comparison> N` grammar; every context (target suffixes, "with" clauses,
++/// sacrifice filters) delegates here so the grammar lives in exactly one place.
+ ///
+ /// Axes parsed:
+ /// - optional leading `each ` — the distributive qualifier in "creatures each
+@@ -155,7 +155,7 @@ fn parse_with_inner(input: &str) -> OracleResult<'_, FilterProp> {
+ ///   discarded.
+ /// - optional `base ` → `PtValueScope::Base` (CR 208.4b); otherwise `Current`.
+ /// - stat selector: `power or toughness` (disjunction → `AnyOf` of two
+-///   `PtComparison`), `power`, or `toughness`.
++///   `PtComparison`), `total power and toughness`, `power`, or `toughness`.
+ /// - comparison tail: either the postfix `N or less` / `N or greater` form, or
+ ///   the infix `less than [or equal to] N` / `greater than [or equal to] N`
+ ///   form (resolving to LE/GE with an `Offset` for strict `<`/`>`).
+@@ -172,8 +172,12 @@ pub fn parse_pt_comparison(input: &str) -> OracleResult<'_, FilterProp> {
+         }
+     })
+     .parse(input)?;
+-    // Stat selector. "power or toughness" must be tried before "power".
++    // Stat selector. Longer phrases must be tried before "power".
+     let (input, stats): (_, &[PtStat]) = alt((
++        value(
++            &[PtStat::TotalPowerToughness][..],
++            tag("total power and toughness"),
++        ),
+         value(
+             &[PtStat::Power, PtStat::Toughness][..],
+             tag("power or toughness"),
+@@ -500,6 +504,21 @@ mod tests {
+         );
+     }
+ 
++    #[test]
++    fn test_parse_pt_comparison_total_power_toughness() {
++        let (rest, p) = parse_pt_comparison("total power and toughness 5 or less").unwrap();
++        assert_eq!(rest, "");
++        assert_eq!(
++            p,
++            FilterProp::PtComparison {
++                stat: PtStat::TotalPowerToughness,
++                scope: PtValueScope::Current,
++                comparator: Comparator::LE,
++                value: QuantityExpr::Fixed { value: 5 },
++            }
++        );
++    }
++
+     #[test]
+     fn test_parse_pt_comparison_exact_base_power() {
+         let (rest, p) = parse_with_property("with base power 1").unwrap();
+diff --git a/crates/engine/src/types/ability.rs b/crates/engine/src/types/ability.rs
+index 05e516f372..800b78bfe2 100644
+--- a/crates/engine/src/types/ability.rs
++++ b/crates/engine/src/types/ability.rs
+@@ -2002,13 +2002,15 @@ pub enum FilterProp {
+     },
+     /// CR 208 (Power/Toughness) + CR 208.4b (base vs current) + CR 613.4b
+     /// (layer 7b: base P/T is set before counters/modifiers in 7c): Matches
+-    /// objects whose power or toughness satisfies `comparator` against `value`.
++    /// objects whose power, toughness, or total power and toughness satisfies
++    /// `comparator` against `value`.
+     ///
+     /// Replaces the former `PowerLE`/`PowerGE`/`ToughnessLE`/`ToughnessGE`
+     /// sibling cluster (a `stat × comparator` cross-product) with a single
+     /// parameterized predicate, mirroring the `Cmc` and `Counters` refactors.
+     /// Three orthogonal axes:
+-    /// - `stat`: which characteristic to read — power (CR 208.1) or toughness.
++    /// - `stat`: which P/T metric to read — power (CR 208.1), toughness, or
++    ///   their total.
+     /// - `scope`: `Current` reads the live `power`/`toughness` (after all layers);
+     ///   `Base` reads `base_power`/`base_toughness` per CR 208.4b — the value
+     ///   after CDAs and set effects (layers 7a/7b) but ignoring counters and
+@@ -3537,16 +3539,18 @@ impl Comparator {
+     }
+ }
+ 
+-/// CR 208: Selects which creature characteristic a `FilterProp::PtComparison`
+-/// reads. Power and toughness are both defined in CR 208 (Power/Toughness) and
+-/// are read identically by a filter — only the field differs — so they are a
+-/// leaf-level parameterization axis, not a cross-section conflation.
++/// CR 208: Selects which creature P/T metric a `FilterProp::PtComparison`
++/// reads. Power, toughness, and their total are all derived from the same CR
++/// 208 characteristic pair, so they are a leaf-level parameterization axis, not
++/// a cross-section conflation.
+ #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+ pub enum PtStat {
+     /// CR 208.1: The creature's power (first number).
+     Power,
+     /// CR 208.1: The creature's toughness (second number).
+     Toughness,
++    /// CR 208.1: The sum of the creature's power and toughness.
++    TotalPowerToughness,
+ }
+ 
+ /// CR 208.4b: Selects whether a `FilterProp::PtComparison` reads the creature's
+diff --git a/crates/engine/tests/integration/anaphoric_scope_allowlist_guard.rs b/crates/engine/tests/integration/anaphoric_scope_allowlist_guard.rs
+index e0a96de889..b4069b4693 100644
+--- a/crates/engine/tests/integration/anaphoric_scope_allowlist_guard.rs
++++ b/crates/engine/tests/integration/anaphoric_scope_allowlist_guard.rs
+@@ -374,6 +374,7 @@ const ANAPHORIC_SCOPE_CARDS: &[&str] = &[
+     "the mystery raceway",
+     "the provider",
+     "the ruinous powers",
++    "thorin, mountain-king",
+     "thought sponge",
+     "thought-string analyst",
+     "too greedily, too deep",
+@@ -459,8 +460,8 @@ fn anaphoric_scope_set_is_frozen() {
+     // both this and ANAPHORIC_SCOPE_CARDS shrink together.
+     assert_eq!(
+         observed.len(),
+-        265,
+-        "Expected exactly 265 cards retaining ObjectScope::Anaphoric (the #495 \
++        266,
++        "Expected exactly 266 cards retaining ObjectScope::Anaphoric (the #495 \
+          behavior-neutral floor of 156, minus four cards unlocked by #607's \
+          target-subject DamageAll source wrapper, plus 89 cards from category 4, \
+          plus the UUID-disambiguated Reanimate print key \
+@@ -472,14 +473,14 @@ fn anaphoric_scope_set_is_frozen() {
+          Phthisis — destroy-target-creature + LoseLife-equal-to-its-P+T, \
+          category-3 target-spell anaphora, plus Captain Ripley Vance category-1 \
+          trigger-source anaphora, plus Sly Spy category-4 reveal/move anaphora, \
+-         minus Thorin, Mountain-King — its category-2/3 misparse was corrected \
+-         by #511/#512 merged from main); count moved to {}.",
++         plus Thorin, Mountain-King — fresh card data still retains the \
++         category-3 target-creature anaphora tracked by #512); count moved to {}.",
+         observed.len()
+     );
+     assert_eq!(
+         ANAPHORIC_SCOPE_CARDS.len(),
+-        265,
+-        "ANAPHORIC_SCOPE_CARDS must list exactly 265 cards."
++        266,
++        "ANAPHORIC_SCOPE_CARDS must list exactly 266 cards."
+     );
+ }
+ 

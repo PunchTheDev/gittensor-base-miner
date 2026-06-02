@@ -1,0 +1,183 @@
+diff --git a/core/build-link/src/main/java/me/seroperson/reload/live/BaseDevServerStart.java b/core/build-link/src/main/java/me/seroperson/reload/live/BaseDevServerStart.java
+index acd9d1c..8166eb6 100644
+--- a/core/build-link/src/main/java/me/seroperson/reload/live/BaseDevServerStart.java
++++ b/core/build-link/src/main/java/me/seroperson/reload/live/BaseDevServerStart.java
+@@ -9,6 +9,7 @@
+ import me.seroperson.reload.live.build.BuildLink;
+ import me.seroperson.reload.live.build.BuildLogger;
+ import me.seroperson.reload.live.build.ReloadableServer;
++import me.seroperson.reload.live.hook.AppFailureRegistry;
+ import me.seroperson.reload.live.hook.Hook;
+ import me.seroperson.reload.live.settings.DevServerSettings;
+ 
+@@ -135,6 +136,7 @@ protected synchronized void startInternal(ReloadGeneration generation) {
+                   // Don't log InterruptedException, as likely they're intended
+                   if (!(e.getCause() instanceof InterruptedException)) {
+                     logger.error("Error in application main thread", e);
++                    AppFailureRegistry.record(Thread.currentThread(), e.getCause());
+                   }
+                 }
+               },
+@@ -173,6 +175,7 @@ protected synchronized void stopInternal() {
+         runHooks(th, cl, shutdownHooks);
+       }
+     } finally {
++      AppFailureRegistry.clear(th);
+       if (cl != null) {
+         logger.debug("Cleaning up old ClassLoader");
+         if (cl instanceof Closeable) {
+diff --git a/core/build-link/src/main/java/me/seroperson/reload/live/hook/AppFailureRegistry.java b/core/build-link/src/main/java/me/seroperson/reload/live/hook/AppFailureRegistry.java
+new file mode 100644
+index 0000000..04cb642
+--- /dev/null
++++ b/core/build-link/src/main/java/me/seroperson/reload/live/hook/AppFailureRegistry.java
+@@ -0,0 +1,32 @@
++package me.seroperson.reload.live.hook;
++
++import java.util.concurrent.ConcurrentHashMap;
++import java.util.concurrent.ConcurrentMap;
++import me.seroperson.reload.live.UnrecoverableException;
++
++/** Records failures from the application {@code main} thread for startup hooks to observe. */
++public final class AppFailureRegistry {
++
++  private static final ConcurrentMap<Thread, Throwable> failures = new ConcurrentHashMap<>();
++
++  private AppFailureRegistry() {}
++
++  public static void record(Thread appThread, Throwable failure) {
++    if (failure != null) {
++      failures.put(appThread, failure);
++    }
++  }
++
++  public static void clear(Thread appThread) {
++    failures.remove(appThread);
++  }
++
++  /** Throws when {@code main} failed; does not use {@link Thread#isAlive()}. */
++  public static void throwIfFailed(Thread appThread) {
++    var failure = failures.get(appThread);
++    if (failure != null) {
++      throw new UnrecoverableException(
++          "Application main thread failed before the health check became ready", failure);
++    }
++  }
++}
+diff --git a/core/build-link/src/main/java/me/seroperson/reload/live/hook/GrpcHealthCheckStartupHook.java b/core/build-link/src/main/java/me/seroperson/reload/live/hook/GrpcHealthCheckStartupHook.java
+index 4316ed1..3eb5ef1 100644
+--- a/core/build-link/src/main/java/me/seroperson/reload/live/hook/GrpcHealthCheckStartupHook.java
++++ b/core/build-link/src/main/java/me/seroperson/reload/live/hook/GrpcHealthCheckStartupHook.java
+@@ -27,6 +27,7 @@ public boolean isAvailable() {
+   public void hook(Thread th, ClassLoader cl, DevServerSettings settings, BuildLogger logger) {
+     try {
+       while (true) {
++        AppFailureRegistry.throwIfFailed(th);
+         logger.debug("Waiting for the GRPC health-check to return success ...");
+         var service = settings.getGrpcHealthService();
+         var healthResponse =
+diff --git a/core/build-link/src/main/java/me/seroperson/reload/live/hook/HealthCheckStartupHook.java b/core/build-link/src/main/java/me/seroperson/reload/live/hook/HealthCheckStartupHook.java
+index 06afe78..19da294 100644
+--- a/core/build-link/src/main/java/me/seroperson/reload/live/hook/HealthCheckStartupHook.java
++++ b/core/build-link/src/main/java/me/seroperson/reload/live/hook/HealthCheckStartupHook.java
+@@ -27,6 +27,7 @@ public boolean isAvailable() {
+   public void hook(Thread th, ClassLoader cl, DevServerSettings settings, BuildLogger logger) {
+     try {
+       while (true) {
++        AppFailureRegistry.throwIfFailed(th);
+         logger.debug("Waiting for the health-check to return success ...");
+         var path = settings.getHealthCheckPath();
+         var healthResponse =
+diff --git a/core/webserver-grpc/src/main/java/me/seroperson/reload/live/webserver/grpc/hook/GrpcHealthCheckStartupHook.java b/core/webserver-grpc/src/main/java/me/seroperson/reload/live/webserver/grpc/hook/GrpcHealthCheckStartupHook.java
+index a65f3f5..6ca85eb 100644
+--- a/core/webserver-grpc/src/main/java/me/seroperson/reload/live/webserver/grpc/hook/GrpcHealthCheckStartupHook.java
++++ b/core/webserver-grpc/src/main/java/me/seroperson/reload/live/webserver/grpc/hook/GrpcHealthCheckStartupHook.java
+@@ -2,6 +2,7 @@
+ 
+ import me.seroperson.reload.live.UnrecoverableException;
+ import me.seroperson.reload.live.build.BuildLogger;
++import me.seroperson.reload.live.hook.AppFailureRegistry;
+ import me.seroperson.reload.live.settings.DevServerSettings;
+ 
+ /**
+@@ -27,6 +28,7 @@ public boolean isAvailable() {
+   public void hook(Thread th, ClassLoader cl, DevServerSettings settings, BuildLogger logger) {
+     try {
+       while (true) {
++        AppFailureRegistry.throwIfFailed(th);
+         logger.debug("Waiting for the GRPC health-check to return SERVING ...");
+         var response = isHealthy(logger, settings);
+         if (response == 1) {
+diff --git a/sbt/src/test/resources/startup-crash/build.sbt b/sbt/src/test/resources/startup-crash/build.sbt
+new file mode 100644
+index 0000000..67f8b30
+--- /dev/null
++++ b/sbt/src/test/resources/startup-crash/build.sbt
+@@ -0,0 +1,26 @@
++enablePlugins(LiveReloadPlugin)
++enablePlugins(BuildInfoPlugin)
++
++scalaVersion := "2.13.16"
++resolvers += Resolver.mavenLocal
++
++val isSbt2 = settingKey[Boolean]("isSbt2")
++isSbt2 := (sbtBinaryVersion.value match {
++  case "2" => true
++  case _   => false
++})
++
++val proxyPort = settingKey[Int]("proxyPort")
++proxyPort := sys.props.get("testkit.proxyPort").map(_.toInt).getOrElse(if (isSbt2.value) 9001 else 9000)
++
++val port = settingKey[Int]("port")
++port := sys.props.get("testkit.port").map(_.toInt).getOrElse(if (isSbt2.value) 8081 else 8080)
++
++liveDevSettings := Seq(
++  DevSettingsKeys.LiveReloadProxyHttpPort -> proxyPort.value.toString,
++  DevSettingsKeys.LiveReloadHttpPort -> port.value.toString,
++  DevSettingsKeys.LiveReloadIsDebug -> "true"
++)
++
++buildInfoKeys := Seq[BuildInfoKey](port)
++buildInfoPackage := "me.seroperson"
+diff --git a/sbt/src/test/resources/startup-crash/project/plugins.sbt b/sbt/src/test/resources/startup-crash/project/plugins.sbt
+new file mode 100644
+index 0000000..cf36c9e
+--- /dev/null
++++ b/sbt/src/test/resources/startup-crash/project/plugins.sbt
+@@ -0,0 +1,6 @@
++updateOptions := updateOptions.value.withLatestSnapshots(false)
++
++resolvers += Resolver.mavenLocal
++
++addSbtPlugin("me.seroperson" % "sbt-live-reload" % sys.props("project.version"))
++addSbtPlugin("com.eed3si9n" % "sbt-buildinfo" % "0.13.1")
+diff --git a/sbt/src/test/resources/startup-crash/src/main/scala/App.scala b/sbt/src/test/resources/startup-crash/src/main/scala/App.scala
+new file mode 100644
+index 0000000..6a82b02
+--- /dev/null
++++ b/sbt/src/test/resources/startup-crash/src/main/scala/App.scala
+@@ -0,0 +1,4 @@
++object App {
++  def main(args: Array[String]): Unit =
++    throw new RuntimeException("boom before binding HTTP server")
++}
+diff --git a/sbt/src/test/scala/me/seroperson/reload/live/LiveReloadSpec.scala b/sbt/src/test/scala/me/seroperson/reload/live/LiveReloadSpec.scala
+index e96b57d..ec4e13e 100644
+--- a/sbt/src/test/scala/me/seroperson/reload/live/LiveReloadSpec.scala
++++ b/sbt/src/test/scala/me/seroperson/reload/live/LiveReloadSpec.scala
+@@ -32,6 +32,14 @@ class LiveReloadSpec extends LiveReloadBase {
+     }
+   }
+ 
++  testEach("startup crash before bind returns HTTP 503") { sbtVersion =>
++    withRunner("startup-crash", sbtVersion) { (runner, proxyPort) =>
++      runner.run("bgRun")
++      verifyHttp("greet", 503, Some("dev server stopped"), proxyPort)
++      verifyPortClosed(proxyPort)
++    }
++  }
++
+   testEach(
+     "cask - hung main thread triggers unrecoverable shutdown",
+     Seq("2.0.0-RC10")

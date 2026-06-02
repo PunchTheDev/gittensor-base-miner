@@ -1,0 +1,1249 @@
+diff --git a/app/src/androidTest/java/dev/touchpilot/app/tools/targets/TargetSelectorLiveTest.kt b/app/src/androidTest/java/dev/touchpilot/app/tools/targets/TargetSelectorLiveTest.kt
+new file mode 100644
+index 0000000..88b9b03
+--- /dev/null
++++ b/app/src/androidTest/java/dev/touchpilot/app/tools/targets/TargetSelectorLiveTest.kt
+@@ -0,0 +1,154 @@
++package dev.touchpilot.app.tools.targets
++
++import android.accessibilityservice.AccessibilityService
++import android.app.UiAutomation
++import android.content.Intent
++import android.graphics.Rect
++import android.provider.Settings
++import android.util.Log
++import android.view.accessibility.AccessibilityNodeInfo
++import androidx.test.ext.junit.runners.AndroidJUnit4
++import androidx.test.platform.app.InstrumentationRegistry
++import org.junit.After
++import org.junit.Assert.assertNotNull
++import org.junit.Assert.assertTrue
++import org.junit.Test
++import org.junit.runner.RunWith
++
++/**
++ * Live behavior proof for issue #76. Runs on a real Android device/emulator.
++ *
++ * The test:
++ * 1. Sends the device to the launcher to start from a known state.
++ * 2. Launches the Android Settings app via Intent so the recorded run has a
++ *    visible app transition.
++ * 3. Walks the live `AccessibilityNodeInfo` tree and builds [TargetSelector]
++ *    instances directly from the live nodes — the same conversion path the
++ *    resolver in issue #77 will use later.
++ * 4. Demonstrates two surfaces the new model adds:
++ *      - **Real-tree selectors with provenance**: `toRedactedJson()` for a
++ *        handful of top-level rows, showing nodeId / bounds / viewId /
++ *        role / source = OBSERVATION.
++ *      - **Sensitivity propagation**: a synthesized "Enter your password"
++ *        label is wrapped through [SelectorText.of] and serialized so the
++ *        recording shows `[REDACTED]` in the display-safe view of the
++ *        selector, while non-sensitive labels round-trip unchanged.
++ * 5. Returns to HOME so subsequent runs start clean.
++ *
++ * `UiAutomation.rootInActiveWindow` grants the same view of the tree the
++ * AccessibilityService would see, so this test does not require enabling
++ * TouchPilot's own service.
++ */
++@RunWith(AndroidJUnit4::class)
++class TargetSelectorLiveTest {
++    private val tag = "TargetSelectorLive"
++
++    @Test
++    fun buildsSelectorsFromLiveSettingsTreeAndRedactsSensitive() {
++        val instrumentation = InstrumentationRegistry.getInstrumentation()
++        val uiAutomation: UiAutomation = instrumentation.uiAutomation
++
++        uiAutomation.performGlobalAction(AccessibilityService.GLOBAL_ACTION_HOME)
++        Thread.sleep(1_500L)
++
++        val context = instrumentation.targetContext
++        context.startActivity(Intent(Settings.ACTION_SETTINGS).apply {
++            addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
++        })
++        Thread.sleep(2_500L)
++
++        val root: AccessibilityNodeInfo? = uiAutomation.rootInActiveWindow
++        assertNotNull("rootInActiveWindow was null on the live device", root)
++
++        val packageName = root!!.packageName?.toString()
++        Log.i(tag, "package=$packageName")
++
++        val selectors = buildLiveSelectors(root, packageName)
++        Log.i(tag, "live selectors gathered: ${selectors.size}")
++
++        // Log the first few selectors as redacted JSON so the recording
++        // captures real on-device target data for the PR body.
++        for (selector in selectors.take(5)) {
++            Log.i(tag, "selector: " + selector.toJson(redacted = true).toString())
++        }
++
++        // Demonstrate sensitivity propagation. The synthesized label is built
++        // through the same SelectorText.of() factory production code uses,
++        // so the JSON below is exactly what would land in a log if a model
++        // proposed a selector that wraps a password label.
++        val sensitiveSelector = TargetSelector(
++            text = SelectorText.of("Enter your password"),
++            nodeId = "synthetic.password.field",
++            packageName = packageName,
++            source = SelectorSource.MODEL,
++        )
++        Log.i(tag, "sensitive selector (redacted): " + sensitiveSelector.toRedactedJson())
++        Log.i(tag, "sensitive selector containsSensitiveText=${sensitiveSelector.containsSensitiveText}")
++
++        // Sanity: at least one observation-sourced selector must come back
++        // as valid; an empty list means the live tree was not usable.
++        assertTrue(
++            "No valid selectors built from live Settings tree",
++            selectors.any { it.isValid() },
++        )
++        assertTrue(
++            "Sensitive selector did not propagate the sensitive flag",
++            sensitiveSelector.containsSensitiveText,
++        )
++    }
++
++    @After
++    fun returnHome() {
++        InstrumentationRegistry.getInstrumentation().uiAutomation
++            .performGlobalAction(AccessibilityService.GLOBAL_ACTION_HOME)
++    }
++
++    /**
++     * Walks the live tree and emits one [TargetSelector] per node that has at
++     * least one identifying dimension (text, contentDescription, viewId, or
++     * non-empty bounds). Each selector's source is recorded as
++     * [SelectorSource.OBSERVATION] to mirror what the future resolver will do.
++     */
++    private fun buildLiveSelectors(
++        root: AccessibilityNodeInfo,
++        packageName: String?,
++    ): List<TargetSelector> {
++        val out = mutableListOf<TargetSelector>()
++        forEachNode(root) { node ->
++            val text = node.text?.toString()?.trim().orEmpty()
++            val desc = node.contentDescription?.toString()?.trim().orEmpty()
++            val viewId = node.viewIdResourceName
++            val rect = Rect().also { node.getBoundsInScreen(it) }
++            val bounds = if (rect.isEmpty) null else TargetBounds(
++                left = rect.left, top = rect.top, right = rect.right, bottom = rect.bottom,
++            )
++            if (text.isEmpty() && desc.isEmpty() && viewId.isNullOrBlank() && bounds == null) {
++                return@forEachNode
++            }
++            out += TargetSelector(
++                text = text.takeIf { it.isNotEmpty() }?.let { SelectorText.of(it) },
++                contentDescription = desc.takeIf { it.isNotEmpty() }?.let { SelectorText.of(it) },
++                nodeId = null,
++                bounds = bounds,
++                viewIdResourceName = viewId,
++                role = null,
++                packageName = packageName,
++                windowTitle = node.window?.title?.toString(),
++                confidence = null,
++                source = SelectorSource.OBSERVATION,
++            )
++        }
++        return out
++    }
++
++    private fun forEachNode(
++        node: AccessibilityNodeInfo,
++        visit: (AccessibilityNodeInfo) -> Unit,
++    ) {
++        visit(node)
++        for (index in 0 until node.childCount) {
++            val child = node.getChild(index) ?: continue
++            forEachNode(child, visit)
++        }
++    }
++}
+diff --git a/app/src/main/java/dev/touchpilot/app/tools/targets/SelectorText.kt b/app/src/main/java/dev/touchpilot/app/tools/targets/SelectorText.kt
+new file mode 100644
+index 0000000..bb314f2
+--- /dev/null
++++ b/app/src/main/java/dev/touchpilot/app/tools/targets/SelectorText.kt
+@@ -0,0 +1,73 @@
++package dev.touchpilot.app.tools.targets
++
++import dev.touchpilot.app.security.SensitiveTextRedactor
++import org.json.JSONObject
++
++/**
++ * Text component of a [TargetSelector] paired with a redaction-safe view of
++ * the same text.
++ *
++ * Mirrors `ScreenText` from the screen package on purpose: callers should be
++ * able to reason about `selector.text` and `node.text` the same way. The
++ * `displaySafe` view is what logs, traces, and agent events expose; the
++ * `raw` view is reserved for tool-execution paths that need the literal
++ * string (e.g. matching a label against a live Accessibility node).
++ *
++ * [isSensitive] is true whenever
++ * [SensitiveTextRedactor.containsSensitiveText] matches the raw text or the
++ * caller already knows the source view is sensitive. That keeps selector
++ * redaction consistent with `ScreenNode.sensitive`, including password fields
++ * whose labels do not trip text heuristics.
++ */
++data class SelectorText(
++    val raw: String,
++    val displaySafe: String,
++    val isSensitive: Boolean,
++) {
++    /**
++     * Returns a copy whose [displaySafe] is `"[REDACTED]"` when the underlying
++     * text is sensitive. Non-sensitive text is left untouched because the
++     * factory in [of] already produced a redacted display view for it.
++     */
++    fun redactedCopy(): SelectorText {
++        return if (isSensitive) copy(displaySafe = "[REDACTED]") else this
++    }
++
++    /**
++     * Serialize as JSON. When [redacted] is true (the default), the `raw`
++     * field is replaced with `displaySafe` so the output is safe to log.
++     */
++    fun toJson(redacted: Boolean = true): JSONObject {
++        val view = if (redacted) redactedCopy() else this
++        return JSONObject().apply {
++            put("raw", if (redacted) view.displaySafe else view.raw)
++            put("displaySafe", view.displaySafe)
++            put("isSensitive", view.isSensitive)
++        }
++    }
++
++    companion object {
++        val Empty: SelectorText = SelectorText(raw = "", displaySafe = "", isSensitive = false)
++
++        /**
++         * Build a [SelectorText] from a raw label. The sensitivity check and
++         * partial-redaction display string come from [SensitiveTextRedactor]
++         * so the result matches what the rest of the agent would compute for
++         * the same string.
++         */
++        fun of(raw: String, forceSensitive: Boolean = false): SelectorText {
++            if (raw.isEmpty()) return Empty
++            val sensitive = forceSensitive || SensitiveTextRedactor.containsSensitiveText(raw)
++            val displaySafe = if (sensitive) "[REDACTED]" else SensitiveTextRedactor.redact(raw)
++            return SelectorText(raw = raw, displaySafe = displaySafe, isSensitive = sensitive)
++        }
++
++        fun fromJson(json: JSONObject): SelectorText {
++            return SelectorText(
++                raw = json.optString("raw", ""),
++                displaySafe = json.optString("displaySafe", ""),
++                isSensitive = json.optBoolean("isSensitive", false),
++            )
++        }
++    }
++}
+diff --git a/app/src/main/java/dev/touchpilot/app/tools/targets/TargetBounds.kt b/app/src/main/java/dev/touchpilot/app/tools/targets/TargetBounds.kt
+new file mode 100644
+index 0000000..6c75e31
+--- /dev/null
++++ b/app/src/main/java/dev/touchpilot/app/tools/targets/TargetBounds.kt
+@@ -0,0 +1,67 @@
++package dev.touchpilot.app.tools.targets
++
++import org.json.JSONObject
++
++/**
++ * Rectangular target bounds in absolute screen coordinates. Kept self-
++ * contained so the selector package does not reach back into
++ * `dev.touchpilot.app.screen` for primitives.
++ *
++ * Coordinates follow the Android convention: `left,top` is the top-left of
++ * the rectangle and `right,bottom` is the bottom-right (exclusive). A
++ * rectangle is [isEmpty] when either dimension is non-positive — same
++ * semantics as `android.graphics.Rect.isEmpty()` — so callers can refuse to
++ * dispatch a tap against a zero-area target without recomputing the check
++ * themselves.
++ */
++data class TargetBounds(
++    val left: Int,
++    val top: Int,
++    val right: Int,
++    val bottom: Int,
++) {
++    val width: Int get() = right - left
++    val height: Int get() = bottom - top
++    val isEmpty: Boolean get() = width <= 0 || height <= 0
++    val centerX: Int get() = (left + right) / 2
++    val centerY: Int get() = (top + bottom) / 2
++
++    fun toJson(): JSONObject = JSONObject().apply {
++        put("left", left)
++        put("top", top)
++        put("right", right)
++        put("bottom", bottom)
++    }
++
++    /**
++     * `"left,top,right,bottom"` — matches the format the existing `tap` tool
++     * accepts in its loose-args `bounds` argument, so this representation can
++     * round-trip cleanly through legacy callers.
++     */
++    fun toBoundsArg(): String = "$left,$top,$right,$bottom"
++
++    companion object {
++        val Unknown: TargetBounds = TargetBounds(left = 0, top = 0, right = 0, bottom = 0)
++
++        fun fromJson(json: JSONObject): TargetBounds = TargetBounds(
++            left = json.optInt("left", 0),
++            top = json.optInt("top", 0),
++            right = json.optInt("right", 0),
++            bottom = json.optInt("bottom", 0),
++        )
++
++        /**
++         * Parse the loose `bounds` argument the current `tap` tool accepts:
++         * `"left,top,right,bottom"`, optionally wrapped in `[ ]` and tolerant
++         * of whitespace. Returns null if the string does not yield exactly
++         * four integers.
++         */
++        fun parse(boundsText: String): TargetBounds? {
++            val values = boundsText
++                .split(",", " ", "[", "]")
++                .mapNotNull { it.trim().takeIf(String::isNotBlank)?.toIntOrNull() }
++            if (values.size != 4) return null
++            return TargetBounds(values[0], values[1], values[2], values[3])
++        }
++    }
++}
+diff --git a/app/src/main/java/dev/touchpilot/app/tools/targets/TargetSelector.kt b/app/src/main/java/dev/touchpilot/app/tools/targets/TargetSelector.kt
+new file mode 100644
+index 0000000..eb8c26d
+--- /dev/null
++++ b/app/src/main/java/dev/touchpilot/app/tools/targets/TargetSelector.kt
+@@ -0,0 +1,177 @@
++package dev.touchpilot.app.tools.targets
++
++import org.json.JSONObject
++
++/**
++ * Provenance of a [TargetSelector] — useful for resolver output, ambiguity
++ * reporting, and log review.
++ *
++ * - [USER]: typed by the user (e.g. "tap the Settings row").
++ * - [AGENT]: produced by deterministic agent logic (intent gate, skill match).
++ * - [MODEL]: emitted by a local model.
++ * - [OBSERVATION]: derived directly from a captured screen node.
++ * - [UNSPECIFIED]: source unknown / not recorded yet.
++ */
++enum class SelectorSource {
++    USER,
++    AGENT,
++    MODEL,
++    OBSERVATION,
++    UNSPECIFIED,
++}
++
++/**
++ * Role hint for a target. Parallels `NodeRole` in the screen package but kept
++ * separate so the selector model can evolve without forcing changes to
++ * `ScreenNode`. Resolver code (issue #77) will translate between the two.
++ */
++enum class TargetRole {
++    BUTTON,
++    LINK,
++    INPUT,
++    TEXT,
++    IMAGE,
++    CONTAINER,
++    SCROLLABLE,
++    HEADING,
++    OTHER,
++}
++
++/**
++ * Structured selector for an Android UI target.
++ *
++ * Replaces the current loose `Map<String, String>` argument shape (`text`,
++ * `node_id`, `bounds`) used by the `tap` tool with a typed model that:
++ *
++ * - supports every dimension the current tools use (text, contentDescription,
++ *   nodeId, bounds, viewIdResourceName),
++ * - carries optional metadata (role, package, window) so the resolver in
++ *   issue #77 can rank and explain ambiguity,
++ * - keeps text fields wrapped in [SelectorText] so any log / trace / agent
++ *   event renders the redacted view by default,
++ * - carries explicit sensitivity from the source node so password fields stay
++ *   sensitive even when their visible label looks harmless,
++ * - exposes [isValid] so callers can refuse to dispatch a tap against an
++ *   empty or under-specified selector (no more "blind taps").
++ *
++ * Per issue #76 acceptance criterion 5 this PR does **not** change runtime
++ * tool behavior; the model lives alongside the existing args path and is
++ * picked up by hardened tools in #78–#80.
++ */
++data class TargetSelector(
++    val text: SelectorText? = null,
++    val contentDescription: SelectorText? = null,
++    val nodeId: String? = null,
++    val bounds: TargetBounds? = null,
++    val viewIdResourceName: String? = null,
++    val role: TargetRole? = null,
++    val packageName: String? = null,
++    val windowTitle: String? = null,
++    val confidence: Float? = null,
++    val sensitive: Boolean = false,
++    val source: SelectorSource = SelectorSource.UNSPECIFIED,
++) {
++    init {
++        val c = confidence
++        if (c != null) {
++            require(c in 0.0f..1.0f) { "confidence must be in [0.0, 1.0], got $c" }
++        }
++    }
++
++    /**
++     * True when no identifying dimension is set. An empty selector cannot
++     * resolve to any node and should not be dispatched to a tool.
++     */
++    val isEmpty: Boolean
++        get() = text == null &&
++            contentDescription == null &&
++            nodeId == null &&
++            bounds == null &&
++            viewIdResourceName == null
++
++    /**
++     * Whether the selector identifies at least one target dimension. The
++     * resolver in #77 uses this as the first gate before scoring candidates.
++     */
++    fun isValid(): Boolean = !isEmpty
++
++    /**
++     * True when the selector carries any text component flagged as sensitive
++     * — used to decide whether the selector itself should be redacted in
++     * surfaces the user did not opt into (logs, traces, agent events).
++     */
++    val containsSensitiveText: Boolean
++        get() = sensitive || (text?.isSensitive == true) || (contentDescription?.isSensitive == true)
++
++    /**
++     * Copy that replaces sensitive text fields with their `[REDACTED]`
++     * display-safe view. All non-text dimensions are preserved because they
++     * are not user-visible labels.
++     */
++    fun redactedCopy(): TargetSelector = copy(
++        text = text?.redactedCopy(),
++        contentDescription = contentDescription?.redactedCopy(),
++    )
++
++    /**
++     * Serialize as JSON. When [redacted] is true (the default), text fields
++     * use their `displaySafe` view so the output can be written to logs and
++     * traces without leaking sensitive labels.
++     */
++    fun toJson(redacted: Boolean = true): JSONObject {
++        val view = if (redacted) redactedCopy() else this
++        return JSONObject().apply {
++            putOrNull("text", view.text?.toJson(redacted))
++            putOrNull("contentDescription", view.contentDescription?.toJson(redacted))
++            putOrNull("nodeId", view.nodeId)
++            putOrNull("bounds", view.bounds?.toJson())
++            putOrNull("viewIdResourceName", view.viewIdResourceName)
++            putOrNull("role", view.role?.name)
++            putOrNull("packageName", view.packageName)
++            putOrNull("windowTitle", view.windowTitle)
++            putOrNull("confidence", view.confidence)
++            put("sensitive", view.sensitive)
++            put("source", view.source.name)
++            put("containsSensitiveText", view.containsSensitiveText)
++        }
++    }
++
++    /**
++     * Pretty-printed redacted JSON. Convenience for traces and PR proofs.
++     */
++    fun toRedactedJson(): String = toJson(redacted = true).toString(2)
++
++    private fun JSONObject.putOrNull(key: String, value: Any?) {
++        if (value == null) put(key, JSONObject.NULL) else put(key, value)
++    }
++
++    companion object {
++        val Empty: TargetSelector = TargetSelector()
++
++        fun fromJson(json: JSONObject): TargetSelector {
++            return TargetSelector(
++                text = if (json.has("text") && !json.isNull("text"))
++                    SelectorText.fromJson(json.getJSONObject("text")) else null,
++                contentDescription = if (json.has("contentDescription") && !json.isNull("contentDescription"))
++                    SelectorText.fromJson(json.getJSONObject("contentDescription")) else null,
++                nodeId = if (json.has("nodeId") && !json.isNull("nodeId")) json.getString("nodeId") else null,
++                bounds = if (json.has("bounds") && !json.isNull("bounds"))
++                    TargetBounds.fromJson(json.getJSONObject("bounds")) else null,
++                viewIdResourceName = if (json.has("viewIdResourceName") && !json.isNull("viewIdResourceName"))
++                    json.getString("viewIdResourceName") else null,
++                role = if (json.has("role") && !json.isNull("role"))
++                    runCatching { TargetRole.valueOf(json.getString("role")) }.getOrNull() else null,
++                packageName = if (json.has("packageName") && !json.isNull("packageName"))
++                    json.getString("packageName") else null,
++                windowTitle = if (json.has("windowTitle") && !json.isNull("windowTitle"))
++                    json.getString("windowTitle") else null,
++                confidence = if (json.has("confidence") && !json.isNull("confidence"))
++                    json.getDouble("confidence").toFloat() else null,
++                sensitive = json.optBoolean("sensitive", false),
++                source = runCatching {
++                    SelectorSource.valueOf(json.optString("source", SelectorSource.UNSPECIFIED.name))
++                }.getOrDefault(SelectorSource.UNSPECIFIED),
++            )
++        }
++    }
++}
+diff --git a/app/src/main/java/dev/touchpilot/app/tools/targets/TargetSelectorBuilder.kt b/app/src/main/java/dev/touchpilot/app/tools/targets/TargetSelectorBuilder.kt
+new file mode 100644
+index 0000000..adb15b9
+--- /dev/null
++++ b/app/src/main/java/dev/touchpilot/app/tools/targets/TargetSelectorBuilder.kt
+@@ -0,0 +1,106 @@
++package dev.touchpilot.app.tools.targets
++
++import dev.touchpilot.app.screen.NodeRole
++import dev.touchpilot.app.screen.ScreenNode
++
++/**
++ * Factory helpers that build [TargetSelector] instances from the two
++ * common sources of target data in the codebase:
++ *
++ * - **Legacy tool arguments** — the loose `Map<String, String>` shape the
++ *   current `tap` tool accepts. [fromLegacyArgs] preserves backward
++ *   compatibility so the typed selector can be introduced without changing
++ *   any caller's call site in this PR (per issue #76 acceptance criterion 5).
++ *
++ * - **Observed screen nodes** — the structured `ScreenNode` produced by
++ *   `ScreenContextBuilder`. [fromScreenNode] is the path the future resolver
++ *   in issue #77 will use when emitting a selector for a resolved candidate.
++ */
++object TargetSelectorBuilder {
++
++    /**
++     * Build a selector from the loose `text`/`node_id`/`bounds` arguments
++     * accepted by the existing `tap` tool. Recognised keys mirror
++     * `AndroidToolCatalog`'s `tap` argument set.
++     *
++     * - `text` -> wrapped in [SelectorText.of] so sensitive labels are
++     *   flagged and any later log emission uses the redacted view.
++     * - `node_id` -> propagated verbatim.
++     * - `bounds` -> parsed via [TargetBounds.parse]; malformed input is
++     *   dropped silently so the resulting selector is simply less specific
++     *   rather than invalid.
++     *
++     * The returned selector's [TargetSelector.source] is [SelectorSource.USER]
++     * because legacy args come from agent / model / user-typed input that
++     * the existing system treats as user-supplied.
++     */
++    fun fromLegacyArgs(args: Map<String, String>): TargetSelector {
++        val text = args["text"]?.takeIf { it.isNotBlank() }?.let { SelectorText.of(it) }
++        val nodeId = args["node_id"]?.takeIf { it.isNotBlank() }
++        val bounds = args["bounds"]?.takeIf { it.isNotBlank() }?.let { TargetBounds.parse(it) }
++
++        return TargetSelector(
++            text = text,
++            nodeId = nodeId,
++            bounds = bounds,
++            source = SelectorSource.USER,
++        )
++    }
++
++    /**
++     * Build a selector from a captured [ScreenNode].
++     *
++     * The node's raw text feeds [SelectorText.of] so sensitivity is computed
++     * consistently with how the rest of the agent treats screen text. Explicit
++     * node sensitivity is also carried onto the selector so password fields
++     * remain sensitive even when their visible label is generic.
++     *
++     * Bounds with zero area are dropped — they cannot identify a target and
++     * the [TargetSelector] is still valid via [TargetSelector.nodeId] /
++     * [TargetSelector.viewIdResourceName] / text dimensions.
++     */
++    fun fromScreenNode(
++        node: ScreenNode,
++        packageName: String? = null,
++        windowTitle: String? = null,
++        confidence: Float? = null,
++        source: SelectorSource = SelectorSource.OBSERVATION,
++    ): TargetSelector {
++        val sensitive = node.sensitive || node.text.isSensitive
++        val text = node.text.raw
++            .takeIf { it.isNotBlank() }
++            ?.let { SelectorText.of(it, forceSensitive = sensitive) }
++        val bounds = TargetBounds(
++            left = node.bounds.left,
++            top = node.bounds.top,
++            right = node.bounds.right,
++            bottom = node.bounds.bottom,
++        ).takeUnless { it.isEmpty }
++
++        return TargetSelector(
++            text = text,
++            contentDescription = null,
++            nodeId = node.nodeId,
++            bounds = bounds,
++            viewIdResourceName = node.viewIdResourceName,
++            role = node.role.toTargetRole(),
++            packageName = packageName,
++            windowTitle = windowTitle,
++            confidence = confidence,
++            sensitive = sensitive,
++            source = source,
++        )
++    }
++
++    private fun NodeRole.toTargetRole(): TargetRole = when (this) {
++        NodeRole.BUTTON -> TargetRole.BUTTON
++        NodeRole.LINK -> TargetRole.LINK
++        NodeRole.INPUT -> TargetRole.INPUT
++        NodeRole.TEXT -> TargetRole.TEXT
++        NodeRole.IMAGE -> TargetRole.IMAGE
++        NodeRole.CONTAINER -> TargetRole.CONTAINER
++        NodeRole.SCROLLABLE -> TargetRole.SCROLLABLE
++        NodeRole.HEADING -> TargetRole.HEADING
++        NodeRole.OTHER -> TargetRole.OTHER
++    }
++}
+diff --git a/app/src/test/java/dev/touchpilot/app/tools/targets/SelectorTextTest.kt b/app/src/test/java/dev/touchpilot/app/tools/targets/SelectorTextTest.kt
+new file mode 100644
+index 0000000..adba714
+--- /dev/null
++++ b/app/src/test/java/dev/touchpilot/app/tools/targets/SelectorTextTest.kt
+@@ -0,0 +1,92 @@
++package dev.touchpilot.app.tools.targets
++
++import org.json.JSONObject
++import kotlin.test.Test
++import kotlin.test.assertEquals
++import kotlin.test.assertFalse
++import kotlin.test.assertTrue
++
++class SelectorTextTest {
++    @Test
++    fun emptyFactoryReturnsSentinel() {
++        assertEquals(SelectorText.Empty, SelectorText.of(""))
++    }
++
++    @Test
++    fun nonSensitiveTextIsPreserved() {
++        val t = SelectorText.of("Settings")
++        assertEquals("Settings", t.raw)
++        assertEquals("Settings", t.displaySafe)
++        assertFalse(t.isSensitive)
++    }
++
++    @Test
++    fun sensitiveWordIsFlaggedAndRedactedForDisplay() {
++        val t = SelectorText.of("Enter your password")
++        assertTrue(t.isSensitive)
++        assertEquals("Enter your password", t.raw)
++        assertEquals("[REDACTED]", t.displaySafe)
++    }
++
++    @Test
++    fun forceSensitiveRedactsBenignLookingLabel() {
++        val t = SelectorText.of("PIN", forceSensitive = true)
++        assertTrue(t.isSensitive)
++        assertEquals("PIN", t.raw)
++        assertEquals("[REDACTED]", t.displaySafe)
++    }
++
++    @Test
++    fun sensitiveAssignmentValueIsRedactedInDisplay() {
++        val t = SelectorText.of("api_key=sk-test-abc123")
++        assertTrue(t.isSensitive)
++        assertEquals("api_key=sk-test-abc123", t.raw)
++        // The display view uses the redactor's partial-replacement output.
++        assertTrue("[REDACTED]" in t.displaySafe)
++        assertFalse("sk-test-abc123" in t.displaySafe)
++    }
++
++    @Test
++    fun redactedCopyReplacesSensitiveDisplayWithRedactedSentinel() {
++        val t = SelectorText.of("Enter your password")
++        val r = t.redactedCopy()
++        assertEquals("[REDACTED]", r.displaySafe)
++    }
++
++    @Test
++    fun redactedCopyIsNoOpOnNonSensitiveText() {
++        val t = SelectorText.of("Battery")
++        assertEquals(t, t.redactedCopy())
++    }
++
++    @Test
++    fun toJsonRedactedUsesDisplaySafeForRaw() {
++        val t = SelectorText.of("Enter your password")
++        val json = t.toJson(redacted = true)
++        assertEquals("[REDACTED]", json.getString("raw"))
++        assertEquals("[REDACTED]", json.getString("displaySafe"))
++        assertTrue(json.getBoolean("isSensitive"))
++    }
++
++    @Test
++    fun toJsonRawExposesRawTextWhenRequested() {
++        val t = SelectorText.of("Enter your password")
++        val json = t.toJson(redacted = false)
++        assertEquals("Enter your password", json.getString("raw"))
++        assertTrue(json.getBoolean("isSensitive"))
++    }
++
++    @Test
++    fun jsonRoundTripPreservesFields() {
++        val original = SelectorText.of("Settings")
++        val json = original.toJson(redacted = false)
++        val restored = SelectorText.fromJson(json)
++        assertEquals(original, restored)
++    }
++
++    @Test
++    fun fromJsonHandlesMissingFields() {
++        val restored = SelectorText.fromJson(JSONObject())
++        assertEquals(SelectorText.Empty, restored)
++    }
++}
+diff --git a/app/src/test/java/dev/touchpilot/app/tools/targets/TargetBoundsTest.kt b/app/src/test/java/dev/touchpilot/app/tools/targets/TargetBoundsTest.kt
+new file mode 100644
+index 0000000..d21a6d7
+--- /dev/null
++++ b/app/src/test/java/dev/touchpilot/app/tools/targets/TargetBoundsTest.kt
+@@ -0,0 +1,71 @@
++package dev.touchpilot.app.tools.targets
++
++import kotlin.test.Test
++import kotlin.test.assertEquals
++import kotlin.test.assertFalse
++import kotlin.test.assertNull
++import kotlin.test.assertTrue
++
++class TargetBoundsTest {
++    @Test
++    fun nonEmptyRectComputesWidthHeightAndCenter() {
++        val b = TargetBounds(left = 100, top = 200, right = 300, bottom = 500)
++        assertEquals(200, b.width)
++        assertEquals(300, b.height)
++        assertEquals(200, b.centerX)
++        assertEquals(350, b.centerY)
++        assertFalse(b.isEmpty)
++    }
++
++    @Test
++    fun zeroAreaIsEmpty() {
++        assertTrue(TargetBounds(0, 0, 0, 0).isEmpty)
++        assertTrue(TargetBounds(50, 50, 50, 100).isEmpty)
++        assertTrue(TargetBounds(50, 50, 100, 50).isEmpty)
++    }
++
++    @Test
++    fun negativeAreaIsEmpty() {
++        // Bottom above top, right left of left -> meaningless rect.
++        assertTrue(TargetBounds(100, 200, 50, 100).isEmpty)
++    }
++
++    @Test
++    fun toBoundsArgRoundTripsThroughParse() {
++        val original = TargetBounds(10, 20, 30, 40)
++        val parsed = TargetBounds.parse(original.toBoundsArg())
++        assertEquals(original, parsed)
++    }
++
++    @Test
++    fun parseAcceptsAndroidStyleBracketFormat() {
++        assertEquals(
++            TargetBounds(0, 0, 100, 200),
++            TargetBounds.parse("[0,0][100,200]"),
++        )
++    }
++
++    @Test
++    fun parseRejectsTooFewIntegers() {
++        assertNull(TargetBounds.parse("1,2,3"))
++        assertNull(TargetBounds.parse(""))
++        assertNull(TargetBounds.parse("nope"))
++    }
++
++    @Test
++    fun parseRejectsExtraIntegers() {
++        assertNull(TargetBounds.parse("1,2,3,4,5"))
++    }
++
++    @Test
++    fun jsonRoundTrip() {
++        val original = TargetBounds(5, 10, 15, 20)
++        val restored = TargetBounds.fromJson(original.toJson())
++        assertEquals(original, restored)
++    }
++
++    @Test
++    fun unknownIsEmpty() {
++        assertTrue(TargetBounds.Unknown.isEmpty)
++    }
++}
+diff --git a/app/src/test/java/dev/touchpilot/app/tools/targets/TargetSelectorBuilderTest.kt b/app/src/test/java/dev/touchpilot/app/tools/targets/TargetSelectorBuilderTest.kt
+new file mode 100644
+index 0000000..0f97766
+--- /dev/null
++++ b/app/src/test/java/dev/touchpilot/app/tools/targets/TargetSelectorBuilderTest.kt
+@@ -0,0 +1,221 @@
++package dev.touchpilot.app.tools.targets
++
++import dev.touchpilot.app.screen.NodeBounds
++import dev.touchpilot.app.screen.NodeRole
++import dev.touchpilot.app.screen.ScreenNode
++import dev.touchpilot.app.screen.ScreenText
++import kotlin.test.Test
++import kotlin.test.assertEquals
++import kotlin.test.assertFalse
++import kotlin.test.assertNotNull
++import kotlin.test.assertNull
++import kotlin.test.assertTrue
++
++class TargetSelectorBuilderTest {
++    // --- fromLegacyArgs ---
++
++    @Test
++    fun fromLegacyArgs_textOnly_buildsTextSelector() {
++        val selector = TargetSelectorBuilder.fromLegacyArgs(mapOf("text" to "Settings"))
++        assertEquals("Settings", selector.text?.raw)
++        assertFalse(selector.text!!.isSensitive)
++        assertNull(selector.nodeId)
++        assertNull(selector.bounds)
++        assertEquals(SelectorSource.USER, selector.source)
++        assertTrue(selector.isValid())
++    }
++
++    @Test
++    fun fromLegacyArgs_sensitiveTextIsFlagged() {
++        val selector = TargetSelectorBuilder.fromLegacyArgs(mapOf("text" to "Enter your password"))
++        assertNotNull(selector.text)
++        assertTrue(selector.text!!.isSensitive)
++        assertTrue(selector.containsSensitiveText)
++    }
++
++    @Test
++    fun fromLegacyArgs_nodeIdOnly_buildsNodeIdSelector() {
++        val selector = TargetSelectorBuilder.fromLegacyArgs(mapOf("node_id" to "0.2.1"))
++        assertEquals("0.2.1", selector.nodeId)
++        assertNull(selector.text)
++        assertNull(selector.bounds)
++        assertTrue(selector.isValid())
++    }
++
++    @Test
++    fun fromLegacyArgs_boundsOnly_buildsBoundsSelector() {
++        val selector = TargetSelectorBuilder.fromLegacyArgs(mapOf("bounds" to "10,20,110,220"))
++        assertEquals(TargetBounds(10, 20, 110, 220), selector.bounds)
++        assertTrue(selector.isValid())
++    }
++
++    @Test
++    fun fromLegacyArgs_boundsBracketFormat_isParsed() {
++        val selector = TargetSelectorBuilder.fromLegacyArgs(mapOf("bounds" to "[0,0][100,200]"))
++        assertEquals(TargetBounds(0, 0, 100, 200), selector.bounds)
++    }
++
++    @Test
++    fun fromLegacyArgs_malformedBounds_droppedSilently() {
++        val selector = TargetSelectorBuilder.fromLegacyArgs(mapOf("bounds" to "garbage,1,2"))
++        // Result is an empty selector — caller can detect via isValid().
++        assertNull(selector.bounds)
++        assertFalse(selector.isValid())
++    }
++
++    @Test
++    fun fromLegacyArgs_blankValues_ignored() {
++        val selector = TargetSelectorBuilder.fromLegacyArgs(
++            mapOf("text" to "  ", "node_id" to "", "bounds" to "   ")
++        )
++        assertFalse(selector.isValid())
++    }
++
++    @Test
++    fun fromLegacyArgs_emptyMap_buildsEmptySelector() {
++        val selector = TargetSelectorBuilder.fromLegacyArgs(emptyMap())
++        assertFalse(selector.isValid())
++        assertEquals(SelectorSource.USER, selector.source)
++    }
++
++    @Test
++    fun fromLegacyArgs_combined_carriesAllProvidedDimensions() {
++        val selector = TargetSelectorBuilder.fromLegacyArgs(
++            mapOf(
++                "text" to "Settings",
++                "node_id" to "0.3.2",
++                "bounds" to "5,5,55,55",
++            )
++        )
++        assertEquals("Settings", selector.text?.raw)
++        assertEquals("0.3.2", selector.nodeId)
++        assertEquals(TargetBounds(5, 5, 55, 55), selector.bounds)
++    }
++
++    // --- fromScreenNode ---
++
++    @Test
++    fun fromScreenNode_basicNode_buildsObservationSelector() {
++        val node = ScreenNode(
++            nodeId = "0.1",
++            role = NodeRole.BUTTON,
++            text = ScreenText.of("Battery"),
++            bounds = NodeBounds(10, 20, 110, 220),
++            clickable = true,
++            viewIdResourceName = "com.android.settings:id/battery_row",
++            className = "android.widget.LinearLayout",
++        )
++        val selector = TargetSelectorBuilder.fromScreenNode(
++            node = node,
++            packageName = "com.android.settings",
++            windowTitle = "Settings",
++            confidence = 0.85f,
++        )
++        assertEquals("Battery", selector.text?.raw)
++        assertEquals("0.1", selector.nodeId)
++        assertEquals(TargetBounds(10, 20, 110, 220), selector.bounds)
++        assertEquals("com.android.settings:id/battery_row", selector.viewIdResourceName)
++        assertEquals(TargetRole.BUTTON, selector.role)
++        assertEquals("com.android.settings", selector.packageName)
++        assertEquals("Settings", selector.windowTitle)
++        assertEquals(0.85f, selector.confidence)
++        assertEquals(SelectorSource.OBSERVATION, selector.source)
++        assertTrue(selector.isValid())
++    }
++
++    @Test
++    fun fromScreenNode_blankText_isOmitted() {
++        val node = ScreenNode(
++            nodeId = "0.1",
++            text = ScreenText.of(""),
++            bounds = NodeBounds(0, 0, 100, 100),
++        )
++        val selector = TargetSelectorBuilder.fromScreenNode(node)
++        assertNull(selector.text)
++        // The selector is still valid via nodeId + bounds.
++        assertTrue(selector.isValid())
++    }
++
++    @Test
++    fun fromScreenNode_zeroBounds_isOmitted() {
++        val node = ScreenNode(
++            nodeId = "0.2",
++            text = ScreenText.of("Save"),
++            bounds = NodeBounds(0, 0, 0, 0),
++        )
++        val selector = TargetSelectorBuilder.fromScreenNode(node)
++        assertNull(selector.bounds)
++        assertTrue(selector.isValid())
++    }
++
++    @Test
++    fun fromScreenNode_sensitiveText_propagatesFlag() {
++        val node = ScreenNode(
++            nodeId = "0.3",
++            text = ScreenText.of("Enter your password"),
++            bounds = NodeBounds(0, 0, 100, 100),
++        )
++        val selector = TargetSelectorBuilder.fromScreenNode(node)
++        assertTrue(selector.text!!.isSensitive)
++        assertTrue(selector.containsSensitiveText)
++    }
++
++    @Test
++    fun fromScreenNode_explicitSensitiveNodeRedactsBenignLookingText() {
++        val node = ScreenNode(
++            nodeId = "0.4",
++            text = ScreenText.of("PIN"),
++            bounds = NodeBounds(0, 0, 100, 100),
++            sensitive = true,
++        )
++        val selector = TargetSelectorBuilder.fromScreenNode(node)
++        assertTrue(selector.sensitive)
++        assertTrue(selector.text!!.isSensitive)
++        assertEquals("[REDACTED]", selector.text!!.displaySafe)
++        assertTrue(selector.containsSensitiveText)
++    }
++
++    @Test
++    fun fromScreenNode_explicitSensitiveNodeWithoutTextStillFlagsSelector() {
++        val node = ScreenNode(
++            nodeId = "0.5",
++            text = ScreenText.Empty,
++            bounds = NodeBounds(0, 0, 100, 100),
++            sensitive = true,
++        )
++        val selector = TargetSelectorBuilder.fromScreenNode(node)
++        assertNull(selector.text)
++        assertTrue(selector.sensitive)
++        assertTrue(selector.containsSensitiveText)
++    }
++
++    @Test
++    fun fromScreenNode_roleMappingCoversAllValues() {
++        // Mapping must be total, otherwise a future NodeRole gets silently
++        // dropped to null on selector emission.
++        for (role in NodeRole.values()) {
++            val node = ScreenNode(
++                nodeId = "0",
++                role = role,
++                text = ScreenText.of("Label"),
++                bounds = NodeBounds(0, 0, 1, 1),
++            )
++            val mapped = TargetSelectorBuilder.fromScreenNode(node).role
++            assertNotNull(mapped, "NodeRole.$role must map to a TargetRole")
++        }
++    }
++
++    @Test
++    fun fromScreenNode_customSourceIsHonored() {
++        val node = ScreenNode(
++            nodeId = "0",
++            text = ScreenText.of("Settings"),
++            bounds = NodeBounds(0, 0, 10, 10),
++        )
++        val selector = TargetSelectorBuilder.fromScreenNode(
++            node = node,
++            source = SelectorSource.MODEL,
++        )
++        assertEquals(SelectorSource.MODEL, selector.source)
++    }
++}
+diff --git a/app/src/test/java/dev/touchpilot/app/tools/targets/TargetSelectorTest.kt b/app/src/test/java/dev/touchpilot/app/tools/targets/TargetSelectorTest.kt
+new file mode 100644
+index 0000000..dbb7118
+--- /dev/null
++++ b/app/src/test/java/dev/touchpilot/app/tools/targets/TargetSelectorTest.kt
+@@ -0,0 +1,234 @@
++package dev.touchpilot.app.tools.targets
++
++import kotlin.test.Test
++import kotlin.test.assertEquals
++import kotlin.test.assertFailsWith
++import kotlin.test.assertFalse
++import kotlin.test.assertNotEquals
++import kotlin.test.assertNull
++import kotlin.test.assertTrue
++
++class TargetSelectorTest {
++    // --- Construction + validation ---
++
++    @Test
++    fun emptyConstantHasNoIdentifyingDimensions() {
++        assertTrue(TargetSelector.Empty.isEmpty)
++        assertFalse(TargetSelector.Empty.isValid())
++    }
++
++    @Test
++    fun selectorWithJustTextIsValid() {
++        val s = TargetSelector(text = SelectorText.of("Settings"))
++        assertFalse(s.isEmpty)
++        assertTrue(s.isValid())
++    }
++
++    @Test
++    fun selectorWithJustNodeIdIsValid() {
++        val s = TargetSelector(nodeId = "0.2.1")
++        assertTrue(s.isValid())
++    }
++
++    @Test
++    fun selectorWithJustBoundsIsValid() {
++        val s = TargetSelector(bounds = TargetBounds(0, 0, 100, 100))
++        assertTrue(s.isValid())
++    }
++
++    @Test
++    fun selectorWithJustViewIdIsValid() {
++        val s = TargetSelector(viewIdResourceName = "com.example:id/save")
++        assertTrue(s.isValid())
++    }
++
++    @Test
++    fun selectorWithJustContentDescriptionIsValid() {
++        val s = TargetSelector(contentDescription = SelectorText.of("Compose"))
++        assertTrue(s.isValid())
++    }
++
++    @Test
++    fun selectorWithMetadataOnlyIsStillInvalid() {
++        // role / packageName / source by themselves cannot identify a node.
++        val s = TargetSelector(
++            role = TargetRole.BUTTON,
++            packageName = "com.android.settings",
++            source = SelectorSource.AGENT,
++        )
++        assertTrue(s.isEmpty)
++        assertFalse(s.isValid())
++    }
++
++    // --- Confidence invariant ---
++
++    @Test
++    fun confidenceOutOfRangeRejected() {
++        assertFailsWith<IllegalArgumentException> {
++            TargetSelector(nodeId = "0", confidence = 1.5f)
++        }
++        assertFailsWith<IllegalArgumentException> {
++            TargetSelector(nodeId = "0", confidence = -0.1f)
++        }
++    }
++
++    @Test
++    fun confidenceInRangeAccepted() {
++        TargetSelector(nodeId = "0", confidence = 0.0f)
++        TargetSelector(nodeId = "0", confidence = 0.5f)
++        TargetSelector(nodeId = "0", confidence = 1.0f)
++    }
++
++    // --- Sensitivity propagation ---
++
++    @Test
++    fun sensitiveTextLabelFlagsSelector() {
++        val s = TargetSelector(text = SelectorText.of("Enter your password"))
++        assertTrue(s.containsSensitiveText)
++    }
++
++    @Test
++    fun sensitiveContentDescriptionFlagsSelector() {
++        val s = TargetSelector(contentDescription = SelectorText.of("password field"))
++        assertTrue(s.containsSensitiveText)
++    }
++
++    @Test
++    fun explicitSensitiveFlagFlagsSelector() {
++        val s = TargetSelector(nodeId = "0.1.2", sensitive = true)
++        assertTrue(s.containsSensitiveText)
++    }
++
++    @Test
++    fun nonSensitiveTextDoesNotFlagSelector() {
++        val s = TargetSelector(text = SelectorText.of("Battery"))
++        assertFalse(s.containsSensitiveText)
++    }
++
++    @Test
++    fun nodeIdAndBoundsAloneDoNotFlagSensitivity() {
++        val s = TargetSelector(nodeId = "0.1.2", bounds = TargetBounds(10, 20, 30, 40))
++        assertFalse(s.containsSensitiveText)
++    }
++
++    // --- Redaction ---
++
++    @Test
++    fun redactedCopyHidesSensitiveTextInDisplaySafe() {
++        val s = TargetSelector(
++            text = SelectorText.of("Enter your password"),
++            contentDescription = SelectorText.of("password field"),
++            nodeId = "0.1",
++        )
++        val r = s.redactedCopy()
++        assertEquals("[REDACTED]", r.text?.displaySafe)
++        assertEquals("[REDACTED]", r.contentDescription?.displaySafe)
++        assertEquals("0.1", r.nodeId, "non-text dimensions must survive redaction")
++    }
++
++    @Test
++    fun redactedCopyIsNoOpOnNonSensitiveSelector() {
++        val s = TargetSelector(
++            text = SelectorText.of("Battery"),
++            nodeId = "0.4",
++            bounds = TargetBounds(0, 0, 100, 100),
++        )
++        assertEquals(s, s.redactedCopy())
++    }
++
++    // --- JSON serialization ---
++
++    @Test
++    fun toJsonRedactedHidesSensitiveText() {
++        val s = TargetSelector(
++            text = SelectorText.of("Enter your password"),
++            nodeId = "0",
++            source = SelectorSource.MODEL,
++        )
++        val json = s.toJson(redacted = true)
++        val textObj = json.getJSONObject("text")
++        assertEquals("[REDACTED]", textObj.getString("raw"))
++        assertEquals("[REDACTED]", textObj.getString("displaySafe"))
++        assertTrue(json.getBoolean("containsSensitiveText"))
++        assertEquals("MODEL", json.getString("source"))
++    }
++
++    @Test
++    fun toJsonRawExposesRawTextWhenRequested() {
++        val s = TargetSelector(text = SelectorText.of("Enter your password"))
++        val json = s.toJson(redacted = false)
++        assertEquals("Enter your password", json.getJSONObject("text").getString("raw"))
++    }
++
++    @Test
++    fun toJsonEmitsNullJsonForMissingFields() {
++        val s = TargetSelector(text = SelectorText.of("Settings"))
++        val json = s.toJson(redacted = true)
++        assertTrue(json.isNull("nodeId"))
++        assertTrue(json.isNull("bounds"))
++        assertTrue(json.isNull("viewIdResourceName"))
++        assertTrue(json.isNull("role"))
++    }
++
++    @Test
++    fun jsonRoundTripPreservesEveryDimension() {
++        val original = TargetSelector(
++            text = SelectorText.of("Settings"),
++            contentDescription = SelectorText.of("Open settings"),
++            nodeId = "0.2.1",
++            bounds = TargetBounds(10, 20, 110, 220),
++            viewIdResourceName = "com.android.settings:id/dashboard",
++            role = TargetRole.BUTTON,
++            packageName = "com.android.settings",
++            windowTitle = "Settings",
++            confidence = 0.92f,
++            sensitive = true,
++            source = SelectorSource.OBSERVATION,
++        )
++        val restored = TargetSelector.fromJson(original.toJson(redacted = false))
++        assertEquals(original, restored)
++    }
++
++    @Test
++    fun jsonRoundTripFallsBackToUnspecifiedSourceOnGarbage() {
++        val s = TargetSelector(nodeId = "0").toJson(redacted = true)
++        s.put("source", "NOT_A_REAL_SOURCE")
++        val restored = TargetSelector.fromJson(s)
++        assertEquals(SelectorSource.UNSPECIFIED, restored.source)
++    }
++
++    @Test
++    fun jsonRoundTripDropsUnknownRoleValuesToNull() {
++        val s = TargetSelector(nodeId = "0", role = TargetRole.BUTTON).toJson(redacted = true)
++        s.put("role", "NOT_A_REAL_ROLE")
++        val restored = TargetSelector.fromJson(s)
++        assertNull(restored.role)
++    }
++
++    // --- toRedactedJson ---
++
++    @Test
++    fun toRedactedJsonIsPrettyPrintedAndContainsRedactedSentinel() {
++        val s = TargetSelector(text = SelectorText.of("Enter your password"), nodeId = "0")
++        val pretty = s.toRedactedJson()
++        assertTrue(pretty.contains("[REDACTED]"))
++        assertTrue(pretty.contains("\"source\""))
++        assertTrue(pretty.contains("\n"))
++    }
++
++    // --- Equality + Empty ---
++
++    @Test
++    fun copyWithSameFieldsIsEqual() {
++        val a = TargetSelector(nodeId = "0", source = SelectorSource.USER)
++        val b = a.copy()
++        assertEquals(a, b)
++    }
++
++    @Test
++    fun differentSourcesAreNotEqual() {
++        val a = TargetSelector(nodeId = "0", source = SelectorSource.USER)
++        val b = TargetSelector(nodeId = "0", source = SelectorSource.MODEL)
++        assertNotEquals(a, b)
++    }
++}

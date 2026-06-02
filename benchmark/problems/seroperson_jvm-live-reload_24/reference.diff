@@ -1,0 +1,174 @@
+diff --git a/README.md b/README.md
+index 6b773a6..b551dcb 100644
+--- a/README.md
++++ b/README.md
+@@ -364,7 +364,7 @@ First, let's check the list of available options:
+ 
+ | Key                                 | Environment                         | Default     | Description                                                                                                                                         |
+ | ----------------------------------- | ----------------------------------- | ----------- | --------------------------------------------------------------------------------------------------------------------------------------------------- |
+-| `live.reload.proxy.http.host`       | `LIVE_RELOAD_PROXY_HTTP_HOST`       | `0.0.0.0`   | The host for the proxy to start on                                                                                                                  |
++| `live.reload.proxy.http.host`       | `LIVE_RELOAD_PROXY_HTTP_HOST`       | `localhost` | The host for the proxy to start on                                                                                                                  |
+ | `live.reload.proxy.http.port`       | `LIVE_RELOAD_PROXY_HTTP_PORT`       | `9000`      | The port for the proxy to listen on                                                                                                                 |
+ | `live.reload.http.host`             | `LIVE_RELOAD_HTTP_HOST`             | `localhost` | The host on which your web application starts                                                                                                       |
+ | `live.reload.http.port`             | `LIVE_RELOAD_HTTP_PORT`             | `8080`      | The port your web application listens on                                                                                                            |
+diff --git a/core/webserver-grpc/src/main/java/me/seroperson/reload/live/webserver/grpc/GrpcDevServerStart.java b/core/webserver-grpc/src/main/java/me/seroperson/reload/live/webserver/grpc/GrpcDevServerStart.java
+index b6ff61f..8a4e840 100644
+--- a/core/webserver-grpc/src/main/java/me/seroperson/reload/live/webserver/grpc/GrpcDevServerStart.java
++++ b/core/webserver-grpc/src/main/java/me/seroperson/reload/live/webserver/grpc/GrpcDevServerStart.java
+@@ -1,12 +1,13 @@
+ package me.seroperson.reload.live.webserver.grpc;
+ 
+-import io.grpc.Grpc;
+ import io.grpc.InsecureServerCredentials;
+ import io.grpc.Server;
+ import io.grpc.ServerCredentials;
+ import io.grpc.TlsServerCredentials;
++import io.grpc.netty.shaded.io.grpc.netty.NettyServerBuilder;
+ import java.io.File;
+ import java.io.IOException;
++import java.net.InetSocketAddress;
+ import java.util.List;
+ import me.seroperson.reload.live.BaseDevServerStart;
+ import me.seroperson.reload.live.UnrecoverableException;
+@@ -64,14 +65,18 @@ public void start() {
+     boolean proxyTls = !(proxyCredentials instanceof InsecureServerCredentials);
+ 
+     try {
++      var proxyAddress =
++          new InetSocketAddress(settings.getProxyGrpcHost(), settings.getProxyGrpcPort());
+       proxyServer =
+-          Grpc.newServerBuilderForPort(settings.getProxyGrpcPort(), proxyCredentials)
++          NettyServerBuilder.forAddress(proxyAddress, proxyCredentials)
+               .fallbackHandlerRegistry(new GrpcProxyHandlerRegistry(logger, proxyHandler))
+               .build()
+               .start();
+ 
+       logger.info(
+-          "🚀 GRPC proxy server started on port "
++          "🚀 GRPC proxy server started on "
++              + settings.getProxyGrpcHost()
++              + ":"
+               + settings.getProxyGrpcPort()
+               + (proxyTls ? " (TLS)" : "")
+               + " -> "
+diff --git a/sbt/src/test/scala/me/seroperson/reload/live/GrpcLiveReloadSpec.scala b/sbt/src/test/scala/me/seroperson/reload/live/GrpcLiveReloadSpec.scala
+index cbcac0f..16e33de 100644
+--- a/sbt/src/test/scala/me/seroperson/reload/live/GrpcLiveReloadSpec.scala
++++ b/sbt/src/test/scala/me/seroperson/reload/live/GrpcLiveReloadSpec.scala
+@@ -292,6 +292,33 @@ class GrpcLiveReloadSpec extends LiveReloadBase {
+     }
+   }
+ 
++  testEach(
++    "grpc-scala3 - proxy respects configured listen host",
++    versions = Seq("1.12.3")
++  ) { sbtVersion =>
++    withRunner(
++      "grpc-scala3",
++      sbtVersion,
++      extraJvmOptions = Seq("-Dlive.reload.proxy.grpc.host=127.0.0.1")
++    ) { (runner, proxyPort) =>
++      val externalAddress = nonLoopbackAddress()
++      assume(
++        externalAddress.nonEmpty,
++        "no non-loopback address available for bind-address verification"
++      )
++
++      runner.run("bgRun")
++      verifyGrpc(
++        "greeter.Greeter",
++        "Greet",
++        "",
++        bytesToHex("Scala3-Hi".getBytes("UTF-8")),
++        proxyPort
++      )
++      verifyPortClosed(proxyPort, externalAddress.get)
++    }
++  }
++
+   testEach("grpc-tls - live reload through full TLS proxy and backend") {
+     sbtVersion =>
+       withRunner("grpc-tls", sbtVersion) { (runner, proxyPort) =>
+diff --git a/sbt/src/test/scala/me/seroperson/reload/live/LiveReloadBase.scala b/sbt/src/test/scala/me/seroperson/reload/live/LiveReloadBase.scala
+index a2e6a0d..3661c60 100644
+--- a/sbt/src/test/scala/me/seroperson/reload/live/LiveReloadBase.scala
++++ b/sbt/src/test/scala/me/seroperson/reload/live/LiveReloadBase.scala
+@@ -2,6 +2,7 @@ package me.seroperson.reload.live
+ 
+ import java.io.IOException
+ import java.net.InetSocketAddress
++import java.net.NetworkInterface
+ import java.net.Socket
+ import java.net.URI
+ import java.net.http.HttpClient
+@@ -11,6 +12,7 @@ import java.time.Duration
+ import me.seroperson.reload.live.sbt.BuildInfo
+ import me.seroperson.sbt.testkit.*
+ import org.scalatest.funsuite.AnyFunSuite
++import scala.jdk.CollectionConverters.*
+ import scala.util.Failure
+ import scala.util.Success
+ import scala.util.Try
+@@ -67,7 +69,8 @@ trait LiveReloadBase extends AnyFunSuite {
+ 
+   protected def withRunner(
+       resourceDir: String,
+-      sbtVersion: String
++      sbtVersion: String,
++      extraJvmOptions: Seq[String] = Seq.empty
+   )(body: (SbtRunner, Int) => Unit): Unit = {
+     val (proxyPort, appPort) = nextPortPair()
+     val runner = SbtRunner
+@@ -75,9 +78,11 @@ trait LiveReloadBase extends AnyFunSuite {
+       .withDirectoryFromResources(resourceDir)
+       .withSbtVersion(sbtVersion)
+       .withJvmOptions(
+-        s"-Dproject.version=${BuildInfo.version}",
+-        s"-Dtestkit.proxyPort=$proxyPort",
+-        s"-Dtestkit.port=$appPort"
++        (Seq(
++          s"-Dproject.version=${BuildInfo.version}",
++          s"-Dtestkit.proxyPort=$proxyPort",
++          s"-Dtestkit.port=$appPort"
++        ) ++ extraJvmOptions)*
+       )
+       .withAttachedStdio()
+       .withDebugLogging()
+@@ -86,20 +91,32 @@ trait LiveReloadBase extends AnyFunSuite {
+     finally runner.close()
+   }
+ 
+-  /** Polls until a TCP connect to `port` is refused, ie. nothing is listening
++  /** Polls until a TCP connect to `host:port` is refused, ie. nothing is
++    * listening
+     */
+-  protected def verifyPortClosed(port: Int): Unit = {
+-    pollUntil(s"TCP connect to $port should be refused") {
++  protected def verifyPortClosed(
++      port: Int,
++      host: String = "localhost"
++  ): Unit = {
++    pollUntil(s"TCP connect to $host:$port should be refused") {
+       val sock = new Socket()
+       try {
+-        sock.connect(new InetSocketAddress("localhost", port), 1000)
+-        throw new AssertionError(s"Port $port is still accepting connections")
++        sock.connect(new InetSocketAddress(host, port), 1000)
++        throw new AssertionError(s"$host:$port is still accepting connections")
+       } catch {
+         case _: IOException => ()
+       } finally sock.close()
+     }
+   }
+ 
++  /** Returns a non-loopback local address if the machine has one. */
++  protected def nonLoopbackAddress(): Option[String] =
++    NetworkInterface.getNetworkInterfaces.asScala
++      .filter(iface => iface.isUp && !iface.isLoopback)
++      .flatMap(_.getInetAddresses.asScala)
++      .find(address => !address.isLoopbackAddress && !address.isAnyLocalAddress)
++      .map(_.getHostAddress)
++
+   protected def verifyHttp(
+       path: String,
+       expectedStatus: Int,

@@ -1,0 +1,602 @@
+diff --git a/packages/registry/src/index.d.ts b/packages/registry/src/index.d.ts
+index df014825c..160091a8b 100644
+--- a/packages/registry/src/index.d.ts
++++ b/packages/registry/src/index.d.ts
+@@ -1103,11 +1103,88 @@ export function buildCorpusLlmsArtifact(
+   params?: Record<string, unknown>,
+ ): string;
+ export const QUALITY_REPORT_SCHEMA_VERSION: number;
++export const SOURCE_HEALTH_REPORT_SCHEMA_VERSION: number;
+ export const LLMS_ARTIFACT_SCHEMA_VERSION: number;
+ export const SUBMISSION_SPEC_SCHEMA_VERSION: number;
++
++export type SourceHealthFreshness =
++  | "fresh"
++  | "aging"
++  | "stale"
++  | "dormant"
++  | "unknown";
++
++export type SourceHealthEntry = {
++  key: string;
++  category: string;
++  slug: string;
++  title: string;
++  sourceStatus: "available" | "missing";
++  sourceQuality: string;
++  freshness: SourceHealthFreshness;
++  ageDays: number | null;
++  lastActivityAt: string;
++  hasSafetyNotes: boolean;
++  hasPrivacyNotes: boolean;
++  packageTrust: DownloadTrust;
++  packageVerified: boolean;
++  hasPackageTrust: boolean;
++  riskBearing: boolean;
++  needsAttention: boolean;
++  attentionReasons: string[];
++};
++
++export type SourceHealthReport = {
++  schemaVersion: number;
++  kind: "source-health-report";
++  generatedAt: string;
++  count: number;
++  thresholds: {
++    freshMaxDays: number;
++    agingMaxDays: number;
++    staleMaxDays: number;
++  };
++  summary: {
++    sourceBackedCount: number;
++    sourceBackedPercent: number;
++    missingSourceCount: number;
++    freshCount: number;
++    agingCount: number;
++    staleCount: number;
++    dormantCount: number;
++    unknownFreshnessCount: number;
++    riskBearingCount: number;
++    missingSafetyNotesCount: number;
++    missingPrivacyNotesCount: number;
++    packageTrustCount: number;
++    packageTrustPercent: number;
++    needsAttentionCount: number;
++  };
++  categoryBreakdown: Record<
++    string,
++    {
++      count: number;
++      sourceBacked: number;
++      stale: number;
++      missingSafetyNotes: number;
++      missingPrivacyNotes: number;
++      packageTrust: number;
++      needsAttention: number;
++    }
++  >;
++  entries: SourceHealthEntry[];
++};
++
+ export function buildSourceProvenance(
+   entry: Partial<ContentEntry>,
+ ): SourceProvenance;
++export function buildEntrySourceHealth(
++  entry: Partial<ContentEntry>,
++  referenceDate?: Date | string,
++): SourceHealthEntry;
++export function buildSourceHealthReport(
++  entries: Partial<ContentEntry>[],
++): SourceHealthReport;
+ export function buildEntryQuality(
+   entry: Partial<ContentEntry>,
+   referenceDate?: Date | string,
+diff --git a/packages/registry/src/quality.js b/packages/registry/src/quality.js
+index 655ded36d..b6eaf53bb 100644
+--- a/packages/registry/src/quality.js
++++ b/packages/registry/src/quality.js
+@@ -294,6 +294,206 @@ export function buildContentQualityReport(entries) {
+   };
+ }
+ 
++export const SOURCE_HEALTH_REPORT_SCHEMA_VERSION = 1;
++
++const SOURCE_HEALTH_RISK_CATEGORIES = new Set([
++  "mcp",
++  "hooks",
++  "skills",
++  "statuslines",
++  "commands",
++]);
++
++const SOURCE_FRESHNESS_THRESHOLDS = {
++  freshMaxDays: 180,
++  agingMaxDays: 365,
++  staleMaxDays: 730,
++};
++
++function isRiskBearingSourceCategory(category) {
++  return SOURCE_HEALTH_RISK_CATEGORIES.has(clean(category));
++}
++
++function hasMeaningfulNotes(value) {
++  return Array.isArray(value) && value.some((item) => clean(item).length > 0);
++}
++
++function percentOf(count, total) {
++  return total > 0 ? Math.round((count / total) * 100) : 0;
++}
++
++function deriveSourceFreshness(entry, referenceDate) {
++  const raw = clean(entry.repoUpdatedAt || entry.dateAdded);
++  if (!raw) {
++    return { freshness: "unknown", ageDays: null, lastActivityAt: "" };
++  }
++  const parsedTime = new Date(raw).getTime();
++  if (!Number.isFinite(parsedTime)) {
++    return { freshness: "unknown", ageDays: null, lastActivityAt: "" };
++  }
++  const referenceTime =
++    referenceDate instanceof Date
++      ? referenceDate.getTime()
++      : new Date(referenceDate).getTime();
++  if (!Number.isFinite(referenceTime)) {
++    return {
++      freshness: "unknown",
++      ageDays: null,
++      lastActivityAt: new Date(parsedTime).toISOString(),
++    };
++  }
++  const ageDays = Math.max(
++    0,
++    Math.floor((referenceTime - parsedTime) / 86_400_000),
++  );
++  let freshness = "dormant";
++  if (ageDays <= SOURCE_FRESHNESS_THRESHOLDS.freshMaxDays) {
++    freshness = "fresh";
++  } else if (ageDays <= SOURCE_FRESHNESS_THRESHOLDS.agingMaxDays) {
++    freshness = "aging";
++  } else if (ageDays <= SOURCE_FRESHNESS_THRESHOLDS.staleMaxDays) {
++    freshness = "stale";
++  }
++  return {
++    freshness,
++    ageDays,
++    lastActivityAt: new Date(parsedTime).toISOString(),
++  };
++}
++
++function derivePackageTrust(entry) {
++  const downloadTrust = clean(entry.downloadTrust);
++  const packageVerified = entry.packageVerified === true;
++  return {
++    packageTrust: downloadTrust || null,
++    packageVerified,
++    hasPackageTrust: downloadTrust === "first-party" || packageVerified,
++  };
++}
++
++export function buildEntrySourceHealth(entry, referenceDate) {
++  const provenance = buildSourceProvenance(entry);
++  const sourceStatus =
++    provenance.sourceUrls.length > 0 ? "available" : "missing";
++  const { freshness, ageDays, lastActivityAt } = deriveSourceFreshness(
++    entry,
++    referenceDate,
++  );
++  const pkg = derivePackageTrust(entry);
++  const hasSafetyNotes = hasMeaningfulNotes(entry.safetyNotes);
++  const hasPrivacyNotes = hasMeaningfulNotes(entry.privacyNotes);
++  const riskBearing = isRiskBearingSourceCategory(entry.category);
++
++  const attentionReasons = [];
++  if (sourceStatus === "missing") {
++    attentionReasons.push("missing-source");
++  }
++  if (freshness === "stale" || freshness === "dormant") {
++    attentionReasons.push("stale-source");
++  }
++  if (riskBearing && !hasSafetyNotes) {
++    attentionReasons.push("missing-safety-notes");
++  }
++  if (riskBearing && !hasPrivacyNotes) {
++    attentionReasons.push("missing-privacy-notes");
++  }
++
++  return {
++    key: `${entry.category}:${entry.slug}`,
++    category: entry.category,
++    slug: entry.slug,
++    title: entry.title,
++    sourceStatus,
++    sourceQuality: provenance.sourceQuality,
++    freshness,
++    ageDays,
++    lastActivityAt,
++    hasSafetyNotes,
++    hasPrivacyNotes,
++    packageTrust: pkg.packageTrust,
++    packageVerified: pkg.packageVerified,
++    hasPackageTrust: pkg.hasPackageTrust,
++    riskBearing,
++    needsAttention: attentionReasons.length > 0,
++    attentionReasons,
++  };
++}
++
++function buildSourceHealthCategoryBreakdown(rows) {
++  return Object.fromEntries(
++    categorySpec.categoryOrder.map((category) => {
++      const categoryRows = rows.filter((row) => row.category === category);
++      const countWhere = (predicate) =>
++        categoryRows.reduce((sum, row) => sum + (predicate(row) ? 1 : 0), 0);
++
++      return [
++        category,
++        {
++          count: categoryRows.length,
++          sourceBacked: countWhere((row) => row.sourceStatus === "available"),
++          stale: countWhere(
++            (row) => row.freshness === "stale" || row.freshness === "dormant",
++          ),
++          missingSafetyNotes: countWhere(
++            (row) => row.riskBearing && !row.hasSafetyNotes,
++          ),
++          missingPrivacyNotes: countWhere(
++            (row) => row.riskBearing && !row.hasPrivacyNotes,
++          ),
++          packageTrust: countWhere((row) => row.hasPackageTrust),
++          needsAttention: countWhere((row) => row.needsAttention),
++        },
++      ];
++    }),
++  );
++}
++
++export function buildSourceHealthReport(entries) {
++  const generatedAt = generatedAtForEntries(entries);
++  const referenceDate = new Date(generatedAt);
++  const rows = entries.map((entry) =>
++    buildEntrySourceHealth(entry, referenceDate),
++  );
++  const total = rows.length;
++  const countWhere = (predicate) =>
++    rows.reduce((sum, row) => sum + (predicate(row) ? 1 : 0), 0);
++
++  const sourceBackedCount = countWhere(
++    (row) => row.sourceStatus === "available",
++  );
++  const packageTrustCount = countWhere((row) => row.hasPackageTrust);
++
++  return {
++    schemaVersion: SOURCE_HEALTH_REPORT_SCHEMA_VERSION,
++    kind: "source-health-report",
++    generatedAt,
++    count: total,
++    thresholds: { ...SOURCE_FRESHNESS_THRESHOLDS },
++    summary: {
++      sourceBackedCount,
++      sourceBackedPercent: percentOf(sourceBackedCount, total),
++      missingSourceCount: total - sourceBackedCount,
++      freshCount: countWhere((row) => row.freshness === "fresh"),
++      agingCount: countWhere((row) => row.freshness === "aging"),
++      staleCount: countWhere((row) => row.freshness === "stale"),
++      dormantCount: countWhere((row) => row.freshness === "dormant"),
++      unknownFreshnessCount: countWhere((row) => row.freshness === "unknown"),
++      riskBearingCount: countWhere((row) => row.riskBearing),
++      missingSafetyNotesCount: countWhere(
++        (row) => row.riskBearing && !row.hasSafetyNotes,
++      ),
++      missingPrivacyNotesCount: countWhere(
++        (row) => row.riskBearing && !row.hasPrivacyNotes,
++      ),
++      packageTrustCount,
++      packageTrustPercent: percentOf(packageTrustCount, total),
++      needsAttentionCount: countWhere((row) => row.needsAttention),
++    },
++    categoryBreakdown: buildSourceHealthCategoryBreakdown(rows),
++    entries: rows,
++  };
++}
++
+ export function buildContentPromptReport(entries, maxPrompts = 30) {
+   const quality = buildContentQualityReport(entries);
+   const prompts = quality.entries
+diff --git a/tests/registry-artifacts.test.ts b/tests/registry-artifacts.test.ts
+index fc4380de5..82b887c99 100644
+--- a/tests/registry-artifacts.test.ts
++++ b/tests/registry-artifacts.test.ts
+@@ -18,6 +18,9 @@ import {
+   buildJsonLdSnapshots,
+   buildRegistryChangelogFeed,
+   buildRegistryTrustReport,
++  buildSourceHealthReport,
++  buildEntrySourceHealth,
++  SOURCE_HEALTH_REPORT_SCHEMA_VERSION,
+   buildReadOnlyEcosystemFeed,
+   buildRaycastEnvelope,
+   buildRaycastDetailMarkdown,
+@@ -1035,3 +1038,283 @@ Use this hook after reviewing the notes.`,
+     ).toHaveLength(1);
+   });
+ });
++
++type SourceHealthFixture = {
++  category: string;
++  slug: string;
++  title?: string;
++  dateAdded?: string;
++  repoUpdatedAt?: string;
++  repoUrl?: string;
++  documentationUrl?: string;
++  downloadTrust?: string;
++  packageVerified?: boolean;
++  safetyNotes?: unknown;
++  privacyNotes?: unknown;
++};
++
++function healthEntry(input: SourceHealthFixture) {
++  return { title: `${input.category}:${input.slug}`, ...input };
++}
++
++// Anchor entry fixes the deterministic reference date at 2026-05-01.
++const sourceHealthFixtures = [
++  healthEntry({
++    category: "mcp",
++    slug: "fresh-secure",
++    dateAdded: "2026-05-01",
++    repoUpdatedAt: "2026-04-15",
++    repoUrl: "https://github.com/acme/fresh-secure",
++    downloadTrust: "first-party",
++    packageVerified: true,
++    safetyNotes: ["Runs a background worker."],
++    privacyNotes: ["Stores OAuth tokens locally."],
++  }),
++  healthEntry({
++    category: "hooks",
++    slug: "aging-gap",
++    dateAdded: "2026-01-01",
++    repoUpdatedAt: "2025-08-01",
++    documentationUrl: "https://example.com/docs",
++  }),
++  healthEntry({
++    category: "tools",
++    slug: "stale-tool",
++    dateAdded: "2025-01-01",
++    repoUpdatedAt: "2024-06-01",
++    repoUrl: "https://github.com/acme/stale-tool",
++  }),
++  healthEntry({
++    category: "agents",
++    slug: "dormant-agent",
++    dateAdded: "2024-01-01",
++    repoUpdatedAt: "2023-01-01",
++    repoUrl: "https://github.com/acme/dormant-agent",
++  }),
++  healthEntry({
++    category: "skills",
++    slug: "unknown-missing",
++    dateAdded: "",
++    repoUpdatedAt: "",
++  }),
++];
++
++describe("source health report", () => {
++  it("produces a deterministic, versioned report envelope", () => {
++    const first = buildSourceHealthReport(sourceHealthFixtures);
++    const second = buildSourceHealthReport(sourceHealthFixtures);
++    expect(first).toEqual(second);
++    expect(first.schemaVersion).toBe(SOURCE_HEALTH_REPORT_SCHEMA_VERSION);
++    expect(first.kind).toBe("source-health-report");
++    expect(first.generatedAt).toBe("2026-05-01T00:00:00.000Z");
++    expect(first.count).toBe(sourceHealthFixtures.length);
++    expect(first.thresholds).toEqual({
++      freshMaxDays: 180,
++      agingMaxDays: 365,
++      staleMaxDays: 730,
++    });
++  });
++
++  it("classifies freshness buckets relative to the generated date", () => {
++    const byKey = Object.fromEntries(
++      buildSourceHealthReport(sourceHealthFixtures).entries.map((row) => [
++        row.key,
++        row,
++      ]),
++    );
++    expect(byKey["mcp:fresh-secure"].freshness).toBe("fresh");
++    expect(byKey["hooks:aging-gap"].freshness).toBe("aging");
++    expect(byKey["tools:stale-tool"].freshness).toBe("stale");
++    expect(byKey["agents:dormant-agent"].freshness).toBe("dormant");
++    expect(byKey["skills:unknown-missing"].freshness).toBe("unknown");
++    expect(byKey["skills:unknown-missing"].ageDays).toBeNull();
++  });
++
++  it("derives source-backed status and package trust", () => {
++    const byKey = Object.fromEntries(
++      buildSourceHealthReport(sourceHealthFixtures).entries.map((row) => [
++        row.key,
++        row,
++      ]),
++    );
++    expect(byKey["mcp:fresh-secure"].sourceStatus).toBe("available");
++    expect(byKey["mcp:fresh-secure"].hasPackageTrust).toBe(true);
++    expect(byKey["mcp:fresh-secure"].packageTrust).toBe("first-party");
++    expect(byKey["skills:unknown-missing"].sourceStatus).toBe("missing");
++    expect(byKey["skills:unknown-missing"].hasPackageTrust).toBe(false);
++    expect(byKey["skills:unknown-missing"].packageTrust).toBeNull();
++  });
++
++  it("flags missing safety/privacy notes only on risk-bearing categories", () => {
++    const byKey = Object.fromEntries(
++      buildSourceHealthReport(sourceHealthFixtures).entries.map((row) => [
++        row.key,
++        row,
++      ]),
++    );
++    const hook = byKey["hooks:aging-gap"];
++    expect(hook.riskBearing).toBe(true);
++    expect(hook.attentionReasons).toEqual(
++      expect.arrayContaining(["missing-safety-notes", "missing-privacy-notes"]),
++    );
++    const tool = byKey["tools:stale-tool"];
++    expect(tool.riskBearing).toBe(false);
++    expect(tool.attentionReasons).not.toContain("missing-safety-notes");
++    expect(tool.attentionReasons).not.toContain("missing-privacy-notes");
++    expect(byKey["mcp:fresh-secure"].needsAttention).toBe(false);
++    expect(byKey["mcp:fresh-secure"].attentionReasons).toEqual([]);
++  });
++
++  it("marks stale, dormant, and source-less entries as needing attention", () => {
++    const byKey = Object.fromEntries(
++      buildSourceHealthReport(sourceHealthFixtures).entries.map((row) => [
++        row.key,
++        row,
++      ]),
++    );
++    expect(byKey["tools:stale-tool"].attentionReasons).toContain(
++      "stale-source",
++    );
++    expect(byKey["agents:dormant-agent"].attentionReasons).toContain(
++      "stale-source",
++    );
++    expect(byKey["skills:unknown-missing"].attentionReasons).toContain(
++      "missing-source",
++    );
++  });
++
++  it("aggregates summary counts and percentages deterministically", () => {
++    const { summary } = buildSourceHealthReport(sourceHealthFixtures);
++    expect(summary.sourceBackedCount).toBe(4);
++    expect(summary.missingSourceCount).toBe(1);
++    expect(summary.sourceBackedPercent).toBe(80);
++    expect(summary.freshCount).toBe(1);
++    expect(summary.agingCount).toBe(1);
++    expect(summary.staleCount).toBe(1);
++    expect(summary.dormantCount).toBe(1);
++    expect(summary.unknownFreshnessCount).toBe(1);
++    expect(summary.packageTrustCount).toBe(1);
++    expect(summary.packageTrustPercent).toBe(20);
++    expect(summary.riskBearingCount).toBe(3);
++    expect(summary.missingSafetyNotesCount).toBe(2);
++    expect(summary.missingPrivacyNotesCount).toBe(2);
++    expect(summary.needsAttentionCount).toBe(4);
++  });
++
++  it("builds a per-category breakdown across the full category order", () => {
++    const report = buildSourceHealthReport(sourceHealthFixtures);
++    expect(report.categoryBreakdown.hooks).toMatchObject({
++      count: 1,
++      missingSafetyNotes: 1,
++      missingPrivacyNotes: 1,
++      needsAttention: 1,
++    });
++    expect(report.categoryBreakdown.mcp).toMatchObject({
++      count: 1,
++      sourceBacked: 1,
++      packageTrust: 1,
++      needsAttention: 0,
++    });
++    expect(report.categoryBreakdown.rules).toMatchObject({
++      count: 0,
++      sourceBacked: 0,
++      needsAttention: 0,
++    });
++  });
++
++  it("handles an empty registry without dividing by zero", () => {
++    const report = buildSourceHealthReport([]);
++    expect(report.count).toBe(0);
++    expect(report.summary.sourceBackedPercent).toBe(0);
++    expect(report.summary.packageTrustPercent).toBe(0);
++    expect(report.entries).toEqual([]);
++  });
++
++  it("returns unknown (not dormant) for unparsable entry or reference dates", () => {
++    const base = healthEntry({
++      category: "mcp",
++      slug: "guard",
++      dateAdded: "2026-05-01",
++      repoUpdatedAt: "2026-04-01",
++      repoUrl: "https://github.com/acme/guard",
++    });
++    const badEntryDate = buildEntrySourceHealth(
++      { ...base, repoUpdatedAt: "not-a-date", dateAdded: "also-bad" },
++      new Date("2026-05-01T00:00:00.000Z"),
++    );
++    expect(badEntryDate.freshness).toBe("unknown");
++    expect(badEntryDate.ageDays).toBeNull();
++    expect(badEntryDate.lastActivityAt).toBe("");
++
++    const badReferenceDate = buildEntrySourceHealth(base, "not-a-date");
++    expect(badReferenceDate.freshness).toBe("unknown");
++    expect(badReferenceDate.ageDays).toBeNull();
++
++    const stringReference = buildEntrySourceHealth(
++      base,
++      "2026-05-01T00:00:00.000Z",
++    );
++    expect(stringReference.freshness).toBe("fresh");
++    expect(typeof stringReference.ageDays).toBe("number");
++  });
++
++  it("uses floor semantics for elapsed full days at freshness boundaries", () => {
++    const reference = new Date("2026-05-01T00:00:00.000Z");
++    const day = 86_400_000;
++    const hour = 3_600_000;
++    const ageOf = (daysBefore: number, extraHours = 0) =>
++      buildEntrySourceHealth(
++        {
++          category: "tools",
++          slug: "boundary",
++          repoUrl: "https://github.com/acme/boundary",
++          repoUpdatedAt: new Date(
++            reference.getTime() - daysBefore * day - extraHours * hour,
++          ).toISOString(),
++        },
++        reference,
++      );
++
++    // Exactly on the fresh/aging boundary stays fresh.
++    expect(ageOf(180).ageDays).toBe(180);
++    expect(ageOf(180).freshness).toBe("fresh");
++    // A partial extra day must NOT advance the bucket (Math.round would have
++    // rounded 180.5 -> 181 and mislabeled this "aging").
++    expect(ageOf(180, 12).ageDays).toBe(180);
++    expect(ageOf(180, 12).freshness).toBe("fresh");
++    // A full extra day crosses into the next bucket.
++    expect(ageOf(181).ageDays).toBe(181);
++    expect(ageOf(181).freshness).toBe("aging");
++
++    // aging/stale boundary at 365 days.
++    expect(ageOf(365).freshness).toBe("aging");
++    expect(ageOf(365, 12).freshness).toBe("aging");
++    expect(ageOf(366).freshness).toBe("stale");
++
++    // stale/dormant boundary at 730 days.
++    expect(ageOf(730).freshness).toBe("stale");
++    expect(ageOf(730, 12).freshness).toBe("stale");
++    expect(ageOf(731).freshness).toBe("dormant");
++  });
++
++  it("derives a consistent report from the real registry content", () => {
++    const entries = loadContentEntries();
++    const report = buildSourceHealthReport(entries);
++    expect(report.count).toBe(entries.length);
++    expect(report.entries).toHaveLength(entries.length);
++    const summedAttention = report.entries.filter(
++      (row) => row.needsAttention,
++    ).length;
++    expect(report.summary.needsAttentionCount).toBe(summedAttention);
++    expect(
++      report.summary.sourceBackedCount + report.summary.missingSourceCount,
++    ).toBe(report.count);
++    const freshnessTotal =
++      report.summary.freshCount +
++      report.summary.agingCount +
++      report.summary.staleCount +
++      report.summary.dormantCount +
++      report.summary.unknownFreshnessCount;
++    expect(freshnessTotal).toBe(report.count);
++  });
++});

@@ -1,0 +1,547 @@
+diff --git a/app/src/main/java/dev/touchpilot/app/androidcontrol/AccessibilityBridge.kt b/app/src/main/java/dev/touchpilot/app/androidcontrol/AccessibilityBridge.kt
+index e304a4f..2bee5a9 100644
+--- a/app/src/main/java/dev/touchpilot/app/androidcontrol/AccessibilityBridge.kt
++++ b/app/src/main/java/dev/touchpilot/app/androidcontrol/AccessibilityBridge.kt
+@@ -1,5 +1,7 @@
+ package dev.touchpilot.app.androidcontrol
+ 
++import dev.touchpilot.app.screen.ScreenContext
++
+ object AccessibilityBridge {
+     @Volatile
+     private var service: TouchPilotAccessibilityService? = null
+@@ -20,6 +22,10 @@ object AccessibilityBridge {
+         return service?.observeScreen() ?: "TouchPilot Control is not enabled."
+     }
+ 
++    fun observeScreenContext(): ScreenContext {
++        return service?.observeScreenContext() ?: ScreenContext.Empty
++    }
++
+     fun tapByText(text: String): Boolean {
+         if (text.isBlank()) return false
+         return service?.tapByText(text) ?: false
+diff --git a/app/src/main/java/dev/touchpilot/app/androidcontrol/AccessibilityNodeSnapshotAdapter.kt b/app/src/main/java/dev/touchpilot/app/androidcontrol/AccessibilityNodeSnapshotAdapter.kt
+new file mode 100644
+index 0000000..b2cb000
+--- /dev/null
++++ b/app/src/main/java/dev/touchpilot/app/androidcontrol/AccessibilityNodeSnapshotAdapter.kt
+@@ -0,0 +1,64 @@
++package dev.touchpilot.app.androidcontrol
++
++import android.graphics.Rect
++import android.view.accessibility.AccessibilityNodeInfo
++import dev.touchpilot.app.screen.AccessibilityNodeSnapshot
++import dev.touchpilot.app.screen.NodeBounds
++
++/**
++ * Maps a live [AccessibilityNodeInfo] subtree to the platform-independent
++ * [AccessibilityNodeSnapshot] consumed by `ScreenContextBuilder`.
++ *
++ * Kept thin on purpose — the adapter only reads fields. All normalization,
++ * filtering, and classification happens in the builder, where it can be
++ * exercised in JVM unit tests.
++ *
++ * Children are limited to [maxDepth] levels to mirror the existing
++ * `observeScreen()` snapshot, so the builder's traversal cost is bounded the
++ * same way the legacy debug serializer is.
++ */
++internal object AccessibilityNodeSnapshotAdapter {
++    const val DefaultMaxDepth: Int = 8
++
++    fun from(
++        node: AccessibilityNodeInfo,
++        nodeId: String = "0",
++        depth: Int = 0,
++        maxDepth: Int = DefaultMaxDepth
++    ): AccessibilityNodeSnapshot {
++        val bounds = Rect().also { node.getBoundsInScreen(it) }
++        val children = if (depth < maxDepth) {
++            buildList {
++                for (index in 0 until node.childCount) {
++                    val child = node.getChild(index) ?: continue
++                    add(from(child, "$nodeId.$index", depth + 1, maxDepth))
++                }
++            }
++        } else {
++            emptyList()
++        }
++        return AccessibilityNodeSnapshot(
++            nodeId = nodeId,
++            className = node.className?.toString(),
++            viewIdResourceName = node.viewIdResourceName,
++            text = node.text?.toString(),
++            contentDescription = node.contentDescription?.toString(),
++            bounds = NodeBounds(
++                left = bounds.left,
++                top = bounds.top,
++                right = bounds.right,
++                bottom = bounds.bottom
++            ),
++            clickable = node.isClickable,
++            longClickable = node.isLongClickable,
++            scrollable = node.isScrollable,
++            enabled = node.isEnabled,
++            focused = node.isFocused,
++            checkable = node.isCheckable,
++            checked = node.isChecked,
++            editable = node.isEditable,
++            password = node.isPassword,
++            children = children
++        )
++    }
++}
+diff --git a/app/src/main/java/dev/touchpilot/app/androidcontrol/TouchPilotAccessibilityService.kt b/app/src/main/java/dev/touchpilot/app/androidcontrol/TouchPilotAccessibilityService.kt
+index e8171c9..b443c80 100644
+--- a/app/src/main/java/dev/touchpilot/app/androidcontrol/TouchPilotAccessibilityService.kt
++++ b/app/src/main/java/dev/touchpilot/app/androidcontrol/TouchPilotAccessibilityService.kt
+@@ -7,6 +7,8 @@ import android.graphics.Rect
+ import android.os.Bundle
+ import android.view.accessibility.AccessibilityEvent
+ import android.view.accessibility.AccessibilityNodeInfo
++import dev.touchpilot.app.screen.ScreenContext
++import dev.touchpilot.app.screen.ScreenContextBuilder
+ import java.util.concurrent.CountDownLatch
+ import java.util.concurrent.TimeUnit
+ import java.util.concurrent.atomic.AtomicBoolean
+@@ -38,6 +40,16 @@ class TouchPilotAccessibilityService : AccessibilityService() {
+         }
+     }
+ 
++    fun observeScreenContext(): ScreenContext {
++        val root = rootInActiveWindow ?: return ScreenContext.Empty
++        val snapshot = AccessibilityNodeSnapshotAdapter.from(root)
++        return ScreenContextBuilder().build(
++            root = snapshot,
++            packageName = root.packageName?.toString(),
++            windowTitle = root.window?.title?.toString()
++        )
++    }
++
+     fun tapByText(text: String): Boolean {
+         val root = rootInActiveWindow ?: return false
+         val node = findNode(root) { candidate ->
+diff --git a/app/src/main/java/dev/touchpilot/app/screen/AccessibilityNodeSnapshot.kt b/app/src/main/java/dev/touchpilot/app/screen/AccessibilityNodeSnapshot.kt
+new file mode 100644
+index 0000000..c6827e9
+--- /dev/null
++++ b/app/src/main/java/dev/touchpilot/app/screen/AccessibilityNodeSnapshot.kt
+@@ -0,0 +1,40 @@
++package dev.touchpilot.app.screen
++
++/**
++ * Minimal, platform-independent view of an `AccessibilityNodeInfo` subtree.
++ *
++ * [ScreenContextBuilder] consumes snapshots so it can be exercised in JVM
++ * unit tests without instantiating the Android platform type. Production
++ * code wraps `AccessibilityNodeInfo` into [AccessibilityNodeSnapshot] inside
++ * the `androidcontrol` package; everything downstream of the model should
++ * keep depending on [ScreenContext] / [ScreenNode], not on this snapshot.
++ *
++ * The snapshot keeps the raw observation shape separate from the normalized
++ * [ScreenContext] (per issue #40 acceptance criteria) so debug tooling that
++ * needs the unfiltered tree can still inspect it without affecting downstream
++ * reasoning.
++ */
++data class AccessibilityNodeSnapshot(
++    val nodeId: String,
++    val className: String? = null,
++    val viewIdResourceName: String? = null,
++    val text: String? = null,
++    val contentDescription: String? = null,
++    val bounds: NodeBounds = NodeBounds.Unknown,
++    val clickable: Boolean = false,
++    val longClickable: Boolean = false,
++    val scrollable: Boolean = false,
++    val enabled: Boolean = true,
++    val focused: Boolean = false,
++    val checkable: Boolean = false,
++    val checked: Boolean = false,
++    val editable: Boolean = false,
++    /**
++     * True when the underlying view is a password field
++     * (`AccessibilityNodeInfo.isPassword`). The builder forwards this to
++     * [ScreenNode.sensitive] so a password input is flagged even if it is
++     * currently empty.
++     */
++    val password: Boolean = false,
++    val children: List<AccessibilityNodeSnapshot> = emptyList()
++)
+diff --git a/app/src/main/java/dev/touchpilot/app/screen/ScreenContextBuilder.kt b/app/src/main/java/dev/touchpilot/app/screen/ScreenContextBuilder.kt
+new file mode 100644
+index 0000000..48c4a24
+--- /dev/null
++++ b/app/src/main/java/dev/touchpilot/app/screen/ScreenContextBuilder.kt
+@@ -0,0 +1,105 @@
++package dev.touchpilot.app.screen
++
++/**
++ * Builds a normalized [ScreenContext] from a raw [AccessibilityNodeSnapshot]
++ * tree.
++ *
++ * The builder is deliberately small and deterministic:
++ *
++ * - Walks the snapshot tree depth-first up to [maxDepth].
++ * - Emits a [ScreenNode] only for nodes that carry useful information
++ *   (clickable, scrollable, editable, focused, or non-blank text/description).
++ *   Empty layout containers are skipped so downstream summaries see signal
++ *   rather than the entire view hierarchy.
++ * - Maps text → [ScreenText] via [ScreenText.of], which routes through
++ *   `SensitiveTextRedactor`; password fields are additionally flagged via
++ *   [ScreenNode.sensitive].
++ * - Classifies role from `className` and the node's capabilities.
++ *
++ * Raw observation data stays in the snapshot — the normalized [ScreenContext]
++ * is the only thing downstream reasoning depends on. This satisfies the "keep
++ * raw observation and normalized context separate" acceptance criterion in
++ * issue #40.
++ */
++class ScreenContextBuilder(
++    private val maxDepth: Int = DefaultMaxDepth
++) {
++    fun build(
++        root: AccessibilityNodeSnapshot,
++        appLabel: String? = null,
++        packageName: String? = null,
++        windowTitle: String? = null
++    ): ScreenContext {
++        val nodes = mutableListOf<ScreenNode>()
++        collect(root, depth = 0, into = nodes)
++        return ScreenContext(
++            appLabel = appLabel,
++            packageName = packageName,
++            windowTitle = windowTitle,
++            nodes = nodes
++        )
++    }
++
++    private fun collect(
++        node: AccessibilityNodeSnapshot,
++        depth: Int,
++        into: MutableList<ScreenNode>
++    ) {
++        if (depth > maxDepth) return
++        if (carriesSignal(node)) {
++            into += toScreenNode(node)
++        }
++        node.children.forEach { child -> collect(child, depth + 1, into) }
++    }
++
++    private fun carriesSignal(node: AccessibilityNodeSnapshot): Boolean {
++        return node.clickable ||
++            node.longClickable ||
++            node.scrollable ||
++            node.editable ||
++            node.focused ||
++            !node.text.isNullOrBlank() ||
++            !node.contentDescription.isNullOrBlank()
++    }
++
++    private fun toScreenNode(node: AccessibilityNodeSnapshot): ScreenNode {
++        val rawText = node.text?.takeIf { it.isNotBlank() }
++            ?: node.contentDescription?.takeIf { it.isNotBlank() }
++            ?: ""
++        return ScreenNode(
++            nodeId = node.nodeId,
++            role = roleFor(node),
++            text = ScreenText.of(rawText),
++            bounds = node.bounds,
++            clickable = node.clickable,
++            longClickable = node.longClickable,
++            scrollable = node.scrollable,
++            enabled = node.enabled,
++            focused = node.focused,
++            checked = if (node.checkable) node.checked else null,
++            isInputField = node.editable,
++            sensitive = node.password,
++            viewIdResourceName = node.viewIdResourceName,
++            className = node.className
++        )
++    }
++
++    private fun roleFor(node: AccessibilityNodeSnapshot): NodeRole {
++        if (node.editable) return NodeRole.INPUT
++        if (node.scrollable) return NodeRole.SCROLLABLE
++        val cls = node.className?.lowercase().orEmpty()
++        return when {
++            "button" in cls || "imagebutton" in cls -> NodeRole.BUTTON
++            "imageview" in cls -> NodeRole.IMAGE
++            "edittext" in cls -> NodeRole.INPUT
++            "textview" in cls -> NodeRole.TEXT
++            node.clickable -> NodeRole.BUTTON
++            node.children.isNotEmpty() -> NodeRole.CONTAINER
++            else -> NodeRole.OTHER
++        }
++    }
++
++    companion object {
++        const val DefaultMaxDepth: Int = 8
++    }
++}
+diff --git a/app/src/test/java/dev/touchpilot/app/screen/ScreenContextBuilderTest.kt b/app/src/test/java/dev/touchpilot/app/screen/ScreenContextBuilderTest.kt
+new file mode 100644
+index 0000000..8693f6c
+--- /dev/null
++++ b/app/src/test/java/dev/touchpilot/app/screen/ScreenContextBuilderTest.kt
+@@ -0,0 +1,261 @@
++package dev.touchpilot.app.screen
++
++import kotlin.test.Test
++import kotlin.test.assertEquals
++import kotlin.test.assertFalse
++import kotlin.test.assertNotNull
++import kotlin.test.assertNull
++import kotlin.test.assertTrue
++
++class ScreenContextBuilderTest {
++    private val builder = ScreenContextBuilder()
++
++    @Test
++    fun settingsLikeScreenExposesClickableEntriesWithStableNodeIds() {
++        val root = container(
++            id = "0",
++            children = listOf(
++                clickable(id = "0.0", text = "Network & internet", bounds = bounds(0, 100, 1000, 200)),
++                clickable(id = "0.1", text = "Connected devices", bounds = bounds(0, 200, 1000, 300)),
++                clickable(id = "0.2", text = "Apps", bounds = bounds(0, 300, 1000, 400)),
++                clickable(id = "0.3", text = "Notifications", bounds = bounds(0, 400, 1000, 500)),
++                clickable(id = "0.4", text = "Battery", bounds = bounds(0, 500, 1000, 600))
++            )
++        )
++
++        val context = builder.build(
++            root = root,
++            appLabel = "Settings",
++            packageName = "com.android.settings",
++            windowTitle = "Settings"
++        )
++
++        assertEquals("Settings", context.appLabel)
++        assertEquals("com.android.settings", context.packageName)
++        assertEquals(5, context.clickableNodes.size)
++        assertEquals(
++            listOf("0.0", "0.1", "0.2", "0.3", "0.4"),
++            context.clickableNodes.map { it.nodeId }
++        )
++        assertEquals(
++            listOf("Network & internet", "Connected devices", "Apps", "Notifications", "Battery"),
++            context.clickableNodes.map { it.text.raw }
++        )
++        assertTrue(context.clickableNodes.all { it.role == NodeRole.BUTTON })
++        assertEquals(100, context.clickableNodes[0].bounds.top)
++    }
++
++    @Test
++    fun emptyContainersBetweenSignalNodesAreSkipped() {
++        val root = container(
++            id = "0",
++            children = listOf(
++                container(id = "0.0", children = emptyList()),
++                clickable(id = "0.1", text = "Wi-Fi"),
++                container(
++                    id = "0.2",
++                    children = listOf(clickable(id = "0.2.0", text = "Bluetooth"))
++                )
++            )
++        )
++
++        val context = builder.build(root)
++
++        assertEquals(
++            listOf("0.1", "0.2.0"),
++            context.nodes.map { it.nodeId }
++        )
++    }
++
++    @Test
++    fun inputFieldsAreExtractedWithInputRole() {
++        val emailInput = AccessibilityNodeSnapshot(
++            nodeId = "0.0",
++            className = "android.widget.EditText",
++            text = "user@example.com",
++            editable = true,
++            bounds = bounds(0, 100, 1000, 200)
++        )
++        val root = container(id = "0", children = listOf(emailInput))
++
++        val context = builder.build(root)
++        val input = assertNotNull(context.inputFields.singleOrNull())
++        assertEquals(NodeRole.INPUT, input.role)
++        assertTrue(input.isInputField)
++        assertEquals("user@example.com", input.text.raw)
++        // Email trips the SensitiveTextRedactor value patterns.
++        assertTrue(input.text.isSensitive)
++        assertEquals("[REDACTED]", input.text.displaySafe)
++    }
++
++    @Test
++    fun passwordFieldsAreFlaggedSensitiveEvenWhenEmpty() {
++        val passwordInput = AccessibilityNodeSnapshot(
++            nodeId = "0.0",
++            className = "android.widget.EditText",
++            text = "",
++            contentDescription = "Password",
++            editable = true,
++            password = true,
++            focused = true
++        )
++        val context = builder.build(container(id = "0", children = listOf(passwordInput)))
++
++        val node = assertNotNull(context.inputFields.singleOrNull())
++        assertTrue(node.sensitive)
++        assertTrue(context.containsSensitiveContent)
++        // contentDescription is used as fallback when text is blank.
++        assertEquals("Password", node.text.raw)
++    }
++
++    @Test
++    fun scrollableContainerIsRetainedWithScrollableRole() {
++        val list = AccessibilityNodeSnapshot(
++            nodeId = "0",
++            className = "androidx.recyclerview.widget.RecyclerView",
++            scrollable = true,
++            children = listOf(
++                clickable(id = "0.0", text = "Item 1"),
++                clickable(id = "0.1", text = "Item 2")
++            )
++        )
++
++        val context = builder.build(list)
++        val scrollable = assertNotNull(context.scrollableNodes.singleOrNull())
++        assertEquals(NodeRole.SCROLLABLE, scrollable.role)
++        assertEquals(2, context.clickableNodes.size)
++    }
++
++    @Test
++    fun checkableNodeReflectsCheckedState() {
++        val toggleOn = AccessibilityNodeSnapshot(
++            nodeId = "0.0",
++            className = "android.widget.Switch",
++            text = "Airplane mode",
++            clickable = true,
++            checkable = true,
++            checked = true
++        )
++        val toggleOff = AccessibilityNodeSnapshot(
++            nodeId = "0.1",
++            className = "android.widget.Switch",
++            text = "Bluetooth",
++            clickable = true,
++            checkable = true,
++            checked = false
++        )
++        val plainButton = clickable(id = "0.2", text = "Save")
++
++        val context = builder.build(
++            container(id = "0", children = listOf(toggleOn, toggleOff, plainButton))
++        )
++
++        assertEquals(true, context.nodes[0].checked)
++        assertEquals(false, context.nodes[1].checked)
++        // Non-checkable nodes don't report a checked state.
++        assertNull(context.nodes[2].checked)
++    }
++
++    @Test
++    fun textOnlyNodesAreExtractedAsTextRole() {
++        val heading = AccessibilityNodeSnapshot(
++            nodeId = "0.0",
++            className = "android.widget.TextView",
++            text = "Networks"
++        )
++        val context = builder.build(container(id = "0", children = listOf(heading)))
++        val node = context.nodes.single()
++        assertEquals(NodeRole.TEXT, node.role)
++        assertFalse(node.clickable)
++        assertEquals("Networks", node.text.raw)
++    }
++
++    @Test
++    fun maxDepthLimitStopsTraversal() {
++        val deep = container(
++            id = "0",
++            children = listOf(
++                container(
++                    id = "0.0",
++                    children = listOf(
++                        container(
++                            id = "0.0.0",
++                            children = listOf(clickable(id = "0.0.0.0", text = "Too deep"))
++                        )
++                    )
++                )
++            )
++        )
++
++        val shallowBuilder = ScreenContextBuilder(maxDepth = 2)
++        val context = shallowBuilder.build(deep)
++
++        // depth 0 = root container (empty -> skipped),
++        // depth 1 = container (empty -> skipped),
++        // depth 2 = container with clickable child,
++        // depth 3 would be the clickable but is beyond maxDepth.
++        assertTrue(context.nodes.isEmpty())
++    }
++
++    @Test
++    fun emptyRootProducesContextWithoutNodes() {
++        val context = builder.build(container(id = "0", children = emptyList()))
++        assertTrue(context.nodes.isEmpty())
++        assertFalse(context.containsSensitiveContent)
++    }
++
++    @Test
++    fun contentDescriptionIsFallbackTextWhenNodeHasNoTextLabel() {
++        val iconButton = AccessibilityNodeSnapshot(
++            nodeId = "0.0",
++            className = "android.widget.ImageButton",
++            contentDescription = "Back",
++            clickable = true
++        )
++        val context = builder.build(container(id = "0", children = listOf(iconButton)))
++        val node = context.nodes.single()
++        assertEquals("Back", node.text.raw)
++        assertEquals(NodeRole.BUTTON, node.role)
++    }
++
++    @Test
++    fun focusedNodeIsRetainedEvenWithoutTextOrClickability() {
++        val focused = AccessibilityNodeSnapshot(
++            nodeId = "0.0",
++            className = "android.view.View",
++            focused = true
++        )
++        val context = builder.build(container(id = "0", children = listOf(focused)))
++        assertEquals(1, context.nodes.size)
++        assertTrue(context.nodes[0].focused)
++    }
++
++    private fun container(
++        id: String,
++        children: List<AccessibilityNodeSnapshot>
++    ): AccessibilityNodeSnapshot {
++        return AccessibilityNodeSnapshot(
++            nodeId = id,
++            className = "android.widget.LinearLayout",
++            children = children
++        )
++    }
++
++    private fun clickable(
++        id: String,
++        text: String,
++        bounds: NodeBounds = NodeBounds.Unknown
++    ): AccessibilityNodeSnapshot {
++        return AccessibilityNodeSnapshot(
++            nodeId = id,
++            className = "android.widget.Button",
++            text = text,
++            clickable = true,
++            bounds = bounds
++        )
++    }
++
++    private fun bounds(left: Int, top: Int, right: Int, bottom: Int): NodeBounds {
++        return NodeBounds(left = left, top = top, right = right, bottom = bottom)
++    }
++}

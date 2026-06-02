@@ -1,0 +1,184 @@
+diff --git a/app/models/budget.rb b/app/models/budget.rb
+index acdd128d12..33f34eb2f5 100644
+--- a/app/models/budget.rb
++++ b/app/models/budget.rb
+@@ -155,11 +155,14 @@ def estimated_spending
+   end
+ 
+   def actual_spending
+-    expense_totals.total
++    [ expense_totals.total - refunds_in_expense_categories, 0 ].max
+   end
+ 
+   def budget_category_actual_spending(budget_category)
+-    expense_totals.category_totals.find { |ct| ct.category.id == budget_category.category.id }&.total || 0
++    cat_id = budget_category.category_id
++    expense = expense_totals_by_category[cat_id]&.total || 0
++    refund = income_totals_by_category[cat_id]&.total || 0
++    [ expense - refund, 0 ].max
+   end
+ 
+   def category_median_monthly_expense(category)
+@@ -235,6 +238,14 @@ def surplus_percent
+   end
+ 
+   private
++    def refunds_in_expense_categories
++      expense_category_ids = budget_categories.map(&:category_id).to_set
++      income_totals.category_totals
++        .reject { |ct| ct.category.subcategory? }
++        .select { |ct| expense_category_ids.include?(ct.category.id) || ct.category.uncategorized? }
++        .sum(&:total)
++    end
++
+     def income_statement
+       @income_statement ||= family.income_statement
+     end
+@@ -246,4 +257,12 @@ def expense_totals
+     def income_totals
+       @income_totals ||= family.income_statement.income_totals(period: period)
+     end
++
++    def expense_totals_by_category
++      @expense_totals_by_category ||= expense_totals.category_totals.index_by { |ct| ct.category.id }
++    end
++
++    def income_totals_by_category
++      @income_totals_by_category ||= income_totals.category_totals.index_by { |ct| ct.category.id }
++    end
+ end
+diff --git a/test/models/budget_test.rb b/test/models/budget_test.rb
+index cff5cd6cc0..cd3e953073 100644
+--- a/test/models/budget_test.rb
++++ b/test/models/budget_test.rb
+@@ -75,6 +75,130 @@ class BudgetTest < ActiveSupport::TestCase
+     assert_nil budget.previous_budget_param
+   end
+ 
++  test "actual_spending nets refunds against expenses in same category" do
++    family = families(:dylan_family)
++    budget = Budget.find_or_bootstrap(family, start_date: Date.current.beginning_of_month)
++
++    healthcare = Category.create!(
++      name: "Healthcare #{Time.now.to_f}",
++      family: family,
++      color: "#e74c3c",
++      classification: "expense"
++    )
++
++    budget.sync_budget_categories
++    budget_category = budget.budget_categories.find_by(category: healthcare)
++    budget_category.update!(budgeted_spending: 200)
++
++    account = accounts(:depository)
++
++    # Create a $500 expense
++    Entry.create!(
++      account: account,
++      entryable: Transaction.create!(category: healthcare),
++      date: Date.current,
++      name: "Doctor visit",
++      amount: 500,
++      currency: "USD"
++    )
++
++    # Create a $200 refund (negative amount = income classification in the SQL)
++    Entry.create!(
++      account: account,
++      entryable: Transaction.create!(category: healthcare),
++      date: Date.current,
++      name: "Insurance reimbursement",
++      amount: -200,
++      currency: "USD"
++    )
++
++    # Clear memoized values
++    budget = Budget.find(budget.id)
++    budget.sync_budget_categories
++
++    # Budget category should show net spending: $500 - $200 = $300
++    assert_equal 300, budget.budget_category_actual_spending(
++      budget.budget_categories.find_by(category: healthcare)
++    )
++  end
++
++  test "budget_category_actual_spending does not go below zero" do
++    family = families(:dylan_family)
++    budget = Budget.find_or_bootstrap(family, start_date: Date.current.beginning_of_month)
++
++    category = Category.create!(
++      name: "Returns Only #{Time.now.to_f}",
++      family: family,
++      color: "#3498db",
++      classification: "expense"
++    )
++
++    budget.sync_budget_categories
++    budget_category = budget.budget_categories.find_by(category: category)
++    budget_category.update!(budgeted_spending: 100)
++
++    account = accounts(:depository)
++
++    # Only a refund, no expense
++    Entry.create!(
++      account: account,
++      entryable: Transaction.create!(category: category),
++      date: Date.current,
++      name: "Full refund",
++      amount: -50,
++      currency: "USD"
++    )
++
++    budget = Budget.find(budget.id)
++    budget.sync_budget_categories
++
++    assert_equal 0, budget.budget_category_actual_spending(
++      budget.budget_categories.find_by(category: category)
++    )
++  end
++
++  test "actual_spending subtracts uncategorized refunds" do
++    family = families(:dylan_family)
++    budget = Budget.find_or_bootstrap(family, start_date: Date.current.beginning_of_month)
++    account = accounts(:depository)
++
++    # Create an uncategorized expense
++    Entry.create!(
++      account: account,
++      entryable: Transaction.create!(category: nil),
++      date: Date.current,
++      name: "Uncategorized purchase",
++      amount: 400,
++      currency: "USD"
++    )
++
++    # Create an uncategorized refund
++    Entry.create!(
++      account: account,
++      entryable: Transaction.create!(category: nil),
++      date: Date.current,
++      name: "Uncategorized refund",
++      amount: -150,
++      currency: "USD"
++    )
++
++    budget = Budget.find(budget.id)
++    budget.sync_budget_categories
++
++    # The uncategorized refund should reduce overall actual_spending
++    # Other fixtures may contribute spending, so check that the net
++    # uncategorized amount (400 - 150 = 250) is reflected by comparing
++    # with and without the refund rather than asserting an exact total.
++    spending_with_refund = budget.actual_spending
++
++    # Remove the refund and check spending increases
++    Entry.find_by(name: "Uncategorized refund").destroy!
++    budget = Budget.find(budget.id)
++    spending_without_refund = budget.actual_spending
++
++    assert_equal 150, spending_without_refund - spending_with_refund
++  end
++
+   test "previous_budget_param returns param when date is valid" do
+     budget = Budget.create!(
+       family: @family,

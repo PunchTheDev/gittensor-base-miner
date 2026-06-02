@@ -1,0 +1,218 @@
+diff --git a/core/build-link/src/main/java/me/seroperson/reload/live/BaseDevServerStart.java b/core/build-link/src/main/java/me/seroperson/reload/live/BaseDevServerStart.java
+index 0f99ee5..acd9d1c 100644
+--- a/core/build-link/src/main/java/me/seroperson/reload/live/BaseDevServerStart.java
++++ b/core/build-link/src/main/java/me/seroperson/reload/live/BaseDevServerStart.java
+@@ -104,42 +104,53 @@ protected synchronized void startInternal(ReloadGeneration generation) {
+           "Unable to start underlying application without a running proxy.");
+     }
+ 
+-    // Perform server-specific preparation before starting the application
+-    prepareServerForNewGeneration();
++    try {
++      // Perform server-specific preparation before starting the application
++      prepareServerForNewGeneration();
+ 
+-    this.classLoader = generation.getReloadedClassLoader();
+-    this.appThread =
+-        new Thread(
+-            appThreadGroup,
+-            () -> {
+-              logger.info("🚀 Starting " + mainClass);
+-              try {
+-                Class<?> clazz = classLoader.loadClass(mainClass);
+-                var mainMethod = clazz.getMethod("main", String[].class);
+-                var currentThread = Thread.currentThread();
+-                logger.debug(
+-                    "Running with Context ClassLoader: "
+-                        + currentThread.getContextClassLoader()
+-                        + " in thread "
+-                        + currentThread);
+-                mainMethod.invoke(null, (Object) new String[0]);
+-                logger.debug("After Application.main(String[]) execution");
+-              } catch (ClassNotFoundException | NoSuchMethodException | IllegalAccessException e) {
+-                logger.error("Failed to invoke main method on " + mainClass, e);
+-                stopInternal();
+-                throw new RuntimeException(e);
+-              } catch (InvocationTargetException e) {
+-                // Don't log InterruptedException, as likely they're intended
+-                if (!(e.getCause() instanceof InterruptedException)) {
+-                  logger.error("Error in application main thread", e);
++      this.classLoader = generation.getReloadedClassLoader();
++      this.appThread =
++          new Thread(
++              appThreadGroup,
++              () -> {
++                logger.info("🚀 Starting " + mainClass);
++                try {
++                  Class<?> clazz = classLoader.loadClass(mainClass);
++                  var mainMethod = clazz.getMethod("main", String[].class);
++                  var currentThread = Thread.currentThread();
++                  logger.debug(
++                      "Running with Context ClassLoader: "
++                          + currentThread.getContextClassLoader()
++                          + " in thread "
++                          + currentThread);
++                  mainMethod.invoke(null, (Object) new String[0]);
++                  logger.debug("After Application.main(String[]) execution");
++                } catch (ClassNotFoundException
++                    | NoSuchMethodException
++                    | IllegalAccessException e) {
++                  logger.error("Failed to invoke main method on " + mainClass, e);
++                  stopInternal();
++                  throw new RuntimeException(e);
++                } catch (InvocationTargetException e) {
++                  // Don't log InterruptedException, as likely they're intended
++                  if (!(e.getCause() instanceof InterruptedException)) {
++                    logger.error("Error in application main thread", e);
++                  }
+                 }
+-              }
+-            },
+-            "main");
+-    appThread.setContextClassLoader(classLoader);
+-    appThread.start();
++              },
++              "main");
++      appThread.setContextClassLoader(classLoader);
++      appThread.start();
+ 
+-    runHooks(appThread, classLoader, startupHooks);
++      runHooks(appThread, classLoader, startupHooks);
++    } catch (RuntimeException | Error t) {
++      try {
++        stopInternal();
++      } catch (Throwable cleanupErr) {
++        t.addSuppressed(cleanupErr);
++      }
++      throw t;
++    }
+   }
+ 
+   /** Stops the currently running application instance. */
+@@ -203,7 +214,12 @@ public boolean reload() {
+       // New application classes
+       logger.info("🔃 Reloading an application");
+       stopInternal();
+-      startInternal(casted);
++      try {
++        startInternal(casted);
++      } catch (RuntimeException | Error t) {
++        throw new UnrecoverableException(
++            "Reload failed; restart `liveReload` after fixing the cause", t);
++      }
+       logger.debug("Finished reloading");
+       return true;
+     } else if (reloadResult == null) {
+diff --git a/core/webserver-grpc/src/main/java/me/seroperson/reload/live/webserver/grpc/GrpcProxyHandlerRegistry.java b/core/webserver-grpc/src/main/java/me/seroperson/reload/live/webserver/grpc/GrpcProxyHandlerRegistry.java
+index 7ab712c..73989d4 100644
+--- a/core/webserver-grpc/src/main/java/me/seroperson/reload/live/webserver/grpc/GrpcProxyHandlerRegistry.java
++++ b/core/webserver-grpc/src/main/java/me/seroperson/reload/live/webserver/grpc/GrpcProxyHandlerRegistry.java
+@@ -13,6 +13,7 @@
+ import java.io.ByteArrayInputStream;
+ import java.io.IOException;
+ import java.io.InputStream;
++import me.seroperson.reload.live.UnrecoverableException;
+ import me.seroperson.reload.live.build.BuildLogger;
+ 
+ /**
+@@ -41,7 +42,17 @@ public GrpcProxyHandlerRegistry(BuildLogger logger, ReloadableGrpcProxyHandler p
+   public ServerMethodDefinition<?, ?> lookupMethod(String methodName, String authority) {
+     logger.debug("Proxying method: " + methodName);
+ 
+-    proxyHandler.reload();
++    try {
++      proxyHandler.reload();
++    } catch (UnrecoverableException e) {
++      logger.error("Unrecoverable error during reloading", e);
++      try {
++        proxyHandler.closeServer();
++      } catch (IOException ioe) {
++        logger.error("Failed to close GRPC server after unrecoverable error", ioe);
++      }
++      throw e;
++    }
+ 
+     // Create a generic method descriptor for proxying
+     MethodDescriptor<byte[], byte[]> proxyMethod =
+diff --git a/core/webserver-grpc/src/main/java/me/seroperson/reload/live/webserver/grpc/ReloadableGrpcProxyHandler.java b/core/webserver-grpc/src/main/java/me/seroperson/reload/live/webserver/grpc/ReloadableGrpcProxyHandler.java
+index 6f60cdb..37aee27 100644
+--- a/core/webserver-grpc/src/main/java/me/seroperson/reload/live/webserver/grpc/ReloadableGrpcProxyHandler.java
++++ b/core/webserver-grpc/src/main/java/me/seroperson/reload/live/webserver/grpc/ReloadableGrpcProxyHandler.java
+@@ -112,6 +112,10 @@ public boolean reload() {
+     return server.reload();
+   }
+ 
++  public void closeServer() throws IOException {
++    server.close();
++  }
++
+   private ManagedChannel createChannel() {
+     logger.debug(
+         "Creating new GRPC channel to "
+diff --git a/sbt/src/test/resources/http4s/changes/AppBrokenHealth.scala.1 b/sbt/src/test/resources/http4s/changes/AppBrokenHealth.scala.1
+new file mode 100644
+index 0000000..a731cb5
+--- /dev/null
++++ b/sbt/src/test/resources/http4s/changes/AppBrokenHealth.scala.1
+@@ -0,0 +1,36 @@
++import cats.effect.{IO, IOApp, Async, Sync}
++import cats.syntax.all._
++import com.comcast.ip4s._
++import org.http4s.ember.server.EmberServerBuilder
++import org.http4s.implicits._
++import org.http4s._
++import org.http4s.dsl.io._
++import org.http4s.dsl.Http4sDsl
++
++// Reload-failure scenario: the new generation compiles and the app process
++// stays up, but the /health endpoint returns 404. RestApiHealthCheckStartupHook
++// raises UnrecoverableException on a 404, which causes BaseDevServerStart.reload()
++// to surface the failure and ReloadHandler to close the dev server.
++object App extends IOApp.Simple {
++
++  def routes[F[_]: Sync]: HttpRoutes[F] = {
++    val dsl = new Http4sDsl[F]{}
++    import dsl._
++    HttpRoutes.of[F] {
++      case GET -> Root / "greet" =>
++        Ok("Hello World")
++    }
++  }
++
++  def runServer[F[_]: Async]: F[Nothing] = {
++    for {
++      _ <-
++        EmberServerBuilder.default[F]
++          .withPort(Port.fromInt(me.seroperson.BuildInfo.port).get)
++          .withHttpApp(routes[F].orNotFound)
++          .build
++    } yield ()
++  }.useForever
++
++  val run = runServer[IO]
++}
+diff --git a/sbt/src/test/scala/me/seroperson/reload/live/LiveReloadSpec.scala b/sbt/src/test/scala/me/seroperson/reload/live/LiveReloadSpec.scala
+index cf5a01b..e96b57d 100644
+--- a/sbt/src/test/scala/me/seroperson/reload/live/LiveReloadSpec.scala
++++ b/sbt/src/test/scala/me/seroperson/reload/live/LiveReloadSpec.scala
+@@ -124,4 +124,20 @@ class LiveReloadSpec extends LiveReloadBase {
+       verifyHttp("greet", 404, port = proxyPort)
+     }
+   }
++
++  testEach(
++    "http4s - throwing startup hook triggers unrecoverable shutdown",
++    Seq("2.0.0-RC10")
++  ) { sbtVersion =>
++    withRunner("http4s", sbtVersion) { (runner, proxyPort) =>
++      runner.run("bgRun")
++      verifyHttp("greet", 200, Some("Hello World"), proxyPort)
++      runner.copyFile(
++        "changes/AppBrokenHealth.scala.1",
++        "src/main/scala/App.scala"
++      )
++      verifyHttp("greet", 503, Some("dev server stopped"), proxyPort)
++      verifyPortClosed(proxyPort)
++    }
++  }
+ }

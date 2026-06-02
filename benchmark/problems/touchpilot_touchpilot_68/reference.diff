@@ -1,0 +1,340 @@
+diff --git a/app/src/main/java/dev/touchpilot/app/security/RedactionRule.kt b/app/src/main/java/dev/touchpilot/app/security/RedactionRule.kt
+new file mode 100644
+index 0000000..d6dc05d
+--- /dev/null
++++ b/app/src/main/java/dev/touchpilot/app/security/RedactionRule.kt
+@@ -0,0 +1,138 @@
++package dev.touchpilot.app.security
++
++/**
++ * A redaction rule that knows how to match a sensitive substring AND how to
++ * replace only the secret portion of its match, leaving the surrounding
++ * structural characters (`}`, `)`, `]`, `>`, quote characters, header
++ * keywords, etc.) intact.
++ *
++ * The previous implementation in [SensitiveTextRedactor] used a single
++ * `[^\s,;]+` token class together with a shared replacement lambda that
++ * truncated the match at its first `:` or `=`. That combination had two
++ * defects:
++ *
++ *  1. `Authorization: Bearer abc123` was rewritten to `Authorization=[REDACTED]`,
++ *     dropping the `Bearer` keyword and changing the header `:` to `=`.
++ *  2. The greedy token class consumed any trailing structural character that
++ *     was not whitespace / comma / semicolon, so a log line such as
++ *     `type_text({text=Authorization: Bearer abc})` was redacted to
++ *     `type_text({text=Authorization=[REDACTED]` — the closing `})` was
++ *     eaten along with the secret.
++ *
++ * Each [RedactionRule] variant owns its own regex (built with the shared
++ * [TokenClass]) and its own replacement lambda, so the prefix is preserved
++ * exactly as written and the closing structural characters fall outside the
++ * match entirely.
++ */
++internal sealed class RedactionRule {
++
++    /** Apply this rule to [text], returning the redacted output. */
++    abstract fun apply(text: String): String
++
++    /** Return true if this rule would match at least one substring of [text]. */
++    abstract fun matches(text: String): Boolean
++
++    /**
++     * Redacts `key = value` / `key: value` assignments where `key` is one of
++     * the supplied sensitive identifiers (`api_key`, `password`, etc.).
++     *
++     * The match has four groups:
++     *
++     *  1. The key + delimiter + surrounding whitespace, preserved verbatim.
++     *  2. An optional opening quote character (`"`, `'`, or `` ` ``) when the
++     *     value is quoted; empty when the value is bare.
++     *  3. (Implicit) the secret token itself, matched by [TokenClass] which
++     *     excludes whitespace, structural closers, and quote characters so
++     *     surrounding scope delimiters are not eaten with the secret.
++     *  4. The matching closing quote (a backreference to group 2) when group
++     *     2 matched; empty otherwise.
++     *
++     * The replacement reassembles group 1 + group 2 + [RedactedToken] +
++     * group 4, so a value like `password="hunter2"` becomes
++     * `password="[REDACTED]"` and a value like `tool({password=hunter2})`
++     * becomes `tool({password=[REDACTED]})` with the closing `})` intact.
++     */
++    class KeyAssignment(keyAlternation: String) : RedactionRule() {
++        private val pattern: Regex = Regex(
++            "(?i)((?:$keyAlternation)\\s*[:=]\\s*)([\"'`])?$TokenClass(\\2?)"
++        )
++
++        override fun apply(text: String): String {
++            return pattern.replace(text) { match ->
++                val prefix = match.groupValues[1]
++                val openQuote = match.groupValues[2]
++                val closeQuote = match.groupValues[3]
++                prefix + openQuote + RedactedToken + closeQuote
++            }
++        }
++
++        override fun matches(text: String): Boolean {
++            return pattern.containsMatchIn(text)
++        }
++    }
++
++    /**
++     * Redacts `Authorization: Bearer <token>` headers. Group 1 captures the
++     * `Authorization: Bearer ` prefix (including any trailing whitespace) so
++     * the header keyword is preserved exactly as written; only the bearer
++     * token is replaced.
++     */
++    class BearerHeader : RedactionRule() {
++        private val pattern: Regex = Regex(
++            "(?i)(authorization:\\s*bearer\\s+)$TokenClass"
++        )
++
++        override fun apply(text: String): String {
++            return pattern.replace(text) { match ->
++                match.groupValues[1] + RedactedToken
++            }
++        }
++
++        override fun matches(text: String): Boolean {
++            return pattern.containsMatchIn(text)
++        }
++    }
++
++    /**
++     * Redacts a self-contained value pattern (long digit runs, six-digit
++     * one-time codes, e-mail addresses). The pattern already matches a
++     * tight character class, so no separate structural-character protection
++     * is needed and the entire match is replaced with [RedactedToken].
++     */
++    class LiteralValue(private val pattern: Regex) : RedactionRule() {
++
++        override fun apply(text: String): String {
++            return pattern.replace(text, RedactedToken)
++        }
++
++        override fun matches(text: String): Boolean {
++            return pattern.containsMatchIn(text)
++        }
++    }
++
++    companion object {
++        /**
++         * Replacement string used for every redacted match. Kept as a single
++         * constant so a future change to the redaction sentinel only needs
++         * to be made in one place.
++         */
++        const val RedactedToken: String = "[REDACTED]"
++
++        /**
++         * Character class for a redacted secret token.
++         *
++         * Excludes:
++         *  - whitespace, comma, semicolon (preserved from the previous
++         *    implementation as legal token boundaries)
++         *  - closing structural characters `}`, `)`, `]`, `>` so a secret
++         *    that ends a JSON-ish, dict-ish, list-ish, or tag-ish enclosing
++         *    scope does not pull the closer into the match
++         *  - the three quote characters `'`, `"`, `` ` `` so a quoted secret
++         *    keeps its closing quote in the surrounding text
++         *
++         * The full set is intentionally conservative: any character that a
++         * caller might rely on as a structural delimiter goes here.
++         */
++        const val TokenClass: String = "[^\\s,;\\}\\)\\]\\>\"'`]+"
++    }
++}
+diff --git a/app/src/main/java/dev/touchpilot/app/security/SensitiveTextRedactor.kt b/app/src/main/java/dev/touchpilot/app/security/SensitiveTextRedactor.kt
+index 1fdc071..86bc874 100644
+--- a/app/src/main/java/dev/touchpilot/app/security/SensitiveTextRedactor.kt
++++ b/app/src/main/java/dev/touchpilot/app/security/SensitiveTextRedactor.kt
+@@ -1,27 +1,24 @@
+ package dev.touchpilot.app.security
+ 
+ object SensitiveTextRedactor {
+-    private val assignmentPatterns = listOf(
+-        Regex("(?i)(api[_-]?key|access[_-]?token|refresh[_-]?token|password|passcode|secret)\\s*[:=]\\s*[^\\s,;]+"),
+-        Regex("(?i)(authorization:\\s*bearer\\s+)[^\\s,;]+")
++    private val redactionRules: List<RedactionRule> = listOf(
++        RedactionRule.KeyAssignment(
++            keyAlternation = "api[_-]?key|access[_-]?token|refresh[_-]?token|password|passcode|secret"
++        ),
++        RedactionRule.BearerHeader(),
++        RedactionRule.LiteralValue(Regex("\\b\\d{13,19}\\b")),
++        RedactionRule.LiteralValue(Regex("\\b\\d{6}\\b")),
++        RedactionRule.LiteralValue(Regex("\\b[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\\.[A-Za-z]{2,}\\b"))
+     )
+-    private val valuePatterns = listOf(
+-        Regex("\\b\\d{13,19}\\b"),
+-        Regex("\\b\\d{6}\\b"),
+-        Regex("\\b[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\\.[A-Za-z]{2,}\\b")
++
++    private val sensitiveWords = Regex(
++        "(?i)\\b(password|passcode|otp|one-time code|api key|secret|token|credit card|card number)\\b"
+     )
+-    private val sensitiveWords = Regex("(?i)\\b(password|passcode|otp|one-time code|api key|secret|token|credit card|card number)\\b")
+ 
+     fun redact(text: String): String {
+         var redacted = text
+-        assignmentPatterns.forEach { pattern ->
+-            redacted = pattern.replace(redacted) { match ->
+-                val prefix = match.value.substringBeforeAny(listOf(":", "="))
+-                "$prefix=[REDACTED]"
+-            }
+-        }
+-        valuePatterns.forEach { pattern ->
+-            redacted = pattern.replace(redacted, "[REDACTED]")
++        for (rule in redactionRules) {
++            redacted = rule.apply(redacted)
+         }
+         return redacted
+     }
+@@ -29,7 +26,7 @@ object SensitiveTextRedactor {
+     fun redact(args: Map<String, String>): Map<String, String> {
+         return args.mapValues { (key, value) ->
+             if (isSensitiveKey(key) || containsSensitiveText(value)) {
+-                "[REDACTED]"
++                RedactionRule.RedactedToken
+             } else {
+                 redact(value)
+             }
+@@ -38,8 +35,7 @@ object SensitiveTextRedactor {
+ 
+     fun containsSensitiveText(text: String): Boolean {
+         return sensitiveWords.containsMatchIn(text) ||
+-            assignmentPatterns.any { it.containsMatchIn(text) } ||
+-            valuePatterns.any { it.containsMatchIn(text) }
++            redactionRules.any { rule -> rule.matches(text) }
+     }
+ 
+     private fun isSensitiveKey(key: String): Boolean {
+@@ -48,11 +44,4 @@ object SensitiveTextRedactor {
+             key.contains("secret", ignoreCase = true) ||
+             key.contains("api_key", ignoreCase = true)
+     }
+-
+-    private fun String.substringBeforeAny(delimiters: List<String>): String {
+-        val index = delimiters.mapNotNull { delimiter ->
+-            indexOf(delimiter).takeIf { it >= 0 }
+-        }.minOrNull()
+-        return if (index == null) this else substring(0, index)
+-    }
+ }
+diff --git a/app/src/test/java/dev/touchpilot/app/security/SensitiveTextRedactorTest.kt b/app/src/test/java/dev/touchpilot/app/security/SensitiveTextRedactorTest.kt
+index 30508c7..c8b75e5 100644
+--- a/app/src/test/java/dev/touchpilot/app/security/SensitiveTextRedactorTest.kt
++++ b/app/src/test/java/dev/touchpilot/app/security/SensitiveTextRedactorTest.kt
+@@ -27,4 +27,115 @@ class SensitiveTextRedactorTest {
+         assertEquals("[REDACTED]", redacted["api_key"])
+         assertEquals("Settings", redacted["target"])
+     }
++
++    @Test
++    fun preservesAuthorizationBearerHeaderStructure() {
++        val redacted = SensitiveTextRedactor.redact("Authorization: Bearer abc123xyz")
++
++        assertEquals("Authorization: Bearer [REDACTED]", redacted)
++    }
++
++    @Test
++    fun preservesAuthorizationBearerCaseAndWhitespace() {
++        val redacted = SensitiveTextRedactor.redact("authorization:  bearer   abc123xyz")
++
++        assertEquals("authorization:  bearer   [REDACTED]", redacted)
++    }
++
++    @Test
++    fun doesNotEatClosingBracketsAfterBearerToken() {
++        val input =
++            "type_text({text=Authorization: Bearer abc123xyz}) -> false: typeIntoFocusedField"
++
++        val redacted = SensitiveTextRedactor.redact(input)
++
++        assertEquals(
++            "type_text({text=Authorization: Bearer [REDACTED]}) -> false: typeIntoFocusedField",
++            redacted
++        )
++    }
++
++    @Test
++    fun doesNotEatClosingBracketsAfterAssignmentValue() {
++        val input = "tool({password=hunter2})"
++
++        val redacted = SensitiveTextRedactor.redact(input)
++
++        assertEquals("tool({password=[REDACTED]})", redacted)
++    }
++
++    @Test
++    fun doesNotEatClosingSquareBracketAfterAssignmentValue() {
++        val input = "[api_key=sk-test]"
++
++        val redacted = SensitiveTextRedactor.redact(input)
++
++        assertEquals("[api_key=[REDACTED]]", redacted)
++    }
++
++    @Test
++    fun doesNotEatClosingAngleBracketAfterAssignmentValue() {
++        val input = "<secret=very-secret>"
++
++        val redacted = SensitiveTextRedactor.redact(input)
++
++        assertEquals("<secret=[REDACTED]>", redacted)
++    }
++
++    @Test
++    fun doesNotEatClosingDoubleQuoteAroundSecretValue() {
++        val input = "config password=\"hunter2\" enabled=true"
++
++        val redacted = SensitiveTextRedactor.redact(input)
++
++        assertEquals("config password=\"[REDACTED]\" enabled=true", redacted)
++    }
++
++    @Test
++    fun doesNotEatClosingSingleQuoteAroundSecretValue() {
++        val input = "config secret='topsecret' enabled=true"
++
++        val redacted = SensitiveTextRedactor.redact(input)
++
++        assertEquals("config secret='[REDACTED]' enabled=true", redacted)
++    }
++
++    @Test
++    fun stopsAtWhitespaceCommaAndSemicolonBoundariesAsBefore() {
++        val input = "password=hunter2, api_key=sk-test; refresh_token=rt-xyz next=value"
++
++        val redacted = SensitiveTextRedactor.redact(input)
++
++        assertEquals(
++            "password=[REDACTED], api_key=[REDACTED]; refresh_token=[REDACTED] next=value",
++            redacted
++        )
++    }
++
++    @Test
++    fun redactsMultipleAuthorizationHeadersInOneString() {
++        val input = "first Authorization: Bearer aaa111 second Authorization: Bearer bbb222"
++
++        val redacted = SensitiveTextRedactor.redact(input)
++
++        assertEquals(
++            "first Authorization: Bearer [REDACTED] second Authorization: Bearer [REDACTED]",
++            redacted
++        )
++    }
++
++    @Test
++    fun containsSensitiveTextRecognisesAuthorizationHeader() {
++        assertTrue(SensitiveTextRedactor.containsSensitiveText("Authorization: Bearer abc123xyz"))
++    }
++
++    @Test
++    fun containsSensitiveTextRecognisesAssignment() {
++        assertTrue(SensitiveTextRedactor.containsSensitiveText("password=hunter2"))
++    }
++
++    @Test
++    fun containsSensitiveTextReturnsFalseForBenignString() {
++        assertFalse(SensitiveTextRedactor.containsSensitiveText("user opened the Settings screen"))
++    }
+ }

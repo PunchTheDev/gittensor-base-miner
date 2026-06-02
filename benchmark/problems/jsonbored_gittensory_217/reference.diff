@@ -1,0 +1,1191 @@
+diff --git a/apps/gittensory-ui/public/openapi.json b/apps/gittensory-ui/public/openapi.json
+index 8a608c8..c965971 100644
+--- a/apps/gittensory-ui/public/openapi.json
++++ b/apps/gittensory-ui/public/openapi.json
+@@ -8131,6 +8131,62 @@
+           "historyCoverage"
+         ]
+       },
++      "RegistryHyperparameterDriftSummary": {
++        "type": "object",
++        "properties": {
++          "totalEvents": {
++            "type": "number"
++          },
++          "omittedEvents": {
++            "type": "number"
++          },
++          "highImpactCount": {
++            "type": "number"
++          },
++          "affectedRepoCount": {
++            "type": "number"
++          },
++          "affectedFields": {
++            "type": "array",
++            "items": {
++              "type": "string",
++              "enum": [
++                "repo",
++                "emissionShare",
++                "issueDiscoveryShare",
++                "maintainerCut",
++                "labelMultipliers",
++                "trustedLabelPipeline",
++                "defaultLabelMultiplier",
++                "fixedBaseScore",
++                "eligibilityMode"
++              ]
++            }
++          },
++          "affectedSurfaces": {
++            "type": "array",
++            "items": {
++              "type": "string",
++              "enum": [
++                "allocation",
++                "lane_fit",
++                "scoreability_assumptions",
++                "maintainer_economics",
++                "issue_discovery_behavior",
++                "label_policy"
++              ]
++            }
++          }
++        },
++        "required": [
++          "totalEvents",
++          "omittedEvents",
++          "highImpactCount",
++          "affectedRepoCount",
++          "affectedFields",
++          "affectedSurfaces"
++        ]
++      },
+       "UpstreamDriftReport": {
+         "type": "object",
+         "properties": {
+@@ -8276,6 +8332,9 @@
+               ]
+             }
+           },
++          "registryHyperparameterDrift": {
++            "$ref": "#/components/schemas/RegistryHyperparameterDriftSummary"
++          },
+           "openReportCount": {
+             "type": "number"
+           },
+@@ -8290,6 +8349,7 @@
+           "generatedAt",
+           "status",
+           "affectedAreas",
++          "registryHyperparameterDrift",
+           "openReportCount",
+           "reports"
+         ]
+diff --git a/src/api/routes.ts b/src/api/routes.ts
+index e289b7d..73bcf11 100644
+--- a/src/api/routes.ts
++++ b/src/api/routes.ts
+@@ -159,7 +159,7 @@ import { MAX_LOCAL_SCORER_WARNING_CHARS, MAX_LOCAL_SCORER_WARNING_COUNT } from "
+ import { loadRepoFocusManifest } from "../signals/focus-manifest-loader";
+ import { buildRepoSettingsPreview } from "../signals/settings-preview";
+ import { buildGittensorConfigRecommendation, buildRegistrationReadiness, type InstallationHealthSummary } from "../signals/registration-readiness";
+-import { fileUpstreamDriftIssues, loadUpstreamStatus, refreshUpstreamDrift } from "../upstream/ruleset";
++import { fileUpstreamDriftIssues, loadUpstreamStatus, refreshUpstreamDrift, registryHyperparameterDriftWarningsForRepo } from "../upstream/ruleset";
+ import type {
+   BountyLifecycleEventRecord,
+   ControlPanelRoleName,
+@@ -1253,6 +1253,11 @@ export function createApp() {
+       ...(upstreamDrift.status === "drift_detected"
+         ? [`Upstream Gittensor ruleset drift detected (${upstreamDrift.highestSeverity ?? "unknown"}): ${Array.isArray(upstreamDrift.affectedAreas) ? upstreamDrift.affectedAreas.join(", ") : "unknown"}.`]
+         : []),
++      ...(upstreamDrift.registryHyperparameterDrift.highImpactCount > 0
++        ? [
++            `High-impact registry hyperparameter drift detected (${upstreamDrift.registryHyperparameterDrift.highImpactCount} event(s) across ${upstreamDrift.registryHyperparameterDrift.affectedRepoCount} repo(s)): ${upstreamDrift.registryHyperparameterDrift.affectedFields.join(", ")}.`,
++          ]
++        : []),
+       ...(upstreamDrift.status === "stale" ? ["Upstream Gittensor ruleset snapshot is stale."] : []),
+       ...(upstreamDrift.status === "unavailable" ? ["Upstream Gittensor ruleset snapshot is unavailable."] : []),
+       ...(installationHealth.some((health) => health.status !== "healthy") ? ["One or more GitHub App installations need attention."] : []),
+@@ -2278,10 +2283,14 @@ function buildDigestItems(args: {
+     });
+   }
+   if (args.upstreamDrift.status !== "current") {
++    const registryDrift = args.upstreamDrift.registryHyperparameterDrift;
+     items.push({
+       kind: "drift",
+       title: "Upstream ruleset drift check is not current",
+-      detail: `Current upstream status: ${args.upstreamDrift.status}.`,
++      detail:
++        registryDrift.highImpactCount > 0
++          ? `Current upstream status: ${args.upstreamDrift.status}; ${registryDrift.highImpactCount} high-impact registry hyperparameter drift event(s) are open.`
++          : `Current upstream status: ${args.upstreamDrift.status}.`,
+       meta: args.upstreamDrift.highestSeverity ?? "watch",
+     });
+   }
+@@ -2411,8 +2420,11 @@ async function buildRepoOutcomePatternsResponse(env: Env, fullName: string) {
+ 
+ async function buildRegistrationReadinessResponse(env: Env, fullName: string) {
+   /* v8 ignore start -- Registration readiness route-level shaping over covered signal helpers. */
+-  const intelligence = await buildRepoIntelligenceResponse(env, fullName);
+-  const settings = await getRepositorySettings(env, fullName);
++  const [intelligence, settings, upstreamReports] = await Promise.all([
++    buildRepoIntelligenceResponse(env, fullName),
++    getRepositorySettings(env, fullName),
++    listUpstreamDriftReports(env, 20),
++  ]);
+   const repo = intelligence.repo;
+   const installation = await loadInstallationHealthSummary(env, repo);
+   const report = buildRegistrationReadiness({
+@@ -2426,6 +2438,7 @@ async function buildRegistrationReadinessResponse(env: Env, fullName: string) {
+     maintainerCutReadiness: intelligence.maintainerCutReadiness as ReturnType<typeof buildMaintainerCutReadiness>,
+     contributorIntakeHealth: intelligence.contributorIntakeHealth as ReturnType<typeof buildContributorIntakeHealth>,
+     installation,
++    upstreamRegistryDriftWarnings: registryHyperparameterDriftWarningsForRepo(upstreamReports, fullName),
+   });
+   return { ...report, dataQuality: intelligence.dataQuality };
+   /* v8 ignore stop */
+diff --git a/src/openapi/schemas.ts b/src/openapi/schemas.ts
+index ad81a08..a6d2e87 100644
+--- a/src/openapi/schemas.ts
++++ b/src/openapi/schemas.ts
+@@ -763,6 +763,31 @@ export const UpstreamDriftReportSchema = z
+   })
+   .openapi("UpstreamDriftReport");
+ 
++const RegistryHyperparameterDriftFieldSchema = z.enum([
++  "repo",
++  "emissionShare",
++  "issueDiscoveryShare",
++  "maintainerCut",
++  "labelMultipliers",
++  "trustedLabelPipeline",
++  "defaultLabelMultiplier",
++  "fixedBaseScore",
++  "eligibilityMode",
++]);
++
++const RegistryDriftSurfaceSchema = z.enum(["allocation", "lane_fit", "scoreability_assumptions", "maintainer_economics", "issue_discovery_behavior", "label_policy"]);
++
++export const RegistryHyperparameterDriftSummarySchema = z
++  .object({
++    totalEvents: z.number(),
++    omittedEvents: z.number(),
++    highImpactCount: z.number(),
++    affectedRepoCount: z.number(),
++    affectedFields: z.array(RegistryHyperparameterDriftFieldSchema),
++    affectedSurfaces: z.array(RegistryDriftSurfaceSchema),
++  })
++  .openapi("RegistryHyperparameterDriftSummary");
++
+ export const UpstreamRulesetSnapshotSchema = z
+   .object({
+     id: z.string(),
+@@ -790,6 +815,7 @@ export const UpstreamStatusSchema = z
+     activeModel: z.enum(["current_density_model", "pending_saturation_model", "exponential_saturation_model", "unknown"]).nullable().optional(),
+     highestSeverity: z.enum(["low", "medium", "high", "blocking"]).nullable().optional(),
+     affectedAreas: z.array(z.enum(["registry", "scoring_model", "issue_discovery", "mirror_linkage", "language_weights", "source"])),
++    registryHyperparameterDrift: RegistryHyperparameterDriftSummarySchema,
+     openReportCount: z.number(),
+     reports: z.array(UpstreamDriftReportSchema),
+   })
+diff --git a/src/signals/registration-readiness.ts b/src/signals/registration-readiness.ts
+index b1e023b..70792c4 100644
+--- a/src/signals/registration-readiness.ts
++++ b/src/signals/registration-readiness.ts
+@@ -73,6 +73,7 @@ export type RegistrationReadinessInput = {
+   maintainerCutReadiness: MaintainerCutReadiness;
+   contributorIntakeHealth: ContributorIntakeHealth;
+   installation: InstallationHealthSummary | null;
++  upstreamRegistryDriftWarnings?: string[] | undefined;
+ };
+ 
+ const REQUIRED_DOCS = ["README", "CONTRIBUTING", "SECURITY", "SUPPORT"];
+@@ -133,7 +134,7 @@ function buildGithubAppBehavior(repo: RepositoryRecord | null, settings: Reposit
+  * Advisory and private/API-first: no public GitHub output, no wallet/score exposure.
+  */
+ export function buildRegistrationReadiness(input: RegistrationReadinessInput): RegistrationReadinessReport {
+-  const { repoFullName, repo, settings, lane, configQuality, labelAudit, queueHealth, maintainerCutReadiness, contributorIntakeHealth, installation } = input;
++  const { repoFullName, repo, settings, lane, configQuality, labelAudit, queueHealth, maintainerCutReadiness, contributorIntakeHealth, installation, upstreamRegistryDriftWarnings = [] } = input;
+   const isRegistered = Boolean(repo?.isRegistered);
+   const configFragile = configQuality.level === "fragile";
+   const configNeedsAttention = configQuality.level === "needs_attention";
+@@ -173,6 +174,7 @@ export function buildRegistrationReadiness(input: RegistrationReadinessInput): R
+     ...(settings.publicSurface === "off" ? ["GitHub App public surface is disabled; maintainers will not get comment/label assistance."] : []),
+     ...testCoverageHealth.warnings,
+     ...labelAudit.missingConfiguredLabels.map((label) => `Configured registry label "${label}" is missing from live GitHub labels.`),
++    ...upstreamRegistryDriftWarnings,
+   ];
+ 
+   const ready = blockers.length === 0 && !configFragile && !configNeedsAttention;
+diff --git a/src/types.ts b/src/types.ts
+index afcde54..ac516d8 100644
+--- a/src/types.ts
++++ b/src/types.ts
+@@ -727,6 +727,34 @@ export type UpstreamSourceSnapshotRecord = {
+ export type UpstreamDriftSeverity = "low" | "medium" | "high" | "blocking";
+ export type UpstreamDriftStatus = "open" | "acknowledged" | "resolved" | "ignored";
+ export type UpstreamDriftArea = "registry" | "scoring_model" | "issue_discovery" | "mirror_linkage" | "language_weights" | "source";
++export type RegistryHyperparameterDriftField =
++  | "repo"
++  | "emissionShare"
++  | "issueDiscoveryShare"
++  | "maintainerCut"
++  | "labelMultipliers"
++  | "trustedLabelPipeline"
++  | "defaultLabelMultiplier"
++  | "fixedBaseScore"
++  | "eligibilityMode";
++export type RegistryDriftSurface = "allocation" | "lane_fit" | "scoreability_assumptions" | "maintainer_economics" | "issue_discovery_behavior" | "label_policy";
++export type RegistryHyperparameterDriftEvent = {
++  repoFullName: string;
++  field: RegistryHyperparameterDriftField;
++  previous: JsonValue;
++  current: JsonValue;
++  severity: UpstreamDriftSeverity;
++  affectedSurfaces: RegistryDriftSurface[];
++  summary: string;
++};
++export type RegistryHyperparameterDriftSummary = {
++  totalEvents: number;
++  omittedEvents: number;
++  highImpactCount: number;
++  affectedRepoCount: number;
++  affectedFields: RegistryHyperparameterDriftField[];
++  affectedSurfaces: RegistryDriftSurface[];
++};
+ 
+ export type UpstreamRulesetSnapshotRecord = {
+   id: string;
+diff --git a/src/upstream/ruleset.ts b/src/upstream/ruleset.ts
+index 316e023..6839bc0 100644
+--- a/src/upstream/ruleset.ts
++++ b/src/upstream/ruleset.ts
+@@ -13,6 +13,10 @@ import { normalizeRegistryPayload } from "../registry/normalize";
+ import { detectActiveModel, parsePythonNumberConstants } from "../scoring/model";
+ import type {
+   JsonValue,
++  RegistryDriftSurface,
++  RegistryHyperparameterDriftEvent,
++  RegistryHyperparameterDriftField,
++  RegistryHyperparameterDriftSummary,
+   RegistryRepoConfig,
+   ScoringModelSnapshotRecord,
+   UpstreamDriftArea,
+@@ -27,6 +31,7 @@ const DEFAULT_UPSTREAM_REPO = "entrius/gittensor";
+ const DEFAULT_UPSTREAM_REF = "test";
+ const DEFAULT_DRIFT_ISSUE_REPO = "JSONbored/gittensory";
+ const UPSTREAM_STALE_MS = 2 * 60 * 60 * 1000;
++const REGISTRY_HYPERPARAMETER_DRIFT_LIMIT = 100;
+ 
+ const TRACKED_SOURCES = [
+   { key: "constants", path: "gittensor/constants.py" },
+@@ -52,6 +57,7 @@ type RulesetPayload = {
+       labelMultipliers: Record<string, number>;
+       trustedLabelPipeline: boolean | null;
+       defaultLabelMultiplier: number | null;
++      fixedBaseScore: number | null;
+       eligibilityMode: string | null;
+     }>;
+   };
+@@ -83,6 +89,7 @@ export type UpstreamStatus = {
+   activeModel: ScoringModelSnapshotRecord["activeModel"] | null;
+   highestSeverity: UpstreamDriftSeverity | null;
+   affectedAreas: UpstreamDriftArea[];
++  registryHyperparameterDrift: RegistryHyperparameterDriftSummary;
+   openReportCount: number;
+   reports: Array<Record<string, JsonValue>>;
+ };
+@@ -198,6 +205,7 @@ export async function loadUpstreamStatus(env: Env): Promise<UpstreamStatus> {
+   const [latestRuleset, reports] = await Promise.all([getLatestUpstreamRulesetSnapshot(env), listUpstreamDriftReports(env, 20)]);
+   const openReports = reports.filter((report) => report.status === "open");
+   const highest = highestSeverity(openReports.map((report) => report.severity));
++  const registryHyperparameterDrift = summarizeRegistryHyperparameterDriftReports(openReports);
+   const generatedAt = nowIso();
+   const stale = latestRuleset ? Date.parse(latestRuleset.generatedAt) + UPSTREAM_STALE_MS < Date.now() : false;
+   const affectedAreas = [...new Set(openReports.flatMap((report) => report.affectedAreas))].sort();
+@@ -210,11 +218,29 @@ export async function loadUpstreamStatus(env: Env): Promise<UpstreamStatus> {
+     activeModel: latestRuleset?.activeModel ?? null,
+     highestSeverity: highest ?? null,
+     affectedAreas,
++    registryHyperparameterDrift,
+     openReportCount: openReports.length,
+     reports: reports.map((report) => publicDriftReport(report)),
+   };
+ }
+ 
++export function registryHyperparameterDriftWarningsForRepo(reports: UpstreamDriftReportRecord[], repoFullName: string, limit = 3): string[] {
++  const normalizedRepo = repoFullName.toLowerCase();
++  const events = reports
++    .filter((report) => report.status === "open")
++    .flatMap((report) => readRegistryHyperparameterDriftPayload(report.payload.registryHyperparameterDrift).events)
++    .filter((event) => event.repoFullName.toLowerCase() === normalizedRepo && (event.severity === "high" || event.severity === "blocking" || event.field === "maintainerCut"))
++    .sort(compareRegistryHyperparameterDriftEvents);
++  const shown = events.slice(0, limit);
++  return [
++    ...shown.map(
++      (event) =>
++        `Upstream registry drift is open for ${repoFullName}: ${registryHyperparameterFieldLabel(event.field)} changed; affected surface(s): ${event.affectedSurfaces.join(", ")}.`,
++    ),
++    ...(events.length > shown.length ? [`${events.length - shown.length} additional high-impact upstream registry drift event(s) are open for ${repoFullName}.`] : []),
++  ];
++}
++
+ export async function fileUpstreamDriftIssues(env: Env): Promise<Record<string, JsonValue>> {
+   if (!truthy(env.GITTENSORY_AUTO_FILE_DRIFT_ISSUES)) {
+     return { status: "disabled", created: 0, updated: 0, skipped: 0 };
+@@ -282,11 +308,12 @@ export async function buildUpstreamDriftReport(current: UpstreamRulesetSnapshotR
+     raise("high");
+     changes.push(`registry totals changed (${previous.registryRepoCount}/${previous.totalEmissionShare} -> ${current.registryRepoCount}/${current.totalEmissionShare})`);
+   }
+-  const repoChanges = changedRegistryRepos(previousPayload.registry.repositories, currentPayload.registry.repositories);
+-  if (repoChanges.length > 0) {
++  const registryHyperparameterDrift = buildRegistryHyperparameterDrift(previousPayload.registry.repositories, currentPayload.registry.repositories);
++  const repoChanges = changedRegistryRepos(registryHyperparameterDrift.events);
++  if (registryHyperparameterDrift.totalEvents > 0) {
+     affected.add("registry");
+-    raise(repoChanges.some((change) => change.includes("emissionShare")) ? "high" : "medium");
+-    changes.push(`${repoChanges.length} repo hyperparameter change(s)`);
++    raise(registryHyperparameterDrift.events[0]!.severity);
++    changes.push(`${registryHyperparameterDrift.totalEvents} registry hyperparameter drift event(s)`);
+   }
+   if (currentPayload.issueDiscovery.branchEligibilityRequired !== previousPayload.issueDiscovery.branchEligibilityRequired) {
+     affected.add("issue_discovery");
+@@ -319,6 +346,7 @@ export async function buildUpstreamDriftReport(current: UpstreamRulesetSnapshotR
+     payload: {
+       changes,
+       repoChanges,
++      registryHyperparameterDrift,
+       current: publicRuleset(current),
+       previous: publicRuleset(previous),
+     },
+@@ -519,17 +547,18 @@ function compactRegistryRepo(repo: RegistryRepoConfig): RulesetPayload["registry
+     labelMultipliers: repo.labelMultipliers,
+     trustedLabelPipeline: repo.trustedLabelPipeline ?? null,
+     defaultLabelMultiplier: repo.defaultLabelMultiplier ?? null,
++    fixedBaseScore: repo.fixedBaseScore ?? null,
+     eligibilityMode: repo.eligibilityMode ?? null,
+   };
+ }
+ 
+-function registryPayload(value: JsonValue | undefined): RulesetPayload["registry"] {
+-  if (!value || typeof value !== "object" || Array.isArray(value)) return { repoCount: 0, totalEmissionShare: 0, repositories: [] };
++function registryPayload(value: JsonValue | undefined, fallback: Pick<RulesetPayload["registry"], "repoCount" | "totalEmissionShare"> = { repoCount: 0, totalEmissionShare: 0 }): RulesetPayload["registry"] {
++  if (!value || typeof value !== "object" || Array.isArray(value)) return { ...fallback, repositories: [] };
+   const payload = value as { repoCount?: JsonValue; totalEmissionShare?: JsonValue; repositories?: JsonValue };
+   return {
+-    repoCount: typeof payload.repoCount === "number" ? payload.repoCount : 0,
+-    totalEmissionShare: typeof payload.totalEmissionShare === "number" ? payload.totalEmissionShare : 0,
+-    repositories: Array.isArray(payload.repositories) ? (payload.repositories as RulesetPayload["registry"]["repositories"]) : [],
++    repoCount: numberPayload(payload.repoCount) ?? fallback.repoCount,
++    totalEmissionShare: numberPayload(payload.totalEmissionShare) ?? fallback.totalEmissionShare,
++    repositories: Array.isArray(payload.repositories) ? normalizeRulesetRegistryRepos(payload.repositories) : [],
+   };
+ }
+ 
+@@ -537,7 +566,7 @@ function rulesetPayload(snapshot: UpstreamRulesetSnapshotRecord): RulesetPayload
+   const payload = snapshot.payload as unknown as Partial<RulesetPayload>;
+   return {
+     upstream: payload.upstream ?? { repo: snapshot.sourceRepo, ref: snapshot.sourceRef, commitSha: snapshot.commitSha },
+-    registry: payload.registry ?? { repoCount: snapshot.registryRepoCount, totalEmissionShare: snapshot.totalEmissionShare, repositories: [] },
++    registry: registryPayload(payload.registry as unknown as JsonValue | undefined, { repoCount: snapshot.registryRepoCount, totalEmissionShare: snapshot.totalEmissionShare }),
+     scoring: payload.scoring ?? { activeModel: snapshot.activeModel, constants: {}, semanticFlags: {} },
+     issueDiscovery: payload.issueDiscovery ?? { branchEligibilityRequired: false },
+     mirrorLinkage: payload.mirrorLinkage ?? { solvedByPrRequired: false },
+@@ -559,23 +588,287 @@ function semanticPayload(payload: RulesetPayload): Record<string, JsonValue> {
+   };
+ }
+ 
+-function changedRegistryRepos(previous: RulesetPayload["registry"]["repositories"], current: RulesetPayload["registry"]["repositories"]): string[] {
++type RulesetRegistryRepo = RulesetPayload["registry"]["repositories"][number];
++type RegistryHyperparameterDriftPayload = RegistryHyperparameterDriftSummary & { events: RegistryHyperparameterDriftEvent[] };
++
++const REGISTRY_DRIFT_FIELD_ORDER: RegistryHyperparameterDriftField[] = [
++  "repo",
++  "emissionShare",
++  "issueDiscoveryShare",
++  "maintainerCut",
++  "fixedBaseScore",
++  "eligibilityMode",
++  "trustedLabelPipeline",
++  "defaultLabelMultiplier",
++  "labelMultipliers",
++];
++type RegistryComparableHyperparameterField = Exclude<RegistryHyperparameterDriftField, "repo">;
++const REGISTRY_DRIFT_COMPARABLE_FIELDS: RegistryComparableHyperparameterField[] = [
++  "emissionShare",
++  "issueDiscoveryShare",
++  "maintainerCut",
++  "fixedBaseScore",
++  "eligibilityMode",
++  "trustedLabelPipeline",
++  "defaultLabelMultiplier",
++  "labelMultipliers",
++];
++
++const REGISTRY_DRIFT_FIELD_METADATA: Record<RegistryHyperparameterDriftField, { severity: UpstreamDriftSeverity; affectedSurfaces: RegistryDriftSurface[] }> = {
++  repo: { severity: "high", affectedSurfaces: ["allocation", "lane_fit"] },
++  emissionShare: { severity: "high", affectedSurfaces: ["allocation", "lane_fit"] },
++  issueDiscoveryShare: { severity: "high", affectedSurfaces: ["issue_discovery_behavior", "lane_fit"] },
++  maintainerCut: { severity: "high", affectedSurfaces: ["maintainer_economics"] },
++  fixedBaseScore: { severity: "high", affectedSurfaces: ["scoreability_assumptions"] },
++  eligibilityMode: { severity: "high", affectedSurfaces: ["lane_fit", "scoreability_assumptions"] },
++  trustedLabelPipeline: { severity: "medium", affectedSurfaces: ["label_policy", "scoreability_assumptions"] },
++  defaultLabelMultiplier: { severity: "medium", affectedSurfaces: ["label_policy", "scoreability_assumptions"] },
++  labelMultipliers: { severity: "medium", affectedSurfaces: ["label_policy", "scoreability_assumptions"] },
++};
++
++function buildRegistryHyperparameterDrift(previous: RulesetRegistryRepo[], current: RulesetRegistryRepo[]): RegistryHyperparameterDriftPayload {
+   const previousByRepo = new Map(previous.map((repo) => [repo.repo, repo]));
+-  return current.flatMap((repo) => {
+-    const old = previousByRepo.get(repo.repo);
+-    if (!old) return [`${repo.repo}: added`];
+-    const changes = [
+-      ...(repo.emissionShare !== old.emissionShare ? [`emissionShare ${old.emissionShare} -> ${repo.emissionShare}`] : []),
+-      ...(repo.issueDiscoveryShare !== old.issueDiscoveryShare ? [`issueDiscoveryShare ${old.issueDiscoveryShare} -> ${repo.issueDiscoveryShare}`] : []),
+-      ...(repo.maintainerCut !== old.maintainerCut ? [`maintainerCut ${old.maintainerCut} -> ${repo.maintainerCut}`] : []),
+-      ...(stableStringify(repo.labelMultipliers) !== stableStringify(old.labelMultipliers) ? ["labelMultipliers changed"] : []),
+-      ...(repo.defaultLabelMultiplier !== old.defaultLabelMultiplier ? [`defaultLabelMultiplier ${old.defaultLabelMultiplier ?? "unset"} -> ${repo.defaultLabelMultiplier ?? "unset"}`] : []),
+-      ...(repo.eligibilityMode !== old.eligibilityMode ? [`eligibilityMode ${old.eligibilityMode ?? "unset"} -> ${repo.eligibilityMode ?? "unset"}`] : []),
+-    ];
+-    return changes.length > 0 ? [`${repo.repo}: ${changes.join(", ")}`] : [];
++  const currentByRepo = new Map(current.map((repo) => [repo.repo, repo]));
++  const events = [
++    ...current.flatMap((repo) => {
++      const old = previousByRepo.get(repo.repo);
++      return old ? changedRegistryRepoEvents(old, repo) : [registryHyperparameterDriftEvent(repo.repo, "repo", null, "added", "added")];
++    }),
++    ...previous.flatMap((repo) => (currentByRepo.has(repo.repo) ? [] : [registryHyperparameterDriftEvent(repo.repo, "repo", "present", null, "removed")])),
++  ].sort(compareRegistryHyperparameterDriftEvents);
++  const capped = events.slice(0, REGISTRY_HYPERPARAMETER_DRIFT_LIMIT);
++  return {
++    ...summarizeRegistryHyperparameterDriftEvents(events),
++    events: capped,
++    omittedEvents: Math.max(events.length - capped.length, 0),
++  };
++}
++
++function changedRegistryRepoEvents(previous: RulesetRegistryRepo, current: RulesetRegistryRepo): RegistryHyperparameterDriftEvent[] {
++  return REGISTRY_DRIFT_COMPARABLE_FIELDS.flatMap((field) => {
++    const oldValue = registryHyperparameterValue(previous, field);
++    const newValue = registryHyperparameterValue(current, field);
++    if (stableStringify(oldValue) === stableStringify(newValue)) return [];
++    return [registryHyperparameterDriftEvent(current.repo, field, oldValue, newValue, registryHyperparameterChangeSummary(field, oldValue, newValue))];
+   });
+ }
+ 
++function registryHyperparameterDriftEvent(repoFullName: string, field: RegistryHyperparameterDriftField, previous: JsonValue, current: JsonValue, summary: string): RegistryHyperparameterDriftEvent {
++  const metadata = REGISTRY_DRIFT_FIELD_METADATA[field];
++  return {
++    repoFullName,
++    field,
++    previous,
++    current,
++    severity: metadata.severity,
++    affectedSurfaces: metadata.affectedSurfaces,
++    summary,
++  };
++}
++
++function changedRegistryRepos(events: RegistryHyperparameterDriftEvent[]): string[] {
++  const byRepo = new Map<string, RegistryHyperparameterDriftEvent[]>();
++  for (const event of events) byRepo.set(event.repoFullName, [...(byRepo.get(event.repoFullName) ?? []), event]);
++  return [...byRepo.entries()]
++    .sort(([left], [right]) => left.localeCompare(right))
++    .map(([repo, repoEvents]) => `${repo}: ${repoEvents.sort(compareRegistryHyperparameterDriftEvents).map((event) => event.summary).join(", ")}`);
++}
++
++function summarizeRegistryHyperparameterDriftEvents(events: RegistryHyperparameterDriftEvent[]): RegistryHyperparameterDriftSummary {
++  return {
++    totalEvents: events.length,
++    omittedEvents: 0,
++    highImpactCount: events.filter((event) => event.severity === "high" || event.severity === "blocking").length,
++    affectedRepoCount: new Set(events.map((event) => event.repoFullName)).size,
++    affectedFields: uniqueSorted(events.map((event) => event.field), REGISTRY_DRIFT_FIELD_ORDER),
++    affectedSurfaces: uniqueSorted(
++      events.flatMap((event) => event.affectedSurfaces),
++      ["allocation", "lane_fit", "scoreability_assumptions", "maintainer_economics", "issue_discovery_behavior", "label_policy"],
++    ),
++  };
++}
++
++function summarizeRegistryHyperparameterDriftReports(reports: UpstreamDriftReportRecord[]): RegistryHyperparameterDriftSummary {
++  const payloads = reports.map((report) => readRegistryHyperparameterDriftPayload(report.payload.registryHyperparameterDrift));
++  const events = payloads.flatMap((payload) => payload.events);
++  const fallbackSummary = summarizeRegistryHyperparameterDriftEvents(events);
++  return {
++    totalEvents: sum(payloads.map((payload) => payload.totalEvents)) || fallbackSummary.totalEvents,
++    omittedEvents: sum(payloads.map((payload) => payload.omittedEvents)),
++    highImpactCount: sum(payloads.map((payload) => payload.highImpactCount)) || fallbackSummary.highImpactCount,
++    affectedRepoCount: sum(payloads.map((payload) => payload.affectedRepoCount)) || fallbackSummary.affectedRepoCount,
++    affectedFields: uniqueSorted(payloads.flatMap((payload) => payload.affectedFields), REGISTRY_DRIFT_FIELD_ORDER),
++    affectedSurfaces: uniqueSorted(
++      payloads.flatMap((payload) => payload.affectedSurfaces),
++      ["allocation", "lane_fit", "scoreability_assumptions", "maintainer_economics", "issue_discovery_behavior", "label_policy"],
++    ),
++  };
++}
++
++function readRegistryHyperparameterDriftPayload(value: JsonValue | undefined): RegistryHyperparameterDriftPayload {
++  if (!value || typeof value !== "object" || Array.isArray(value)) return emptyRegistryHyperparameterDriftPayload();
++  const payload = value as Record<string, JsonValue>;
++  const events = Array.isArray(payload.events) ? payload.events.flatMap(readRegistryHyperparameterDriftEvent) : [];
++  const fallback = summarizeRegistryHyperparameterDriftEvents(events);
++  const affectedFields = arrayPayload(payload.affectedFields).flatMap(readRegistryHyperparameterDriftField);
++  const affectedSurfaces = arrayPayload(payload.affectedSurfaces).flatMap(readRegistryDriftSurface);
++  return {
++    events,
++    totalEvents: numberPayload(payload.totalEvents) ?? fallback.totalEvents,
++    omittedEvents: numberPayload(payload.omittedEvents) ?? fallback.omittedEvents,
++    highImpactCount: numberPayload(payload.highImpactCount) ?? fallback.highImpactCount,
++    affectedRepoCount: numberPayload(payload.affectedRepoCount) ?? fallback.affectedRepoCount,
++    affectedFields: affectedFields.length > 0 ? affectedFields : fallback.affectedFields,
++    affectedSurfaces: affectedSurfaces.length > 0 ? affectedSurfaces : fallback.affectedSurfaces,
++  };
++}
++
++function readRegistryHyperparameterDriftEvent(value: JsonValue): RegistryHyperparameterDriftEvent[] {
++  if (!value || typeof value !== "object" || Array.isArray(value)) return [];
++  const payload = value as Record<string, JsonValue>;
++  const repoFullName = typeof payload.repoFullName === "string" ? payload.repoFullName : null;
++  const field = readRegistryHyperparameterDriftField(payload.field)[0];
++  const severity = readUpstreamDriftSeverity(payload.severity);
++  if (!repoFullName || !field || !severity) return [];
++  return [
++    {
++      repoFullName,
++      field,
++      previous: payload.previous ?? null,
++      current: payload.current ?? null,
++      severity,
++      affectedSurfaces: arrayPayload(payload.affectedSurfaces).flatMap(readRegistryDriftSurface),
++      summary: typeof payload.summary === "string" ? payload.summary : registryHyperparameterChangeSummary(field, payload.previous ?? null, payload.current ?? null),
++    },
++  ];
++}
++
++function emptyRegistryHyperparameterDriftPayload(): RegistryHyperparameterDriftPayload {
++  return {
++    events: [],
++    totalEvents: 0,
++    omittedEvents: 0,
++    highImpactCount: 0,
++    affectedRepoCount: 0,
++    affectedFields: [],
++    affectedSurfaces: [],
++  };
++}
++
++function normalizeRulesetRegistryRepos(value: JsonValue[]): RulesetRegistryRepo[] {
++  return value.flatMap((entry) => {
++    if (!entry || typeof entry !== "object" || Array.isArray(entry)) return [];
++    const repo = entry as Record<string, JsonValue>;
++    return typeof repo.repo === "string"
++      ? [
++          {
++            repo: repo.repo,
++            emissionShare: numberPayload(repo.emissionShare) ?? 0,
++            issueDiscoveryShare: numberPayload(repo.issueDiscoveryShare) ?? 0,
++            maintainerCut: numberPayload(repo.maintainerCut) ?? 0,
++            labelMultipliers: numericRecord(repo.labelMultipliers),
++            trustedLabelPipeline: booleanPayload(repo.trustedLabelPipeline),
++            defaultLabelMultiplier: numberPayload(repo.defaultLabelMultiplier),
++            fixedBaseScore: numberPayload(repo.fixedBaseScore),
++            eligibilityMode: stringPayload(repo.eligibilityMode),
++          },
++        ]
++      : [];
++  });
++}
++
++function registryHyperparameterValue(repo: RulesetRegistryRepo, field: RegistryComparableHyperparameterField): JsonValue {
++  switch (field) {
++    case "emissionShare":
++      return repo.emissionShare;
++    case "issueDiscoveryShare":
++      return repo.issueDiscoveryShare;
++    case "maintainerCut":
++      return repo.maintainerCut;
++    case "labelMultipliers":
++      return repo.labelMultipliers;
++    case "trustedLabelPipeline":
++      return repo.trustedLabelPipeline;
++    case "defaultLabelMultiplier":
++      return repo.defaultLabelMultiplier;
++    case "fixedBaseScore":
++      return repo.fixedBaseScore;
++    case "eligibilityMode":
++      return repo.eligibilityMode;
++  }
++}
++
++function registryHyperparameterChangeSummary(field: RegistryHyperparameterDriftField, previous: JsonValue, current: JsonValue): string {
++  if (field === "labelMultipliers") return "labelMultipliers changed";
++  return `${field} ${formatRegistryHyperparameterValue(previous)} -> ${formatRegistryHyperparameterValue(current)}`;
++}
++
++function registryHyperparameterFieldLabel(field: RegistryHyperparameterDriftField): string {
++  return {
++    repo: "repository membership",
++    emissionShare: "allocation",
++    issueDiscoveryShare: "issue-discovery share",
++    maintainerCut: "maintainer cut",
++    labelMultipliers: "label multipliers",
++    trustedLabelPipeline: "trusted-label flag",
++    defaultLabelMultiplier: "default label multiplier",
++    fixedBaseScore: "fixed base score",
++    eligibilityMode: "eligibility mode",
++  }[field];
++}
++
++function formatRegistryHyperparameterValue(value: JsonValue): string {
++  if (value === null) return "unset";
++  if (typeof value === "object") return "changed";
++  return String(value);
++}
++
++function compareRegistryHyperparameterDriftEvents(left: RegistryHyperparameterDriftEvent, right: RegistryHyperparameterDriftEvent): number {
++  return (
++    severityRank(right.severity) - severityRank(left.severity) ||
++    left.repoFullName.localeCompare(right.repoFullName) ||
++    REGISTRY_DRIFT_FIELD_ORDER.indexOf(left.field) - REGISTRY_DRIFT_FIELD_ORDER.indexOf(right.field)
++  );
++}
++
++function uniqueSorted<T extends string>(values: T[], order: readonly T[]): T[] {
++  const unique = [...new Set(values)];
++  return unique.sort((left, right) => order.indexOf(left) - order.indexOf(right));
++}
++
++function readRegistryHyperparameterDriftField(value: JsonValue | undefined): RegistryHyperparameterDriftField[] {
++  return typeof value === "string" && REGISTRY_DRIFT_FIELD_ORDER.includes(value as RegistryHyperparameterDriftField) ? [value as RegistryHyperparameterDriftField] : [];
++}
++
++function readRegistryDriftSurface(value: JsonValue | undefined): RegistryDriftSurface[] {
++  const surfaces: RegistryDriftSurface[] = ["allocation", "lane_fit", "scoreability_assumptions", "maintainer_economics", "issue_discovery_behavior", "label_policy"];
++  return typeof value === "string" && surfaces.includes(value as RegistryDriftSurface) ? [value as RegistryDriftSurface] : [];
++}
++
++function readUpstreamDriftSeverity(value: JsonValue | undefined): UpstreamDriftSeverity | null {
++  return typeof value === "string" && ["low", "medium", "high", "blocking"].includes(value) ? (value as UpstreamDriftSeverity) : null;
++}
++
++function numberPayload(value: JsonValue | undefined): number | null {
++  return typeof value === "number" && Number.isFinite(value) ? value : null;
++}
++
++function stringPayload(value: JsonValue | undefined): string | null {
++  return typeof value === "string" ? value : null;
++}
++
++function booleanPayload(value: JsonValue | undefined): boolean | null {
++  return typeof value === "boolean" ? value : null;
++}
++
++function arrayPayload(value: JsonValue | undefined): JsonValue[] {
++  return Array.isArray(value) ? value : [];
++}
++
++function sum(values: number[]): number {
++  return values.reduce((total, value) => total + value, 0);
++}
++
+ function publicRuleset(snapshot: UpstreamRulesetSnapshotRecord): Record<string, JsonValue> {
+   return {
+     id: snapshot.id,
+diff --git a/test/integration/api.test.ts b/test/integration/api.test.ts
+index 8401ac9..e5cc9c0 100644
+--- a/test/integration/api.test.ts
++++ b/test/integration/api.test.ts
+@@ -18,6 +18,7 @@ import {
+   listProductUsageEvents,
+   listLatestSignalSnapshotsByTarget,
+   persistUpstreamRulesetSnapshot,
++  upsertUpstreamDriftReport,
+   upsertRepoLabel,
+   upsertRepoSyncSegment,
+   upsertRepoSyncState,
+@@ -3518,6 +3519,47 @@ describe("api routes", () => {
+       issuePolicy: "split_pr_and_issue_discovery_enabled",
+     });
+ 
++    await upsertUpstreamDriftReport(env, {
++      id: "report-registration-maintainer-cut-drift",
++      fingerprint: "registration-maintainer-cut-drift",
++      severity: "high",
++      status: "open",
++      summary: "1 registry hyperparameter drift event(s)",
++      affectedAreas: ["registry"],
++      previousRulesetId: "previous-ruleset",
++      currentRulesetId: "current-ruleset",
++      payload: {
++        registryHyperparameterDrift: {
++          totalEvents: 1,
++          omittedEvents: 0,
++          highImpactCount: 1,
++          affectedRepoCount: 1,
++          affectedFields: ["maintainerCut"],
++          affectedSurfaces: ["maintainer_economics"],
++          events: [
++            {
++              repoFullName: "entrius/allways-ui",
++              field: "maintainerCut",
++              previous: 0.03,
++              current: 0.1,
++              severity: "high",
++              affectedSurfaces: ["maintainer_economics"],
++              summary: "maintainerCut 0.03 -> 0.1",
++            },
++          ],
++        },
++      },
++      generatedAt: "2026-05-27T00:00:00.000Z",
++      updatedAt: "2026-05-27T00:00:00.000Z",
++    });
++    const driftReadiness = await app.request("/v1/repos/entrius/allways-ui/registration-readiness", { headers: apiHeaders(env) }, env);
++    expect(driftReadiness.status).toBe(200);
++    await expect(driftReadiness.json()).resolves.toMatchObject({
++      warnings: expect.arrayContaining([
++        "Upstream registry drift is open for entrius/allways-ui: maintainer cut changed; affected surface(s): maintainer_economics.",
++      ]),
++    });
++
+     const recommendation = await app.request("/v1/repos/entrius/allways-ui/gittensor-config-recommendation", { headers: apiHeaders(env) }, env);
+     expect(recommendation.status).toBe(200);
+     await expect(recommendation.json()).resolves.toMatchObject({
+diff --git a/test/unit/upstream-ruleset.test.ts b/test/unit/upstream-ruleset.test.ts
+index f39025b..ae015ee 100644
+--- a/test/unit/upstream-ruleset.test.ts
++++ b/test/unit/upstream-ruleset.test.ts
+@@ -11,6 +11,7 @@ import {
+   buildUpstreamDriftReport,
+   fileUpstreamDriftIssues,
+   loadUpstreamStatus,
++  registryHyperparameterDriftWarningsForRepo,
+   refreshUpstreamDrift,
+   refreshUpstreamSourceSnapshots,
+ } from "../../src/upstream/ruleset";
+@@ -206,6 +207,68 @@ describe("upstream ruleset drift tracking", () => {
+     expect(emptySnapshot.payload).toMatchObject({ languageWeights: { count: 0 } });
+   });
+ 
++  it("normalizes stored ruleset registry repositories defensively", async () => {
++    const snapshot = await buildUpstreamRulesetSnapshot(createTestEnv(), [
++      sourceSnapshot("registry", {
++        registry: {
++          repoCount: 4,
++          totalEmissionShare: 0.2,
++          repositories: [
++            null,
++            {},
++            {
++              repo: "owner/defaults",
++              emissionShare: "bad",
++              issueDiscoveryShare: "bad",
++              maintainerCut: "bad",
++              labelMultipliers: { feature: "bad" },
++              trustedLabelPipeline: "bad",
++              defaultLabelMultiplier: "bad",
++              fixedBaseScore: "bad",
++              eligibilityMode: 7,
++            },
++            {
++              repo: "owner/policy",
++              emissionShare: 0.2,
++              issueDiscoveryShare: 0.4,
++              maintainerCut: 0.1,
++              labelMultipliers: { feature: 1.1 },
++              trustedLabelPipeline: false,
++              defaultLabelMultiplier: 1.2,
++              fixedBaseScore: 12,
++              eligibilityMode: "linked_issue_required",
++            },
++          ],
++        },
++      }),
++    ]);
++
++    expect(rulesetRegistry(snapshot).repositories).toEqual([
++      {
++        repo: "owner/defaults",
++        emissionShare: 0,
++        issueDiscoveryShare: 0,
++        maintainerCut: 0,
++        labelMultipliers: {},
++        trustedLabelPipeline: null,
++        defaultLabelMultiplier: null,
++        fixedBaseScore: null,
++        eligibilityMode: null,
++      },
++      {
++        repo: "owner/policy",
++        emissionShare: 0.2,
++        issueDiscoveryShare: 0.4,
++        maintainerCut: 0.1,
++        labelMultipliers: { feature: 1.1 },
++        trustedLabelPipeline: false,
++        defaultLabelMultiplier: 1.2,
++        fixedBaseScore: 12,
++        eligibilityMode: "linked_issue_required",
++      },
++    ]);
++  });
++
+   it("can build a ruleset from stored latest snapshots", async () => {
+     const env = createTestEnv();
+     vi.stubGlobal("fetch", upstreamNoCommitShaFetch(fixturesWithoutOptionalRegistryFields("58", 0.01)));
+@@ -218,6 +281,7 @@ describe("upstream ruleset drift tracking", () => {
+     expect(rulesetRegistry(snapshot).repositories[0]).toMatchObject({
+       trustedLabelPipeline: null,
+       defaultLabelMultiplier: null,
++      fixedBaseScore: null,
+       eligibilityMode: null,
+     });
+   });
+@@ -274,7 +338,7 @@ describe("upstream ruleset drift tracking", () => {
+         }),
+         base,
+       ),
+-    ).resolves.toMatchObject({ severity: "medium", affectedAreas: ["registry"] });
++    ).resolves.toMatchObject({ severity: "high", affectedAreas: ["registry"] });
+ 
+     await expect(
+       buildUpstreamDriftReport(
+@@ -295,10 +359,16 @@ describe("upstream ruleset drift tracking", () => {
+         base,
+       ),
+     ).resolves.toMatchObject({
+-      severity: "medium",
++      severity: "high",
+       affectedAreas: ["registry"],
+-      summary: "1 repo hyperparameter change(s)",
++      summary: "4 registry hyperparameter drift event(s)",
+       payload: {
++        registryHyperparameterDrift: {
++          totalEvents: 4,
++          highImpactCount: 2,
++          affectedFields: ["issueDiscoveryShare", "eligibilityMode", "defaultLabelMultiplier", "labelMultipliers"],
++          affectedSurfaces: ["lane_fit", "scoreability_assumptions", "issue_discovery_behavior", "label_policy"],
++        },
+         repoChanges: [
+           expect.stringContaining("issueDiscoveryShare 0 -> 0.25"),
+         ],
+@@ -321,7 +391,7 @@ describe("upstream ruleset drift tracking", () => {
+         }),
+         policyBase,
+       ),
+-    ).resolves.toMatchObject({ severity: "medium", affectedAreas: ["registry"] });
++    ).resolves.toMatchObject({ severity: "high", affectedAreas: ["registry"] });
+ 
+     await expect(
+       buildUpstreamDriftReport(
+@@ -334,7 +404,7 @@ describe("upstream ruleset drift tracking", () => {
+         }),
+         base,
+       ),
+-    ).resolves.toMatchObject({ severity: "medium", affectedAreas: ["registry"] });
++    ).resolves.toMatchObject({ severity: "high", affectedAreas: ["registry"] });
+ 
+     await expect(buildUpstreamDriftReport({ ...base, id: "source-only", semanticHash: "source-only-hash" }, { ...base, id: "previous-source", semanticHash: "previous-source-hash" })).resolves.toMatchObject({
+       severity: "low",
+@@ -343,6 +413,204 @@ describe("upstream ruleset drift tracking", () => {
+     });
+   });
+ 
++  it("classifies registry hyperparameter drift by field, surface, and severity", async () => {
++    const base = ruleset("base", "base-hash", "pending_saturation_model", 1, 0.01, "2026-05-30T00:00:00.000Z");
++    const baseRegistry = rulesetRegistry(base);
++    const [baseRepo] = baseRegistry.repositories;
++
++    const labelOnly = await buildUpstreamDriftReport(
++      withPayload(base, "label-only", {
++        registry: {
++          ...baseRegistry,
++          repositories: [{ ...baseRepo!, labelMultipliers: { feature: 1.5, bugfix: 1.1 } }],
++        },
++      }),
++      base,
++    );
++    const labelDrift = registryDriftPayload(labelOnly!);
++    expect(labelOnly).toMatchObject({ severity: "medium", affectedAreas: ["registry"] });
++    expect(labelDrift).toMatchObject({
++      totalEvents: 1,
++      highImpactCount: 0,
++      affectedFields: ["labelMultipliers"],
++      affectedSurfaces: ["scoreability_assumptions", "label_policy"],
++    });
++    expect(labelDrift.events).toEqual([
++      expect.objectContaining({ field: "labelMultipliers", severity: "medium", affectedSurfaces: ["label_policy", "scoreability_assumptions"] }),
++    ]);
++
++    const allFields = await buildUpstreamDriftReport(
++      withPayload(base, "all-registry-fields", {
++        registry: {
++          ...baseRegistry,
++          repositories: [
++            {
++              ...baseRepo!,
++              emissionShare: 0.02,
++              issueDiscoveryShare: 0.25,
++              maintainerCut: 0.4,
++              labelMultipliers: { feature: 1.5, bugfix: 1.1 },
++              trustedLabelPipeline: false,
++              defaultLabelMultiplier: 1.2,
++              fixedBaseScore: 12,
++              eligibilityMode: "linked_issue_required",
++            },
++          ],
++        },
++      }),
++      base,
++    );
++    const allFieldsDrift = registryDriftPayload(allFields!);
++    expect(allFields).toMatchObject({ severity: "high", summary: "8 registry hyperparameter drift event(s)" });
++    expect(allFieldsDrift).toMatchObject({
++      totalEvents: 8,
++      omittedEvents: 0,
++      highImpactCount: 5,
++      affectedRepoCount: 1,
++      affectedFields: [
++        "emissionShare",
++        "issueDiscoveryShare",
++        "maintainerCut",
++        "fixedBaseScore",
++        "eligibilityMode",
++        "trustedLabelPipeline",
++        "defaultLabelMultiplier",
++        "labelMultipliers",
++      ],
++      affectedSurfaces: ["allocation", "lane_fit", "scoreability_assumptions", "maintainer_economics", "issue_discovery_behavior", "label_policy"],
++    });
++    expect(allFieldsDrift.events.map((event) => event.field)).toEqual([
++      "emissionShare",
++      "issueDiscoveryShare",
++      "maintainerCut",
++      "fixedBaseScore",
++      "eligibilityMode",
++      "trustedLabelPipeline",
++      "defaultLabelMultiplier",
++      "labelMultipliers",
++    ]);
++    expect(allFieldsDrift.events.find((event) => event.field === "maintainerCut")).toMatchObject({ severity: "high", affectedSurfaces: ["maintainer_economics"] });
++    expect(registryHyperparameterDriftWarningsForRepo([allFields!], "JSONbored/gittensory")).toEqual([
++      "Upstream registry drift is open for JSONbored/gittensory: allocation changed; affected surface(s): allocation, lane_fit.",
++      "Upstream registry drift is open for JSONbored/gittensory: issue-discovery share changed; affected surface(s): issue_discovery_behavior, lane_fit.",
++      "Upstream registry drift is open for JSONbored/gittensory: maintainer cut changed; affected surface(s): maintainer_economics.",
++      "2 additional high-impact upstream registry drift event(s) are open for JSONbored/gittensory.",
++    ]);
++    expect(registryHyperparameterDriftWarningsForRepo([allFields!], "JSONbored/gittensory").join(" ")).not.toMatch(/wallet|hotkey|raw trust score|payout|reward estimate|farming|private reviewability|public score estimate/i);
++  });
++
++  it("keeps large registry drift payloads bounded and deterministically sorted", async () => {
++    const previousRepos = Array.from({ length: 150 }, (_, index) => registryRepo(`owner/repo-${String(index).padStart(3, "0")}`, { labelMultipliers: { feature: 1 } }));
++    const currentRepos = previousRepos.map((repo) => ({ ...repo, labelMultipliers: { feature: 1.1 } }));
++    const previous = rulesetWithRegistry("large-previous", previousRepos);
++    const current = rulesetWithRegistry("large-current", currentRepos);
++
++    const report = await buildUpstreamDriftReport(current, previous);
++    const drift = registryDriftPayload(report!);
++
++    expect(report).toMatchObject({ severity: "medium", affectedAreas: ["registry"] });
++    expect(drift).toMatchObject({ totalEvents: 150, omittedEvents: 50, highImpactCount: 0, affectedRepoCount: 150 });
++    expect(drift.events).toHaveLength(100);
++    expect(drift.events.map((event) => event.repoFullName).slice(0, 3)).toEqual(["owner/repo-000", "owner/repo-001", "owner/repo-002"]);
++    expect(drift.events.map((event) => event.repoFullName).at(-1)).toBe("owner/repo-099");
++    expect((report!.payload.repoChanges as string[])).toHaveLength(100);
++  });
++
++  it("does not treat legacy missing optional registry fields as drift", async () => {
++    const base = ruleset("legacy-registry-base", "legacy-registry-base-hash", "pending_saturation_model", 1, 0.01, "2026-05-30T00:00:00.000Z");
++    const baseRegistry = rulesetRegistry(base);
++    const [baseRepo] = baseRegistry.repositories;
++    const { defaultLabelMultiplier: _defaultLabelMultiplier, fixedBaseScore: _fixedBaseScore, eligibilityMode: _eligibilityMode, ...legacyRepo } = baseRepo!;
++
++    const previous = withPayload(base, "legacy-registry-previous", {
++      registry: {
++        ...baseRegistry,
++        repositories: [legacyRepo],
++      },
++    });
++    const current = withPayload(base, "legacy-registry-current", { registry: baseRegistry });
++
++    const report = await buildUpstreamDriftReport(current, previous);
++
++    expect(report).toMatchObject({
++      severity: "low",
++      affectedAreas: ["source"],
++      payload: {
++        repoChanges: [],
++        registryHyperparameterDrift: { totalEvents: 0, highImpactCount: 0, affectedFields: [], events: [] },
++      },
++    });
++  });
++
++  it("tracks registry membership drift and tolerates malformed stored registry drift payloads", async () => {
++    const previous = rulesetWithRegistry("membership-previous", [registryRepo("owner/removed")]);
++    const current = rulesetWithRegistry("membership-current", [registryRepo("owner/added")]);
++    const membership = await buildUpstreamDriftReport(current, previous);
++
++    expect(registryDriftPayload(membership!)).toMatchObject({
++      totalEvents: 2,
++      highImpactCount: 2,
++      affectedFields: ["repo"],
++      affectedSurfaces: ["allocation", "lane_fit"],
++      events: [
++        expect.objectContaining({ repoFullName: "owner/added", field: "repo", summary: "added" }),
++        expect.objectContaining({ repoFullName: "owner/removed", field: "repo", summary: "removed" }),
++      ],
++    });
++    expect(membership!.payload.repoChanges).toEqual(["owner/added: added", "owner/removed: removed"]);
++
++    const env = createTestEnv();
++    await persistUpstreamRulesetSnapshot(env, ruleset("current", "current-hash", "pending_saturation_model", 1, 0.01, new Date().toISOString()));
++    await upsertUpstreamDriftReport(env, driftReport("bad-registry-payload", { affectedAreas: ["registry"], payload: { registryHyperparameterDrift: "bad" } }));
++    await upsertUpstreamDriftReport(
++      env,
++      driftReport("summary-only-registry-payload", {
++        affectedAreas: ["registry"],
++        payload: {
++          registryHyperparameterDrift: {
++            totalEvents: 2,
++            omittedEvents: 1,
++            highImpactCount: 1,
++            affectedRepoCount: 1,
++            affectedFields: ["maintainerCut", "not-a-field"],
++            affectedSurfaces: ["maintainer_economics", "not-a-surface"],
++            events: "bad",
++          },
++        },
++      }),
++    );
++    await upsertUpstreamDriftReport(
++      env,
++      driftReport("event-fallback-registry-payload", {
++        affectedAreas: ["registry"],
++        payload: {
++          registryHyperparameterDrift: {
++            events: [
++              null,
++              { repoFullName: "owner/repo", field: "not-a-field", severity: "high" },
++              { field: "maintainerCut", severity: "high" },
++              { repoFullName: "owner/repo", field: "maintainerCut", severity: "bad" },
++              { repoFullName: "owner/repo", field: "repo", previous: {}, current: {}, severity: "high", affectedSurfaces: "bad" },
++              { repoFullName: "owner/missing-values", field: "maintainerCut", severity: "high", affectedSurfaces: ["maintainer_economics"] },
++            ],
++          },
++        },
++      }),
++    );
++
++    await expect(loadUpstreamStatus(env)).resolves.toMatchObject({
++      status: "drift_detected",
++      registryHyperparameterDrift: {
++        totalEvents: 4,
++        omittedEvents: 1,
++        highImpactCount: 3,
++        affectedRepoCount: 3,
++        affectedFields: ["repo", "maintainerCut"],
++        affectedSurfaces: ["maintainer_economics"],
++      },
++    });
++  });
++
+   it("builds low-severity source drift reports from legacy or partial ruleset payloads", async () => {
+     const previous = {
+       ...ruleset("legacy-previous", "legacy-previous-hash", "pending_saturation_model", 1, 0.01, "2026-05-30T00:00:00.000Z"),
+@@ -791,6 +1059,7 @@ function ruleset(
+             labelMultipliers: { feature: 1.5 },
+             trustedLabelPipeline: true,
+             defaultLabelMultiplier: null,
++            fixedBaseScore: null,
+             eligibilityMode: null,
+           },
+         ],
+@@ -839,12 +1108,56 @@ function rulesetRegistry(snapshot: UpstreamRulesetSnapshotRecord): {
+     labelMultipliers: Record<string, number>;
+     trustedLabelPipeline: boolean | null;
+     defaultLabelMultiplier: number | null;
++    fixedBaseScore: number | null;
+     eligibilityMode: string | null;
+   }>;
+ } {
+   return rulesetPayload(snapshot).registry as ReturnType<typeof rulesetRegistry>;
+ }
+ 
++type TestRulesetRegistryRepo = ReturnType<typeof rulesetRegistry>["repositories"][number];
++
++function registryRepo(repo: string, overrides: Partial<TestRulesetRegistryRepo> = {}): TestRulesetRegistryRepo {
++  return {
++    repo,
++    emissionShare: 0.01,
++    issueDiscoveryShare: 0,
++    maintainerCut: 0.3,
++    labelMultipliers: { feature: 1.5 },
++    trustedLabelPipeline: true,
++    defaultLabelMultiplier: null,
++    fixedBaseScore: null,
++    eligibilityMode: null,
++    ...overrides,
++  };
++}
++
++function rulesetWithRegistry(id: string, repositories: TestRulesetRegistryRepo[]): UpstreamRulesetSnapshotRecord {
++  const totalEmissionShare = repositories.reduce((sum, repo) => sum + repo.emissionShare, 0);
++  const base = ruleset(id, `${id}-hash`, "pending_saturation_model", repositories.length, totalEmissionShare, "2026-05-30T00:00:00.000Z");
++  return withPayload(base, id, {
++    registry: {
++      repoCount: repositories.length,
++      totalEmissionShare,
++      repositories,
++    },
++  });
++}
++
++type RegistryDriftPayload = {
++  totalEvents: number;
++  omittedEvents: number;
++  highImpactCount: number;
++  affectedRepoCount: number;
++  affectedFields: string[];
++  affectedSurfaces: string[];
++  events: Array<{ repoFullName: string; field: string; severity: string; affectedSurfaces: string[]; summary: string }>;
++};
++
++function registryDriftPayload(report: UpstreamDriftReportRecord): RegistryDriftPayload {
++  return report.payload.registryHyperparameterDrift as unknown as RegistryDriftPayload;
++}
++
+ function withPayload(
+   base: UpstreamRulesetSnapshotRecord,
+   id: string,
+@@ -863,7 +1176,7 @@ function withPayload(
+ 
+ function driftReport(
+   fingerprint: string,
+-  overrides: Partial<Pick<UpstreamDriftReportRecord, "severity" | "affectedAreas" | "summary" | "previousRulesetId" | "currentRulesetId" | "issueNumber" | "issueUrl">> = {},
++  overrides: Partial<Pick<UpstreamDriftReportRecord, "severity" | "affectedAreas" | "summary" | "previousRulesetId" | "currentRulesetId" | "issueNumber" | "issueUrl" | "payload">> = {},
+ ): UpstreamDriftReportRecord {
+   return {
+     id: `report-${fingerprint}`,
+@@ -876,7 +1189,7 @@ function driftReport(
+     currentRulesetId: overrides.currentRulesetId === undefined ? "current" : overrides.currentRulesetId,
+     issueNumber: overrides.issueNumber,
+     issueUrl: overrides.issueUrl,
+-    payload: { changes: ["scoring constants changed"] },
++    payload: overrides.payload ?? { changes: ["scoring constants changed"] },
+     generatedAt: "2026-05-30T00:00:00.000Z",
+     updatedAt: "2026-05-30T00:00:00.000Z",
+   };
+diff --git a/test/unit/weekly-value-report.test.ts b/test/unit/weekly-value-report.test.ts
+index dc855f7..310b56d 100644
+--- a/test/unit/weekly-value-report.test.ts
++++ b/test/unit/weekly-value-report.test.ts
+@@ -311,6 +311,7 @@ function upstream(input: Pick<UpstreamStatus, "status" | "openReportCount">): Up
+     activeModel: "current_density_model",
+     highestSeverity: null,
+     affectedAreas: [],
++    registryHyperparameterDrift: { totalEvents: 0, omittedEvents: 0, highImpactCount: 0, affectedRepoCount: 0, affectedFields: [], affectedSurfaces: [] },
+     openReportCount: input.openReportCount,
+     reports: [],
+   };

@@ -1,0 +1,280 @@
+diff --git a/crates/engine/src/game/effects/mod.rs b/crates/engine/src/game/effects/mod.rs
+index a363415b8b..e027d3fd9c 100644
+--- a/crates/engine/src/game/effects/mod.rs
++++ b/crates/engine/src/game/effects/mod.rs
+@@ -2127,6 +2127,22 @@ pub(crate) fn resolve_player_for_context_ref(
+             return player;
+         }
+     }
++    // CR 115.1d + CR 608.2c: Parent-target controller/owner anaphors bind to
++    // targets inherited from the parent instruction when present (Assassin's
++    // Trophy, Amphin Mutineer). This must precede `resolve_event_context_target`:
++    // that helper's `ParentTargetController` arm resolves the *trigger event*
++    // source's controller (the entering permanent), not the parent ability's
++    // chosen target (the exiled creature).
++    if matches!(target_filter, TargetFilter::ParentTargetController) {
++        if let Some(player) = crate::game::ability_utils::parent_target_controller(ability, state) {
++            return player;
++        }
++    }
++    if matches!(target_filter, TargetFilter::ParentTargetOwner) {
++        if let Some(player) = crate::game::ability_utils::parent_target_owner(ability, state) {
++            return player;
++        }
++    }
+     if let Some(target_ref) = crate::game::targeting::resolve_event_context_target(
+         state,
+         target_filter,
+@@ -2154,31 +2170,9 @@ pub(crate) fn resolve_player_for_context_ref(
+     if matches!(target_filter, TargetFilter::OriginalController) {
+         return ability.original_controller.unwrap_or(ability.controller);
+     }
+-    // CR 115.1d: `ParentTargetController` resolves the controller of the parent
+-    // ability's targeted object. In a spell-resolution chain (no
+-    // `current_trigger_event` set, so `resolve_event_context_target` returns
+-    // None for this filter), the parent's chosen Object lives in
+-    // `ability.targets` from chain target propagation — read it here. This is
+-    // the Assassin's Trophy-shape pattern: "Destroy target permanent. Its
+-    // controller may search their library …" — the sub-ability's filter is
+-    // `ParentTargetController`, and we resolve to the destroyed permanent's
+-    // controller. Note we deliberately read AFTER the trigger-event path so
+-    // an actual triggered context (where the helper at `targeting.rs:265`
+-    // succeeds) wins over chain inheritance.
+-    if matches!(target_filter, TargetFilter::ParentTargetController) {
+-        if let Some(player) = crate::game::ability_utils::parent_target_controller(ability, state) {
+-            return player;
+-        }
+-    }
+-    // CR 108.3 + CR 608.2c: `ParentTargetOwner` mirrors `ParentTargetController`
+-    // for the owner-axis ("its owner" anaphor). Resolves through
+-    // `parent_target_owner` (parent target's owner), then via the unified
+-    // event-context resolver (which falls back to the source's AttachedTo
+-    // host for Aura phase triggers like Enslave).
++    // CR 108.3 + CR 608.2c: `ParentTargetOwner` AttachedTo fallback when no
++    // inherited targets and no trigger-event referent (Enslave phase trigger).
+     if matches!(target_filter, TargetFilter::ParentTargetOwner) {
+-        if let Some(player) = crate::game::ability_utils::parent_target_owner(ability, state) {
+-            return player;
+-        }
+         if let Some(player) =
+             crate::game::targeting::resolve_effect_player_ref(state, ability, target_filter)
+         {
+@@ -5660,6 +5654,57 @@ mod tests {
+         assert_eq!(state.players[0].hand.len(), 1);
+     }
+ 
++    /// CR 115.1d: With inherited object targets, `ParentTargetController` must
++    /// not resolve to the trigger-event source's controller (issue #935).
++    #[test]
++    fn parent_target_controller_prefers_inherited_targets_over_trigger_source() {
++        let mut state = GameState::new_two_player(42);
++        let prey = create_object(
++            &mut state,
++            CardId(1),
++            PlayerId(1),
++            "Prey".to_string(),
++            Zone::Battlefield,
++        );
++        let ability = ResolvedAbility::new(
++            Effect::Token {
++                name: "Salamander Warrior".to_string(),
++                power: PtValue::Fixed(4),
++                toughness: PtValue::Fixed(3),
++                types: vec!["Salamander".to_string(), "Warrior".to_string()],
++                colors: vec![ManaColor::Blue],
++                keywords: vec![],
++                tapped: false,
++                count: QuantityExpr::Fixed { value: 1 },
++                owner: TargetFilter::ParentTargetController,
++                attach_to: None,
++                enters_attacking: false,
++                supertypes: vec![],
++                static_abilities: vec![],
++                enter_with_counters: vec![],
++            },
++            vec![TargetRef::Object(prey)],
++            ObjectId(100),
++            PlayerId(0),
++        );
++        let trigger_source = ObjectId(100);
++        state.current_trigger_event = Some(GameEvent::ZoneChanged {
++            object_id: trigger_source,
++            from: Some(Zone::Hand),
++            to: Zone::Battlefield,
++            record: Box::new(ZoneChangeRecord::test_minimal(
++                trigger_source,
++                Some(Zone::Hand),
++                Zone::Battlefield,
++            )),
++        });
++
++        assert_eq!(
++            resolve_player_for_context_ref(&state, &ability, &TargetFilter::ParentTargetController,),
++            PlayerId(1),
++        );
++    }
++
+     #[test]
+     fn damage_chain_controller_rider_ignores_parent_targets() {
+         let mut state = GameState::new_two_player(42);
+diff --git a/crates/engine/tests/integration/amphin_mutineer_regression.rs b/crates/engine/tests/integration/amphin_mutineer_regression.rs
+new file mode 100644
+index 0000000000..c10ad1ba70
+--- /dev/null
++++ b/crates/engine/tests/integration/amphin_mutineer_regression.rs
+@@ -0,0 +1,143 @@
++//! Regression for issue #935 — Amphin Mutineer ETB exile + token for exiled creature's controller.
++//!
++//! Oracle: "When this creature enters, exile up to one target non-Salamander creature.
++//! That creature's controller creates a 4/3 blue Salamander Warrior creature token."
++
++use engine::game::scenario::{GameScenario, P0, P1};
++use engine::parser::oracle::parse_oracle_text;
++use engine::types::ability::{Effect, TargetFilter, TargetRef};
++use engine::types::actions::GameAction;
++use engine::types::game_state::WaitingFor;
++use engine::types::identifiers::ObjectId;
++use engine::types::mana::{ManaType, ManaUnit};
++use engine::types::phase::Phase;
++use engine::types::triggers::TriggerMode;
++use engine::types::zones::Zone;
++
++const AMPHIN_FULL: &str = "When this creature enters, exile up to one target non-Salamander creature. That creature's controller creates a 4/3 blue Salamander Warrior creature token.\nEncore {4}{U}{U} ({4}{U}{U}, Exile this card from your graveyard: For each opponent, create a token copy that attacks that opponent this turn if able. They gain haste. Sacrifice them at the beginning of the next end step. Activate only as a sorcery.)";
++
++const AMPHIN_ETB: &str = "When this creature enters, exile up to one target non-Salamander creature. That creature's controller creates a 4/3 blue Salamander Warrior creature token.";
++
++fn floating_mana(generic: usize, blue: usize) -> Vec<ManaUnit> {
++    let mut pool = Vec::new();
++    for _ in 0..generic {
++        pool.push(ManaUnit::new(
++            ManaType::Colorless,
++            ObjectId(0),
++            false,
++            vec![],
++        ));
++    }
++    for _ in 0..blue {
++        pool.push(ManaUnit::new(ManaType::Blue, ObjectId(0), false, vec![]));
++    }
++    pool
++}
++
++fn cast_and_resolve_etb(
++    scenario: GameScenario,
++    mutineer: ObjectId,
++    prey: ObjectId,
++) -> engine::game::scenario::GameRunner {
++    let mut runner = scenario.build();
++    let card_id = runner.state().objects[&mutineer].card_id;
++
++    runner
++        .act(GameAction::CastSpell {
++            object_id: mutineer,
++            card_id,
++            targets: vec![],
++        })
++        .expect("cast Amphin Mutineer");
++
++    for _ in 0..60 {
++        match runner.state().waiting_for.clone() {
++            WaitingFor::TargetSelection { .. } | WaitingFor::TriggerTargetSelection { .. } => {
++                runner
++                    .act(GameAction::SelectTargets {
++                        targets: vec![TargetRef::Object(prey)],
++                    })
++                    .expect("select exile target");
++            }
++            WaitingFor::Priority { .. } => {
++                if runner.state().stack.is_empty() {
++                    if runner.act(GameAction::PassPriority).is_err() {
++                        break;
++                    }
++                    if runner.state().stack.is_empty()
++                        && matches!(runner.state().waiting_for, WaitingFor::Priority { .. })
++                    {
++                        break;
++                    }
++                } else if runner.act(GameAction::PassPriority).is_err() {
++                    break;
++                }
++            }
++            _ => break,
++        }
++    }
++    runner
++}
++
++#[test]
++fn amphin_mutineer_full_card_etb_has_token_sub_ability() {
++    let parsed = parse_oracle_text(
++        AMPHIN_FULL,
++        "Amphin Mutineer",
++        &["encore".to_string()],
++        &[],
++        &[],
++    );
++    let etb = parsed
++        .triggers
++        .iter()
++        .find(|t| t.mode == TriggerMode::ChangesZone)
++        .expect("ETB trigger");
++    let execute = etb.execute.as_ref().expect("execute");
++    let token_ability = execute.sub_ability.as_ref().expect("token sub_ability");
++    assert!(matches!(
++        token_ability.effect.as_ref(),
++        Effect::Token {
++            owner: TargetFilter::ParentTargetController,
++            ..
++        }
++    ));
++}
++
++/// CR 111.2: Exiling an opponent's non-Salamander creature creates a Salamander Warrior under that creature's controller.
++#[test]
++fn amphin_mutineer_etb_exile_and_token_for_target_controller() {
++    let mut scenario = GameScenario::new();
++    scenario.at_phase(Phase::PreCombatMain);
++    let mutineer = scenario
++        .add_creature_to_hand_from_oracle(P0, "Amphin Mutineer", 3, 3, AMPHIN_ETB)
++        .id();
++    let prey = scenario.add_creature(P1, "Grizzly Bear", 2, 2).id();
++    scenario.with_mana_pool(P0, floating_mana(3, 1));
++
++    let runner = cast_and_resolve_etb(scenario, mutineer, prey);
++    let state = runner.state();
++
++    assert_eq!(
++        state.objects.get(&prey).map(|o| o.zone),
++        Some(Zone::Exile),
++        "target should be exiled"
++    );
++
++    let salamander_tokens: Vec<_> = state
++        .objects
++        .values()
++        .filter(|o| {
++            o.zone == Zone::Battlefield
++                && o.controller == P1
++                && o.is_token
++                && o.power == Some(4)
++                && o.toughness == Some(3)
++                && o.card_types.subtypes.iter().any(|s| s == "Salamander")
++        })
++        .collect();
++    assert!(
++        !salamander_tokens.is_empty(),
++        "P1 should control a 4/3 Salamander Warrior token"
++    );
++}
+diff --git a/crates/engine/tests/integration/main.rs b/crates/engine/tests/integration/main.rs
+index ce628b6413..c1bf8da54e 100644
+--- a/crates/engine/tests/integration/main.rs
++++ b/crates/engine/tests/integration/main.rs
+@@ -3,6 +3,7 @@ mod abundance_optional_draw_replacement;
+ mod adapter_contract_fixtures;
+ mod advanced_reconstruction_regression;
+ mod ajani_nacatl_pariah_transform;
++mod amphin_mutineer_regression;
+ mod anaphoric_scope_allowlist_guard;
+ mod armored_kincaller_or_condition;
+ mod ashaya_nontoken_lands;

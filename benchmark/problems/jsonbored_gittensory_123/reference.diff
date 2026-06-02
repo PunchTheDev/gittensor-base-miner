@@ -1,0 +1,599 @@
+diff --git a/src/api/routes.ts b/src/api/routes.ts
+index 5b2379f..50b10c2 100644
+--- a/src/api/routes.ts
++++ b/src/api/routes.ts
+@@ -1300,6 +1300,7 @@ async function loadContributorFastContext(env: Env, login: string) {
+     pullRequests: contributorPullRequests,
+     issues: contributorIssues,
+     repoStats,
++    cachedRepoStats,
+   });
+   return {
+     login,
+diff --git a/src/mcp/server.ts b/src/mcp/server.ts
+index 940ef84..da1f938 100644
+--- a/src/mcp/server.ts
++++ b/src/mcp/server.ts
+@@ -887,6 +887,7 @@ export class GittensoryMcp {
+       pullRequests: contributorPullRequests,
+       issues: contributorIssues,
+       repoStats,
++      cachedRepoStats,
+     });
+     return {
+       profile,
+diff --git a/src/openapi/schemas.ts b/src/openapi/schemas.ts
+index 60f7f27..75dd492 100644
+--- a/src/openapi/schemas.ts
++++ b/src/openapi/schemas.ts
+@@ -945,11 +945,58 @@ export const RoleContextSchema = z
+   })
+   .openapi("RoleContext");
+ 
++const ContributorOutcomeCountsSchema = z.object({
++  pullRequests: z.number(),
++  mergedPullRequests: z.number(),
++  openPullRequests: z.number(),
++  closedPullRequests: z.number(),
++  issues: z.number(),
++  openIssues: z.number(),
++  closedIssues: z.number(),
++  solvedIssues: z.number(),
++  validSolvedIssues: z.number(),
++});
++
++const ContributorOutcomeTotalsSchema = ContributorOutcomeCountsSchema.extend({
++  closedPullRequestRate: z.number(),
++  credibility: z.number(),
++  issueCredibility: z.number(),
++});
++
++const ContributorReconciliationReportSchema = z.object({
++  login: z.string(),
++  generatedAt: z.string(),
++  source: z.enum(["gittensor_api", "github_cache"]),
++  officialAuthoritative: z.boolean(),
++  totals: z.object({
++    official: ContributorOutcomeTotalsSchema.optional(),
++    cached: ContributorOutcomeTotalsSchema,
++    effective: ContributorOutcomeTotalsSchema,
++  }),
++  repos: z.array(
++    z.object({
++      repoFullName: z.string(),
++      maintainerLane: z.boolean(),
++      official: ContributorOutcomeCountsSchema.optional(),
++      cached: ContributorOutcomeCountsSchema,
++      effective: ContributorOutcomeCountsSchema,
++      discrepancyReasons: z.array(z.string()),
++      freshness: z.object({
++        officialUpdatedAt: z.string().optional(),
++        cachedLastActivityAt: z.string().optional(),
++      }),
++    }),
++  ),
++  findings: z.array(FindingSchema),
++  summary: z.string(),
++});
++
+ export const ContributorOutcomeHistorySchema = z
+   .object({
+     login: z.string(),
+     generatedAt: z.string(),
+     source: z.enum(["gittensor_api", "github_cache"]),
++    reconciliation: ContributorReconciliationReportSchema.optional(),
+     totals: z.record(z.number()),
+     repoOutcomes: z.array(z.record(z.unknown())),
+     successPatterns: z.array(z.record(z.unknown())),
+diff --git a/src/queue/processors.ts b/src/queue/processors.ts
+index cb951d4..c762660 100644
+--- a/src/queue/processors.ts
++++ b/src/queue/processors.ts
+@@ -298,7 +298,7 @@ async function buildContributorEvidence(env: Env, login?: string): Promise<void>
+     const profile = buildContributorProfile(contributorLogin, github, contributorPullRequests, contributorIssues, repoStats, gittensorSnapshot);
+     const fit = buildContributorFit(profile, repositories, allIssues, allPullRequests, syncStates, repoStats, issueQualityByRepo);
+     const scoringProfile = buildContributorScoringProfile({ login: contributorLogin, fit, scoringSnapshot: snapshot });
+-    const outcomeHistory = buildContributorOutcomeHistory({ login: contributorLogin, profile, repositories, pullRequests: allPullRequests, issues: allIssues, repoStats });
++    const outcomeHistory = buildContributorOutcomeHistory({ login: contributorLogin, profile, repositories, pullRequests: allPullRequests, issues: allIssues, repoStats, cachedRepoStats });
+     const strategy = buildContributorStrategy({ login: contributorLogin, fit, scoringProfile, scoringSnapshot: snapshot, outcomeHistory });
+     const evidence: ContributorEvidenceRecord = {
+       login: contributorLogin,
+diff --git a/src/services/agent-orchestrator.ts b/src/services/agent-orchestrator.ts
+index ff133f4..243ecff 100644
+--- a/src/services/agent-orchestrator.ts
++++ b/src/services/agent-orchestrator.ts
+@@ -302,7 +302,7 @@ async function analyzeLocalBranch(env: Env, input: LocalBranchAnalysisInput): Pr
+     ]);
+   const repoStats = contributorRepoStatsFromGittensor(gittensorSnapshot).length > 0 ? contributorRepoStatsFromGittensor(gittensorSnapshot) : cachedRepoStats;
+   const profile = buildContributorProfile(input.login, github, contributorPullRequests, contributorIssues, repoStats, gittensorSnapshot);
+-  const outcomeHistory = buildContributorOutcomeHistory({ login: input.login, profile, repositories, pullRequests: contributorPullRequests, issues: contributorIssues, repoStats });
++  const outcomeHistory = buildContributorOutcomeHistory({ login: input.login, profile, repositories, pullRequests: contributorPullRequests, issues: contributorIssues, repoStats, cachedRepoStats });
+   const fit = buildContributorFit(profile, repositories, [], [], syncStates, repoStats);
+   const scoringProfile = buildContributorScoringProfile({ login: input.login, fit, scoringSnapshot });
+   const checkSummaries = await loadCheckSummariesForPullRequests(env, input.repoFullName, pullRequests);
+diff --git a/src/services/decision-pack.ts b/src/services/decision-pack.ts
+index dbc783f..87967ce 100644
+--- a/src/services/decision-pack.ts
++++ b/src/services/decision-pack.ts
+@@ -262,6 +262,7 @@ export async function buildAndPersistContributorDecisionPack(env: Env, login: st
+     pullRequests: contributorPullRequests,
+     issues: contributorIssues,
+     repoStats,
++    cachedRepoStats,
+   });
+   const fit = buildContributorFit(profile, repositories, [], [], syncStates, repoStats);
+   const scoringProfile = buildContributorScoringProfile({ login, fit, scoringSnapshot });
+diff --git a/src/signals/engine.ts b/src/signals/engine.ts
+index f114bd9..90ab87e 100644
+--- a/src/signals/engine.ts
++++ b/src/signals/engine.ts
+@@ -197,6 +197,7 @@ export type ContributorOutcomeHistory = {
+   login: string;
+   generatedAt: string;
+   source: ContributorProfile["source"];
++  reconciliation?: ContributorReconciliationReport | undefined;
+   totals: {
+     pullRequests: number;
+     mergedPullRequests: number;
+@@ -238,6 +239,37 @@ export type ContributorOutcomeHistory = {
+   summary: string;
+ };
+ 
++type ContributorOutcomeCounts = Pick<
++  ContributorOutcomeHistory["repoOutcomes"][number],
++  "pullRequests" | "mergedPullRequests" | "openPullRequests" | "closedPullRequests" | "issues" | "openIssues" | "closedIssues" | "solvedIssues" | "validSolvedIssues"
++>;
++
++export type ContributorReconciliationReport = {
++  login: string;
++  generatedAt: string;
++  source: ContributorProfile["source"];
++  officialAuthoritative: boolean;
++  totals: {
++    official?: ContributorOutcomeHistory["totals"] | undefined;
++    cached: ContributorOutcomeHistory["totals"];
++    effective: ContributorOutcomeHistory["totals"];
++  };
++  repos: Array<{
++    repoFullName: string;
++    maintainerLane: boolean;
++    official?: ContributorOutcomeCounts | undefined;
++    cached: ContributorOutcomeCounts;
++    effective: ContributorOutcomeCounts;
++    discrepancyReasons: string[];
++    freshness: {
++      officialUpdatedAt?: string | undefined;
++      cachedLastActivityAt?: string | undefined;
++    };
++  }>;
++  findings: SignalFinding[];
++  summary: string;
++};
++
+ export type OutcomePattern = {
+   repoFullName?: string | undefined;
+   title: string;
+@@ -1272,6 +1304,7 @@ export function buildContributorOutcomeHistory(args: {
+   pullRequests: PullRequestRecord[];
+   issues: IssueRecord[];
+   repoStats: ContributorRepoStatRecord[];
++  cachedRepoStats?: ContributorRepoStatRecord[] | undefined;
+ }): ContributorOutcomeHistory {
+   const repoByName = new Map(args.repositories.map((repo) => [repo.fullName.toLowerCase(), repo]));
+   const repoNamesByKey = new Map<string, { repoFullName: string; priority: number }>();
+@@ -1295,12 +1328,12 @@ export function buildContributorOutcomeHistory(args: {
+       const repo = repoByName.get(repoFullName.toLowerCase()) ?? null;
+       const official = officialByRepo.get(repoFullName.toLowerCase());
+       const cachedStat = statsByRepo.get(repoFullName.toLowerCase());
+-      const cachedPrs = args.pullRequests.filter((pr) => pr.repoFullName === repoFullName && sameLogin(pr.authorLogin, args.login));
+-      const cachedIssues = args.issues.filter((issue) => issue.repoFullName === repoFullName && sameLogin(issue.authorLogin, args.login));
++      const cachedPrs = args.pullRequests.filter((pr) => sameRepo(pr.repoFullName, repoFullName) && sameLogin(pr.authorLogin, args.login));
++      const cachedIssues = args.issues.filter((issue) => sameRepo(issue.repoFullName, repoFullName) && sameLogin(issue.authorLogin, args.login));
+       const pullRequests = official?.pullRequests ?? Math.max(cachedPrs.length, cachedStat?.pullRequests ?? 0);
+       const mergedPullRequests = official?.mergedPullRequests ?? Math.max(cachedPrs.filter((pr) => pr.mergedAt || pr.state === "merged").length, cachedStat?.mergedPullRequests ?? 0);
+       const openPullRequests = official?.openPullRequests ?? Math.max(cachedPrs.filter((pr) => pr.state === "open").length, cachedStat?.openPullRequests ?? 0);
+-      const closedPullRequests = official?.closedPullRequests ?? Math.max(cachedPrs.filter((pr) => pr.state === "closed").length, pullRequests - mergedPullRequests - openPullRequests, 0);
++      const closedPullRequests = official?.closedPullRequests ?? Math.max(cachedPrs.filter((pr) => pr.state === "closed" && !pr.mergedAt).length, pullRequests - mergedPullRequests - openPullRequests, 0);
+       const openIssues = official?.openIssues ?? cachedIssues.filter((issue) => issue.state === "open").length;
+       const closedIssues = official?.closedIssues ?? cachedIssues.filter((issue) => issue.state !== "open").length;
+       const solvedIssues = official?.solvedIssues ?? 0;
+@@ -1371,6 +1404,7 @@ export function buildContributorOutcomeHistory(args: {
+     login: args.login,
+     generatedAt: nowIso(),
+     source: args.profile.source,
++    reconciliation: undefined as ContributorReconciliationReport | undefined,
+     totals,
+     repoOutcomes,
+     successPatterns: [] as OutcomePattern[],
+@@ -1379,10 +1413,209 @@ export function buildContributorOutcomeHistory(args: {
+   };
+   history.successPatterns = outcomeSuccessPatterns(history);
+   history.failurePatterns = outcomeFailurePatterns(history);
++  history.reconciliation = buildContributorReconciliationReport({ ...args, history });
+   history.summary = `${args.login} has ${totals.pullRequests} official/cached PR(s), ${totals.mergedPullRequests} merged, ${totals.closedPullRequests} closed, ${totals.openPullRequests} open, and ${history.repoOutcomes.length} repo-specific outcome profile(s).`;
+   return history;
+ }
+ 
++export function buildContributorReconciliationReport(args: {
++  login: string;
++  profile: ContributorProfile;
++  repositories: RepositoryRecord[];
++  pullRequests: PullRequestRecord[];
++  issues: IssueRecord[];
++  repoStats: ContributorRepoStatRecord[];
++  cachedRepoStats?: ContributorRepoStatRecord[] | undefined;
++  history?: ContributorOutcomeHistory | undefined;
++}): ContributorReconciliationReport {
++  const cachedStats = args.cachedRepoStats ?? args.repoStats;
++  const repoNamesByKey = new Map<string, { repoFullName: string; priority: number }>();
++  const addRepoName = (repoFullName: string, priority: number) => {
++    const key = repoFullName.toLowerCase();
++    const current = repoNamesByKey.get(key);
++    if (!current || priority >= current.priority) repoNamesByKey.set(key, { repoFullName, priority });
++  };
++  for (const repoFullName of args.profile.registeredRepoActivity.reposTouched) addRepoName(repoFullName, 1);
++  for (const stat of cachedStats.filter((stat) => sameLogin(stat.login, args.login))) addRepoName(stat.repoFullName, 2);
++  for (const pr of args.pullRequests.filter((pr) => sameLogin(pr.authorLogin, args.login))) addRepoName(pr.repoFullName, 3);
++  for (const issue of args.issues.filter((issue) => sameLogin(issue.authorLogin, args.login))) addRepoName(issue.repoFullName, 3);
++  for (const repo of args.profile.gittensor?.repositories ?? []) addRepoName(repo.repoFullName, 4);
++  const officialByRepo = new Map(args.profile.gittensor?.repositories.map((repo) => [repo.repoFullName.toLowerCase(), repo]) ?? []);
++  const statByRepo = new Map(cachedStats.filter((stat) => sameLogin(stat.login, args.login)).map((stat) => [stat.repoFullName.toLowerCase(), stat]));
++  const repoByName = new Map(args.repositories.map((repo) => [repo.fullName.toLowerCase(), repo]));
++  const officialAuthoritative = Boolean(args.profile.gittensor);
++  const repos = [...repoNamesByKey.values()].map((entry) => entry.repoFullName).sort((left, right) => left.localeCompare(right)).map((repoFullName) => {
++    const key = repoFullName.toLowerCase();
++    const official = officialByRepo.get(key);
++    const cached = cachedReconciliationCounts(args.login, repoFullName, args.pullRequests, args.issues, statByRepo.get(key));
++    const officialCounts = official
++      ? {
++          pullRequests: official.pullRequests,
++          mergedPullRequests: official.mergedPullRequests,
++          openPullRequests: official.openPullRequests,
++          closedPullRequests: official.closedPullRequests,
++          issues: official.openIssues + official.closedIssues,
++          openIssues: official.openIssues,
++          closedIssues: official.closedIssues,
++          solvedIssues: official.solvedIssues,
++          validSolvedIssues: official.validSolvedIssues,
++        }
++      : undefined;
++    const repo = repoByName.get(key);
++    const [repoOwner] = repoFullName.split("/");
++    const maintainerLane =
++      sameLogin(repo?.owner, args.login) ||
++      sameLogin(repoOwner, args.login) ||
++      args.pullRequests.some((pr) => sameRepo(pr.repoFullName, repoFullName) && sameLogin(pr.authorLogin, args.login) && isMaintainerAssociation(pr.authorAssociation)) ||
++      args.issues.some((issue) => sameRepo(issue.repoFullName, repoFullName) && sameLogin(issue.authorLogin, args.login) && isMaintainerAssociation(issue.authorAssociation));
++    return {
++      repoFullName,
++      maintainerLane,
++      official: officialCounts,
++      cached,
++      effective: officialCounts ?? (officialAuthoritative ? emptyOutcomeCounts() : cached),
++      discrepancyReasons: reconciliationReasons(officialCounts, cached, maintainerLane, officialAuthoritative),
++      freshness: {
++        officialUpdatedAt: args.profile.gittensor?.updatedAt ?? args.profile.gittensor?.evaluatedAt,
++        cachedLastActivityAt: cachedLastActivityAt(args.login, repoFullName, args.pullRequests, args.issues),
++      },
++    };
++  });
++  const cachedTotals = sumReconciliationCounts(repos.map((repo) => repo.cached));
++  const officialTotals = args.profile.gittensor
++    ? {
++        pullRequests: args.profile.gittensor.totals.pullRequests,
++        mergedPullRequests: args.profile.gittensor.totals.mergedPullRequests,
++        openPullRequests: args.profile.gittensor.totals.openPullRequests,
++        closedPullRequests: args.profile.gittensor.totals.closedPullRequests,
++        closedPullRequestRate: rate(args.profile.gittensor.totals.closedPullRequests, args.profile.gittensor.totals.pullRequests),
++        issues: args.profile.gittensor.totals.openIssues + args.profile.gittensor.totals.closedIssues,
++        openIssues: args.profile.gittensor.totals.openIssues,
++        closedIssues: args.profile.gittensor.totals.closedIssues,
++        solvedIssues: args.profile.gittensor.totals.solvedIssues,
++        validSolvedIssues: args.profile.gittensor.totals.validSolvedIssues,
++        credibility: args.profile.gittensor.credibility,
++        issueCredibility: args.profile.gittensor.issueCredibility,
++      }
++    : undefined;
++  const findings: SignalFinding[] = [
++    ...(!officialTotals
++      ? [
++          {
++            code: "official_source_unavailable",
++            severity: "warning" as const,
++            title: "Official contributor totals unavailable",
++            detail: "Cached GitHub history is context only until official contributor totals are available.",
++          },
++        ]
++      : []),
++    ...repos
++      .filter((repo) => repo.maintainerLane)
++      .map((repo) => ({
++        code: "maintainer_lane_context",
++        severity: "info" as const,
++        title: "Maintainer-lane history is separated",
++        detail: `${repo.repoFullName} is maintainer-associated context and should not inflate normal contributor evidence.`,
++      })),
++  ];
++  return {
++    login: args.login,
++    generatedAt: nowIso(),
++    source: args.profile.source,
++    officialAuthoritative: Boolean(officialTotals),
++    totals: { official: officialTotals, cached: cachedTotals, effective: officialTotals ?? cachedTotals },
++    repos,
++    findings,
++    summary: `${args.login} reconciliation: ${officialTotals ? "official totals authoritative" : "cached context only"}; ${repos.length} repo(s) compared.`,
++  };
++}
++
++function cachedReconciliationCounts(
++  login: string,
++  repoFullName: string,
++  pullRequests: PullRequestRecord[],
++  issues: IssueRecord[],
++  stat?: ContributorRepoStatRecord | undefined,
++): ContributorOutcomeCounts {
++  const cachedPrs = pullRequests.filter((pr) => sameRepo(pr.repoFullName, repoFullName) && sameLogin(pr.authorLogin, login));
++  const cachedIssues = issues.filter((issue) => sameRepo(issue.repoFullName, repoFullName) && sameLogin(issue.authorLogin, login));
++  const mergedPullRequests = Math.max(cachedPrs.filter((pr) => pr.mergedAt || pr.state === "merged").length, stat?.mergedPullRequests ?? 0);
++  const openPullRequests = Math.max(cachedPrs.filter((pr) => pr.state === "open").length, stat?.openPullRequests ?? 0);
++  const pullRequestCount = Math.max(cachedPrs.length, stat?.pullRequests ?? 0);
++  const closedUnmergedPullRequests = cachedPrs.filter((pr) => pr.state === "closed" && !pr.mergedAt).length;
++  const closedPullRequests = Math.max(closedUnmergedPullRequests, pullRequestCount - mergedPullRequests - openPullRequests, 0);
++  const openIssueRows = cachedIssues.filter((issue) => issue.state === "open").length;
++  const closedIssueRows = cachedIssues.filter((issue) => issue.state !== "open").length;
++  const issueCount = Math.max(cachedIssues.length, stat?.issues ?? 0);
++  const openIssues = openIssueRows;
++  const closedIssues = Math.max(closedIssueRows, issueCount - openIssues, 0);
++  return {
++    pullRequests: pullRequestCount,
++    mergedPullRequests,
++    openPullRequests,
++    closedPullRequests,
++    issues: issueCount,
++    openIssues,
++    closedIssues,
++    solvedIssues: 0,
++    validSolvedIssues: 0,
++  };
++}
++
++function sumReconciliationCounts(counts: ContributorOutcomeCounts[]): ContributorOutcomeHistory["totals"] {
++  const summed = counts.reduce(
++    (acc, count) => ({
++      pullRequests: acc.pullRequests + count.pullRequests,
++      mergedPullRequests: acc.mergedPullRequests + count.mergedPullRequests,
++      openPullRequests: acc.openPullRequests + count.openPullRequests,
++      closedPullRequests: acc.closedPullRequests + count.closedPullRequests,
++      issues: acc.issues + count.issues,
++      openIssues: acc.openIssues + count.openIssues,
++      closedIssues: acc.closedIssues + count.closedIssues,
++      solvedIssues: acc.solvedIssues + count.solvedIssues,
++      validSolvedIssues: acc.validSolvedIssues + count.validSolvedIssues,
++    }),
++    { pullRequests: 0, mergedPullRequests: 0, openPullRequests: 0, closedPullRequests: 0, issues: 0, openIssues: 0, closedIssues: 0, solvedIssues: 0, validSolvedIssues: 0 },
++  );
++  return { ...summed, closedPullRequestRate: rate(summed.closedPullRequests, summed.pullRequests), credibility: 0, issueCredibility: 0 };
++}
++
++function emptyOutcomeCounts(): ContributorOutcomeCounts {
++  return { pullRequests: 0, mergedPullRequests: 0, openPullRequests: 0, closedPullRequests: 0, issues: 0, openIssues: 0, closedIssues: 0, solvedIssues: 0, validSolvedIssues: 0 };
++}
++
++function reconciliationReasons(official: ContributorOutcomeCounts | undefined, cached: ContributorOutcomeCounts, maintainerLane: boolean, officialAuthoritative: boolean): string[] {
++  return [
++    ...(!official && officialAuthoritative && cached.pullRequests + cached.issues > 0 ? ["Official source omits this repo; cached GitHub history is context only."] : []),
++    ...(!official && !officialAuthoritative ? ["Official source unavailable; cached GitHub history is context only."] : []),
++    ...(official && official.pullRequests !== cached.pullRequests
++      ? [`Official PR total ${official.pullRequests} differs from cached GitHub context ${cached.pullRequests}; official total is authoritative.`]
++      : []),
++    ...(official && official.mergedPullRequests !== cached.mergedPullRequests
++      ? [`Official merged PR total ${official.mergedPullRequests} differs from cached GitHub context ${cached.mergedPullRequests}; official merge data is authoritative.`]
++      : []),
++    ...(official && official.openPullRequests !== cached.openPullRequests ? ["Official open PR count differs from cached GitHub context; refresh timing or lookback windows may differ."] : []),
++    ...(official && official.closedPullRequests !== cached.closedPullRequests ? ["Official closed PR count differs from cached closed-unmerged context."] : []),
++    ...(official && official.issues !== cached.issues
++      ? [`Official issue total ${official.issues} differs from cached GitHub context ${cached.issues}; official issue data is authoritative.`]
++      : []),
++    ...(official && official.openIssues !== cached.openIssues ? ["Official open issue count differs from cached GitHub context."] : []),
++    ...(official && official.closedIssues !== cached.closedIssues ? ["Official closed issue count differs from cached GitHub context."] : []),
++    ...(official && official.solvedIssues !== cached.solvedIssues ? ["Official solved issue count differs from cached solver context."] : []),
++    ...(official && official.validSolvedIssues !== cached.validSolvedIssues ? ["Official valid-solved issue count differs from cached solver context."] : []),
++    ...(maintainerLane ? ["Maintainer-owned repo history is separated from normal contributor evidence."] : []),
++  ];
++}
++
++function cachedLastActivityAt(login: string, repoFullName: string, pullRequests: PullRequestRecord[], issues: IssueRecord[]): string | undefined {
++  return [...pullRequests, ...issues]
++    .filter((item) => sameRepo(item.repoFullName, repoFullName) && sameLogin(item.authorLogin, login))
++    .map((item) => item.updatedAt ?? item.createdAt)
++    .filter((value): value is string => Boolean(value))
++    .sort()
++    .at(-1);
++}
++
+ export function buildContributorPatternReport(history: ContributorOutcomeHistory, patternType: "success" | "failure"): ContributorPatternReport {
+   const patterns = patternType === "success" ? history.successPatterns : history.failurePatterns;
+   return {
+@@ -2541,6 +2774,10 @@ function sameLogin(value: string | null | undefined, login: string): boolean {
+   return value?.toLowerCase() === login.toLowerCase();
+ }
+ 
++function sameRepo(left: string | null | undefined, right: string | null | undefined): boolean {
++  return Boolean(left && right && left.toLowerCase() === right.toLowerCase());
++}
++
+ function topItems(items: string[], limit: number): string[] {
+   const counts = new Map<string, number>();
+   for (const item of items) counts.set(item, (counts.get(item) ?? 0) + 1);
+diff --git a/test/unit/openapi.test.ts b/test/unit/openapi.test.ts
+index ffc3e37..be0b868 100644
+--- a/test/unit/openapi.test.ts
++++ b/test/unit/openapi.test.ts
+@@ -74,6 +74,7 @@ describe("OpenAPI contract", () => {
+     expect(spec.components?.schemas?.AgentAction).toBeDefined();
+     expect(JSON.stringify(spec.components?.schemas?.ScorePreviewResult)).toContain("scenarioPreviews");
+     expect(JSON.stringify(spec.components?.schemas?.RepoIntelligence)).toContain("burdenForecastFreshness");
++    expect(JSON.stringify(spec.components?.schemas?.ContributorOutcomeHistory)).toContain("reconciliation");
+     expect(JSON.stringify(spec.components?.schemas?.LocalBranchAnalysis)).toContain("baseFreshness");
+     expect(JSON.stringify(spec.components?.schemas?.LocalBranchAnalysis)).toContain("recommendedRerunCondition");
+   });
+diff --git a/test/unit/signals-v2.test.ts b/test/unit/signals-v2.test.ts
+index 45a3850..cd0480d 100644
+--- a/test/unit/signals-v2.test.ts
++++ b/test/unit/signals-v2.test.ts
+@@ -635,6 +635,14 @@ describe("v2 signal builders", () => {
+     expect(role).toMatchObject({ role: "owner", maintainerLane: true, normalContributorEvidenceAllowed: false });
+     expect(history.repoOutcomes.filter((outcome) => outcome.repoFullName.toLowerCase() === "jsonbored/awesome-claude")).toHaveLength(1);
+     expect(history.repoOutcomes.find((outcome) => outcome.repoFullName === "jsonbored/awesome-claude")).toMatchObject({ successLevel: "maintainer_context" });
++    expect(history.reconciliation).toMatchObject({ officialAuthoritative: true, totals: { effective: { pullRequests: 63, mergedPullRequests: 46 } } });
++    expect(history.reconciliation?.repos.find((entry) => entry.repoFullName.toLowerCase() === "jsonbored/awesome-claude")).toMatchObject({
++      maintainerLane: true,
++      discrepancyReasons: expect.arrayContaining([
++        expect.stringContaining("Official PR total"),
++        expect.stringContaining("Maintainer-owned repo history"),
++      ]),
++    });
+     expect(buildContributorPatternReport(history, "failure").patterns.map((pattern) => pattern.title)).toContain("Raw issue activity is not solved discovery evidence");
+     expect(strategy.maintainerLaneRepos).toEqual(expect.arrayContaining([expect.objectContaining({ repoFullName: "jsonbored/awesome-claude" })]));
+     expect(recommendation.recommendation).toBe("maintainer_lane");
+@@ -645,6 +653,139 @@ describe("v2 signal builders", () => {
+     expect(JSON.stringify({ strategy, review })).not.toMatch(/wallet|farming|reward/i);
+   });
+ 
++  it("labels GitHub-only contributor reconciliation as context", () => {
++    const profile = buildContributorProfile("oktofeesh1", { login: "oktofeesh1", topLanguages: ["TypeScript"], source: "github" }, pullRequests, issues);
++    const history = buildContributorOutcomeHistory({
++      login: "oktofeesh1",
++      profile,
++      repositories: [repo],
++      pullRequests,
++      issues,
++      repoStats: [{ login: "oktofeesh1", repoFullName: repo.fullName, pullRequests: 2, mergedPullRequests: 1, openPullRequests: 1, issues: 1, stalePullRequests: 0, unlinkedPullRequests: 0, dominantLabels: ["feature"], lastActivityAt: "2026-05-30T00:00:00.000Z" }],
++    });
++
++    expect(history.reconciliation).toMatchObject({ officialAuthoritative: false, source: "github_cache" });
++    expect(history.reconciliation?.findings).toEqual(expect.arrayContaining([expect.objectContaining({ code: "official_source_unavailable" })]));
++    expect(history.reconciliation?.repos[0]?.discrepancyReasons).toEqual(expect.arrayContaining([expect.stringContaining("Official source unavailable")]));
++  });
++
++  it("keeps cached reconciliation stats separate from official profile counts", () => {
++    const profile = buildContributorProfile(
++      "jsonbored",
++      { login: "JSONbored", topLanguages: ["TypeScript"], source: "github" },
++      [],
++      [],
++      [
++        {
++          login: "jsonbored",
++          repoFullName: "JSONbored/awesome-claude",
++          pullRequests: 10,
++          mergedPullRequests: 8,
++          openPullRequests: 1,
++          issues: 5,
++          stalePullRequests: 0,
++          unlinkedPullRequests: 0,
++          dominantLabels: ["feature"],
++        },
++      ],
++      {
++        source: "gittensor_api",
++        githubId: "49853598",
++        githubUsername: "JSONbored",
++        isEligible: true,
++        credibility: 1,
++        eligibleRepoCount: 1,
++        issueDiscoveryScore: 0,
++        issueTokenScore: 0,
++        issueCredibility: 1,
++        isIssueEligible: true,
++        issueEligibleRepoCount: 1,
++        alphaPerDay: 0,
++        taoPerDay: 0,
++        usdPerDay: 0,
++        totals: { pullRequests: 10, mergedPullRequests: 8, openPullRequests: 1, closedPullRequests: 1, openIssues: 3, closedIssues: 2, solvedIssues: 1, validSolvedIssues: 1 },
++        repositories: [
++          {
++            repoFullName: "JSONbored/awesome-claude",
++            pullRequests: 10,
++            mergedPullRequests: 8,
++            openPullRequests: 1,
++            closedPullRequests: 1,
++            openIssues: 3,
++            closedIssues: 2,
++            solvedIssues: 1,
++            validSolvedIssues: 1,
++            isEligible: true,
++            isIssueEligible: true,
++            credibility: 1,
++            issueCredibility: 1,
++            totalScore: 10,
++            baseTotalScore: 10,
++          },
++        ],
++        pullRequests: [],
++        issueLabels: ["feature"],
++      },
++    );
++    const officialStats: ContributorRepoStatRecord[] = [
++      { login: "jsonbored", repoFullName: "JSONbored/awesome-claude", pullRequests: 10, mergedPullRequests: 8, openPullRequests: 1, issues: 5, stalePullRequests: 0, unlinkedPullRequests: 0, dominantLabels: ["feature"] },
++    ];
++    const cachedRepoStats: ContributorRepoStatRecord[] = [
++      { login: "jsonbored", repoFullName: "jsonbored/Awesome-Claude", pullRequests: 2, mergedPullRequests: 1, openPullRequests: 1, issues: 4, stalePullRequests: 0, unlinkedPullRequests: 0, dominantLabels: ["bug"] },
++      { login: "jsonbored", repoFullName: "entrius/gittensor", pullRequests: 1, mergedPullRequests: 0, openPullRequests: 1, issues: 0, stalePullRequests: 0, unlinkedPullRequests: 0, dominantLabels: ["bug"] },
++    ];
++    const history = buildContributorOutcomeHistory({
++      login: "jsonbored",
++      profile,
++      repositories: [],
++      pullRequests: [
++        { ...pullRequests[0]!, repoFullName: "JSONbored/awesome-claude", number: 1, authorLogin: "jsonbored", state: "closed", mergedAt: "2026-05-01T00:00:00.000Z" },
++        { ...pullRequests[0]!, repoFullName: "jsonbored/Awesome-Claude", number: 2, authorLogin: "jsonbored", state: "open", mergedAt: null },
++        { ...pullRequests[0]!, repoFullName: "entrius/gittensor", number: 3, authorLogin: "jsonbored", state: "open", mergedAt: null },
++      ],
++      issues: [{ ...issues[0]!, repoFullName: "JSONbored/awesome-claude", number: 3, authorLogin: "jsonbored", authorAssociation: "OWNER", state: "open" }],
++      repoStats: officialStats,
++      cachedRepoStats,
++    });
++
++    const matchingRepos = history.reconciliation?.repos.filter((entry) => entry.repoFullName.toLowerCase() === "jsonbored/awesome-claude") ?? [];
++    expect(matchingRepos).toHaveLength(1);
++    expect(matchingRepos[0]).toMatchObject({
++      maintainerLane: true,
++      official: { pullRequests: 10, mergedPullRequests: 8, openPullRequests: 1, closedPullRequests: 1, issues: 5, openIssues: 3, closedIssues: 2, solvedIssues: 1, validSolvedIssues: 1 },
++      cached: { pullRequests: 2, mergedPullRequests: 1, openPullRequests: 1, closedPullRequests: 0, issues: 4, openIssues: 1, closedIssues: 3 },
++    });
++    expect(matchingRepos[0]?.discrepancyReasons).toEqual(
++      expect.arrayContaining([
++        expect.stringContaining("Official PR total"),
++        expect.stringContaining("Official merged PR total"),
++        expect.stringContaining("Official issue total"),
++        expect.stringContaining("Official open issue count"),
++        expect.stringContaining("Official valid-solved issue count"),
++        expect.stringContaining("Maintainer-owned repo history"),
++      ]),
++    );
++    expect(history.reconciliation?.totals.cached).toMatchObject({ pullRequests: 3, mergedPullRequests: 1, openPullRequests: 2, closedPullRequests: 0, issues: 4, openIssues: 1, closedIssues: 3 });
++    expect(history.reconciliation?.repos.find((entry) => entry.repoFullName === "entrius/gittensor")).toMatchObject({
++      official: undefined,
++      cached: { pullRequests: 1, openPullRequests: 1 },
++      effective: { pullRequests: 0, openPullRequests: 0 },
++      discrepancyReasons: expect.arrayContaining([expect.stringContaining("Official source omits this repo")]),
++    });
++  });
++
++  it("uses cached issue associations for reconciliation maintainer lanes", () => {
++    const issueOnly: IssueRecord = { repoFullName: "entrius/allways", number: 88, title: "Maintainer filed issue", state: "open", authorLogin: "memberdev", authorAssociation: "MEMBER", labels: ["bug"], linkedPrs: [] };
++    const profile = buildContributorProfile("memberdev", { login: "memberdev", topLanguages: ["TypeScript"], source: "github" }, [], [issueOnly]);
++    const history = buildContributorOutcomeHistory({ login: "memberdev", profile, repositories: [], pullRequests: [], issues: [issueOnly], repoStats: [] });
++
++    expect(history.reconciliation?.repos[0]).toMatchObject({
++      repoFullName: "entrius/allways",
++      maintainerLane: true,
++      discrepancyReasons: expect.arrayContaining([expect.stringContaining("Maintainer-owned repo history")]),
++    });
++  });
++
+   it("classifies role context from GitHub associations, official activity, cache activity, and unknown state", () => {
+     const memberPr: PullRequestRecord = {
+       ...pullRequests[0]!,

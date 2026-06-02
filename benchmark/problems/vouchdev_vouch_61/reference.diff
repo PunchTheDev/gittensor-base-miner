@@ -1,0 +1,74 @@
+diff --git a/CHANGELOG.md b/CHANGELOG.md
+index 695b773..06ce3f8 100644
+--- a/CHANGELOG.md
++++ b/CHANGELOG.md
+@@ -19,6 +19,11 @@ All notable changes to vouch are documented here. Format follows
+   the same tarball. `import_apply`, `import_check`, and `export_check`
+   now validate every member path and raise on unsafe names.
+ - Fix `vouch search` CLI: assign backend label per code path so substring fallback results are no longer mislabelled as `fts5`; update stale docstring to reflect multi-backend search surface (#52).
++- `vouch crystallize` now indexes its session-summary page into FTS5 so it
++  surfaces from `vouch search` / `kb.search` / `kb.context` without a
++  `vouch index` rebuild. Previously the summary was written via
++  `store.put_page()` only, so on KBs with a populated `state.db` it was
++  silently absent from search results (#60).
+ - Bundle export uses POSIX `/` separators in `manifest.json` and tar member
+   names on every platform. Previously on Windows the manifest stored
+   `sources\<sha>\meta.yaml` while the tarball stored `sources/<sha>/meta.yaml`,
+diff --git a/src/vouch/sessions.py b/src/vouch/sessions.py
+index 5b4d635..d27d633 100644
+--- a/src/vouch/sessions.py
++++ b/src/vouch/sessions.py
+@@ -12,7 +12,7 @@
+ import uuid
+ from datetime import UTC, datetime
+ 
+-from . import audit
++from . import audit, index_db
+ from .models import Page, PageType, ProposalStatus, Session
+ from .proposals import approve
+ from .storage import KBStore
+@@ -107,6 +107,11 @@ def crystallize(
+             ],
+         )
+         store.put_page(page)
++        with index_db.open_db(store.kb_dir) as conn:
++            index_db.index_page(
++                conn, id=page.id, title=page.title, body=page.body,
++                type=page.type.value, tags=page.tags,
++            )
+         summary_page_id = page.id
+ 
+     audit.log_event(
+diff --git a/tests/test_sessions.py b/tests/test_sessions.py
+index 37f655f..18a3190 100644
+--- a/tests/test_sessions.py
++++ b/tests/test_sessions.py
+@@ -7,6 +7,7 @@
+ 
+ import pytest
+ 
++from vouch import index_db
+ from vouch import sessions as sess_mod
+ from vouch.proposals import approve, propose_claim
+ from vouch.storage import KBStore
+@@ -46,6 +47,20 @@ def test_crystallize_skips_already_approved(store: KBStore) -> None:
+     assert result["approved"] == []  # already handled
+ 
+ 
++def test_crystallize_summary_page_is_fts5_indexed(store: KBStore) -> None:
++    src = store.put_source(b"e")
++    sess = sess_mod.session_start(store, agent="claude-code")
++    propose_claim(store, text="findable claim", evidence=[src.id],
++                  proposed_by="claude-code", session_id=sess.id)
++    sess_mod.session_end(store, sess.id)
++    result = sess_mod.crystallize(store, sess.id, approver="u")
++
++    summary_id = result["summary_page_id"]
++    assert summary_id is not None
++    hits = index_db.search(store.kb_dir, sess.id, limit=10)
++    assert any(kind == "page" and hid == summary_id for kind, hid, _, _ in hits)
++
++
+ def test_crystallize_collects_approval_failures(store: KBStore) -> None:
+     src = store.put_source(b"e")
+     sess = sess_mod.session_start(store, agent="a", task="t")

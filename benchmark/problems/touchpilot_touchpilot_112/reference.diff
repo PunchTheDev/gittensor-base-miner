@@ -1,0 +1,847 @@
+diff --git a/app/src/main/java/dev/touchpilot/app/screen/ScreenContext.kt b/app/src/main/java/dev/touchpilot/app/screen/ScreenContext.kt
+index e482589..405fe4d 100644
+--- a/app/src/main/java/dev/touchpilot/app/screen/ScreenContext.kt
++++ b/app/src/main/java/dev/touchpilot/app/screen/ScreenContext.kt
+@@ -94,7 +94,14 @@ data class ScreenNode(
+      */
+     val sensitive: Boolean = false,
+     val viewIdResourceName: String? = null,
+-    val className: String? = null
++    val className: String? = null,
++    /**
++     * Raw accessibility `contentDescription` kept separate from [text] so
++     * tools like `find_element` can query and report the two independently.
++     * The builder still falls back to `contentDescription` when populating
++     * [text] so existing downstream callers continue to see a usable label.
++     */
++    val contentDescription: ScreenText? = null
+ ) {
+     fun toJson(redacted: Boolean = true): JSONObject {
+         val nodeToSerialize = if (redacted) redactedCopy() else this
+@@ -113,12 +120,14 @@ data class ScreenNode(
+             put("sensitive", nodeToSerialize.sensitive)
+             put("viewIdResourceName", nodeToSerialize.viewIdResourceName)
+             put("className", nodeToSerialize.className)
++            put("contentDescription", nodeToSerialize.contentDescription?.toJson(redacted))
+         }
+     }
+ 
+     fun redactedCopy(): ScreenNode {
+         return copy(
+-            text = text.redactedCopy()
++            text = text.redactedCopy(),
++            contentDescription = contentDescription?.redactedCopy()
+         )
+     }
+ 
+@@ -130,7 +139,7 @@ data class ScreenNode(
+             } catch (e: IllegalArgumentException) {
+                 NodeRole.OTHER
+             }
+-            
++
+             return ScreenNode(
+                 nodeId = if (json.has("nodeId") && !json.isNull("nodeId")) json.getString("nodeId") else null,
+                 role = role,
+@@ -145,7 +154,9 @@ data class ScreenNode(
+                 isInputField = json.optBoolean("isInputField", false),
+                 sensitive = json.optBoolean("sensitive", false),
+                 viewIdResourceName = if (json.has("viewIdResourceName") && !json.isNull("viewIdResourceName")) json.getString("viewIdResourceName") else null,
+-                className = if (json.has("className") && !json.isNull("className")) json.getString("className") else null
++                className = if (json.has("className") && !json.isNull("className")) json.getString("className") else null,
++                contentDescription = if (json.has("contentDescription") && !json.isNull("contentDescription"))
++                    ScreenText.fromJson(json.getJSONObject("contentDescription")) else null
+             )
+         }
+     }
+diff --git a/app/src/main/java/dev/touchpilot/app/screen/ScreenContextBuilder.kt b/app/src/main/java/dev/touchpilot/app/screen/ScreenContextBuilder.kt
+index 48c4a24..6db3d70 100644
+--- a/app/src/main/java/dev/touchpilot/app/screen/ScreenContextBuilder.kt
++++ b/app/src/main/java/dev/touchpilot/app/screen/ScreenContextBuilder.kt
+@@ -66,6 +66,7 @@ class ScreenContextBuilder(
+         val rawText = node.text?.takeIf { it.isNotBlank() }
+             ?: node.contentDescription?.takeIf { it.isNotBlank() }
+             ?: ""
++        val rawContentDescription = node.contentDescription?.takeIf { it.isNotBlank() }
+         return ScreenNode(
+             nodeId = node.nodeId,
+             role = roleFor(node),
+@@ -80,7 +81,8 @@ class ScreenContextBuilder(
+             isInputField = node.editable,
+             sensitive = node.password,
+             viewIdResourceName = node.viewIdResourceName,
+-            className = node.className
++            className = node.className,
++            contentDescription = rawContentDescription?.let { ScreenText.of(it) }
+         )
+     }
+ 
+diff --git a/app/src/main/java/dev/touchpilot/app/tools/AndroidToolExecutor.kt b/app/src/main/java/dev/touchpilot/app/tools/AndroidToolExecutor.kt
+index d57b201..bbc380f 100644
+--- a/app/src/main/java/dev/touchpilot/app/tools/AndroidToolExecutor.kt
++++ b/app/src/main/java/dev/touchpilot/app/tools/AndroidToolExecutor.kt
+@@ -27,6 +27,7 @@ class AndroidToolExecutor(
+     private val scrollResolver: ScrollResolver = ScrollResolver(targetResolver),
+     private val retryPolicy: AndroidToolRetryPolicy = AndroidToolRetryPolicy(),
+     private val verifier: ToolVerifier = ToolVerifier(),
++    private val findElementMatcher: FindElementMatcher = FindElementMatcher(),
+     private val sleeper: (Long) -> Unit = { Thread.sleep(it) }
+ ) {
+     fun execute(
+@@ -216,6 +217,9 @@ class AndroidToolExecutor(
+                     data = foregroundAppData(info)
+                 )
+             }
++            "find_element" -> {
++                executeFindElement(args)
++            }
+             "clear_text" -> {
+                 executeClearText(args)
+             }
+@@ -226,6 +230,45 @@ class AndroidToolExecutor(
+         }
+     }
+ 
++    private fun executeFindElement(args: Map<String, String>): ToolResult {
++        val query = FindElementQuery(
++            text = args["text"]?.takeIf { it.isNotBlank() },
++            contentDescription = args["content_description"]?.takeIf { it.isNotBlank() },
++            nodeId = args["node_id"]?.takeIf { it.isNotBlank() },
++            className = args["class_name"]?.takeIf { it.isNotBlank() },
++            match = MatchMode.fromWire(args["match"]) ?: MatchMode.Default,
++            limit = args["limit"]?.toIntOrNull() ?: FindElementQuery.DefaultLimit,
++        )
++        val screen = AccessibilityBridge.observeScreenContext()
++        val candidates = findElementMatcher.match(screen, query)
++        val payload = FindElementResultEncoder.encode(candidates, query)
++        val message = "find_element matched ${candidates.size} candidate(s)"
++        val logArgs = "match=\"${query.match.wireName}\", limit=${query.effectiveLimit()}, " +
++            "filters=${findElementFilterSummary(query)}"
++        record("find_element", logArgs, true, message)
++        return ToolResult(
++            ok = true,
++            message = message,
++            data = mapOf(
++                "count" to candidates.size.toString(),
++                "candidates_json" to payload,
++                "match_mode" to query.match.wireName,
++                "limit" to query.effectiveLimit().toString(),
++            )
++        )
++    }
++
++    private fun findElementFilterSummary(query: FindElementQuery): String {
++        val parts = mutableListOf<String>()
++        if (!query.text.isNullOrBlank()) parts += "text_length=${query.text.length}"
++        if (!query.contentDescription.isNullOrBlank()) {
++            parts += "content_description_length=${query.contentDescription.length}"
++        }
++        if (!query.nodeId.isNullOrBlank()) parts += "node_id=\"${query.nodeId}\""
++        if (!query.className.isNullOrBlank()) parts += "class_name=\"${query.className}\""
++        return parts.joinToString(prefix = "[", postfix = "]")
++    }
++
+     private fun executeWaitForIdle(args: Map<String, String>): ToolResult {
+         val result = WaitForIdle.waitUntilIdle(
+             args = args,
+diff --git a/app/src/main/java/dev/touchpilot/app/tools/FindElementMatcher.kt b/app/src/main/java/dev/touchpilot/app/tools/FindElementMatcher.kt
+new file mode 100644
+index 0000000..5704015
+--- /dev/null
++++ b/app/src/main/java/dev/touchpilot/app/tools/FindElementMatcher.kt
+@@ -0,0 +1,239 @@
++package dev.touchpilot.app.tools
++
++import dev.touchpilot.app.screen.ScreenContext
++import dev.touchpilot.app.screen.ScreenNode
++import dev.touchpilot.app.screen.ScreenText
++import dev.touchpilot.app.security.SensitiveTextRedactor
++import org.json.JSONArray
++import org.json.JSONObject
++
++/**
++ * Deterministic, local matcher for the `find_element` Android tool.
++ *
++ * `find_element` is a read-only lookup primitive: it inspects the current
++ * normalized [ScreenContext] and returns ranked candidate nodes that match a
++ * structured query. It does not execute any Accessibility action, so its
++ * output is safe to expose to the local router and small model as a structured
++ * alternative to parsing raw `observe_screen` output.
++ *
++ * Candidate fields preserve the same redaction and sensitivity semantics as
++ * the rest of the screen model: a node's `displaySafe` text is what we emit,
++ * a `sensitive` flag is forwarded from [ScreenNode.sensitive] / the text
++ * heuristics, and password fields stay flagged even when their label is
++ * harmless.
++ */
++class FindElementMatcher {
++
++    fun match(context: ScreenContext, query: FindElementQuery): List<FindElementCandidate> {
++        if (!query.hasAnyFilter()) return emptyList()
++        if (context.nodes.isEmpty()) return emptyList()
++
++        return context.nodes
++            .mapNotNull { node -> scoreNode(node, query) }
++            .sortedWith(
++                compareByDescending<FindElementCandidate> { it.score }
++                    .thenByDescending { it.node.clickable }
++                    .thenBy { it.node.nodeId.orEmpty() }
++            )
++            .take(query.effectiveLimit())
++    }
++
++    private fun scoreNode(node: ScreenNode, query: FindElementQuery): FindElementCandidate? {
++        var score = 0
++        val reasons = mutableListOf<String>()
++
++        if (query.nodeId != null) {
++            if (node.nodeId == query.nodeId) {
++                score += 100
++                reasons += "node_id"
++            } else {
++                return null
++            }
++        }
++
++        if (query.className != null) {
++            val nodeClass = node.className.orEmpty()
++            if (nodeClass.equals(query.className, ignoreCase = true) ||
++                nodeClass.endsWith("." + query.className, ignoreCase = true)
++            ) {
++                score += 20
++                reasons += "class_name"
++            } else {
++                return null
++            }
++        }
++
++        if (query.text != null) {
++            val textScore = scoreText(query.text, node.text.raw, query.match)
++            if (textScore <= 0) return null
++            score += textScore
++            reasons += "text_${query.match.wireName}"
++        }
++
++        if (query.contentDescription != null) {
++            val cdScore = scoreText(
++                query.contentDescription,
++                node.contentDescription?.raw.orEmpty(),
++                query.match,
++            )
++            if (cdScore <= 0) return null
++            score += cdScore
++            reasons += "content_description_${query.match.wireName}"
++        }
++
++        if (score == 0) return null
++
++        return FindElementCandidate(
++            node = node,
++            score = score,
++            matchReasons = reasons,
++        )
++    }
++
++    private fun scoreText(query: String, candidate: String, mode: MatchMode): Int {
++        if (query.isBlank() || candidate.isBlank()) return 0
++        val q = query.trim()
++        val c = candidate.trim()
++
++        if (q.equals(c, ignoreCase = true)) return 70
++
++        return when (mode) {
++            MatchMode.EXACT -> 0
++            MatchMode.CONTAINS -> if (c.contains(q, ignoreCase = true)) 50 else 0
++            MatchMode.SEMANTIC -> semanticScore(q, c)
++        }
++    }
++
++    /**
++     * Local "semantic" mode falls back to a token-set overlap. Real semantic
++     * matching requires a local model; until that's wired in, we accept exact
++     * matches, case-insensitive substring matches, and any candidate whose
++     * normalized tokens are a superset of the query tokens. This keeps the
++     * tool useful without making promises the runtime cannot keep.
++     */
++    private fun semanticScore(query: String, candidate: String): Int {
++        if (candidate.contains(query, ignoreCase = true)) return 55
++        val queryTokens = query.normalizedTokens()
++        val candidateTokens = candidate.normalizedTokens()
++        if (queryTokens.isEmpty() || candidateTokens.isEmpty()) return 0
++        return if (candidateTokens.containsAll(queryTokens)) 40 else 0
++    }
++
++    private fun String.normalizedTokens(): Set<String> {
++        return lowercase()
++            .replace(Regex("[^a-z0-9]+"), " ")
++            .trim()
++            .split(' ')
++            .filter { it.isNotBlank() }
++            .toSet()
++    }
++}
++
++enum class MatchMode(val wireName: String) {
++    EXACT("exact"),
++    CONTAINS("contains"),
++    SEMANTIC("semantic");
++
++    companion object {
++        val Default: MatchMode = CONTAINS
++
++        fun fromWire(value: String?): MatchMode? {
++            if (value.isNullOrBlank()) return Default
++            return values().firstOrNull { it.wireName.equals(value, ignoreCase = true) }
++        }
++    }
++}
++
++data class FindElementQuery(
++    val text: String? = null,
++    val contentDescription: String? = null,
++    val nodeId: String? = null,
++    val className: String? = null,
++    val match: MatchMode = MatchMode.Default,
++    val limit: Int = DefaultLimit,
++) {
++    fun hasAnyFilter(): Boolean {
++        return !text.isNullOrBlank() ||
++            !contentDescription.isNullOrBlank() ||
++            !nodeId.isNullOrBlank() ||
++            !className.isNullOrBlank()
++    }
++
++    fun effectiveLimit(): Int = limit.coerceIn(1, MaxLimit)
++
++    companion object {
++        const val DefaultLimit: Int = 5
++        const val MaxLimit: Int = 25
++    }
++}
++
++data class FindElementCandidate(
++    val node: ScreenNode,
++    val score: Int,
++    val matchReasons: List<String>,
++) {
++    /**
++     * Redacted, display-safe JSON view of this candidate. `text` and
++     * `content_description` always use the `displaySafe` form so the tool
++     * output is safe to log, trace, and surface to the local model.
++     */
++    fun toRedactedJson(): JSONObject {
++        val sensitiveFlag = node.sensitive || node.text.isSensitive ||
++            (node.contentDescription?.isSensitive == true)
++        return JSONObject().apply {
++            putOrNull("node_id", node.nodeId)
++            putOrNull("class_name", node.className)
++            putOrNull("view_id", node.viewIdResourceName)
++            put("role", node.role.name)
++            put("text", node.text.displayJson())
++            put("content_description", node.contentDescription?.displayJson() ?: JSONObject.NULL)
++            put("bounds", node.bounds.toJson())
++            put("enabled", node.enabled)
++            put("clickable", node.clickable)
++            put("long_clickable", node.longClickable)
++            put("scrollable", node.scrollable)
++            put("focused", node.focused)
++            put("is_input_field", node.isInputField)
++            put("sensitive", sensitiveFlag)
++            put("score", score)
++            put("match_reasons", JSONArray(matchReasons))
++        }
++    }
++
++    private fun ScreenText.displayJson(): JSONObject = JSONObject().apply {
++        put("displaySafe", displaySafe)
++        put("isSensitive", isSensitive)
++    }
++
++    private fun JSONObject.putOrNull(key: String, value: String?) {
++        if (value.isNullOrEmpty()) put(key, JSONObject.NULL) else put(key, value)
++    }
++}
++
++/**
++ * Serializes the candidate list for the `find_element` tool result. The
++ * top-level payload is always redacted; raw text never leaves the matcher.
++ */
++object FindElementResultEncoder {
++    fun encode(
++        candidates: List<FindElementCandidate>,
++        query: FindElementQuery,
++    ): String {
++        val payload = JSONObject().apply {
++            put("query", JSONObject().apply {
++                put("text", SensitiveTextRedactor.redact(query.text.orEmpty()))
++                put("content_description", SensitiveTextRedactor.redact(query.contentDescription.orEmpty()))
++                put("node_id", query.nodeId.orEmpty())
++                put("class_name", query.className.orEmpty())
++                put("match", query.match.wireName)
++                put("limit", query.effectiveLimit())
++            })
++            put("count", candidates.size)
++            put("candidates", JSONArray().apply {
++                candidates.forEach { put(it.toRedactedJson()) }
++            })
++        }
++        return payload.toString()
++    }
++}
++
+diff --git a/app/src/main/java/dev/touchpilot/app/tools/RetryPolicy.kt b/app/src/main/java/dev/touchpilot/app/tools/RetryPolicy.kt
+index d8f6882..09ddfd3 100644
+--- a/app/src/main/java/dev/touchpilot/app/tools/RetryPolicy.kt
++++ b/app/src/main/java/dev/touchpilot/app/tools/RetryPolicy.kt
+@@ -96,6 +96,7 @@ class AndroidToolRetryPolicy(
+                 "wait_for_app" to ToolRetryConfig(maxAttempts = 1, retryable = false),
+                 "focus_input" to action,
+                 "get_foreground_app" to ToolRetryConfig(maxAttempts = 1, retryable = false),
++                "find_element" to ToolRetryConfig(maxAttempts = 1, retryable = false),
+                 // Single attempt only. The tool flips the IME show mode via
+                 // softKeyboardController, which is idempotent and has no
+                 // navigation hazard, but retrying would still spend extra
+diff --git a/app/src/main/java/dev/touchpilot/app/tools/ToolModels.kt b/app/src/main/java/dev/touchpilot/app/tools/ToolModels.kt
+index 6d0c575..0ffe508 100644
+--- a/app/src/main/java/dev/touchpilot/app/tools/ToolModels.kt
++++ b/app/src/main/java/dev/touchpilot/app/tools/ToolModels.kt
+@@ -140,6 +140,20 @@ object AndroidToolCatalog {
+             risk = ToolRisk.LOW,
+             arguments = emptyMap()
+         ),
++        ToolSpec(
++            name = "find_element",
++            description = "Search the current screen for elements matching a structured query and return ranked candidates.",
++            risk = ToolRisk.LOW,
++            arguments = mapOf(
++                "text" to "Visible text query.",
++                "content_description" to "Accessibility content description query.",
++                "node_id" to "Stable node_id from observe_screen.",
++                "class_name" to "Android class name filter (e.g. android.widget.Button).",
++                "match" to "Match mode: exact, contains, or semantic. Defaults to contains.",
++                "limit" to "Maximum number of candidates to return (1-25). Defaults to 5."
++            ),
++            requiredArguments = emptySet()
++        ),
+         ToolSpec(
+             name = "clear_text",
+             description = "Clear the focused or resolved editable input field.",
+@@ -252,6 +266,25 @@ object AndroidToolCatalog {
+             }
+         }
+ 
++        if (name == "find_element") {
++            val filters = listOf("text", "content_description", "node_id", "class_name")
++                .filter { args[it].isNullOrBlank().not() }
++            if (filters.isEmpty()) {
++                return "find_element requires at least one filter: text, content_description, node_id, or class_name"
++            }
++            val match = args["match"]
++            if (!match.isNullOrBlank() && MatchMode.fromWire(match) == null) {
++                return "find_element match must be one of: exact, contains, semantic"
++            }
++            val limit = args["limit"]
++            if (!limit.isNullOrBlank()) {
++                val parsed = limit.toIntOrNull()
++                if (parsed == null || parsed < 1 || parsed > FindElementQuery.MaxLimit) {
++                    return "find_element limit must be an integer between 1 and ${FindElementQuery.MaxLimit}"
++                }
++            }
++        }
++
+         val timeout = args["timeout_ms"]
+         if (timeout != null && timeout.toLongOrNull() == null) {
+             return "timeout_ms must be a number"
+diff --git a/app/src/main/java/dev/touchpilot/app/tools/ToolVerification.kt b/app/src/main/java/dev/touchpilot/app/tools/ToolVerification.kt
+index 065a178..1760677 100644
+--- a/app/src/main/java/dev/touchpilot/app/tools/ToolVerification.kt
++++ b/app/src/main/java/dev/touchpilot/app/tools/ToolVerification.kt
+@@ -49,6 +49,13 @@ class ToolVerifier {
+                     "package_name" to (result.data["package_name"] ?: ""),
+                 )
+             )
++            "find_element" -> ToolVerificationResult.Passed(
++                reason = "find_element is a read-only lookup",
++                data = mapOf(
++                    "count" to (result.data["count"] ?: "0"),
++                    "match_mode" to (result.data["match_mode"] ?: ""),
++                )
++            )
+             "clear_text" -> verifyClearText(after)
+             "dismiss_keyboard" -> verifyDismissKeyboard(result)
+             else -> ToolVerificationResult.Skipped("no verifier for $toolName")
+diff --git a/app/src/test/java/dev/touchpilot/app/tools/FindElementCatalogTest.kt b/app/src/test/java/dev/touchpilot/app/tools/FindElementCatalogTest.kt
+new file mode 100644
+index 0000000..acf1878
+--- /dev/null
++++ b/app/src/test/java/dev/touchpilot/app/tools/FindElementCatalogTest.kt
+@@ -0,0 +1,131 @@
++package dev.touchpilot.app.tools
++
++import kotlin.test.Test
++import kotlin.test.assertContains
++import kotlin.test.assertEquals
++import kotlin.test.assertNotNull
++import kotlin.test.assertNull
++import kotlin.test.assertTrue
++
++class FindElementCatalogTest {
++    @Test
++    fun findElementIsRegisteredAsLowRisk() {
++        val spec = assertNotNull(AndroidToolCatalog.find("find_element"))
++        assertEquals(ToolRisk.LOW, spec.risk)
++        assertTrue(spec.requiredArguments.isEmpty())
++    }
++
++    @Test
++    fun findElementAdvertisesEveryQueryArgument() {
++        val spec = AndroidToolCatalog.find("find_element")!!
++        listOf("text", "content_description", "node_id", "class_name", "match", "limit")
++            .forEach { arg ->
++                assertTrue(spec.arguments.containsKey(arg), "missing arg: $arg")
++            }
++    }
++
++    @Test
++    fun validationAcceptsTextFilter() {
++        assertNull(AndroidToolCatalog.validate("find_element", mapOf("text" to "Settings")))
++    }
++
++    @Test
++    fun validationAcceptsContentDescriptionFilter() {
++        assertNull(AndroidToolCatalog.validate("find_element", mapOf("content_description" to "Open menu")))
++    }
++
++    @Test
++    fun validationAcceptsNodeIdFilter() {
++        assertNull(AndroidToolCatalog.validate("find_element", mapOf("node_id" to "0.1.2")))
++    }
++
++    @Test
++    fun validationAcceptsClassNameFilter() {
++        assertNull(AndroidToolCatalog.validate("find_element", mapOf("class_name" to "android.widget.Button")))
++    }
++
++    @Test
++    fun validationAcceptsExplicitMatchModes() {
++        listOf("exact", "contains", "semantic").forEach { mode ->
++            assertNull(
++                AndroidToolCatalog.validate(
++                    "find_element",
++                    mapOf("text" to "Save", "match" to mode)
++                ),
++                "match=$mode should validate"
++            )
++        }
++    }
++
++    @Test
++    fun validationAcceptsLimitAtBoundaries() {
++        assertNull(AndroidToolCatalog.validate("find_element", mapOf("text" to "Save", "limit" to "1")))
++        assertNull(AndroidToolCatalog.validate("find_element", mapOf("text" to "Save", "limit" to "25")))
++    }
++
++    @Test
++    fun validationRejectsNoFilter() {
++        val error = AndroidToolCatalog.validate("find_element", emptyMap())
++        assertNotNull(error)
++        assertContains(error, "at least one filter")
++    }
++
++    @Test
++    fun validationRejectsBlankFilters() {
++        val error = AndroidToolCatalog.validate(
++            "find_element",
++            mapOf("text" to "  ", "content_description" to "")
++        )
++        assertNotNull(error)
++        assertContains(error, "at least one filter")
++    }
++
++    @Test
++    fun validationRejectsUnknownMatchMode() {
++        val error = AndroidToolCatalog.validate(
++            "find_element",
++            mapOf("text" to "Settings", "match" to "fuzzy")
++        )
++        assertNotNull(error)
++        assertContains(error, "match must be one of")
++    }
++
++    @Test
++    fun validationRejectsOutOfRangeLimit() {
++        val tooLow = AndroidToolCatalog.validate(
++            "find_element",
++            mapOf("text" to "Save", "limit" to "0")
++        )
++        val tooHigh = AndroidToolCatalog.validate(
++            "find_element",
++            mapOf("text" to "Save", "limit" to "100")
++        )
++        val notNumber = AndroidToolCatalog.validate(
++            "find_element",
++            mapOf("text" to "Save", "limit" to "lots")
++        )
++        assertNotNull(tooLow)
++        assertNotNull(tooHigh)
++        assertNotNull(notNumber)
++        assertContains(tooLow, "limit must be an integer")
++        assertContains(tooHigh, "limit must be an integer")
++        assertContains(notNumber, "limit must be an integer")
++    }
++
++    @Test
++    fun validationRejectsUnknownArgs() {
++        val error = AndroidToolCatalog.validate(
++            "find_element",
++            mapOf("text" to "Settings", "extra" to "nope")
++        )
++        assertNotNull(error)
++        assertContains(error, "Unknown argument")
++    }
++
++    @Test
++    fun retryPolicyTreatsFindElementAsReadOnly() {
++        val config = AndroidToolRetryPolicy().configFor("find_element")
++        assertEquals(1, config.maxAttempts)
++        assertEquals(false, config.retryable)
++    }
++}
+diff --git a/app/src/test/java/dev/touchpilot/app/tools/FindElementMatcherTest.kt b/app/src/test/java/dev/touchpilot/app/tools/FindElementMatcherTest.kt
+new file mode 100644
+index 0000000..fb42235
+--- /dev/null
++++ b/app/src/test/java/dev/touchpilot/app/tools/FindElementMatcherTest.kt
+@@ -0,0 +1,232 @@
++package dev.touchpilot.app.tools
++
++import dev.touchpilot.app.screen.NodeBounds
++import dev.touchpilot.app.screen.NodeRole
++import dev.touchpilot.app.screen.ScreenContext
++import dev.touchpilot.app.screen.ScreenNode
++import dev.touchpilot.app.screen.ScreenText
++import org.json.JSONObject
++import kotlin.test.Test
++import kotlin.test.assertEquals
++import kotlin.test.assertFalse
++import kotlin.test.assertTrue
++
++class FindElementMatcherTest {
++    private val matcher = FindElementMatcher()
++
++    @Test
++    fun emptyQueryReturnsNothing() {
++        val ctx = context(
++            node("a", text = "Settings", clickable = true)
++        )
++        val candidates = matcher.match(ctx, FindElementQuery())
++        assertTrue(candidates.isEmpty())
++    }
++
++    @Test
++    fun exactMatchOnlyAcceptsFullStringEqualityCaseInsensitive() {
++        val ctx = context(
++            node("a", text = "Settings"),
++            node("b", text = "Open Settings"),
++        )
++        val exact = matcher.match(ctx, FindElementQuery(text = "settings", match = MatchMode.EXACT))
++        assertEquals(listOf("a"), exact.nodeIds())
++    }
++
++    @Test
++    fun containsMatchAcceptsSubstrings() {
++        val ctx = context(
++            node("a", text = "Settings"),
++            node("b", text = "Open Settings"),
++            node("c", text = "Notifications"),
++        )
++        val contains = matcher.match(ctx, FindElementQuery(text = "set", match = MatchMode.CONTAINS))
++        assertEquals(setOf("a", "b"), contains.nodeIds().toSet())
++    }
++
++    @Test
++    fun semanticMatchAcceptsTokenSupersets() {
++        val ctx = context(
++            node("a", text = "Open Wi-Fi settings"),
++            node("b", text = "Save changes"),
++            node("c", text = "settings open"),
++        )
++        val semantic = matcher.match(
++            ctx,
++            FindElementQuery(text = "open settings", match = MatchMode.SEMANTIC)
++        )
++        assertEquals(setOf("a", "c"), semantic.nodeIds().toSet())
++        assertFalse(semantic.nodeIds().contains("b"))
++    }
++
++    @Test
++    fun limitClampsCandidateCount() {
++        val ctx = context(
++            *(1..10).map { node("n$it", text = "Item $it Settings") }.toTypedArray()
++        )
++        val limited = matcher.match(
++            ctx,
++            FindElementQuery(text = "Settings", match = MatchMode.CONTAINS, limit = 3)
++        )
++        assertEquals(3, limited.size)
++    }
++
++    @Test
++    fun limitDefaultsToFiveWhenUnspecified() {
++        val ctx = context(
++            *(1..8).map { node("n$it", text = "Settings $it") }.toTypedArray()
++        )
++        val results = matcher.match(
++            ctx,
++            FindElementQuery(text = "Settings", match = MatchMode.CONTAINS)
++        )
++        assertEquals(FindElementQuery.DefaultLimit, results.size)
++    }
++
++    @Test
++    fun limitIsClampedToMaxAllowedValue() {
++        val ctx = context(
++            *(1..30).map { node("n$it", text = "Settings $it") }.toTypedArray()
++        )
++        val results = matcher.match(
++            ctx,
++            FindElementQuery(text = "Settings", match = MatchMode.CONTAINS, limit = 999)
++        )
++        assertEquals(FindElementQuery.MaxLimit, results.size)
++    }
++
++    @Test
++    fun nodeIdFilterMatchesOnlyExactNodeId() {
++        val ctx = context(
++            node("0.1", text = "First"),
++            node("0.2", text = "Second"),
++        )
++        val results = matcher.match(ctx, FindElementQuery(nodeId = "0.2"))
++        assertEquals(listOf("0.2"), results.nodeIds())
++    }
++
++    @Test
++    fun classNameFilterMatchesShortAndFullyQualifiedNames() {
++        val ctx = context(
++            node("a", text = "Open", className = "android.widget.Button"),
++            node("b", text = "Open", className = "android.widget.TextView"),
++        )
++        val short = matcher.match(ctx, FindElementQuery(className = "Button"))
++        val full = matcher.match(ctx, FindElementQuery(className = "android.widget.Button"))
++        assertEquals(listOf("a"), short.nodeIds())
++        assertEquals(listOf("a"), full.nodeIds())
++    }
++
++    @Test
++    fun contentDescriptionFilterMatchesIndependentlyOfText() {
++        val ctx = context(
++            node("a", text = "", contentDescription = "Compose new email", clickable = true),
++            node("b", text = "Compose", clickable = true),
++        )
++        val results = matcher.match(
++            ctx,
++            FindElementQuery(contentDescription = "compose", match = MatchMode.CONTAINS)
++        )
++        assertEquals(listOf("a"), results.nodeIds())
++    }
++
++    @Test
++    fun candidateJsonExposesDisplaySafeTextAndRedactsSensitiveLabels() {
++        val ctx = context(
++            node("pw", text = "password: hunter2", isInputField = true, sensitive = true)
++        )
++        val results = matcher.match(
++            ctx,
++            FindElementQuery(text = "password", match = MatchMode.CONTAINS)
++        )
++        assertEquals(1, results.size)
++        val json = results.first().toRedactedJson()
++        val textJson = json.getJSONObject("text")
++        assertEquals("[REDACTED]", textJson.getString("displaySafe"))
++        assertTrue(textJson.getBoolean("isSensitive"))
++        assertTrue(json.getBoolean("sensitive"))
++        val rendered = json.toString()
++        assertFalse(rendered.contains("hunter2"), "raw sensitive text leaked: $rendered")
++    }
++
++    @Test
++    fun encodedPayloadRedactsSensitiveQueryAndCandidateText() {
++        val ctx = context(
++            node("pw", text = "password: hunter2", isInputField = true, sensitive = true)
++        )
++        val query = FindElementQuery(text = "password: hunter2", match = MatchMode.CONTAINS)
++        val results = matcher.match(ctx, query)
++        val payload = FindElementResultEncoder.encode(results, query)
++        assertFalse(payload.contains("hunter2"), "raw secret leaked into payload: $payload")
++        val parsed = JSONObject(payload)
++        assertEquals(1, parsed.getInt("count"))
++        assertEquals("contains", parsed.getJSONObject("query").getString("match"))
++    }
++
++    @Test
++    fun matchReasonsRecordTheModeThatMatched() {
++        val ctx = context(node("a", text = "Open Settings", clickable = true))
++        val results = matcher.match(
++            ctx,
++            FindElementQuery(text = "open", match = MatchMode.CONTAINS)
++        )
++        assertEquals(1, results.size)
++        assertTrue(results.first().matchReasons.contains("text_contains"))
++    }
++
++    @Test
++    fun clickableCandidatesRankAboveNonClickableOnTies() {
++        val ctx = context(
++            node("text", text = "Settings", clickable = false),
++            node("button", text = "Settings", clickable = true),
++        )
++        val results = matcher.match(
++            ctx,
++            FindElementQuery(text = "Settings", match = MatchMode.EXACT)
++        )
++        assertEquals(listOf("button", "text"), results.nodeIds())
++    }
++
++    @Test
++    fun matchModeFromWireFallsBackToContainsWhenBlank() {
++        assertEquals(MatchMode.CONTAINS, MatchMode.fromWire(null))
++        assertEquals(MatchMode.CONTAINS, MatchMode.fromWire(""))
++        assertEquals(MatchMode.EXACT, MatchMode.fromWire("exact"))
++        assertEquals(MatchMode.SEMANTIC, MatchMode.fromWire("SEMANTIC"))
++    }
++
++    private fun List<FindElementCandidate>.nodeIds(): List<String> =
++        mapNotNull { it.node.nodeId }
++
++    private fun context(vararg nodes: ScreenNode): ScreenContext {
++        return ScreenContext(
++            appLabel = "Test",
++            packageName = "dev.test",
++            windowTitle = "Test",
++            nodes = nodes.toList()
++        )
++    }
++
++    private fun node(
++        id: String,
++        text: String = "",
++        contentDescription: String? = null,
++        className: String? = null,
++        clickable: Boolean = false,
++        isInputField: Boolean = false,
++        sensitive: Boolean = false,
++        role: NodeRole = NodeRole.OTHER,
++    ): ScreenNode {
++        return ScreenNode(
++            nodeId = id,
++            role = role,
++            text = ScreenText.of(text),
++            bounds = NodeBounds(left = 0, top = 0, right = 100, bottom = 50),
++            clickable = clickable,
++            isInputField = isInputField,
++            sensitive = sensitive,
++            className = className,
++            contentDescription = contentDescription?.let { ScreenText.of(it) }
++        )
++    }
++}

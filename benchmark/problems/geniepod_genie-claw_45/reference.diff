@@ -1,0 +1,1207 @@
+diff --git a/CHANGELOG.md b/CHANGELOG.md
+index eb328c1..5e99001 100644
+--- a/CHANGELOG.md
++++ b/CHANGELOG.md
+@@ -15,6 +15,45 @@
+   consumer halves via `Arc<TtsEngine>`. The first-reply latency banner
+   (#19) now reports the true LLM-until-first-sentence figure instead
+   of the full-response figure.
++- **Voice-cycle integration test + mockable surface** (#21). Extracts
++  `voice_loop::process_transcript` from `voice_cycle` so the
++  post-record orchestration (intent gate, speaker identity, memory
++  recall, quick-tool fast path, LLM streaming + TTS, tool dispatch,
++  conversation persistence, latency banner, memory extract) can be
++  driven end-to-end with mocks. Adds `LlmClient::mock(replies)` (new
++  `MockLlmBackend` implementation of the existing `LlmBackendClient`
++  trait, replays scripted replies on both `chat` and `chat_stream`,
++  optional `with_fallback("…")`), `SttEngine::mock(transcripts)` (new
++  `SttMode::Mock` variant with a `MockTranscript` queue;
++  `transcribe_file` pops the next scripted transcript), and
++  `TtsEngine::silent()` (new `TtsMode::Silent` variant; `speak`,
++  `synthesize`, `synthesize_to_file`, `start`, and `stop` all no-op).
++  `TtsEngine::snapshot()` returns a config-only copy so a borrowed
++  `&TtsEngine` can be wrapped in `Arc<TtsEngine>` for
++  `streaming::stream_and_speak`. New integration test at
++  `crates/genie-core/tests/voice_loop_integration.rs` drives
++  `process_transcript` with these mocks and asserts on transcript
++  flow, the conversation store, and the dispatcher's tool-audit
++  JSONL.
++- **Parallel-safe SQLite test paths** (#21). The memory test helper
++  now gives every test a `${tmpdir}/geniepod-mem-${label}-${pid}-${id}-${nanos}/`
++  parent directory; the DB lives at `<dir>/memory.db` and
++  `Memory::open` derives `canonical_dir = <dir>/memory`, so the
++  markdown promotion pipeline (`MEMORY.md`, `namespaces/*/preference.md`,
++  `events/*.jsonl`) is per-test instead of shared. Fixes the
++  `promotion_redacts_person_memory_in_namespace_note` flake the
++  issue calls out. The two bespoke-path memory tests
++  (`evergreen_memories_dont_decay`,
++  `open_backfills_policy_columns_for_existing_rows`) flow through
++  the same `temp_memory_path("label")` helper.
++- **`tools::parser` Linux-only test gate** (#21). The
++  `try_tool_call_executes_single_key_system_info_shape` test asserts
++  the rendered `system_info` tool output contains `Memory available:`,
++  which the production tool only emits on Linux (the line comes from
++  `tegrastats::mem_available_mb()` reading `/proc/meminfo`). Gated
++  behind `#[cfg(target_os = "linux")]` so macOS CI no longer flags a
++  false negative.
++
+ ### Changed
+ 
+ - `deploy/scripts/genie-restart-all.sh` rewritten as a full hard-reset:
+diff --git a/crates/genie-core/src/llm/mock.rs b/crates/genie-core/src/llm/mock.rs
+new file mode 100644
+index 0000000..c81145d
+--- /dev/null
++++ b/crates/genie-core/src/llm/mock.rs
+@@ -0,0 +1,153 @@
++//! In-memory `LlmBackendClient` for tests. Issue #21, IS-2.
++//!
++//! Implements the same `LlmBackendClient` trait the real backends do
++//! (llama.cpp, genie-ai-runtime) so anywhere `LlmClient` is consumed the
++//! mock can be dropped in. Lets `tests/voice_loop_integration.rs` exercise
++//! the LLM-driven part of the voice cycle without a live model server.
++//!
++//! The mock is deliberately tiny — it does NOT try to be a smart fixture:
++//! it returns the next scripted reply on each call, streams it token by
++//! token if `chat_stream` is invoked, and reports healthy.
++
++use anyhow::{Result, bail};
++use async_trait::async_trait;
++use std::sync::Mutex;
++
++use super::{LlmBackendClient, Message, ResponseFormat};
++
++/// Scripted-reply LLM backend.
++///
++/// Construct with a queue of replies; each call to `chat_with_format` or
++/// `chat_stream` consumes the next reply in order. When the queue is empty
++/// the backend returns the configured fallback (`Result::Err` by default,
++/// or a fixed string if set via [`MockLlmBackend::with_fallback`]).
++pub struct MockLlmBackend {
++    replies: Mutex<Vec<String>>,
++    fallback: Option<String>,
++    backend_name: String,
++}
++
++impl MockLlmBackend {
++    /// New mock that will replay `replies` in order. After the last reply
++    /// is consumed, further calls return `Err`.
++    pub fn new<I, S>(replies: I) -> Self
++    where
++        I: IntoIterator<Item = S>,
++        S: Into<String>,
++    {
++        let mut q: Vec<String> = replies.into_iter().map(Into::into).collect();
++        q.reverse(); // pop from the back so we yield in insertion order
++        Self {
++            replies: Mutex::new(q),
++            fallback: None,
++            backend_name: "mock".into(),
++        }
++    }
++
++    /// Configure a fallback reply used once the scripted queue is exhausted.
++    /// Useful when a test wants the mock to "keep talking" rather than fail.
++    pub fn with_fallback(mut self, fallback: impl Into<String>) -> Self {
++        self.fallback = Some(fallback.into());
++        self
++    }
++
++    fn next_reply(&self) -> Result<String> {
++        let mut q = self.replies.lock().expect("mock LLM reply queue poisoned");
++        if let Some(reply) = q.pop() {
++            Ok(reply)
++        } else if let Some(fallback) = &self.fallback {
++            Ok(fallback.clone())
++        } else {
++            bail!("MockLlmBackend reply queue exhausted");
++        }
++    }
++}
++
++#[async_trait]
++impl LlmBackendClient for MockLlmBackend {
++    fn backend_name(&self) -> &str {
++        &self.backend_name
++    }
++
++    async fn health(&self) -> bool {
++        true
++    }
++
++    async fn chat_with_format(
++        &self,
++        _messages: &[Message],
++        _max_tokens: Option<u32>,
++        _response_format: Option<ResponseFormat>,
++    ) -> Result<String> {
++        self.next_reply()
++    }
++
++    async fn chat_stream(
++        &self,
++        _messages: &[Message],
++        _max_tokens: Option<u32>,
++        on_token: &mut (dyn for<'a> FnMut(&'a str) + Send),
++    ) -> Result<String> {
++        let reply = self.next_reply()?;
++        // Stream word-by-word so callers see the streaming code path.
++        for token in reply.split_inclusive(' ') {
++            on_token(token);
++        }
++        Ok(reply)
++    }
++}
++
++#[cfg(test)]
++mod tests {
++    use super::*;
++
++    #[tokio::test]
++    async fn returns_scripted_replies_in_order() {
++        let mock = MockLlmBackend::new(["first", "second"]);
++        assert_eq!(
++            mock.chat_with_format(&[], None, None).await.unwrap(),
++            "first"
++        );
++        assert_eq!(
++            mock.chat_with_format(&[], None, None).await.unwrap(),
++            "second"
++        );
++        assert!(mock.chat_with_format(&[], None, None).await.is_err());
++    }
++
++    #[tokio::test]
++    async fn fallback_kicks_in_after_exhaustion() {
++        let mock = MockLlmBackend::new(["only"]).with_fallback("filler");
++        assert_eq!(
++            mock.chat_with_format(&[], None, None).await.unwrap(),
++            "only"
++        );
++        assert_eq!(
++            mock.chat_with_format(&[], None, None).await.unwrap(),
++            "filler"
++        );
++        assert_eq!(
++            mock.chat_with_format(&[], None, None).await.unwrap(),
++            "filler"
++        );
++    }
++
++    #[tokio::test]
++    async fn stream_emits_tokens_and_returns_full_reply() {
++        let mock = MockLlmBackend::new(["hello there friend"]);
++        let mut seen = String::new();
++        let full = mock
++            .chat_stream(&[], None, &mut |tok| seen.push_str(tok))
++            .await
++            .unwrap();
++        assert_eq!(full, "hello there friend");
++        assert_eq!(seen, "hello there friend");
++    }
++
++    #[tokio::test]
++    async fn backend_name_is_mock_and_health_is_true() {
++        let mock = MockLlmBackend::new(Vec::<String>::new());
++        assert_eq!(mock.backend_name(), "mock");
++        assert!(mock.health().await);
++    }
++}
+diff --git a/crates/genie-core/src/llm/mod.rs b/crates/genie-core/src/llm/mod.rs
+index bbc4fa0..869e253 100644
+--- a/crates/genie-core/src/llm/mod.rs
++++ b/crates/genie-core/src/llm/mod.rs
+@@ -1,5 +1,6 @@
+ mod genie_ai_runtime;
+ mod llama_cpp;
++mod mock;
+ mod openai_compat;
+ mod retry;
+ 
+@@ -9,6 +10,7 @@ use genie_common::config::{LlmBackendKind, ServiceEndpoint};
+ 
+ pub use genie_ai_runtime::GenieAiRuntimeBackend;
+ pub use llama_cpp::LlamaCppBackend;
++pub use mock::MockLlmBackend;
+ pub use openai_compat::{Message, ResponseFormat};
+ #[allow(unused_imports)]
+ pub use retry::RetryLlmClient;
+@@ -82,6 +84,18 @@ impl LlmClient {
+         }
+     }
+ 
++    /// Construct an in-memory LLM client that replays the given scripted
++    /// replies in order. Used by `tests/voice_loop_integration.rs` (issue #21).
++    pub fn mock<I, S>(replies: I) -> Self
++    where
++        I: IntoIterator<Item = S>,
++        S: Into<String>,
++    {
++        Self {
++            backend: Box::new(MockLlmBackend::new(replies)),
++        }
++    }
++
+     pub fn backend_name(&self) -> &str {
+         self.backend.backend_name()
+     }
+diff --git a/crates/genie-core/src/memory/mod.rs b/crates/genie-core/src/memory/mod.rs
+index 4b9f888..8f9a665 100644
+--- a/crates/genie-core/src/memory/mod.rs
++++ b/crates/genie-core/src/memory/mod.rs
+@@ -1419,30 +1419,39 @@ mod tests {
+     use super::*;
+ 
+     use std::sync::atomic::{AtomicU32, Ordering};
++    use std::time::{SystemTime, UNIX_EPOCH};
+     static TEST_COUNTER: AtomicU32 = AtomicU32::new(0);
+ 
+-    // Each test gets its own subdirectory so the canonical memory layout
+-    // (`memory/`, `namespaces/`, `events/`) doesn't collide across parallel
+-    // tests. `rebuild_root_memory_file` does `remove_dir_all` on `namespaces/`
+-    // before rewriting it; sharing one dir caused tests to race-wipe each
+-    // other's files when run with multiple test threads.
+-    fn temp_memory() -> Memory {
+-        Memory::open(&temp_memory_path("test")).unwrap()
+-    }
+-
++    /// Return a freshly-created unique parent dir and a `memory.db` path
++    /// inside it. `Memory::open` derives
++    /// `canonical_dir = path.parent().join("memory")` and writes promotion
++    /// and namespace markdown files into it, so sharing a parent dir across
++    /// tests causes promotion tests to race on shared files like
++    /// `namespaces/person/preference.md` (issue #21, AC-D2). Every memory
++    /// test path MUST flow through this helper. The `nanos` suffix on top
++    /// of `pid + counter` defends against rapid test-binary reruns that
++    /// could reuse a pid before the previous run's tempdir was cleaned.
+     fn temp_memory_path(label: &str) -> PathBuf {
+         let id = TEST_COUNTER.fetch_add(1, Ordering::Relaxed);
++        let nanos = SystemTime::now()
++            .duration_since(UNIX_EPOCH)
++            .map(|d| d.as_nanos())
++            .unwrap_or(0);
+         let dir = std::env::temp_dir().join(format!(
+-            "geniepod-mem-{}-{}-{}",
++            "geniepod-mem-{}-{}-{}-{}",
+             label,
+             std::process::id(),
+-            id
++            id,
++            nanos
+         ));
+-        let _ = std::fs::remove_dir_all(&dir);
+-        std::fs::create_dir_all(&dir).unwrap();
++        std::fs::create_dir_all(&dir).expect("create temp memory dir");
+         dir.join("memory.db")
+     }
+ 
++    fn temp_memory() -> Memory {
++        Memory::open(&temp_memory_path("test")).unwrap()
++    }
++
+     #[test]
+     fn store_and_search() {
+         let mem = temp_memory();
+diff --git a/crates/genie-core/src/tools/parser.rs b/crates/genie-core/src/tools/parser.rs
+index dc9b570..7458ab7 100644
+--- a/crates/genie-core/src/tools/parser.rs
++++ b/crates/genie-core/src/tools/parser.rs
+@@ -249,6 +249,14 @@ mod tests {
+         assert!(normalize_single_key_tool_call(value, &dispatcher).is_none());
+     }
+ 
++    // The `system_info` tool reads /proc/meminfo (via tegrastats), /proc/uptime,
++    // and /proc/loadavg. On macOS those files do not exist, so the "Memory
++    // available:" line is absent from the rendered output and this assertion
++    // fails. Per issue #21 AC-D1 we gate the test (not the production code) —
++    // the tool itself is Linux-targeted by design, so its end-to-end shape
++    // assertion only makes sense on Linux. macOS dev boxes still exercise the
++    // dispatch / parsing path through the unit tests above.
++    #[cfg(target_os = "linux")]
+     #[tokio::test]
+     async fn try_tool_call_executes_single_key_system_info_shape() {
+         let dispatcher = ToolDispatcher::new(None);
+diff --git a/crates/genie-core/src/voice/stt.rs b/crates/genie-core/src/voice/stt.rs
+index 64a4cc8..66878eb 100644
+--- a/crates/genie-core/src/voice/stt.rs
++++ b/crates/genie-core/src/voice/stt.rs
+@@ -85,6 +85,45 @@ enum SttMode {
+     Server { port: u16 },
+     /// whisper CLI — transcribe individual WAV files.
+     Cli,
++    /// In-memory scripted transcript queue. Used by
++    /// `tests/voice_loop_integration.rs` so the voice cycle can be
++    /// exercised without a real whisper-cpp binary or audio device
++    /// (issue #21, IS-1 / IS-2).
++    Mock {
++        transcripts: std::sync::Mutex<Vec<MockTranscript>>,
++    },
++}
++
++#[derive(Debug, Clone)]
++pub struct MockTranscript {
++    pub text: String,
++    pub language: Option<String>,
++}
++
++impl MockTranscript {
++    pub fn new(text: impl Into<String>) -> Self {
++        Self {
++            text: text.into(),
++            language: None,
++        }
++    }
++
++    pub fn with_language(mut self, language: impl Into<String>) -> Self {
++        self.language = Some(language.into());
++        self
++    }
++}
++
++impl From<&str> for MockTranscript {
++    fn from(text: &str) -> Self {
++        Self::new(text)
++    }
++}
++
++impl From<String> for MockTranscript {
++    fn from(text: String) -> Self {
++        Self::new(text)
++    }
+ }
+ 
+ /// Transcription result from STT.
+@@ -144,6 +183,31 @@ impl SttEngine {
+         }
+     }
+ 
++    /// Create an in-memory STT engine that replays the given scripted
++    /// transcripts in order. `transcribe_file` ignores its argument and
++    /// pops the next scripted transcript instead. When the queue is
++    /// exhausted, `transcribe_file` returns an error.
++    ///
++    /// Used by `tests/voice_loop_integration.rs` (issue #21, IS-1 / IS-2).
++    pub fn mock<I, T>(transcripts: I) -> Self
++    where
++        I: IntoIterator<Item = T>,
++        T: Into<MockTranscript>,
++    {
++        let mut q: Vec<MockTranscript> = transcripts.into_iter().map(Into::into).collect();
++        q.reverse(); // pop from the back so callers see insertion order
++        Self {
++            mode: SttMode::Mock {
++                transcripts: std::sync::Mutex::new(q),
++            },
++            model_path: String::new(),
++            cli_path: String::new(),
++            language_hint: None,
++            no_gpu: false,
++            child: None,
++        }
++    }
++
+     pub fn with_language_hint(mut self, language: Option<String>) -> Self {
+         self.language_hint =
+             language.and_then(|value| super::language::configured_language(&value));
+@@ -179,13 +243,27 @@ impl SttEngine {
+         Ok(())
+     }
+ 
+-    /// Transcribe a WAV file (works in both modes).
++    /// Transcribe a WAV file (works in all modes).
+     pub async fn transcribe_file(&self, wav_path: &str) -> Result<Transcript> {
+         let start = std::time::Instant::now();
+ 
+         match &self.mode {
+             SttMode::Server { port } => self.transcribe_via_server(*port, wav_path).await,
+             SttMode::Cli => self.transcribe_via_cli(wav_path).await,
++            SttMode::Mock { transcripts } => {
++                let mut q = transcripts
++                    .lock()
++                    .expect("mock STT transcript queue poisoned");
++                if let Some(next) = q.pop() {
++                    Ok(Transcript {
++                        text: next.text,
++                        duration_ms: 0,
++                        language: next.language,
++                    })
++                } else {
++                    anyhow::bail!("SttEngine::mock transcript queue exhausted")
++                }
++            }
+         }
+         .map(|mut t| {
+             t.duration_ms = start.elapsed().as_millis() as u64;
+diff --git a/crates/genie-core/src/voice/tts.rs b/crates/genie-core/src/voice/tts.rs
+index 0d928cf..890feaf 100644
+--- a/crates/genie-core/src/voice/tts.rs
++++ b/crates/genie-core/src/voice/tts.rs
+@@ -87,6 +87,12 @@ enum TtsMode {
+     Pipe,
+     /// One-shot per utterance: outputs a WAV file.
+     File,
++    /// No-op TTS for tests — `speak`, `synthesize`, `synthesize_to_file`
++    /// return immediately without spawning Piper or aplay. Used by
++    /// `tests/voice_loop_integration.rs` so the voice cycle can be driven
++    /// on hosts with no Piper binary and no audio output device
++    /// (issue #21, IS-1 / IS-2).
++    Silent,
+ }
+ 
+ impl TtsEngine {
+@@ -116,6 +122,22 @@ impl TtsEngine {
+         }
+     }
+ 
++    /// Create a no-op TTS engine for tests. `speak`, `synthesize`,
++    /// `synthesize_to_file`, `start`, and `stop` are no-ops; the engine
++    /// never spawns Piper or aplay. Used by the voice-cycle integration
++    /// test (issue #21).
++    pub fn silent() -> Self {
++        Self {
++            model_path: String::new(),
++            piper_path: String::new(),
++            mode: TtsMode::Silent,
++            child: None,
++            sample_rate: 22050,
++            audio_device: String::new(),
++            post_silence_ms: 0,
++        }
++    }
++
+     /// Create TTS engine with full configuration.
+     pub fn configured(
+         model_path: &str,
+@@ -156,6 +178,24 @@ impl TtsEngine {
+         }
+     }
+ 
++    /// Return a config-only copy of this engine (no child process).
++    /// `speak()` and `synthesize()` spawn a fresh Piper per call anyway,
++    /// so the new copy is independently usable. Needed so callers that
++    /// receive a `&TtsEngine` (e.g. the integration test's
++    /// `tts_engine_override`) can move it into an `Arc<TtsEngine>` for
++    /// `streaming::stream_and_speak`.
++    pub fn snapshot(&self) -> Self {
++        Self {
++            model_path: self.model_path.clone(),
++            piper_path: self.piper_path.clone(),
++            mode: self.mode,
++            child: None,
++            sample_rate: self.sample_rate,
++            audio_device: self.audio_device.clone(),
++            post_silence_ms: self.post_silence_ms,
++        }
++    }
++
+     /// Start the Piper subprocess (pipe mode only).
+     /// Piper stays running and accepts text lines on stdin.
+     pub async fn start(&mut self) -> Result<()> {
+@@ -187,6 +227,7 @@ impl TtsEngine {
+         match &self.mode {
+             TtsMode::Pipe => self.synthesize_pipe(text).await,
+             TtsMode::File => self.synthesize_file(text).await,
++            TtsMode::Silent => Ok(Vec::new()),
+         }
+     }
+ 
+@@ -202,6 +243,12 @@ impl TtsEngine {
+         // to separate "LLM-thinking" from "first-sentence Piper synth".
+         mark_first_speak_called();
+ 
++        if matches!(self.mode, TtsMode::Silent) {
++            // No-op: the integration test (issue #21) drives the voice cycle
++            // on hosts with no Piper / aplay binaries.
++            return Ok(());
++        }
++
+         let clean = text.replace('\n', " ");
+         tracing::info!(text_len = text.len(), "speaking via Piper → aplay");
+ 
+@@ -292,6 +339,13 @@ impl TtsEngine {
+ 
+     /// Synthesize and write directly to a WAV file.
+     pub async fn synthesize_to_file(&self, text: &str, output_path: &str) -> Result<()> {
++        if matches!(self.mode, TtsMode::Silent) {
++            // No-op for tests: create an empty file so any downstream
++            // existence check still passes.
++            tokio::fs::write(output_path, &[][..]).await?;
++            return Ok(());
++        }
++
+         let clean = text.replace('\'', "'\\''");
+ 
+         let output = Command::new("sh")
+diff --git a/crates/genie-core/src/voice_loop.rs b/crates/genie-core/src/voice_loop.rs
+index 8e746e2..e38b71f 100644
+--- a/crates/genie-core/src/voice_loop.rs
++++ b/crates/genie-core/src/voice_loop.rs
+@@ -894,7 +894,6 @@ async fn voice_cycle(
+ 
+     // Step 3: Transcribe.
+     eprintln!("[voice] Transcribing...");
+-    let stt_start = std::time::Instant::now();
+     let transcript = match stt_engine.transcribe_file(&wav_path).await {
+         Ok(t) => t,
+         Err(e) => {
+@@ -904,14 +903,101 @@ async fn voice_cycle(
+         }
+     };
+ 
++    process_transcript(
++        transcript,
++        ProcessTranscriptInputs {
++            voice_cfg,
++            audio_device,
++            llm,
++            tools,
++            memory,
++            conversations,
++            system_prompt,
++            max_history,
++            model_family,
++            conv_id,
++            wav_path: Some(&wav_path),
++            tts_engine_override: None,
++            t_preprocess_done,
++        },
++    )
++    .await
++}
++
++/// Inputs threaded through `process_transcript` (extracted from
++/// `voice_cycle` for #21 AC-B). Most fields are forwarded directly;
++/// `wav_path` and `tts_engine_override` exist so the integration test
++/// can drive the orchestration without a real WAV on disk and without
++/// spawning Piper.
++pub struct ProcessTranscriptInputs<'a> {
++    pub voice_cfg: &'a VoiceConfig,
++    pub audio_device: &'a str,
++    pub llm: &'a LlmClient,
++    pub tools: &'a ToolDispatcher,
++    pub memory: &'a Memory,
++    pub conversations: &'a ConversationStore,
++    pub system_prompt: &'a str,
++    pub max_history: usize,
++    pub model_family: ModelFamily,
++    pub conv_id: &'a str,
++    /// Recording path for speaker identity + cleanup. `None` in tests
++    /// where the transcript came from `SttEngine::mock` and no WAV
++    /// exists on disk.
++    pub wav_path: Option<&'a str>,
++    /// Test hook: when `Some`, the LLM-to-TTS streaming bridge uses a
++    /// snapshot of this engine instead of building one via
++    /// `tts_engine_for_language(voice_cfg, ...)`. Tests pass
++    /// `Some(&TtsEngine::silent())` so Piper / aplay never spawn.
++    pub tts_engine_override: Option<&'a tts::TtsEngine>,
++    /// Latency-banner marker for the (preprocess -> STT) phase. Tests
++    /// can pass `std::time::Instant::now()`; the banner output is
++    /// informational and is fine with arbitrary tiny deltas.
++    pub t_preprocess_done: std::time::Instant,
++}
++
++/// Post-record orchestration of a voice cycle: intent gate, speaker
++/// identity, memory recall, quick-tool fast path, LLM streaming + TTS,
++/// tool dispatch, conversation persistence, latency banner, memory
++/// extract. Extracted from `voice_cycle` so
++/// `tests/voice_loop_integration.rs` can drive the full path end-to-end
++/// with `SttEngine::mock`, `LlmClient::mock`, and `TtsEngine::silent`
++/// (issue #21 AC-B / IS-1).
++///
++/// Returns `false` only when the caller should exit the outer voice
++/// loop — today nothing here ever signals exit, so this always returns
++/// `true`.
++pub async fn process_transcript(
++    transcript: stt::Transcript,
++    inputs: ProcessTranscriptInputs<'_>,
++) -> bool {
++    let ProcessTranscriptInputs {
++        voice_cfg,
++        audio_device,
++        llm,
++        tools,
++        memory,
++        conversations,
++        system_prompt,
++        max_history,
++        model_family,
++        conv_id,
++        wav_path,
++        tts_engine_override,
++        t_preprocess_done,
++    } = inputs;
++
+     let text = transcript.text.trim().to_string();
+     if text.is_empty() {
+-        let _ = tokio::fs::remove_file(&wav_path).await;
++        if let Some(path) = wav_path {
++            let _ = tokio::fs::remove_file(path).await;
++        }
+         eprintln!("[voice] No speech detected.");
+         return true;
+     }
+     if let VoiceIntentDecision::Reject(reason) = intent::assess_transcript(&text) {
+-        let _ = tokio::fs::remove_file(&wav_path).await;
++        if let Some(path) = wav_path {
++            let _ = tokio::fs::remove_file(path).await;
++        }
+         eprintln!(
+             "[voice] Ignoring low-confidence transcript ({}): \"{}\"",
+             reason, text
+@@ -925,12 +1011,14 @@ async fn voice_cycle(
+     let speaker = voice_cfg
+         .speaker_identity
+         .identify(&identity::SpeakerIdentityRequest {
+-            wav_path: Some(&wav_path),
++            wav_path,
+             transcript: &text,
+             detected_language: response_language.as_deref(),
+         });
+     let read_context = identity::build_memory_read_context(&text, &speaker);
+-    let _ = tokio::fs::remove_file(&wav_path).await;
++    if let Some(path) = wav_path {
++        let _ = tokio::fs::remove_file(path).await;
++    }
+ 
+     // T1 for the latency banner (#19): STT response is in.
+     let t_stt_done = std::time::Instant::now();
+@@ -995,11 +1083,13 @@ async fn voice_cycle(
+     // Step 4: LLM → streaming TTS (speak each sentence as it completes).
+     eprintln!("[voice] Thinking...");
+     let llm_start = std::time::Instant::now();
+-    let tts_engine = Arc::new(tts_engine_for_language(
+-        voice_cfg,
+-        audio_device,
+-        response_language.as_deref(),
+-    ));
++    let tts_engine = Arc::new(match tts_engine_override {
++        // Test path (#21 AC-B): caller passes in `&TtsEngine::silent()`.
++        // Snapshot it into an owned copy so we can wrap in `Arc` for the
++        // streaming task without forcing the caller to give up ownership.
++        Some(engine) => engine.snapshot(),
++        None => tts_engine_for_language(voice_cfg, audio_device, response_language.as_deref()),
++    });
+ 
+     let response =
+         match streaming::stream_and_speak(llm, &messages, 256, Arc::clone(&tts_engine)).await {
+diff --git a/crates/genie-core/tests/voice_loop_integration.rs b/crates/genie-core/tests/voice_loop_integration.rs
+new file mode 100644
+index 0000000..5da010d
+--- /dev/null
++++ b/crates/genie-core/tests/voice_loop_integration.rs
+@@ -0,0 +1,515 @@
++// Voice integration test — the entire file depends on the `voice` Cargo
++// feature, since the production modules under test (`voice::*`,
++// `voice_loop::*`, `voice::stt::SttEngine::mock`, `TtsEngine::silent`,
++// etc.) are gated behind `#[cfg(feature = "voice")]` in `lib.rs`. Without
++// this gate the `cargo test --no-default-features` axis (CI job
++// `no-default-features`) fails to compile because the imports below
++// resolve to "configured out" items in `genie_core`.
++#![cfg(feature = "voice")]
++
++//! Integration test for the voice cycle's mockable surface. Issue #21,
++//! IS-1 / IS-2 / AC-B.
++//!
++//! Drives `voice_loop::process_transcript` — the orchestration step
++//! extracted from `voice_loop::voice_cycle` — end-to-end on every
++//! supported platform, using the new mocks (`SttEngine::mock`,
++//! `LlmClient::mock`, `TtsEngine::silent`) against real
++//! `Memory` / `ConversationStore` / `ToolDispatcher`.
++//!
++//! Coverage:
++//!
++//! 1. **STT** — `SttEngine::mock` replays canned `MockTranscript`s on
++//!    `transcribe_file()`, with optional language hints.
++//! 2. **LLM** — `LlmClient::mock` replays canned replies on both `chat`
++//!    and `chat_stream`; the streaming path tokenizes word-by-word so the
++//!    caller's per-token callback fires, mirroring the contract
++//!    `process_transcript` depends on for per-sentence TTS.
++//! 3. **TTS** — `TtsEngine::silent` no-ops on `speak()`, `synthesize()`,
++//!    `synthesize_to_file()`, `start()`, `stop()` so the LLM->TTS bridge
++//!    (`voice::streaming::stream_and_speak`) can be exercised without
++//!    Piper or aplay.
++//! 4. **Streaming bridge** — `voice::streaming::stream_and_speak(mock_llm,
++//!    msgs, max, silent_tts)` runs inside `process_transcript`; the
++//!    composite test below confirms the full bridge executes.
++//! 5. **Conversation persistence** — a full (user, assistant) turn is
++//!    appended to a real `ConversationStore` SQLite DB in a process-unique
++//!    temp dir, surviving parallel test execution (issue #21 IS-4).
++//! 6. **Tool dispatch + audit log** — `ToolDispatcher` configured with a
++//!    tool-audit path; after `process_transcript` runs, the test asserts
++//!    the dispatcher wrote a JSON event to the audit file, satisfying
++//!    #21 AC-B's "audit logs" assertion.
++
++use std::collections::HashMap;
++use std::sync::atomic::{AtomicU32, Ordering};
++use std::time::{SystemTime, UNIX_EPOCH};
++
++use genie_core::conversation::ConversationStore;
++use genie_core::llm::{LlmClient, Message};
++use genie_core::memory::Memory;
++use genie_core::prompt::ModelFamily;
++use genie_core::tools::{ToolDispatcher, ToolExecutionContext, try_tool_call_with_context};
++use genie_core::voice::identity::SpeakerIdentityProvider;
++use genie_core::voice::streaming::stream_and_speak;
++use genie_core::voice::stt::{MockTranscript, SttEngine, Transcript};
++use genie_core::voice::tts::TtsEngine;
++use genie_core::voice_loop::{ProcessTranscriptInputs, VoiceConfig, process_transcript};
++
++/// Each test gets its own parent dir so SQLite WAL/SHM sidecars and
++/// audit-log JSONLs cannot collide and ConversationStore::open's
++/// CREATE-TABLE-IF-NOT-EXISTS path is fresh.
++fn unique_dir(label: &str) -> std::path::PathBuf {
++    static COUNTER: AtomicU32 = AtomicU32::new(0);
++    let nanos = SystemTime::now()
++        .duration_since(UNIX_EPOCH)
++        .map(|d| d.as_nanos())
++        .unwrap_or(0);
++    let dir = std::env::temp_dir().join(format!(
++        "geniepod-voice-loop-it-{}-{}-{}-{}",
++        label,
++        std::process::id(),
++        COUNTER.fetch_add(1, Ordering::Relaxed),
++        nanos
++    ));
++    std::fs::create_dir_all(&dir).expect("create temp dir for integration test");
++    dir
++}
++
++#[tokio::test]
++async fn mock_stt_replays_scripted_transcripts_in_order() {
++    let stt = SttEngine::mock([
++        MockTranscript::new("hello there"),
++        MockTranscript::new("what's the weather"),
++    ]);
++
++    let first = stt.transcribe_file("ignored.wav").await.unwrap();
++    assert_eq!(first.text, "hello there");
++
++    let second = stt.transcribe_file("ignored.wav").await.unwrap();
++    assert_eq!(second.text, "what's the weather");
++
++    assert!(
++        stt.transcribe_file("ignored.wav").await.is_err(),
++        "queue exhausted: expected error on third call"
++    );
++}
++
++#[tokio::test]
++async fn mock_stt_attaches_language_hint_to_transcript() {
++    let stt = SttEngine::mock([MockTranscript::new("bonjour").with_language("fr")]);
++    let t = stt.transcribe_file("ignored.wav").await.unwrap();
++    assert_eq!(t.text, "bonjour");
++    assert_eq!(t.language.as_deref(), Some("fr"));
++}
++
++#[tokio::test]
++async fn mock_llm_replays_replies_for_both_blocking_and_streaming_calls() {
++    let llm = LlmClient::mock(["I can help with that."]);
++    let messages = vec![Message {
++        role: "user".into(),
++        content: "ping".into(),
++    }];
++
++    let mut tokens = String::new();
++    let full = llm
++        .chat_stream(&messages, Some(64), |tok| tokens.push_str(tok))
++        .await
++        .unwrap();
++
++    assert_eq!(full, "I can help with that.");
++    assert_eq!(tokens, "I can help with that.");
++}
++
++#[tokio::test]
++async fn silent_tts_speak_returns_ok_without_spawning_piper() {
++    // Confirms TtsEngine::silent does not require piper / aplay binaries.
++    let tts = TtsEngine::silent();
++    tts.speak("anything").await.unwrap();
++    tts.speak("twice in a row").await.unwrap();
++}
++
++#[tokio::test]
++async fn streaming_stream_and_speak_runs_end_to_end_with_silent_tts() {
++    // `voice_cycle` calls `streaming::stream_and_speak(llm, &messages, 256,
++    // &tts_engine)` to bridge LLM streaming to per-sentence TTS. This test
++    // runs that exact orchestration step with the mocks.
++    let llm = LlmClient::mock(["The kitchen light is now on. Anything else?"]);
++    let tts = TtsEngine::silent();
++    let messages = vec![Message {
++        role: "user".into(),
++        content: "turn the kitchen light on".into(),
++    }];
++
++    let response = stream_and_speak(&llm, &messages, 256, std::sync::Arc::new(tts))
++        .await
++        .unwrap();
++
++    assert_eq!(response, "The kitchen light is now on. Anything else?");
++}
++
++#[tokio::test]
++async fn tool_dispatch_via_try_tool_call_writes_audit_log_event() {
++    // `voice_cycle` routes LLM output through `tools::try_tool_call_with_context`,
++    // which the dispatcher records in its tool-audit JSONL. AC-B requires
++    // asserting on "audit logs" — this test gives the dispatcher an audit
++    // path, executes a get_time call (built-in, no HA, no network), and
++    // confirms the JSONL gained an entry.
++    let dir = unique_dir("audit");
++    let audit_path = dir.join("tool-audit.jsonl");
++    let dispatcher = ToolDispatcher::new(None).with_tool_audit_path(audit_path.clone());
++
++    let llm_output = r#"{"tool": "get_time", "arguments": {}}"#;
++    let result =
++        try_tool_call_with_context(llm_output, &dispatcher, ToolExecutionContext::default())
++            .await
++            .expect("get_time should be dispatchable");
++    assert_eq!(result.tool, "get_time");
++    assert!(result.success, "get_time should succeed");
++
++    // The dispatcher's tool-audit logger appends one JSON line per dispatch.
++    let log_contents = std::fs::read_to_string(&audit_path).expect("audit log file should exist");
++    assert!(
++        !log_contents.trim().is_empty(),
++        "audit log should contain at least one event after dispatch"
++    );
++    assert!(
++        log_contents.contains("get_time"),
++        "audit log should mention the dispatched tool name; got: {}",
++        log_contents
++    );
++}
++
++#[tokio::test]
++async fn full_mock_voice_turn_persists_user_and_assistant_to_conversation_store() {
++    // Stage the same canned data the production voice loop would receive
++    // from whisper-cpp and llama.cpp.
++    let stt = SttEngine::mock([MockTranscript::new("turn the kitchen light on")]);
++    let llm = LlmClient::mock(["Done — kitchen light is on."]);
++
++    // Real conversation store, unique DB per test.
++    let conv_dir = unique_dir("conv");
++    let store = ConversationStore::open(&conv_dir.join("conversations.db")).unwrap();
++    let conv_id = "voice-it";
++    store.ensure(conv_id, "voice cycle integration").unwrap();
++
++    // STT half — exactly what voice_cycle does after arecord returns.
++    let transcript = stt.transcribe_file("ignored.wav").await.unwrap();
++    assert_eq!(transcript.text, "turn the kitchen light on");
++    store
++        .append(conv_id, "user", transcript.text.trim(), None)
++        .unwrap();
++
++    // LLM half — exactly what voice_cycle does after the system prompt is
++    // assembled. We use chat (blocking) here; chat_stream is exercised in
++    // the test above.
++    let messages = vec![Message {
++        role: "user".into(),
++        content: transcript.text.clone(),
++    }];
++    let reply = llm.chat(&messages, Some(128)).await.unwrap();
++    assert_eq!(reply, "Done — kitchen light is on.");
++    store.append(conv_id, "assistant", &reply, None).unwrap();
++
++    // Assert: the conversation store ends in (user, assistant) order, the
++    // same shape voice_cycle would have produced.
++    let recent = store.get_recent(conv_id, 4).unwrap();
++    assert_eq!(recent.len(), 2, "expected exactly user + assistant");
++    assert_eq!(recent[0].role, "user");
++    assert_eq!(recent[0].content, "turn the kitchen light on");
++    assert_eq!(recent[1].role, "assistant");
++    assert_eq!(recent[1].content, "Done — kitchen light is on.");
++}
++
++#[tokio::test]
++async fn mock_voice_cycle_drives_stt_then_llm_then_streaming_tts_then_tool_audit() {
++    // The composite "one full mocked voice cycle" #21 AC-B asks for, built
++    // from the publicly-exposed building blocks `voice_loop::voice_cycle`
++    // composes internally. Asserts on transcript flow (1), conversation
++    // store (2), and audit logs (3) — the three observables AC-B lists.
++
++    // 1. Real components.
++    let dir = unique_dir("full-cycle");
++    let store = ConversationStore::open(&dir.join("conversations.db")).unwrap();
++    let conv_id = "voice-it-full";
++    store.ensure(conv_id, "full voice cycle").unwrap();
++    let audit_path = dir.join("tool-audit.jsonl");
++    let dispatcher = ToolDispatcher::new(None).with_tool_audit_path(audit_path.clone());
++
++    // 2. Mocked components — STT yields a canned transcript; LLM yields a
++    //    canned reply that happens to be a get_time tool call (so the tool
++    //    dispatch + audit path also fires); TTS is silent.
++    let stt = SttEngine::mock([MockTranscript::new("what time is it")]);
++    let llm = LlmClient::mock([r#"{"tool": "get_time", "arguments": {}}"#]);
++    let tts = TtsEngine::silent();
++
++    // 3. Drive the voice cycle's post-record orchestration in order.
++    let transcript = stt.transcribe_file("ignored.wav").await.unwrap();
++    assert_eq!(transcript.text, "what time is it"); // (a) transcript flow
++
++    store
++        .append(conv_id, "user", transcript.text.trim(), None)
++        .unwrap();
++
++    let messages = vec![Message {
++        role: "user".into(),
++        content: transcript.text.clone(),
++    }];
++    let llm_output = stream_and_speak(&llm, &messages, 256, std::sync::Arc::new(tts))
++        .await
++        .unwrap();
++    assert!(llm_output.contains("get_time"));
++
++    // Tool dispatch — exactly what voice_cycle does on the LLM output.
++    let tool_result =
++        try_tool_call_with_context(&llm_output, &dispatcher, ToolExecutionContext::default())
++            .await
++            .expect("LLM output should parse as a tool call");
++    assert_eq!(tool_result.tool, "get_time");
++    assert!(tool_result.success);
++
++    store
++        .append(conv_id, "assistant", &llm_output, Some(&tool_result.tool))
++        .unwrap();
++    store
++        .append(
++            conv_id,
++            "system",
++            &format!("Tool: {}", tool_result.output),
++            None,
++        )
++        .unwrap();
++
++    // (b) Conversation store assertion.
++    let history = store.get_recent(conv_id, 10).unwrap();
++    assert_eq!(history.len(), 3);
++    assert_eq!(history[0].role, "user");
++    assert_eq!(history[0].content, "what time is it");
++    assert_eq!(history[1].role, "assistant");
++    assert_eq!(history[2].role, "system");
++
++    // (c) Audit log assertion — dispatcher must have written a JSONL line
++    //     for the get_time dispatch.
++    let log_contents =
++        std::fs::read_to_string(&audit_path).expect("audit log should exist after dispatch");
++    assert!(
++        log_contents.contains("get_time"),
++        "audit log should record the get_time dispatch; got: {}",
++        log_contents
++    );
++}
++
++#[tokio::test]
++async fn mock_voice_turn_handles_back_to_back_cycles_without_state_bleed() {
++    // Two cycles in a row, each on its own LLM + STT queue and its own
++    // conversation store DB — confirms parallel-safety of the path layout.
++    let stt = SttEngine::mock([
++        MockTranscript::new("first prompt"),
++        MockTranscript::new("second prompt"),
++    ]);
++    let llm = LlmClient::mock(["first reply", "second reply"]);
++
++    let conv_dir = unique_dir("conv-2cycle");
++    let store = ConversationStore::open(&conv_dir.join("conversations.db")).unwrap();
++    let conv_id = "voice-it-2";
++    store.ensure(conv_id, "two cycles").unwrap();
++
++    for expected_user in ["first prompt", "second prompt"] {
++        let t = stt.transcribe_file("ignored.wav").await.unwrap();
++        assert_eq!(t.text, expected_user);
++        store.append(conv_id, "user", &t.text, None).unwrap();
++        let reply = llm
++            .chat(
++                &[Message {
++                    role: "user".into(),
++                    content: t.text.clone(),
++                }],
++                Some(64),
++            )
++            .await
++            .unwrap();
++        store.append(conv_id, "assistant", &reply, None).unwrap();
++    }
++
++    let all = store.get_recent(conv_id, 10).unwrap();
++    assert_eq!(all.len(), 4);
++    assert_eq!(all[0].content, "first prompt");
++    assert_eq!(all[1].content, "first reply");
++    assert_eq!(all[2].content, "second prompt");
++    assert_eq!(all[3].content, "second reply");
++}
++
++/// VoiceConfig populated with mock-friendly values: no audio device, no
++/// piper binary, no whisper, default speaker identity. Suitable for
++/// `process_transcript` invocations where the LLM and TTS are mocked.
++fn test_voice_config() -> VoiceConfig {
++    VoiceConfig {
++        whisper_model: String::new(),
++        whisper_cli_path: String::new(),
++        whisper_port: 0,
++        piper_model: String::new(),
++        piper_path: String::new(),
++        piper_pipe_mode: false,
++        stt_language: String::new(),
++        voice_tts_models: HashMap::new(),
++        audio_device: String::new(),
++        audio_output_device: String::new(),
++        sample_rate: 16000,
++        audio_denoiser: "none".into(),
++        deep_filter_path: String::new(),
++        deep_filter_atten_lim_db: 100.0,
++        post_tts_silence_ms: 0,
++        record_secs: 4,
++        llm_model_path: String::new(),
++        wakeword_script: String::new(),
++        voice_continuous: false,
++        voice_continuous_secs: 0,
++        speaker_identity: SpeakerIdentityProvider::None,
++    }
++}
++
++#[tokio::test]
++async fn process_transcript_drives_full_voice_cycle_with_mocks() {
++    // The canonical AC-B test: calls `voice_loop::process_transcript`
++    // directly with mock STT-derived transcript, mock LLM, silent TTS,
++    // real Memory, real ConversationStore, and real ToolDispatcher wired
++    // to a tool-audit JSONL. Asserts on transcript flow, conversation
++    // store, AND audit logs — the three observables #21 AC-B lists.
++
++    let dir = unique_dir("process-transcript");
++    let memory = Memory::open(&dir.join("memory.db")).unwrap();
++    let conversations = ConversationStore::open(&dir.join("conversations.db")).unwrap();
++    let conv_id = "voice-it-process";
++    conversations
++        .ensure(conv_id, "process_transcript integration")
++        .unwrap();
++
++    let audit_path = dir.join("tool-audit.jsonl");
++    let tools = ToolDispatcher::new(None).with_tool_audit_path(audit_path.clone());
++
++    // Mock LLM: emits a get_time tool-call JSON, then a follow-up summary
++    // reply for the post-tool LLM call that `process_transcript` makes.
++    let llm = LlmClient::mock([
++        r#"{"tool": "get_time", "arguments": {}}"#,
++        "Sure — that is the current time.",
++    ]);
++    let tts = TtsEngine::silent();
++    let voice_cfg = test_voice_config();
++
++    // Transcript the mock STT would have produced. "tell me a story"
++    // is deliberately not a quick-tool pattern (no time / weather /
++    // calc / system_info match), so the LLM path runs.
++    let transcript = Transcript {
++        text: "tell me a story".into(),
++        duration_ms: 0,
++        language: None,
++    };
++
++    let kept_running = process_transcript(
++        transcript,
++        ProcessTranscriptInputs {
++            voice_cfg: &voice_cfg,
++            audio_device: "",
++            llm: &llm,
++            tools: &tools,
++            memory: &memory,
++            conversations: &conversations,
++            system_prompt: "You are GeniePod, a household assistant.",
++            max_history: 8,
++            model_family: ModelFamily::Phi,
++            conv_id,
++            wav_path: None,
++            tts_engine_override: Some(&tts),
++            t_preprocess_done: std::time::Instant::now(),
++        },
++    )
++    .await;
++
++    assert!(kept_running, "process_transcript should return true");
++
++    // (a) Transcript flow — the user message ended up in the conversation
++    //     store, sourced from the transcript text.
++    let history = conversations.get_recent(conv_id, 10).unwrap();
++    assert!(
++        history
++            .iter()
++            .any(|m| m.role == "user" && m.content == "tell me a story"),
++        "transcript text should appear as the user message; got {:?}",
++        history
++            .iter()
++            .map(|m| (&m.role, &m.content))
++            .collect::<Vec<_>>()
++    );
++
++    // (b) Conversation store — after the LLM-emitted tool call dispatches
++    //     to get_time, process_transcript appends assistant + system
++    //     messages and a final summary assistant message.
++    assert!(
++        history.iter().any(|m| m.role == "assistant"),
++        "process_transcript should have appended at least one assistant message"
++    );
++    assert!(
++        history
++            .iter()
++            .any(|m| m.role == "system" && m.content.starts_with("Tool:")),
++        "process_transcript should have appended the system 'Tool:' record"
++    );
++
++    // (c) Audit logs — the dispatcher wrote at least one JSONL event for
++    //     the get_time dispatch.
++    let log_contents = std::fs::read_to_string(&audit_path).expect("audit log should exist");
++    assert!(
++        log_contents.contains("get_time"),
++        "audit log should record the get_time dispatch; got: {}",
++        log_contents
++    );
++}
++
++#[tokio::test]
++async fn process_transcript_ignores_empty_transcript() {
++    // Empty / whitespace transcripts must short-circuit cleanly without
++    // touching the LLM, the conversation store, or the audit log.
++    let dir = unique_dir("process-empty");
++    let memory = Memory::open(&dir.join("memory.db")).unwrap();
++    let conversations = ConversationStore::open(&dir.join("conversations.db")).unwrap();
++    let conv_id = "voice-it-empty";
++    conversations.ensure(conv_id, "empty transcript").unwrap();
++
++    // LLM with zero replies — if process_transcript reaches it, the call
++    // errors and the test fails to maintain its invariants.
++    let llm = LlmClient::mock(Vec::<String>::new());
++    let tts = TtsEngine::silent();
++    let voice_cfg = test_voice_config();
++    let tools = ToolDispatcher::new(None);
++
++    let transcript = Transcript {
++        text: "   ".into(),
++        duration_ms: 0,
++        language: None,
++    };
++
++    let kept_running = process_transcript(
++        transcript,
++        ProcessTranscriptInputs {
++            voice_cfg: &voice_cfg,
++            audio_device: "",
++            llm: &llm,
++            tools: &tools,
++            memory: &memory,
++            conversations: &conversations,
++            system_prompt: "",
++            max_history: 8,
++            model_family: ModelFamily::Phi,
++            conv_id,
++            wav_path: None,
++            tts_engine_override: Some(&tts),
++            t_preprocess_done: std::time::Instant::now(),
++        },
++    )
++    .await;
++
++    assert!(kept_running);
++    let history = conversations.get_recent(conv_id, 10).unwrap();
++    assert!(
++        history.is_empty(),
++        "no messages should be appended for empty transcript"
++    );
++}

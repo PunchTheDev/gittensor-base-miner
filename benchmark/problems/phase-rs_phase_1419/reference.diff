@@ -1,0 +1,379 @@
+diff --git a/crates/engine/src/game/stack.rs b/crates/engine/src/game/stack.rs
+index 3f5cb7b33e..61fa555d0d 100644
+--- a/crates/engine/src/game/stack.rs
++++ b/crates/engine/src/game/stack.rs
+@@ -167,7 +167,7 @@ pub fn resolve_top(state: &mut GameState, events: &mut Vec<GameEvent>) {
+ 
+     // Extract the resolved ability from the stack entry. `KeywordAction` is
+     // handled by the early return above and never reaches this match.
+-    let (ability, is_spell, casting_variant, actual_mana_spent) = match &entry.kind {
++    let (mut ability, is_spell, casting_variant, actual_mana_spent) = match &entry.kind {
+         StackEntryKind::Spell {
+             ability,
+             casting_variant,
+@@ -188,6 +188,39 @@ pub fn resolve_top(state: &mut GameState, events: &mut Vec<GameEvent>) {
+         ),
+     };
+ 
++    // CR 120.3a + CR 115.10a + CR 506.2: A "deals [combat] damage to a player" /
++    // "attacks a player" trigger introduces the damaged/attacked player as the
++    // event referent. Per CR 120.3a damage to a player makes that player lose
++    // life, and per CR 115.10a the player is not a *target* — so "they"/"their"
++    // binds to the event's player, not a chosen target. Stamp it onto the
++    // resolving ability's `scoped_player` (when not already bound) so
++    // `PlayerScope::ScopedPlayer` quantities such as "they lose half their life,
++    // rounded up" (Unstoppable Slasher) resolve against that player rather than
++    // falling back to the source's controller. Mirrors the Phase-trigger
++    // stamping in `triggers::build_triggered_ability`; the parser rebinds these
++    // possessives to `ScopedPlayer` in `lower_trigger_ir`. Gated on
++    // `TriggeredAbility` because only triggered abilities carry an event
++    // referent in `current_trigger_event`.
++    if matches!(entry.kind, StackEntryKind::TriggeredAbility { .. }) {
++        if let Some(ability) = ability.as_mut() {
++            if ability.scoped_player.is_none() {
++                if let Some(pid) = state.current_trigger_event.as_ref().and_then(|event| {
++                    matches!(
++                        event,
++                        GameEvent::DamageDealt {
++                            target: TargetRef::Player(_),
++                            ..
++                        } | GameEvent::AttackersDeclared { .. }
++                    )
++                    .then(|| targeting::extract_player_from_event(event, state))
++                    .flatten()
++                }) {
++                    ability.set_scoped_player_recursive(pid);
++                }
++            }
++        }
++    }
++
+     // Capture targets for Aura attachment after resolution
+     let spell_targets = ability
+         .as_ref()
+diff --git a/crates/engine/src/parser/oracle_effect/mod.rs b/crates/engine/src/parser/oracle_effect/mod.rs
+index 3dcde72a1d..8af3f8bc7f 100644
+--- a/crates/engine/src/parser/oracle_effect/mod.rs
++++ b/crates/engine/src/parser/oracle_effect/mod.rs
+@@ -11267,7 +11267,7 @@ fn strip_trailing_activation_restriction_sentence(text: &str) -> String {
+ /// "their hand") in Oracle text. Variants not listed here keep their
+ /// expressions untouched; add arms here when a new variant surfaces a
+ /// possessive quantity.
+-fn each_quantity_expr_mut(effect: &mut Effect, f: &mut impl FnMut(&mut QuantityExpr)) {
++pub(crate) fn each_quantity_expr_mut(effect: &mut Effect, f: &mut impl FnMut(&mut QuantityExpr)) {
+     match effect {
+         Effect::LoseLife { amount, .. }
+         | Effect::GainLife { amount, .. }
+@@ -11536,6 +11536,81 @@ fn apply_player_scope_rewrites(def: &mut AbilityDefinition) {
+     }
+ }
+ 
++/// CR 120.3a + CR 119.3 + CR 115.10a: Rebind the event-bound player possessive
++/// inside a "deals [combat] damage to a player" / "attacks a player" trigger
++/// body from the *targeting* reading (`PlayerScope::Target`, emitted by the
++/// generic "their life" / "their hand" possessive parser) to the
++/// *event* reading (`PlayerScope::ScopedPlayer`).
++///
++/// These triggers are NOT targeted (CR 115.10a): "they"/"their" binds to the
++/// damaged/attacked player carried on the triggering event, which the engine
++/// stamps onto `ResolvedAbility::scoped_player` at resolution. Without this
++/// rewrite, "they lose half their life" parses its amount as
++/// `LifeTotal { Target }`, which reads an absent player target and resolves to
++/// 0 (Unstoppable Slasher's silent no-op). Mirrors the each-player rewrite in
++/// [`rewrite_player_scope_refs`] but is deliberately narrower — it touches only
++/// quantity refs, never `You`-scoped filters, so "you draw a card" on the same
++/// trigger still acts for the controller.
++pub(crate) fn rewrite_event_player_quantity_refs_to_scoped(def: &mut AbilityDefinition) {
++    use crate::types::ability::{CountScope, PlayerScope, QuantityRef, ZoneRef};
++
++    fn rewrite_qty(expr: &mut QuantityExpr) {
++        match expr {
++            QuantityExpr::Ref { qty } => match qty {
++                QuantityRef::LifeTotal { player }
++                | QuantityRef::HandSize { player }
++                | QuantityRef::LifeLostThisTurn { player }
++                | QuantityRef::LifeGainedThisTurn { player }
++                | QuantityRef::PartySize { player }
++                    if *player == PlayerScope::Target =>
++                {
++                    *player = PlayerScope::ScopedPlayer;
++                }
++                QuantityRef::TargetZoneCardCount { zone } => match zone {
++                    ZoneRef::Hand => {
++                        *qty = QuantityRef::HandSize {
++                            player: PlayerScope::ScopedPlayer,
++                        }
++                    }
++                    ZoneRef::Library | ZoneRef::Graveyard => {
++                        *qty = QuantityRef::ZoneCardCount {
++                            zone: zone.clone(),
++                            card_types: Vec::new(),
++                            scope: CountScope::ScopedPlayer,
++                        };
++                    }
++                    // No scoped-player equivalent for exile counts; leave as-is.
++                    ZoneRef::Exile => {}
++                },
++                _ => {}
++            },
++            QuantityExpr::DivideRounded { inner, .. }
++            | QuantityExpr::Multiply { inner, .. }
++            | QuantityExpr::Offset { inner, .. } => rewrite_qty(inner),
++            QuantityExpr::Sum { exprs } => {
++                for inner in exprs {
++                    rewrite_qty(inner);
++                }
++            }
++            QuantityExpr::UpTo { max } => rewrite_qty(max),
++            QuantityExpr::Power { exponent, .. } => rewrite_qty(exponent),
++            QuantityExpr::Difference { left, right } => {
++                rewrite_qty(left);
++                rewrite_qty(right);
++            }
++            QuantityExpr::Fixed { .. } => {}
++        }
++    }
++
++    each_quantity_expr_mut(&mut def.effect, &mut rewrite_qty);
++    if let Some(sub) = def.sub_ability.as_mut() {
++        rewrite_event_player_quantity_refs_to_scoped(sub);
++    }
++    if let Some(else_branch) = def.else_ability.as_mut() {
++        rewrite_event_player_quantity_refs_to_scoped(else_branch);
++    }
++}
++
+ /// CR 107.1a: Back-apply a rounding mode to every `DivideRounded` in an ability
+ /// tree. Used by `parse_effect_chain_ir` after stripping a trailing
+ /// "Round down each time" / "Round up each time" sentence (Pox Plague), so
+diff --git a/crates/engine/src/parser/oracle_effect/subject.rs b/crates/engine/src/parser/oracle_effect/subject.rs
+index 0f81d2a07d..c4b3f69be1 100644
+--- a/crates/engine/src/parser/oracle_effect/subject.rs
++++ b/crates/engine/src/parser/oracle_effect/subject.rs
+@@ -1179,6 +1179,17 @@ fn resolve_they_pronoun(ctx: &mut ParseContext) -> TargetFilter {
+     if matches!(ctx.relative_player_scope, Some(ControllerRef::ScopedPlayer)) {
+         return TargetFilter::ScopedPlayer;
+     }
++    // CR 603.7c + CR 120.3 + CR 506.2: A "deals [combat] damage to a player" or
++    // "attacks a player" trigger introduces the damaged/attacked player as the
++    // event referent (the parser stamps `relative_player_scope = TargetPlayer`).
++    // "They" inside such an effect ("they lose half their life") refers to that
++    // event player, which auto-resolves from the triggering event
++    // (`TriggeringPlayer`) — NOT a chosen target. Without this, "they" fell
++    // through to `ParentTarget`, leaving the effect with no player to act on
++    // (Unstoppable Slasher's half-life loss silently resolved as "lose 0").
++    if matches!(ctx.relative_player_scope, Some(ControllerRef::TargetPlayer)) {
++        return TargetFilter::TriggeringPlayer;
++    }
+     // CR 608.2c + CR 109.4: "They" after a `Choose(Player)` clause refers to
+     // the chosen player — a player-only `Typed` filter carrying the chosen
+     // scope (Gluntch's "choose a player. They put two +1/+1 counters …").
+diff --git a/crates/engine/src/parser/oracle_ir/trigger.rs b/crates/engine/src/parser/oracle_ir/trigger.rs
+index 3e2c495edb..76d4b31fe4 100644
+--- a/crates/engine/src/parser/oracle_ir/trigger.rs
++++ b/crates/engine/src/parser/oracle_ir/trigger.rs
+@@ -8,8 +8,8 @@ use serde::Serialize;
+ 
+ use super::effect_chain::EffectChainIr;
+ use crate::types::ability::{
+-    AbilityDefinition, TargetFilter, TriggerCondition, TriggerConstraint, TriggerDefinition,
+-    UnlessPayModifier,
++    AbilityDefinition, ControllerRef, TargetFilter, TriggerCondition, TriggerConstraint,
++    TriggerDefinition, UnlessPayModifier,
+ };
+ use crate::types::triggers::TriggerMode;
+ 
+@@ -66,4 +66,14 @@ pub(crate) struct TriggerModifiers {
+     pub(crate) has_up_to: bool,
+     /// Lowered effect text (after comma split), for `effect_adds_mana_to_triggering_player`.
+     pub(crate) effect_lower: String,
++    /// CR 109.4 + CR 603.7c: The relative-player scope the trigger condition
++    /// established for its effect body (`TargetPlayer` for "deals [combat]
++    /// damage to a player" / "attacks a player", `ParentTargetController` for
++    /// damage-source-controller triggers, `ScopedPlayer` for scoped-phase
++    /// triggers). Lowering reads this to rebind the body's `PlayerScope::Target`
++    /// possessive quantities ("they lose half their life") to
++    /// `PlayerScope::ScopedPlayer` for the `TargetPlayer` case, which resolves
++    /// against the damaged/attacked player stamped on the resolving ability from
++    /// the triggering event.
++    pub(crate) relative_player_scope: Option<ControllerRef>,
+ }
+diff --git a/crates/engine/src/parser/oracle_trigger.rs b/crates/engine/src/parser/oracle_trigger.rs
+index f430cc1bc6..2d8186d00c 100644
+--- a/crates/engine/src/parser/oracle_trigger.rs
++++ b/crates/engine/src/parser/oracle_trigger.rs
+@@ -699,6 +699,10 @@ pub(crate) fn parse_trigger_line_with_index_ir(
+     } else if condition_introduces_scoped_phase_player(&cond_lower) {
+         effect_ctx.relative_player_scope = Some(ControllerRef::ScopedPlayer);
+     }
++    // Snapshot the condition-established scope before body parsing (which may
++    // temporarily rebind it via `with_player_scope`) so lowering sees the scope
++    // the condition introduced, not a transient nested-clause value.
++    let relative_player_scope = effect_ctx.relative_player_scope.clone();
+ 
+     // Parse the effect body
+     let effect_for_parse_lower = effect_for_parse.to_lowercase();
+@@ -780,6 +784,7 @@ pub(crate) fn parse_trigger_line_with_index_ir(
+             constraint,
+             has_up_to,
+             effect_lower: effect_lower.to_string(),
++            relative_player_scope,
+         },
+         source_text: text.to_string(),
+     }
+@@ -829,6 +834,18 @@ pub(crate) fn lower_trigger_ir(ir: &TriggerIr) -> TriggerDefinition {
+         None => None,
+     };
+ 
++    // CR 603.7c + CR 120.3 + CR 506.2: For triggers that introduce an
++    // event-bound player ("deals combat damage to a player, they lose half
++    // their life"), rebind the body's `PlayerScope::Target` possessive
++    // quantities to `PlayerScope::ScopedPlayer` so they resolve against the
++    // damaged/attacked player rather than an absent chosen target.
++    let mut execute = execute;
++    if modifiers.relative_player_scope == Some(ControllerRef::TargetPlayer) {
++        if let Some(ability) = execute.as_deref_mut() {
++            crate::parser::oracle_effect::rewrite_event_player_quantity_refs_to_scoped(ability);
++        }
++    }
++
+     def.execute = execute;
+     def.optional = modifiers.optional;
+     def.unless_pay = modifiers.unless_pay.clone();
+@@ -11769,6 +11786,55 @@ mod tests {
+         }
+     }
+ 
++    /// CR 120.3a + CR 119.3: Unstoppable Slasher — "Whenever this
++    /// creature deals combat damage to a player, they lose half their life,
++    /// rounded up." is an event-bound (non-targeted) trigger per CR 115.10a.
++    /// "they" must resolve to `TriggeringPlayer` (the damaged player), and the
++    /// half-life amount must read `PlayerScope::ScopedPlayer`, NOT the
++    /// targeting `PlayerScope::Target` (which has no chosen target on an
++    /// event-bound trigger and resolves to 0 — the reported silent no-op).
++    #[test]
++    fn parse_unstoppable_slasher_combat_damage_half_life() {
++        use crate::types::ability::{Effect, PlayerScope, QuantityExpr, QuantityRef, RoundingMode};
++
++        let def = parse_trigger_line(
++            "Whenever this creature deals combat damage to a player, they lose half their life, rounded up.",
++            "Unstoppable Slasher",
++        );
++
++        let execute = def.execute.as_ref().expect("execute must be Some");
++        match &*execute.effect {
++            Effect::LoseLife { amount, target } => {
++                assert_eq!(
++                    target.as_ref(),
++                    Some(&TargetFilter::TriggeringPlayer),
++                    "LoseLife.target must be TriggeringPlayer (the damaged player), not ParentTarget",
++                );
++                match amount {
++                    QuantityExpr::DivideRounded {
++                        inner,
++                        divisor,
++                        rounding,
++                    } => {
++                        assert_eq!(*divisor, 2, "half ⇒ divisor 2");
++                        assert_eq!(*rounding, RoundingMode::Up, "rounded up");
++                        assert_eq!(
++                            **inner,
++                            QuantityExpr::Ref {
++                                qty: QuantityRef::LifeTotal {
++                                    player: PlayerScope::ScopedPlayer,
++                                },
++                            },
++                            "inner amount must read the event player's life (ScopedPlayer), got {inner:?}",
++                        );
++                    }
++                    other => panic!("amount must be DivideRounded, got {other:?}"),
++                }
++            }
++            other => panic!("effect must be LoseLife, got {other:?}"),
++        }
++    }
++
+     /// CR 603.4 + CR 608.2c + CR 119.3 + CR 107.1a: Cecil, Dark Knight —
+     /// damage-done trigger with a "Then if your life total is less than or
+     /// equal to half your starting life total, untap ~ and transform it"
+diff --git a/crates/engine/tests/integration/main.rs b/crates/engine/tests/integration/main.rs
+index ce628b6413..e3cb635f1e 100644
+--- a/crates/engine/tests/integration/main.rs
++++ b/crates/engine/tests/integration/main.rs
+@@ -91,6 +91,7 @@ mod treasured_find_regression;
+ mod turn_control_priority_softlock;
+ mod twice_instead_repeat_for;
+ mod tyvar_activate_as_though_haste;
++mod unstoppable_slasher_half_life;
+ mod ureni_attack_trigger;
+ mod urzas_saga_chapter_two;
+ mod urzas_tower_conditional_mana;
+diff --git a/crates/engine/tests/integration/unstoppable_slasher_half_life.rs b/crates/engine/tests/integration/unstoppable_slasher_half_life.rs
+new file mode 100644
+index 0000000000..a211305d20
+--- /dev/null
++++ b/crates/engine/tests/integration/unstoppable_slasher_half_life.rs
+@@ -0,0 +1,63 @@
++//! Regression test for #1245 — Unstoppable Slasher's combat-damage trigger
++//! ("Whenever this creature deals combat damage to a player, they lose half
++//! their life, rounded up.") silently resolved as "lose 0 life".
++//!
++//! The trigger is event-bound (CR 115.10a): "they"/"their" refers to the
++//! damaged player carried on the triggering event, not a chosen target.
++//! Before the fix, "they" parsed to `ParentTarget` and the half-life amount
++//! to `LifeTotal { Target }` — both reading an absent player target, so the
++//! lose-life resolved to 0 (a visible trigger with no life change).
++//!
++//! The fix:
++//!   * `resolve_they_pronoun` binds "they" to `TriggeringPlayer` for
++//!     damage-/attack-to-player triggers.
++//!   * `lower_trigger_ir` rebinds the body's `PlayerScope::Target` possessives
++//!     to `PlayerScope::ScopedPlayer`.
++//!   * stack resolution stamps `scoped_player` from the triggering event so
++//!     the `ScopedPlayer` amount resolves to the damaged player.
++
++use engine::game::scenario::{GameScenario, P0, P1};
++use engine::types::phase::Phase;
++
++use super::rules::run_combat;
++
++/// Verified Oracle clause from `client/public/card-data.json`
++/// (`jq '.["unstoppable slasher"]'`).
++const SLASHER_ORACLE: &str = "Whenever this creature deals combat damage to a \
++    player, they lose half their life, rounded up.";
++
++/// CR 603.7c + CR 119.3 + CR 107.1a: an unblocked Unstoppable Slasher deals its
++/// combat damage and then the trigger makes the damaged player lose
++/// `ceil(life_after_damage / 2)` more life.
++#[test]
++fn unstoppable_slasher_combat_damage_halves_damaged_player_life() {
++    let mut scenario = GameScenario::new();
++    scenario.at_phase(Phase::PreCombatMain);
++    // P1 at 20: a 3/3 Slasher deals 3 → 17, then the trigger removes
++    // ceil(17/2) = 9 → 8. The odd intermediate total (17) pins "rounded up".
++    scenario.with_life(P1, 20);
++
++    let slasher = scenario
++        .add_creature_from_oracle(P0, "Unstoppable Slasher", 3, 3, SLASHER_ORACLE)
++        .id();
++
++    let mut runner = scenario.build();
++
++    let life_before = runner.life(P1);
++    assert_eq!(life_before, 20, "precondition: P1 starts at 20 life");
++
++    // 3/3 Slasher attacks P1 unblocked (CR 510.1b: 3 combat damage to P1).
++    run_combat(&mut runner, vec![slasher], vec![]);
++    // CR 510.3a: the combat-damage trigger goes on the stack — drain it so the
++    // half-life loss resolves before asserting.
++    runner.advance_until_stack_empty();
++
++    // 20 − 3 (combat) − ceil(17 / 2) = 20 − 3 − 9 = 8.
++    assert_eq!(
++        runner.life(P1),
++        8,
++        "CR 603.7c + CR 119.3: P1 takes 3 combat damage (→17), then the \
++         event-bound trigger removes ceil(17/2) = 9 (→8). A regression to the \
++         pre-fix parse resolves the trigger as 'lose 0' and leaves P1 at 17."
++    );
++}

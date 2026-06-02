@@ -1,0 +1,1379 @@
+diff --git a/app/controllers/import/configurations_controller.rb b/app/controllers/import/configurations_controller.rb
+index 12e47a477b..6602e3fbe1 100644
+--- a/app/controllers/import/configurations_controller.rb
++++ b/app/controllers/import/configurations_controller.rb
+@@ -4,6 +4,8 @@ class Import::ConfigurationsController < ApplicationController
+   before_action :set_import
+ 
+   def show
++    # PDF imports are auto-configured from AI extraction, skip to clean step
++    redirect_to import_clean_path(@import) if @import.is_a?(PdfImport)
+   end
+ 
+   def update
+diff --git a/app/controllers/imports_controller.rb b/app/controllers/imports_controller.rb
+index 88a3468385..f1a2175296 100644
+--- a/app/controllers/imports_controller.rb
++++ b/app/controllers/imports_controller.rb
+@@ -1,7 +1,23 @@
+ class ImportsController < ApplicationController
+   include SettingsHelper
+ 
+-  before_action :set_import, only: %i[show publish destroy revert apply_template]
++  before_action :set_import, only: %i[show update publish destroy revert apply_template]
++
++  def update
++    # Handle both pdf_import[account_id] and import[account_id] param formats
++    account_id = params.dig(:pdf_import, :account_id) || params.dig(:import, :account_id)
++
++    if account_id.present?
++      account = Current.family.accounts.find_by(id: account_id)
++      unless account
++        redirect_back_or_to import_path(@import), alert: t("imports.update.invalid_account", default: "Account not found.")
++        return
++      end
++      @import.update!(account: account)
++    end
++
++    redirect_to import_path(@import), notice: t("imports.update.account_saved", default: "Account saved.")
++  end
+ 
+   def publish
+     @import.publish_later
+diff --git a/app/jobs/process_pdf_job.rb b/app/jobs/process_pdf_job.rb
+index 25c31f11fe..8fb4fccefe 100644
+--- a/app/jobs/process_pdf_job.rb
++++ b/app/jobs/process_pdf_job.rb
+@@ -5,18 +5,22 @@ def perform(pdf_import)
+     return unless pdf_import.is_a?(PdfImport)
+     return unless pdf_import.pdf_uploaded?
+     return if pdf_import.status == "complete"
+-    return if pdf_import.ai_processed? && (!pdf_import.bank_statement? || pdf_import.has_extracted_transactions?)
++    return if pdf_import.ai_processed? && (!pdf_import.bank_statement? || pdf_import.rows_count > 0)
+ 
+     pdf_import.update!(status: :importing)
+ 
+     begin
+       pdf_import.process_with_ai
+ 
+-      # For bank statements, extract transactions
++      # For bank statements, extract transactions and generate import rows
+       if pdf_import.bank_statement?
+         Rails.logger.info("ProcessPdfJob: Extracting transactions for bank statement import #{pdf_import.id}")
+         pdf_import.extract_transactions
+         Rails.logger.info("ProcessPdfJob: Extracted #{pdf_import.extracted_transactions.size} transactions")
++
++        pdf_import.generate_rows_from_extracted_data
++        pdf_import.sync_mappings
++        Rails.logger.info("ProcessPdfJob: Generated #{pdf_import.rows_count} import rows")
+       end
+ 
+       # Find the user who created this import (first admin or any user in the family)
+@@ -26,7 +30,10 @@ def perform(pdf_import)
+         pdf_import.send_next_steps_email(user)
+       end
+ 
+-      pdf_import.update!(status: :complete)
++      # Bank statements with rows go to pending for user review/publish
++      # Non-bank statements are marked complete (no further action needed)
++      final_status = pdf_import.bank_statement? && pdf_import.rows_count > 0 ? :pending : :complete
++      pdf_import.update!(status: final_status)
+     rescue StandardError => e
+       sanitized_error = sanitize_error_message(e)
+       Rails.logger.error("PDF processing failed for import #{pdf_import.id}: #{e.class.name} - #{sanitized_error}")
+diff --git a/app/models/pdf_import.rb b/app/models/pdf_import.rb
+index 8b25e8bfae..0e0250462c 100644
+--- a/app/models/pdf_import.rb
++++ b/app/models/pdf_import.rb
+@@ -3,6 +3,34 @@ class PdfImport < Import
+ 
+   validates :document_type, inclusion: { in: DOCUMENT_TYPES }, allow_nil: true
+ 
++  def import!
++    raise "Account required for PDF import" unless account.present?
++
++    transaction do
++      mappings.each(&:create_mappable!)
++
++      new_transactions = rows.map do |row|
++        category = mappings.categories.mappable_for(row.category)
++
++        Transaction.new(
++          category: category,
++          entry: Entry.new(
++            account: account,
++            date: row.date_iso,
++            amount: row.signed_amount,
++            name: row.name,
++            currency: row.currency,
++            notes: row.notes,
++            import: self,
++            import_locked: true
++          )
++        )
++      end
++
++      Transaction.import!(new_transactions, recursive: true) if new_transactions.any?
++    end
++  end
++
+   def pdf_uploaded?
+     pdf_file.attached?
+   end
+@@ -71,6 +99,34 @@ def extracted_transactions
+     extracted_data&.dig("transactions") || []
+   end
+ 
++  def generate_rows_from_extracted_data
++    transaction do
++      rows.destroy_all
++
++      unless has_extracted_transactions?
++        update_column(:rows_count, 0)
++        return
++      end
++
++      currency = account&.currency || family.currency
++
++      mapped_rows = extracted_transactions.map do |txn|
++        {
++          import_id: id,
++          date: format_date_for_import(txn["date"]),
++          amount: txn["amount"].to_s,
++          name: txn["name"].to_s,
++          category: txn["category"].to_s,
++          notes: txn["notes"].to_s,
++          currency: currency
++        }
++      end
++
++      Import::Row.insert_all!(mapped_rows) if mapped_rows.any?
++      update_column(:rows_count, mapped_rows.size)
++    end
++  end
++
+   def send_next_steps_email(user)
+     PdfImportMailer.with(
+       user: user,
+@@ -83,19 +139,19 @@ def uploaded?
+   end
+ 
+   def configured?
+-    ai_processed?
++    ai_processed? && rows_count > 0
+   end
+ 
+   def cleaned?
+-    ai_processed?
++    configured? && rows.all?(&:valid?)
+   end
+ 
+   def publishable?
+-    false
++    account.present? && bank_statement? && cleaned? && mappings.all?(&:valid?)
+   end
+ 
+   def column_keys
+-    []
++    %i[date amount name category notes]
+   end
+ 
+   def requires_csv_workflow?
+@@ -107,4 +163,27 @@ def pdf_file_content
+ 
+     pdf_file.download
+   end
++
++  def required_column_keys
++    %i[date amount]
++  end
++
++  def mapping_steps
++    base = []
++    # Only include CategoryMapping if rows have non-empty categories
++    base << Import::CategoryMapping if rows.where.not(category: [ nil, "" ]).exists?
++    # Note: PDF imports use direct account selection in the UI, not AccountMapping
++    # AccountMapping is designed for CSV imports where rows have different account values
++    base
++  end
++
++  private
++
++    def format_date_for_import(date_str)
++      return "" if date_str.blank?
++
++      Date.parse(date_str).strftime(date_format)
++    rescue ArgumentError
++      date_str.to_s
++    end
+ end
+diff --git a/app/models/provider/openai.rb b/app/models/provider/openai.rb
+index 08ac224f91..6ec10333d9 100644
+--- a/app/models/provider/openai.rb
++++ b/app/models/provider/openai.rb
+@@ -118,21 +118,20 @@ def auto_detect_merchants(transactions: [], user_merchants: [], model: "", famil
+ 
+   # Can be disabled via ENV for OpenAI-compatible endpoints that don't support vision
+   # Only vision-capable models (gpt-4o, gpt-4-turbo, gpt-4.1, etc.) support PDF input
+-  def supports_pdf_processing?
++  def supports_pdf_processing?(model: @default_model)
+     return false unless ENV.fetch("OPENAI_SUPPORTS_PDF_PROCESSING", "true").to_s.downcase.in?(%w[true 1 yes])
+ 
+     # Custom providers manage their own model capabilities
+     return true if custom_provider?
+ 
+-    # Check if the configured model supports vision/PDF input
+-    VISION_CAPABLE_MODEL_PREFIXES.any? { |prefix| @default_model.start_with?(prefix) }
++    # Check if the specified model supports vision/PDF input
++    VISION_CAPABLE_MODEL_PREFIXES.any? { |prefix| model.start_with?(prefix) }
+   end
+ 
+   def process_pdf(pdf_content:, model: "", family: nil)
+-    raise "Model does not support PDF/vision processing" unless supports_pdf_processing?
+-
+     with_provider_response do
+       effective_model = model.presence || @default_model
++      raise Error, "Model does not support PDF/vision processing: #{effective_model}" unless supports_pdf_processing?(model: effective_model)
+ 
+       trace = create_langfuse_trace(
+         name: "openai.process_pdf",
+diff --git a/app/models/provider/openai/pdf_processor.rb b/app/models/provider/openai/pdf_processor.rb
+index b99caa77c8..f65510e876 100644
+--- a/app/models/provider/openai/pdf_processor.rb
++++ b/app/models/provider/openai/pdf_processor.rb
+@@ -42,7 +42,7 @@ def instructions
+       For each document, you must determine:
+ 
+       1. **Document Type**: Classify the document as one of the following:
+-         - `bank_statement`: A bank account statement showing transactions, balances, and account activity
++         - `bank_statement`: A bank account statement showing transactions, balances, and account activity. This includes mobile money statements (like M-PESA, Venmo, PayPal, Cash App), digital wallet statements, and any statement showing a list of financial transactions with dates and amounts.
+          - `credit_card_statement`: A credit card statement showing charges, payments, and balances
+          - `investment_statement`: An investment/brokerage statement showing holdings, trades, or portfolio performance
+          - `financial_document`: General financial documents like tax forms, receipts, invoices, or financial reports
+diff --git a/app/views/imports/_nav.html.erb b/app/views/imports/_nav.html.erb
+index 898c78255a..26435d8b67 100644
+--- a/app/views/imports/_nav.html.erb
++++ b/app/views/imports/_nav.html.erb
+@@ -1,18 +1,29 @@
+ <%# locals: (import:) %>
+ 
+-<% steps = [
+-  { name: "Upload", path: import_upload_path(import), is_complete: import.uploaded?, step_number: 1 },
+-  { name: "Configure", path: import_configuration_path(import), is_complete: import.configured?, step_number: 2 },
+-  { name: "Clean", path: import_clean_path(import), is_complete: import.cleaned?, step_number: 3 },
+-  { name: "Map", path: import_confirm_path(import), is_complete: import.publishable?, step_number: 4 },
+-  { name: "Confirm", path: import_path(import), is_complete: import.complete?, step_number: 5 }
+-].reject { |step| step[:name] == "Map" && import.mapping_steps.empty? } %>
++<% steps = if import.is_a?(PdfImport)
++  # PDF imports have a simplified flow: Upload -> Confirm
++  # Upload/Configure/Clean are always complete for processed PDF imports
++  [
++    { name: t("imports.steps.upload", default: "Upload"), path: nil, is_complete: import.pdf_uploaded?, step_number: 1 },
++    { name: t("imports.steps.configure", default: "Configure"), path: nil, is_complete: import.configured?, step_number: 2 },
++    { name: t("imports.steps.clean", default: "Clean"), path: nil, is_complete: import.cleaned?, step_number: 3 },
++    { name: t("imports.steps.confirm", default: "Confirm"), path: import_path(import), is_complete: import.complete?, step_number: 4 }
++  ]
++else
++  [
++    { name: t("imports.steps.upload", default: "Upload"), path: import_upload_path(import), is_complete: import.uploaded?, step_number: 1 },
++    { name: t("imports.steps.configure", default: "Configure"), path: import_configuration_path(import), is_complete: import.configured?, step_number: 2 },
++    { name: t("imports.steps.clean", default: "Clean"), path: import_clean_path(import), is_complete: import.cleaned?, step_number: 3 },
++    { name: t("imports.steps.map", default: "Map"), key: "Map", path: import_confirm_path(import), is_complete: import.publishable?, step_number: 4 },
++    { name: t("imports.steps.confirm", default: "Confirm"), path: import_path(import), is_complete: import.complete?, step_number: 5 }
++  ].reject { |step| step[:key] == "Map" && import.mapping_steps.empty? }
++end %>
+ 
+ <% content_for :mobile_import_progress do %>
+-  <% active_step = steps.detect { |s| request.path.eql?(s[:path]) } %>
+-  <% if active_step.present? %>
++  <% active_step_index = steps.index { |s| request.path.eql?(s[:match_path] || s[:path]) } %>
++  <% if active_step_index %>
+     <div class="md:hidden text-center text-secondary text-md my-2">
+-      <span class="text-gray-500">Step <%= active_step[:step_number] %> of <%= steps.size %></span>
++      <span class="text-secondary"><%= t("imports.steps.progress", step: active_step_index + 1, total: steps.size, default: "Step %{step} of %{total}") %></span>
+     </div>
+   <% end %>
+ <% end %>
+@@ -20,7 +31,7 @@
+ <ul class="hidden md:flex items-center gap-2">
+   <% steps.each_with_index do |step, idx| %>
+     <li class="flex items-center gap-2 group">
+-      <% is_current = request.path == step[:path] %>
++      <% is_current = request.path == (step[:match_path] || step[:path]) %>
+ 
+       <% text_class = if is_current
+                   "text-primary"
+@@ -33,7 +44,7 @@
+                   step[:is_complete] ? "bg-green-600/10 border-alpha-black-25" : "bg-container-inset"
+                 end %>
+ 
+-      <%= link_to step[:path], class: "flex items-center gap-3" do %>
++      <% step_content = capture do %>
+         <div class="flex items-center gap-2 text-sm font-medium <%= text_class %>">
+           <span class="<%= step_class %> w-7 h-7 rounded-full shrink-0 inline-flex items-center justify-center border border-transparent">
+             <%= step[:is_complete] && !is_current ? icon("check", size: "sm", color: "current") : idx + 1 %>
+@@ -42,6 +53,11 @@
+           <span><%= step[:name] %></span>
+         </div>
+       <% end %>
++      <% if step[:path].present? %>
++        <%= link_to step[:path], class: "flex items-center gap-3" do %><%= step_content %><% end %>
++      <% else %>
++        <div class="flex items-center gap-3"><%= step_content %></div>
++      <% end %>
+ 
+       <hr class="border border-secondary w-12 group-last:hidden">
+     </li>
+diff --git a/app/views/imports/_pdf_import.html.erb b/app/views/imports/_pdf_import.html.erb
+index f2b1ea969c..834dbd894b 100644
+--- a/app/views/imports/_pdf_import.html.erb
++++ b/app/views/imports/_pdf_import.html.erb
+@@ -2,7 +2,66 @@
+ 
+ <div class="h-full flex flex-col justify-center items-center">
+   <div class="space-y-6 max-w-lg w-full">
+-    <% if import.importing? || import.pending? %>
++    <% if import.pending? && import.rows_count > 0 %>
++      <%# Bank statement with rows ready for review %>
++      <div class="mx-auto bg-success/10 h-8 w-8 rounded-full flex items-center justify-center">
++        <%= icon "check", class: "text-success" %>
++      </div>
++
++      <div class="text-center space-y-2">
++        <h1 class="font-medium text-primary text-center text-3xl"><%= t("imports.pdf_import.ready_for_review_title", default: "Ready for Review") %></h1>
++        <p class="text-sm text-secondary"><%= t("imports.pdf_import.ready_for_review_description", default: "We extracted %{count} transactions from your bank statement. Review and publish them to add to your account.", count: import.rows_count) %></p>
++      </div>
++
++      <div class="bg-container border border-primary rounded-xl p-4 space-y-4">
++        <div class="space-y-2">
++          <h2 class="font-medium text-primary"><%= t("imports.pdf_import.document_type_label") %></h2>
++          <p class="text-sm text-secondary px-3 py-2 bg-gray-500/5 rounded-lg">
++            <%= t("imports.document_types.#{import.document_type}", default: import.document_type&.humanize || t("imports.pdf_import.unknown_document_type", default: "Unknown")) %>
++          </p>
++        </div>
++
++        <div class="space-y-2">
++          <h2 class="font-medium text-primary"><%= t("imports.pdf_import.transactions_extracted", default: "Transactions Extracted") %></h2>
++          <p class="text-sm text-secondary px-3 py-2 bg-gray-500/5 rounded-lg">
++            <%= t("imports.pdf_import.transactions_extracted_count", count: import.rows_count, default: "%{count} transactions") %>
++          </p>
++        </div>
++
++        <div class="space-y-2">
++          <h2 class="font-medium text-primary"><%= t("imports.pdf_import.select_account", default: "Import to Account") %></h2>
++          <%= form_with model: import, url: import_path(import), method: :patch, class: "space-y-2" do |f| %>
++            <% accounts = import.family.accounts.manual.alphabetically %>
++            <% if accounts.any? %>
++              <%= f.select :account_id, options_for_select(accounts.map { |a| [a.name, a.id] }, import.account_id), { include_blank: t("imports.pdf_import.select_account_placeholder", default: "Select an account...") }, class: "form-field__input" %>
++              <% if import.account.nil? %>
++                <p class="text-xs text-secondary"><%= t("imports.pdf_import.select_account_hint", default: "Choose which account to import these transactions into.") %></p>
++              <% end %>
++            <% else %>
++              <p class="text-sm text-secondary px-3 py-2 bg-yellow-500/10 rounded-lg">
++                <%= t("imports.pdf_import.no_accounts", default: "No accounts available. Please create an account first.") %>
++              </p>
++              <%= render DS::Link.new(text: t("imports.pdf_import.create_account", default: "Create Account"), href: new_account_path(return_to: import_path(import)), variant: "primary", full_width: true, frame: :modal) %>
++            <% end %>
++            <% if accounts.any? %>
++              <%= f.submit t("imports.pdf_import.save_account", default: "Save"), class: "w-full font-medium text-sm px-3 py-2 rounded-lg text-inverse bg-inverse hover:bg-inverse-hover" %>
++            <% end %>
++          <% end %>
++        </div>
++      </div>
++
++      <div class="space-y-2 flex flex-col">
++        <% if import.publishable? %>
++          <%= button_to t("imports.pdf_import.publish_transactions", default: "Publish %{count} Transactions", count: import.rows_count), publish_import_path(import), method: :post, class: "w-full font-medium text-sm px-3 py-2 rounded-lg text-inverse bg-inverse hover:bg-inverse-hover" %>
++        <% elsif import.account.present? %>
++          <%= render DS::Link.new(text: t("imports.pdf_import.review_transactions", default: "Review Transactions"), href: import_confirm_path(import), variant: "primary", full_width: true) %>
++        <% else %>
++          <p class="text-center text-sm text-secondary"><%= t("imports.pdf_import.select_account_to_continue", default: "Please select an account above to continue.") %></p>
++        <% end %>
++        <%= render DS::Link.new(text: t("imports.pdf_import.back_to_imports"), href: imports_path, variant: "secondary", full_width: true) %>
++      </div>
++
++    <% elsif import.importing? || import.pending? %>
+       <div class="mx-auto bg-gray-500/5 h-8 w-8 rounded-full flex items-center justify-center">
+         <%= icon "loader", class: "animate-pulse" %>
+       </div>
+@@ -32,7 +91,7 @@
+ 
+       <div class="space-y-2 flex flex-col">
+         <%= render DS::Link.new(text: t("imports.pdf_import.try_again"), href: new_import_path, variant: "primary", full_width: true) %>
+-        <%= button_to t("imports.pdf_import.delete_import"), import_path(import), method: :delete, class: "btn btn--secondary w-full" %>
++        <%= button_to t("imports.pdf_import.delete_import"), import_path(import), method: :delete, class: "w-full font-medium text-sm px-3 py-2 rounded-lg text-primary bg-gray-200 hover:bg-gray-300" %>
+       </div>
+ 
+     <% elsif import.complete? && import.ai_processed? %>
+@@ -49,7 +108,7 @@
+         <div class="space-y-2">
+           <h2 class="font-medium text-primary"><%= t("imports.pdf_import.document_type_label") %></h2>
+           <p class="text-sm text-secondary px-3 py-2 bg-gray-500/5 rounded-lg">
+-            <%= t("imports.document_types.#{import.document_type}") %>
++            <%= t("imports.document_types.#{import.document_type}", default: import.document_type&.humanize || t("imports.pdf_import.unknown_document_type", default: "Unknown")) %>
+           </p>
+         </div>
+ 
+@@ -67,7 +126,7 @@
+ 
+       <div class="space-y-2 flex flex-col">
+         <%= render DS::Link.new(text: t("imports.pdf_import.back_to_imports"), href: imports_path, variant: "primary", full_width: true) %>
+-        <%= button_to t("imports.pdf_import.delete_import"), import_path(import), method: :delete, class: "btn btn--secondary w-full" %>
++        <%= button_to t("imports.pdf_import.delete_import"), import_path(import), method: :delete, class: "w-full font-medium text-sm px-3 py-2 rounded-lg text-primary bg-gray-200 hover:bg-gray-300" %>
+       </div>
+ 
+     <% else %>
+diff --git a/config/routes.rb b/config/routes.rb
+index 9ee83db626..632b5ca201 100644
+--- a/config/routes.rb
++++ b/config/routes.rb
+@@ -208,7 +208,7 @@
+ 
+   resources :transfers, only: %i[new create destroy show update]
+ 
+-  resources :imports, only: %i[index new show create destroy] do
++  resources :imports, only: %i[index new show create update destroy] do
+     member do
+       post :publish
+       put :revert
+diff --git a/db/migrate/20240701000000_add_category_fields_to_import_rows.rb b/db/migrate/20240701000000_add_category_fields_to_import_rows.rb
+deleted file mode 100644
+index 8a42102235..0000000000
+--- a/db/migrate/20240701000000_add_category_fields_to_import_rows.rb
++++ /dev/null
+@@ -1,7 +0,0 @@
+-class AddCategoryFieldsToImportRows < ActiveRecord::Migration[7.1]
+-  def change
+-    add_column :import_rows, :category_parent, :string
+-    add_column :import_rows, :category_color, :string
+-    add_column :import_rows, :category_classification, :string
+-  end
+-end
+diff --git a/db/migrate/20240701000001_add_category_icon_to_import_rows.rb b/db/migrate/20240701000001_add_category_icon_to_import_rows.rb
+deleted file mode 100644
+index 66f3892336..0000000000
+--- a/db/migrate/20240701000001_add_category_icon_to_import_rows.rb
++++ /dev/null
+@@ -1,5 +0,0 @@
+-class AddCategoryIconToImportRows < ActiveRecord::Migration[7.1]
+-  def change
+-    add_column :import_rows, :category_icon, :string
+-  end
+-end
+diff --git a/db/migrate/20240925112219_ensure_category_fields_on_import_rows.rb b/db/migrate/20240925112219_ensure_category_fields_on_import_rows.rb
+new file mode 100644
+index 0000000000..ad6f5e72f5
+--- /dev/null
++++ b/db/migrate/20240925112219_ensure_category_fields_on_import_rows.rb
+@@ -0,0 +1,7 @@
++class EnsureCategoryFieldsOnImportRows < ActiveRecord::Migration[7.2]
++  def change
++    add_column :import_rows, :category_parent, :string unless column_exists?(:import_rows, :category_parent)
++    add_column :import_rows, :category_color, :string unless column_exists?(:import_rows, :category_color)
++    add_column :import_rows, :category_classification, :string unless column_exists?(:import_rows, :category_classification)
++  end
++end
+diff --git a/db/migrate/20240925112220_ensure_category_icon_on_import_rows.rb b/db/migrate/20240925112220_ensure_category_icon_on_import_rows.rb
+new file mode 100644
+index 0000000000..aaacb22750
+--- /dev/null
++++ b/db/migrate/20240925112220_ensure_category_icon_on_import_rows.rb
+@@ -0,0 +1,5 @@
++class EnsureCategoryIconOnImportRows < ActiveRecord::Migration[7.2]
++  def change
++    add_column :import_rows, :category_icon, :string unless column_exists?(:import_rows, :category_icon)
++  end
++end
+diff --git a/test/controllers/api/v1/tags_controller_test.rb b/test/controllers/api/v1/tags_controller_test.rb
+index c9d6666cd4..6fcb36bbd7 100644
+--- a/test/controllers/api/v1/tags_controller_test.rb
++++ b/test/controllers/api/v1/tags_controller_test.rb
+@@ -1,262 +1,262 @@
+-# frozen_string_literal: true
+-
+-require "test_helper"
+-
+-class Api::V1::TagsControllerTest < ActionDispatch::IntegrationTest
+-  setup do
+-    @user = users(:family_admin)
+-    @other_family_user = users(:empty)
+-
+-    @oauth_app = Doorkeeper::Application.create!(
+-      name: "Test App",
+-      redirect_uri: "https://example.com/callback",
+-      scopes: "read read_write"
+-    )
+-
+-    @read_token = Doorkeeper::AccessToken.create!(
+-      application: @oauth_app,
+-      resource_owner_id: @user.id,
+-      scopes: "read"
+-    )
+-
+-    @read_write_token = Doorkeeper::AccessToken.create!(
+-      application: @oauth_app,
+-      resource_owner_id: @user.id,
+-      scopes: "read_write"
+-    )
+-
+-    @tag = @user.family.tags.create!(name: "Test Tag #{SecureRandom.hex(4)}", color: "#3b82f6")
+-  end
+-
+-  # Index action tests
+-  test "index requires authentication" do
+-    get api_v1_tags_url
+-
+-    assert_response :unauthorized
+-  end
+-
+-  test "index returns user's family tags successfully" do
+-    get api_v1_tags_url, headers: read_headers
+-
+-    assert_response :success
+-
+-    tags = JSON.parse(response.body)
+-    assert_kind_of Array, tags
+-    assert tags.length >= 1
+-
+-    tag = tags.first
+-    assert tag.key?("id")
+-    assert tag.key?("name")
+-    assert tag.key?("color")
+-    assert tag.key?("created_at")
+-    assert tag.key?("updated_at")
+-  end
+-
+-  test "index does not return tags from other families" do
+-    other_tag = @other_family_user.family.tags.create!(name: "Other Tag", color: "#3b82f6")
+-
+-    get api_v1_tags_url, headers: read_headers
+-
+-    assert_response :success
+-    tags = JSON.parse(response.body)
+-    tag_ids = tags.map { |t| t["id"] }
+-
+-    assert_includes tag_ids, @tag.id
+-    assert_not_includes tag_ids, other_tag.id
+-  end
+-
+-  # Show action tests
+-  test "show requires authentication" do
+-    get api_v1_tag_url(@tag)
+-
+-    assert_response :unauthorized
+-  end
+-
+-  test "show returns tag successfully" do
+-    get api_v1_tag_url(@tag), headers: read_headers
+-
+-    assert_response :success
+-
+-    tag = JSON.parse(response.body)
+-    assert_equal @tag.id, tag["id"]
+-    assert_equal @tag.name, tag["name"]
+-    assert_equal "#3b82f6", tag["color"]
+-  end
+-
+-  test "show returns 404 for non-existent tag" do
+-    get api_v1_tag_url(id: SecureRandom.uuid), headers: read_headers
+-
+-    assert_response :not_found
+-  end
+-
+-  test "show returns 404 for tag from another family" do
+-    other_tag = @other_family_user.family.tags.create!(name: "Other Tag", color: "#3b82f6")
+-
+-    get api_v1_tag_url(other_tag), headers: read_headers
+-
+-    assert_response :not_found
+-  end
+-
+-  # Create action tests
+-  test "create requires authentication" do
+-    post api_v1_tags_url, params: { tag: { name: "New Tag" } }
+-
+-    assert_response :unauthorized
+-  end
+-
+-  test "create requires read_write scope" do
+-    post api_v1_tags_url,
+-         params: { tag: { name: "New Tag", color: "#4da568" } },
+-         headers: read_headers
+-
+-    assert_response :forbidden
+-  end
+-
+-  test "create tag successfully" do
+-    tag_name = "New Tag #{SecureRandom.hex(4)}"
+-
+-    assert_difference -> { @user.family.tags.count }, 1 do
+-      post api_v1_tags_url,
+-           params: { tag: { name: tag_name, color: "#4da568" } },
+-           headers: read_write_headers
+-    end
+-
+-    assert_response :created
+-
+-    tag = JSON.parse(response.body)
+-    assert_equal tag_name, tag["name"]
+-    assert_equal "#4da568", tag["color"]
+-  end
+-
+-  test "create tag with auto-assigned color" do
+-    tag_name = "Auto Color Tag #{SecureRandom.hex(4)}"
+-
+-    post api_v1_tags_url,
+-         params: { tag: { name: tag_name } },
+-         headers: read_write_headers
+-
+-    assert_response :created
+-
+-    tag = JSON.parse(response.body)
+-    assert_equal tag_name, tag["name"]
+-    assert tag["color"].present?
+-  end
+-
+-  test "create fails with duplicate name" do
+-    post api_v1_tags_url,
+-         params: { tag: { name: @tag.name } },
+-         headers: read_write_headers
+-
+-    assert_response :unprocessable_entity
+-  end
+-
+-  # Update action tests
+-  test "update requires authentication" do
+-    patch api_v1_tag_url(@tag), params: { tag: { name: "Updated" } }
+-
+-    assert_response :unauthorized
+-  end
+-
+-  test "update requires read_write scope" do
+-    patch api_v1_tag_url(@tag),
+-          params: { tag: { name: "Updated" } },
+-          headers: read_headers
+-
+-    assert_response :forbidden
+-  end
+-
+-  test "update tag successfully" do
+-    new_name = "Updated Tag #{SecureRandom.hex(4)}"
+-
+-    patch api_v1_tag_url(@tag),
+-          params: { tag: { name: new_name, color: "#db5a54" } },
+-          headers: read_write_headers
+-
+-    assert_response :success
+-
+-    tag = JSON.parse(response.body)
+-    assert_equal new_name, tag["name"]
+-    assert_equal "#db5a54", tag["color"]
+-  end
+-
+-  test "update tag partially" do
+-    original_name = @tag.name
+-
+-    patch api_v1_tag_url(@tag),
+-          params: { tag: { color: "#eb5429" } },
+-          headers: read_write_headers
+-
+-    assert_response :success
+-
+-    tag = JSON.parse(response.body)
+-    assert_equal original_name, tag["name"]
+-    assert_equal "#eb5429", tag["color"]
+-  end
+-
+-  test "update returns 404 for non-existent tag" do
+-    patch api_v1_tag_url(id: SecureRandom.uuid),
+-          params: { tag: { name: "Not Found" } },
+-          headers: read_write_headers
+-
+-    assert_response :not_found
+-  end
+-
+-  test "update returns 404 for tag from another family" do
+-    other_tag = @other_family_user.family.tags.create!(name: "Other Tag", color: "#3b82f6")
+-
+-    patch api_v1_tag_url(other_tag),
+-          params: { tag: { name: "Hacker Update" } },
+-          headers: read_write_headers
+-
+-    assert_response :not_found
+-  end
+-
+-  # Destroy action tests
+-  test "destroy requires authentication" do
+-    delete api_v1_tag_url(@tag)
+-
+-    assert_response :unauthorized
+-  end
+-
+-  test "destroy requires read_write scope" do
+-    delete api_v1_tag_url(@tag), headers: read_headers
+-
+-    assert_response :forbidden
+-  end
+-
+-  test "destroy tag successfully" do
+-    tag_to_delete = @user.family.tags.create!(name: "Delete Me #{SecureRandom.hex(4)}", color: "#c44fe9")
+-
+-    assert_difference -> { @user.family.tags.count }, -1 do
+-      delete api_v1_tag_url(tag_to_delete), headers: read_write_headers
+-    end
+-
+-    assert_response :no_content
+-  end
+-
+-  test "destroy returns 404 for non-existent tag" do
+-    delete api_v1_tag_url(id: SecureRandom.uuid), headers: read_write_headers
+-
+-    assert_response :not_found
+-  end
+-
+-  test "destroy returns 404 for tag from another family" do
+-    other_tag = @other_family_user.family.tags.create!(name: "Other Tag", color: "#3b82f6")
+-
+-    assert_no_difference -> { @other_family_user.family.tags.count } do
+-      delete api_v1_tag_url(other_tag), headers: read_write_headers
+-    end
+-
+-    assert_response :not_found
+-  end
+-
+-  private
+-
+-    def read_headers
+-      { "Authorization" => "Bearer #{@read_token.token}" }
+-    end
+-
+-    def read_write_headers
+-      { "Authorization" => "Bearer #{@read_write_token.token}" }
+-    end
+-end
++# frozen_string_literal: true
++
++require "test_helper"
++
++class Api::V1::TagsControllerTest < ActionDispatch::IntegrationTest
++  setup do
++    @user = users(:family_admin)
++    @other_family_user = users(:empty)
++
++    @oauth_app = Doorkeeper::Application.create!(
++      name: "Test App",
++      redirect_uri: "https://example.com/callback",
++      scopes: "read read_write"
++    )
++
++    @read_token = Doorkeeper::AccessToken.create!(
++      application: @oauth_app,
++      resource_owner_id: @user.id,
++      scopes: "read"
++    )
++
++    @read_write_token = Doorkeeper::AccessToken.create!(
++      application: @oauth_app,
++      resource_owner_id: @user.id,
++      scopes: "read_write"
++    )
++
++    @tag = @user.family.tags.create!(name: "Test Tag #{SecureRandom.hex(4)}", color: "#3b82f6")
++  end
++
++  # Index action tests
++  test "index requires authentication" do
++    get api_v1_tags_url
++
++    assert_response :unauthorized
++  end
++
++  test "index returns user's family tags successfully" do
++    get api_v1_tags_url, headers: read_headers
++
++    assert_response :success
++
++    tags = JSON.parse(response.body)
++    assert_kind_of Array, tags
++    assert tags.length >= 1
++
++    tag = tags.first
++    assert tag.key?("id")
++    assert tag.key?("name")
++    assert tag.key?("color")
++    assert tag.key?("created_at")
++    assert tag.key?("updated_at")
++  end
++
++  test "index does not return tags from other families" do
++    other_tag = @other_family_user.family.tags.create!(name: "Other Tag", color: "#3b82f6")
++
++    get api_v1_tags_url, headers: read_headers
++
++    assert_response :success
++    tags = JSON.parse(response.body)
++    tag_ids = tags.map { |t| t["id"] }
++
++    assert_includes tag_ids, @tag.id
++    assert_not_includes tag_ids, other_tag.id
++  end
++
++  # Show action tests
++  test "show requires authentication" do
++    get api_v1_tag_url(@tag)
++
++    assert_response :unauthorized
++  end
++
++  test "show returns tag successfully" do
++    get api_v1_tag_url(@tag), headers: read_headers
++
++    assert_response :success
++
++    tag = JSON.parse(response.body)
++    assert_equal @tag.id, tag["id"]
++    assert_equal @tag.name, tag["name"]
++    assert_equal "#3b82f6", tag["color"]
++  end
++
++  test "show returns 404 for non-existent tag" do
++    get api_v1_tag_url(id: SecureRandom.uuid), headers: read_headers
++
++    assert_response :not_found
++  end
++
++  test "show returns 404 for tag from another family" do
++    other_tag = @other_family_user.family.tags.create!(name: "Other Tag", color: "#3b82f6")
++
++    get api_v1_tag_url(other_tag), headers: read_headers
++
++    assert_response :not_found
++  end
++
++  # Create action tests
++  test "create requires authentication" do
++    post api_v1_tags_url, params: { tag: { name: "New Tag" } }
++
++    assert_response :unauthorized
++  end
++
++  test "create requires read_write scope" do
++    post api_v1_tags_url,
++         params: { tag: { name: "New Tag", color: "#4da568" } },
++         headers: read_headers
++
++    assert_response :forbidden
++  end
++
++  test "create tag successfully" do
++    tag_name = "New Tag #{SecureRandom.hex(4)}"
++
++    assert_difference -> { @user.family.tags.count }, 1 do
++      post api_v1_tags_url,
++           params: { tag: { name: tag_name, color: "#4da568" } },
++           headers: read_write_headers
++    end
++
++    assert_response :created
++
++    tag = JSON.parse(response.body)
++    assert_equal tag_name, tag["name"]
++    assert_equal "#4da568", tag["color"]
++  end
++
++  test "create tag with auto-assigned color" do
++    tag_name = "Auto Color Tag #{SecureRandom.hex(4)}"
++
++    post api_v1_tags_url,
++         params: { tag: { name: tag_name } },
++         headers: read_write_headers
++
++    assert_response :created
++
++    tag = JSON.parse(response.body)
++    assert_equal tag_name, tag["name"]
++    assert tag["color"].present?
++  end
++
++  test "create fails with duplicate name" do
++    post api_v1_tags_url,
++         params: { tag: { name: @tag.name } },
++         headers: read_write_headers
++
++    assert_response :unprocessable_entity
++  end
++
++  # Update action tests
++  test "update requires authentication" do
++    patch api_v1_tag_url(@tag), params: { tag: { name: "Updated" } }
++
++    assert_response :unauthorized
++  end
++
++  test "update requires read_write scope" do
++    patch api_v1_tag_url(@tag),
++          params: { tag: { name: "Updated" } },
++          headers: read_headers
++
++    assert_response :forbidden
++  end
++
++  test "update tag successfully" do
++    new_name = "Updated Tag #{SecureRandom.hex(4)}"
++
++    patch api_v1_tag_url(@tag),
++          params: { tag: { name: new_name, color: "#db5a54" } },
++          headers: read_write_headers
++
++    assert_response :success
++
++    tag = JSON.parse(response.body)
++    assert_equal new_name, tag["name"]
++    assert_equal "#db5a54", tag["color"]
++  end
++
++  test "update tag partially" do
++    original_name = @tag.name
++
++    patch api_v1_tag_url(@tag),
++          params: { tag: { color: "#eb5429" } },
++          headers: read_write_headers
++
++    assert_response :success
++
++    tag = JSON.parse(response.body)
++    assert_equal original_name, tag["name"]
++    assert_equal "#eb5429", tag["color"]
++  end
++
++  test "update returns 404 for non-existent tag" do
++    patch api_v1_tag_url(id: SecureRandom.uuid),
++          params: { tag: { name: "Not Found" } },
++          headers: read_write_headers
++
++    assert_response :not_found
++  end
++
++  test "update returns 404 for tag from another family" do
++    other_tag = @other_family_user.family.tags.create!(name: "Other Tag", color: "#3b82f6")
++
++    patch api_v1_tag_url(other_tag),
++          params: { tag: { name: "Hacker Update" } },
++          headers: read_write_headers
++
++    assert_response :not_found
++  end
++
++  # Destroy action tests
++  test "destroy requires authentication" do
++    delete api_v1_tag_url(@tag)
++
++    assert_response :unauthorized
++  end
++
++  test "destroy requires read_write scope" do
++    delete api_v1_tag_url(@tag), headers: read_headers
++
++    assert_response :forbidden
++  end
++
++  test "destroy tag successfully" do
++    tag_to_delete = @user.family.tags.create!(name: "Delete Me #{SecureRandom.hex(4)}", color: "#c44fe9")
++
++    assert_difference -> { @user.family.tags.count }, -1 do
++      delete api_v1_tag_url(tag_to_delete), headers: read_write_headers
++    end
++
++    assert_response :no_content
++  end
++
++  test "destroy returns 404 for non-existent tag" do
++    delete api_v1_tag_url(id: SecureRandom.uuid), headers: read_write_headers
++
++    assert_response :not_found
++  end
++
++  test "destroy returns 404 for tag from another family" do
++    other_tag = @other_family_user.family.tags.create!(name: "Other Tag", color: "#3b82f6")
++
++    assert_no_difference -> { @other_family_user.family.tags.count } do
++      delete api_v1_tag_url(other_tag), headers: read_write_headers
++    end
++
++    assert_response :not_found
++  end
++
++  private
++
++    def read_headers
++      { "Authorization" => "Bearer #{@read_token.token}" }
++    end
++
++    def read_write_headers
++      { "Authorization" => "Bearer #{@read_write_token.token}" }
++    end
++end
+diff --git a/test/controllers/settings/hostings_controller_test.rb b/test/controllers/settings/hostings_controller_test.rb
+index 99473e7c3e..5b1edb7cf0 100644
+--- a/test/controllers/settings/hostings_controller_test.rb
++++ b/test/controllers/settings/hostings_controller_test.rb
+@@ -89,7 +89,7 @@ class Settings::HostingsControllerTest < ActionDispatch::IntegrationTest
+ 
+       assert_response :unprocessable_entity
+       assert_match(/OpenAI model is required/, flash[:alert])
+-      assert_nil Setting.openai_uri_base
++      assert Setting.openai_uri_base.blank?, "Expected openai_uri_base to remain blank after failed validation"
+     end
+   end
+ 
+diff --git a/test/fixtures/imports.yml b/test/fixtures/imports.yml
+index 3e9e185a98..9645855935 100644
+--- a/test/fixtures/imports.yml
++++ b/test/fixtures/imports.yml
+@@ -24,3 +24,24 @@ pdf_processed:
+   status: complete
+   ai_summary: "This is a bank statement from Chase Bank for the period January 1-31, 2024. It shows 15 transactions with an opening balance of $5,000 and closing balance of $4,500."
+   document_type: bank_statement
++
++pdf_with_rows:
++  family: dylan_family
++  account: checking
++  type: PdfImport
++  status: pending
++  ai_summary: "Bank statement with extracted transactions"
++  document_type: bank_statement
++  extracted_data:
++    transactions:
++      - date: "2024-01-15"
++        amount: -50.00
++        name: "Coffee Shop"
++        category: "Food & Drink"
++        notes: "Morning coffee"
++      - date: "2024-01-16"
++        amount: 1500.00
++        name: "Salary"
++        category: "Income"
++        notes: ""
++  rows_count: 2
+diff --git a/test/models/pdf_import_test.rb b/test/models/pdf_import_test.rb
+index 3138c884b2..a2491ee1a7 100644
+--- a/test/models/pdf_import_test.rb
++++ b/test/models/pdf_import_test.rb
+@@ -6,6 +6,7 @@ class PdfImportTest < ActiveSupport::TestCase
+   setup do
+     @import = imports(:pdf)
+     @processed_import = imports(:pdf_processed)
++    @import_with_rows = imports(:pdf_with_rows)
+   end
+ 
+   test "pdf_uploaded? returns false when no file attached" do
+@@ -24,27 +25,28 @@ class PdfImportTest < ActiveSupport::TestCase
+     assert_not @import.uploaded?
+   end
+ 
+-  test "configured? returns true when AI processed" do
+-    assert @processed_import.configured?
++  test "configured? requires AI processed and rows" do
+     assert_not @import.configured?
++    assert_not @processed_import.configured?
++    assert @import_with_rows.configured?
+   end
+ 
+-  test "cleaned? returns true when AI processed" do
+-    assert @processed_import.cleaned?
++  test "cleaned? requires configured and valid rows" do
+     assert_not @import.cleaned?
++    assert_not @processed_import.cleaned?
+   end
+ 
+-  test "publishable? always returns false for PDF imports" do
++  test "publishable? requires bank statement with cleaned rows and valid mappings" do
+     assert_not @import.publishable?
+     assert_not @processed_import.publishable?
+   end
+ 
+-  test "column_keys returns empty array" do
+-    assert_equal [], @import.column_keys
++  test "column_keys returns transaction columns" do
++    assert_equal %i[date amount name category notes], @import.column_keys
+   end
+ 
+-  test "required_column_keys returns empty array" do
+-    assert_equal [], @import.required_column_keys
++  test "required_column_keys returns date and amount" do
++    assert_equal %i[date amount], @import.required_column_keys
+   end
+ 
+   test "document_type validates against allowed types" do
+@@ -66,4 +68,68 @@ class PdfImportTest < ActiveSupport::TestCase
+       @import.process_with_ai_later
+     end
+   end
++
++  test "generate_rows_from_extracted_data creates import rows" do
++    import = imports(:pdf_with_rows)
++    import.rows.destroy_all
++    import.update_column(:rows_count, 0)
++
++    import.generate_rows_from_extracted_data
++
++    assert_equal 2, import.rows.count
++    assert_equal 2, import.rows_count
++
++    coffee_row = import.rows.find_by(name: "Coffee Shop")
++    assert_not_nil coffee_row
++    assert_equal "-50.0", coffee_row.amount
++    assert_equal "Food & Drink", coffee_row.category
++
++    salary_row = import.rows.find_by(name: "Salary")
++    assert_not_nil salary_row
++    assert_equal "1500.0", salary_row.amount
++  end
++
++  test "generate_rows_from_extracted_data does nothing without extracted transactions" do
++    @import.generate_rows_from_extracted_data
++    assert_equal 0, @import.rows.count
++  end
++
++  test "extracted_transactions returns transactions from extracted_data" do
++    assert_equal 2, @import_with_rows.extracted_transactions.size
++    assert_equal "Coffee Shop", @import_with_rows.extracted_transactions.first["name"]
++  end
++
++  test "extracted_transactions returns empty array when no data" do
++    assert_equal [], @import.extracted_transactions
++  end
++
++  test "has_extracted_transactions? returns true with transactions" do
++    assert @import_with_rows.has_extracted_transactions?
++  end
++
++  test "has_extracted_transactions? returns false without transactions" do
++    assert_not @import.has_extracted_transactions?
++  end
++
++  test "mapping_steps is empty when no categories in rows" do
++    # PDF imports use direct account selection in UI, not AccountMapping
++    assert_equal [], @import.mapping_steps
++  end
++
++  test "mapping_steps includes CategoryMapping when rows have categories" do
++    @import_with_rows.rows.create!(
++      date: "01/15/2024",
++      amount: -50.00,
++      currency: "USD",
++      name: "Test Transaction",
++      category: "Groceries"
++    )
++    assert_equal [ Import::CategoryMapping ], @import_with_rows.mapping_steps
++  end
++
++  test "mapping_steps does not include AccountMapping even when account is nil" do
++    # PDF imports handle account selection via direct UI, not mapping system
++    assert_nil @import.account
++    assert_not_includes @import.mapping_steps, Import::AccountMapping
++  end
+ end
+diff --git a/test/models/provider/openai/bank_statement_extractor_test.rb b/test/models/provider/openai/bank_statement_extractor_test.rb
+new file mode 100644
+index 0000000000..0359e75175
+--- /dev/null
++++ b/test/models/provider/openai/bank_statement_extractor_test.rb
+@@ -0,0 +1,197 @@
++require "test_helper"
++
++class Provider::Openai::BankStatementExtractorTest < ActiveSupport::TestCase
++  setup do
++    @client = mock("openai_client")
++    @model = "gpt-4.1"
++  end
++
++  test "extracts transactions from PDF content" do
++    mock_response = {
++      "choices" => [ {
++        "message" => {
++          "content" => {
++            "bank_name" => "Test Bank",
++            "account_holder" => "John Doe",
++            "account_number" => "1234",
++            "statement_period" => {
++              "start_date" => "2024-01-01",
++              "end_date" => "2024-01-31"
++            },
++            "opening_balance" => 5000.00,
++            "closing_balance" => 4500.00,
++            "transactions" => [
++              { "date" => "2024-01-15", "description" => "Coffee Shop", "amount" => -5.50 },
++              { "date" => "2024-01-20", "description" => "Salary Deposit", "amount" => 3000.00 }
++            ]
++          }.to_json
++        }
++      } ]
++    }
++
++    @client.expects(:chat).returns(mock_response)
++
++    extractor = Provider::Openai::BankStatementExtractor.new(
++      client: @client,
++      pdf_content: "dummy",
++      model: @model
++    )
++
++    # Mock the PDF text extraction
++    extractor.stubs(:extract_pages_from_pdf).returns([ "Page 1 bank statement text" ])
++
++    result = extractor.extract
++
++    assert_equal "Test Bank", result[:bank_name]
++    assert_equal "John Doe", result[:account_holder]
++    assert_equal "1234", result[:account_number]
++    assert_equal 5000.00, result[:opening_balance]
++    assert_equal 4500.00, result[:closing_balance]
++    assert_equal 2, result[:transactions].size
++
++    first_txn = result[:transactions].first
++    assert_equal "2024-01-15", first_txn[:date]
++    assert_equal "Coffee Shop", first_txn[:name]
++    assert_equal(-5.50, first_txn[:amount])
++  end
++
++  test "handles empty PDF content" do
++    extractor = Provider::Openai::BankStatementExtractor.new(
++      client: @client,
++      pdf_content: "",
++      model: @model
++    )
++
++    assert_raises(Provider::Openai::Error) do
++      extractor.extract
++    end
++  end
++
++  test "handles nil PDF content" do
++    extractor = Provider::Openai::BankStatementExtractor.new(
++      client: @client,
++      pdf_content: nil,
++      model: @model
++    )
++
++    assert_raises(Provider::Openai::Error) do
++      extractor.extract
++    end
++  end
++
++  test "deduplicates transactions across chunk boundaries" do
++    # First chunk response
++    first_response = {
++      "choices" => [ {
++        "message" => {
++          "content" => {
++            "bank_name" => "Test Bank",
++            "account_holder" => "John Doe",
++            "account_number" => "1234",
++            "statement_period" => { "start_date" => "2024-01-01", "end_date" => "2024-01-31" },
++            "opening_balance" => 5000.00,
++            "closing_balance" => 4500.00,
++            "transactions" => [
++              { "date" => "2024-01-15", "description" => "Coffee Shop", "amount" => -5.50 },
++              { "date" => "2024-01-16", "description" => "Grocery Store", "amount" => -50.00 }
++            ]
++          }.to_json
++        }
++      } ]
++    }
++
++    # Second chunk response with duplicate at boundary
++    second_response = {
++      "choices" => [ {
++        "message" => {
++          "content" => {
++            "transactions" => [
++              { "date" => "2024-01-16", "description" => "Grocery Store", "amount" => -50.00 },
++              { "date" => "2024-01-17", "description" => "Gas Station", "amount" => -40.00 }
++            ]
++          }.to_json
++        }
++      } ]
++    }
++
++    @client.expects(:chat).twice.returns(first_response, second_response)
++
++    extractor = Provider::Openai::BankStatementExtractor.new(
++      client: @client,
++      pdf_content: "dummy",
++      model: @model
++    )
++
++    # Mock multiple pages that will create multiple chunks
++    extractor.stubs(:extract_pages_from_pdf).returns([
++      "Page 1 " * 500,  # ~3500 chars, first chunk
++      "Page 2 " * 500   # ~3500 chars, second chunk
++    ])
++
++    result = extractor.extract
++
++    # Should deduplicate the "Grocery Store" transaction at chunk boundary
++    assert_equal 3, result[:transactions].size
++    names = result[:transactions].map { |t| t[:name] }
++    assert_includes names, "Coffee Shop"
++    assert_includes names, "Grocery Store"
++    assert_includes names, "Gas Station"
++  end
++
++  test "normalizes transaction amounts" do
++    mock_response = {
++      "choices" => [ {
++        "message" => {
++          "content" => {
++            "transactions" => [
++              { "date" => "2024-01-15", "description" => "Test 1", "amount" => "-$5.50" },
++              { "date" => "2024-01-16", "description" => "Test 2", "amount" => "1,234.56" },
++              { "date" => "2024-01-17", "description" => "Test 3", "amount" => -100 }
++            ]
++          }.to_json
++        }
++      } ]
++    }
++
++    @client.expects(:chat).returns(mock_response)
++
++    extractor = Provider::Openai::BankStatementExtractor.new(
++      client: @client,
++      pdf_content: "dummy",
++      model: @model
++    )
++
++    extractor.stubs(:extract_pages_from_pdf).returns([ "Page 1 text" ])
++
++    result = extractor.extract
++
++    assert_equal(-5.50, result[:transactions][0][:amount])
++    assert_equal 1234.56, result[:transactions][1][:amount]
++    assert_equal(-100.0, result[:transactions][2][:amount])
++  end
++
++  test "handles malformed JSON response gracefully" do
++    mock_response = {
++      "choices" => [ {
++        "message" => {
++          "content" => "This is not valid JSON"
++        }
++      } ]
++    }
++
++    @client.expects(:chat).returns(mock_response)
++
++    extractor = Provider::Openai::BankStatementExtractor.new(
++      client: @client,
++      pdf_content: "dummy",
++      model: @model
++    )
++
++    extractor.stubs(:extract_pages_from_pdf).returns([ "Page 1 text" ])
++
++    result = extractor.extract
++
++    # Should return empty transactions on parse error
++    assert_equal [], result[:transactions]
++  end
++end

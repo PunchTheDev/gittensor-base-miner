@@ -1,0 +1,649 @@
+diff --git a/packages/mcp/src/registry.d.ts b/packages/mcp/src/registry.d.ts
+index d58a6c812..414323fba 100644
+--- a/packages/mcp/src/registry.d.ts
++++ b/packages/mcp/src/registry.d.ts
+@@ -81,7 +81,10 @@ export function listRegistryResourceTemplates(): Record<string, unknown>;
+ 
+ export function readRegistryResource(
+   args?: Record<string, unknown>,
+-  options?: RegistryArtifactLoaders,
++  options?: RegistryArtifactLoaders & {
++    publicApiBaseUrl?: string;
++    fetchPublicApi?: (apiPath: string) => Promise<unknown>;
++  },
+ ): Promise<Record<string, unknown>>;
+ 
+ export function listRegistryPrompts(): Record<string, unknown>;
+@@ -165,6 +168,27 @@ export function reviewEntrySafety(
+   options?: RegistryArtifactLoaders,
+ ): Promise<RegistryToolResult>;
+ 
++export function listRegistryRecent(
++  options?: RegistryArtifactLoaders & {
++    publicApiBaseUrl?: string;
++    fetchPublicApi?: (apiPath: string) => Promise<unknown>;
++  },
++): Promise<RegistryToolResult>;
++
++export function listRegistryTrending(
++  options?: RegistryArtifactLoaders & {
++    publicApiBaseUrl?: string;
++    fetchPublicApi?: (apiPath: string) => Promise<unknown>;
++  },
++): Promise<RegistryToolResult>;
++
++export function listJobsActive(
++  options?: RegistryArtifactLoaders & {
++    publicApiBaseUrl?: string;
++    fetchPublicApi?: (apiPath: string) => Promise<unknown>;
++  },
++): Promise<RegistryToolResult>;
++
+ export function callRegistryTool(
+   name: string,
+   args?: Record<string, unknown>,
+diff --git a/packages/mcp/src/registry.js b/packages/mcp/src/registry.js
+index cfe2f4070..8161fcc96 100644
+--- a/packages/mcp/src/registry.js
++++ b/packages/mcp/src/registry.js
+@@ -33,6 +33,8 @@ const repoRoot = path.resolve(
+ const defaultDataDir = path.join(repoRoot, "apps", "web", "public", "data");
+ const safePathPartPattern = /^[a-z0-9-]+$/;
+ const jsonMimeType = "application/json";
++const DISCOVERY_RESOURCE_LIMIT = 25;
++const DISCOVERY_FETCH_TIMEOUT_MS = 5000;
+ 
+ export const MCP_PUBLIC_POLICY = {
+   apiKeyRequired: false,
+@@ -1259,6 +1261,312 @@ export const RESOURCE_TEMPLATES = [
+   },
+ ];
+ 
++/**
++ * Static MCP resource descriptors for the bounded discovery surfaces
++ * exposed alongside the directory and category feeds. Appended to
++ * {@link listRegistryResources} output and routed by
++ * {@link readRegistryResource}.
++ *
++ * @type {Array<{ uri: string, name: string, title: string, description: string, mimeType: string }>}
++ */
++const DISCOVERY_RESOURCES = [
++  {
++    uri: "heyclaude://registry/recent",
++    name: "HeyClaude recent registry updates",
++    title: "HeyClaude recent registry updates",
++    description:
++      "Bounded list of recently added or upstream-updated HeyClaude entries from the generated search index.",
++    mimeType: jsonMimeType,
++  },
++  {
++    uri: "heyclaude://registry/trending",
++    name: "HeyClaude trending registry entries",
++    title: "HeyClaude trending registry entries",
++    description:
++      "Bounded list of trending HeyClaude entries from the public /api/registry/trending endpoint; degrades gracefully when dynamic state is unavailable.",
++    mimeType: jsonMimeType,
++  },
++  {
++    uri: "heyclaude://jobs/active",
++    name: "HeyClaude active jobs",
++    title: "HeyClaude active jobs",
++    description:
++      "Bounded list of active public job listings from the public /api/jobs endpoint; degrades gracefully when dynamic state is unavailable.",
++    mimeType: jsonMimeType,
++  },
++];
++
++/**
++ * Resolve the public HeyClaude API base URL. Prefers an explicit override
++ * on `options.publicApiBaseUrl`, then the `HEYCLAUDE_PUBLIC_API_URL`
++ * environment variable, then falls back to the canonical site URL.
++ *
++ * @param {{ publicApiBaseUrl?: string }} [options]
++ * @returns {string} Base URL used to build `/api/...` requests.
++ */
++function publicApiBaseUrl(options = {}) {
++  return options.publicApiBaseUrl || process.env.HEYCLAUDE_PUBLIC_API_URL || SITE_URL;
++}
++
++/**
++ * Fetch JSON from a public HeyClaude API path. Tests inject a deterministic
++ * fetcher via `options.fetchPublicApi`; production uses `fetch()` with a
++ * bounded {@link DISCOVERY_FETCH_TIMEOUT_MS} timeout, `redirect: "error"`,
++ * and a JSON `accept` header. Throws on non-2xx responses so callers can
++ * convert failures into the "unavailable" graceful-degradation envelope.
++ *
++ * @param {string} apiPath API path beginning with `/api/...`.
++ * @param {{
++ *   publicApiBaseUrl?: string,
++ *   fetchPublicApi?: (apiPath: string) => Promise<unknown>,
++ * }} [options]
++ * @returns {Promise<unknown>} Parsed JSON body from the upstream response.
++ */
++async function fetchPublicApiJson(apiPath, options = {}) {
++  if (typeof options.fetchPublicApi === "function") {
++    return options.fetchPublicApi(apiPath);
++  }
++  const baseUrl = publicApiBaseUrl(options).replace(/\/+$/, "");
++  const url = `${baseUrl}${apiPath.startsWith("/") ? "" : "/"}${apiPath}`;
++  const controller = new AbortController();
++  const timeout = setTimeout(
++    () => controller.abort(),
++    DISCOVERY_FETCH_TIMEOUT_MS,
++  );
++  try {
++    const response = await fetch(url, {
++      method: "GET",
++      headers: { accept: jsonMimeType },
++      redirect: "error",
++      signal: controller.signal,
++    });
++    if (!response.ok) {
++      throw new Error(`Public API ${apiPath} returned ${response.status}.`);
++    }
++    return await response.json();
++  } finally {
++    clearTimeout(timeout);
++  }
++}
++
++/**
++ * Build the standard "unavailable" error envelope used when a dynamic
++ * resource cannot be loaded. Distinct from `notFound` / `invalid` so MCP
++ * clients can tell apart "endpoint failed" from "no such resource" and
++ * keep the surface read-only.
++ *
++ * @param {string} message Human-readable explanation.
++ * @param {string} [details] Optional underlying error message.
++ * @returns {{ ok: false, error: { code: "unavailable", message: string, details?: string } }}
++ */
++function unavailable(message, details) {
++  return {
++    ok: false,
++    error: {
++      code: "unavailable",
++      message,
++      ...(details ? { details } : {}),
++    },
++  };
++}
++
++/**
++ * Build the `heyclaude://registry/recent` resource payload. Reads the
++ * generated `search-index.json` artifact, sorts entries by `repoUpdatedAt`
++ * (falling back to `updatedAt` / `dateAdded`) descending, and bounds
++ * output to {@link DISCOVERY_RESOURCE_LIMIT} entries. Each entry carries
++ * the standard `toEntrySummary` shape plus `updatedAt` and `updateKind`.
++ *
++ * @param {import("./registry.d.ts").RegistryArtifactLoaders} [options]
++ * @returns {Promise<import("./registry.d.ts").RegistryToolResult>}
++ */
++export async function listRegistryRecent(options = {}) {
++  const searchIndex = unwrapEntries(
++    await readJsonArtifact("search-index.json", options),
++  );
++  const entries = searchIndex
++    .slice()
++    .sort((left, right) => {
++      const dateCompare = entryUpdatedAt(right).localeCompare(
++        entryUpdatedAt(left),
++      );
++      if (dateCompare !== 0) return dateCompare;
++      return String(left.title || "").localeCompare(String(right.title || ""));
++    })
++    .slice(0, DISCOVERY_RESOURCE_LIMIT)
++    .map((entry) => ({
++      ...toEntrySummary(entry),
++      updatedAt: entryUpdatedAt(entry),
++      updateKind: entry.repoUpdatedAt ? "upstream_update" : "added",
++    }));
++
++  return {
++    ok: true,
++    kind: "registry-recent",
++    schemaVersion: 1,
++    limit: DISCOVERY_RESOURCE_LIMIT,
++    count: entries.length,
++    entries,
++  };
++}
++
++/**
++ * Normalize a raw `/api/registry/trending` entry into the small, stable
++ * shape published by the MCP `registry/trending` resource. Defends against
++ * upstream field churn (missing arrays, non-numeric scores, dropped
++ * `trustSignals`) so MCP clients see a predictable schema.
++ *
++ * @param {Record<string, unknown> & { category: string, slug: string }} entry
++ * @returns {Record<string, unknown>} Normalized trending entry.
++ */
++function toTrendingEntry(entry) {
++  return {
++    key: `${entry.category}:${entry.slug}`,
++    category: entry.category,
++    slug: entry.slug,
++    title: entry.title || "",
++    description: entry.description || "",
++    canonicalUrl:
++      entry.canonicalUrl || `${SITE_URL}/${entry.category}/${entry.slug}`,
++    platforms: Array.isArray(entry.platforms) ? entry.platforms : [],
++    tags: Array.isArray(entry.tags) ? entry.tags : [],
++    dateAdded: entry.dateAdded || "",
++    score: typeof entry.score === "number" ? entry.score : 0,
++    reasons: Array.isArray(entry.reasons) ? entry.reasons : [],
++    trustSignals: entry.trustSignals || { sourceStatus: "missing" },
++  };
++}
++
++/**
++ * Build the `heyclaude://registry/trending` resource payload. Reuses the
++ * public `/api/registry/trending` endpoint (no DB access from the MCP
++ * package). Returns an `unavailable` envelope when the upstream fetch
++ * fails so MCP clients degrade gracefully. Output is bounded to
++ * {@link DISCOVERY_RESOURCE_LIMIT} entries and forwards `signalsAvailable`
++ * when present so consumers can tell which scoring signals applied.
++ *
++ * @param {import("./registry.d.ts").RegistryArtifactLoaders & {
++ *   publicApiBaseUrl?: string,
++ *   fetchPublicApi?: (apiPath: string) => Promise<unknown>,
++ * }} [options]
++ * @returns {Promise<import("./registry.d.ts").RegistryToolResult>}
++ */
++export async function listRegistryTrending(options = {}) {
++  let payload;
++  try {
++    payload = await fetchPublicApiJson(
++      `/api/registry/trending?limit=${DISCOVERY_RESOURCE_LIMIT}`,
++      options,
++    );
++  } catch (error) {
++    return unavailable(
++      "Trending registry state is currently unavailable.",
++      String(error?.message || error || ""),
++    );
++  }
++
++  if (!payload || !Array.isArray(payload.entries)) {
++    return unavailable(
++      "Trending registry state is currently unavailable.",
++      "Upstream payload is missing the expected entries array.",
++    );
++  }
++  const entries = payload.entries
++    .slice(0, DISCOVERY_RESOURCE_LIMIT)
++    .map(toTrendingEntry);
++
++  return {
++    ok: true,
++    kind: "registry-trending",
++    schemaVersion: payload?.schemaVersion ?? 1,
++    category: payload?.category || "all",
++    platform: payload?.platform || "all",
++    limit: DISCOVERY_RESOURCE_LIMIT,
++    count: entries.length,
++    signalsAvailable:
++      payload?.signalsAvailable && typeof payload.signalsAvailable === "object"
++        ? payload.signalsAvailable
++        : null,
++    source: "public-api",
++    entries,
++  };
++}
++
++/**
++ * Normalize a raw `/api/jobs` entry into the small, stable shape published
++ * by the MCP `jobs/active` resource. Defends against upstream field churn
++ * and never exposes private/admin-only fields (we only project the public
++ * subset already returned by `buildPublicJobsIndex`).
++ *
++ * @param {Record<string, unknown>} job
++ * @returns {Record<string, unknown>} Normalized public job entry.
++ */
++function toJobEntry(job) {
++  return {
++    id: job.id || job.slug || "",
++    title: job.title || "",
++    company: job.company || "",
++    location: job.location || "",
++    type: job.type || "",
++    isRemote: Boolean(job.isRemote),
++    tier: job.tier || "",
++    applyUrl: job.applyUrl || job.url || "",
++    sourceLabel: job.sourceLabel || "",
++    postedAt: job.postedAt || job.publishedAt || "",
++    labels: Array.isArray(job.labels) ? job.labels : [],
++  };
++}
++
++/**
++ * Build the `heyclaude://jobs/active` resource payload. Reuses the public
++ * `/api/jobs` endpoint (no DB access from the MCP package) and returns an
++ * `unavailable` envelope when the upstream fetch fails. Output is bounded
++ * to {@link DISCOVERY_RESOURCE_LIMIT} entries and forwards `totalAvailable`
++ * when the upstream reports it.
++ *
++ * @param {import("./registry.d.ts").RegistryArtifactLoaders & {
++ *   publicApiBaseUrl?: string,
++ *   fetchPublicApi?: (apiPath: string) => Promise<unknown>,
++ * }} [options]
++ * @returns {Promise<import("./registry.d.ts").RegistryToolResult>}
++ */
++export async function listJobsActive(options = {}) {
++  let payload;
++  try {
++    payload = await fetchPublicApiJson(
++      `/api/jobs?limit=${DISCOVERY_RESOURCE_LIMIT}`,
++      options,
++    );
++  } catch (error) {
++    return unavailable(
++      "Active jobs state is currently unavailable.",
++      String(error?.message || error || ""),
++    );
++  }
++
++  if (!payload || !Array.isArray(payload.entries)) {
++    return unavailable(
++      "Active jobs state is currently unavailable.",
++      "Upstream payload is missing the expected entries array.",
++    );
++  }
++  const entries = payload.entries
++    .slice(0, DISCOVERY_RESOURCE_LIMIT)
++    .map(toJobEntry);
++
++  return {
++    ok: true,
++    kind: "jobs-active",
++    schemaVersion: payload?.schemaVersion ?? 1,
++    limit: DISCOVERY_RESOURCE_LIMIT,
++    count: entries.length,
++    totalAvailable:
++      typeof payload?.totalAvailable === "number" ? payload.totalAvailable : null,
++    source: "public-api",
++    entries,
++  };
++}
++
+ export const PROMPT_DEFINITIONS = [
+   {
+     name: "find_best_asset",
+@@ -1341,6 +1649,7 @@ export async function listRegistryResources(args = {}, options = {}) {
+         description: `Generated public ${category} category summary entries.`,
+         mimeType: jsonMimeType,
+       })),
++      ...DISCOVERY_RESOURCES,
+     ],
+   };
+ }
+@@ -1402,6 +1711,24 @@ export async function readRegistryResource(args = {}, options = {}) {
+     const [category, slug] = parts.map(normalizeText);
+     const detail = await getEntryDetail({ category, slug }, options);
+     payload = detail;
++  } else if (
++    parsed.hostname === "registry" &&
++    parts.length === 1 &&
++    parts[0] === "recent"
++  ) {
++    payload = await listRegistryRecent(options);
++  } else if (
++    parsed.hostname === "registry" &&
++    parts.length === 1 &&
++    parts[0] === "trending"
++  ) {
++    payload = await listRegistryTrending(options);
++  } else if (
++    parsed.hostname === "jobs" &&
++    parts.length === 1 &&
++    parts[0] === "active"
++  ) {
++    payload = await listJobsActive(options);
+   } else {
+     return resourcePayload(
+       notFound(`Unsupported HeyClaude resource URI: ${uri}`),
+diff --git a/tests/mcp-server.test.ts b/tests/mcp-server.test.ts
+index f9436c5f3..f4e321a48 100644
+--- a/tests/mcp-server.test.ts
++++ b/tests/mcp-server.test.ts
+@@ -1655,4 +1655,241 @@ describe("HeyClaude read-only MCP helpers", () => {
+       }
+     });
+   });
++
++  describe("jobs and trending discovery resources", () => {
++    it("documents the new discovery helpers with JSDoc (docstring coverage gate)", () => {
++      const registrySource = fs.readFileSync(
++        path.join(repoRoot, "packages/mcp/src/registry.js"),
++        "utf8",
++      );
++
++      const requireDocstringBefore = (declaration: string) => {
++        const index = registrySource.indexOf(declaration);
++        expect(
++          index,
++          `Expected to find declaration: ${declaration}`,
++        ).toBeGreaterThan(-1);
++        const preceding = registrySource.slice(Math.max(0, index - 4000), index);
++        const trimmed = preceding.trimEnd();
++        expect(
++          trimmed.endsWith("*/"),
++          `Missing JSDoc block immediately before: ${declaration}`,
++        ).toBe(true);
++        const blockStart = trimmed.lastIndexOf("/**");
++        expect(
++          blockStart,
++          `Missing JSDoc opener before: ${declaration}`,
++        ).toBeGreaterThan(-1);
++        const block = trimmed.slice(blockStart);
++        expect(block.length).toBeGreaterThan(40);
++      };
++
++      requireDocstringBefore("export async function listRegistryRecent(");
++      requireDocstringBefore("export async function listRegistryTrending(");
++      requireDocstringBefore("export async function listJobsActive(");
++      requireDocstringBefore("async function fetchPublicApiJson(");
++      requireDocstringBefore("function publicApiBaseUrl(");
++      requireDocstringBefore("function unavailable(");
++      requireDocstringBefore("function toTrendingEntry(");
++      requireDocstringBefore("function toJobEntry(");
++      requireDocstringBefore("const DISCOVERY_RESOURCES = [");
++    });
++
++    it("lists discovery resources alongside the directory and category feeds", async () => {
++      const resources = await listRegistryResources({}, { dataDir });
++      const uris = (resources.resources as Array<{ uri: string }>).map(
++        (resource) => resource.uri,
++      );
++      expect(uris).toEqual(
++        expect.arrayContaining([
++          "heyclaude://feeds/directory",
++          "heyclaude://registry/recent",
++          "heyclaude://registry/trending",
++          "heyclaude://jobs/active",
++        ]),
++      );
++
++      await withMcpClient(async (client) => {
++        const remote = await client.listResources();
++        const remoteUris = remote.resources.map(
++          (resource: { uri: string }) => resource.uri,
++        );
++        expect(remoteUris).toEqual(
++          expect.arrayContaining([
++            "heyclaude://registry/recent",
++            "heyclaude://registry/trending",
++            "heyclaude://jobs/active",
++          ]),
++        );
++      });
++    });
++
++    it("reads bounded recent registry updates from the local search index", async () => {
++      const resource = await readRegistryResource(
++        { uri: "heyclaude://registry/recent" },
++        { dataDir },
++      );
++      const payload = JSON.parse(resource.contents[0].text);
++      expect(payload).toMatchObject({
++        ok: true,
++        kind: "registry-recent",
++        policy: { readOnly: true, createsIssues: false },
++      });
++      expect(payload.entries.length).toBeGreaterThan(0);
++      expect(payload.entries.length).toBeLessThanOrEqual(25);
++      const dates = payload.entries.map((entry: { updatedAt: string }) => entry.updatedAt);
++      expect(dates).toEqual([...dates].sort().reverse());
++      expect(payload.entries[0]).toMatchObject({
++        key: expect.stringContaining(":"),
++        updateKind: expect.stringMatching(/added|upstream_update/),
++      });
++    });
++
++    it("reads trending entries via an injected public-api fetcher", async () => {
++      const fetchPublicApi = async (apiPath: string) => {
++        expect(apiPath).toContain("/api/registry/trending");
++        return {
++          schemaVersion: 1,
++          kind: "registry-trending",
++          category: "all",
++          platform: "all",
++          limit: 25,
++          count: 1,
++          signalsAvailable: { votes: true, community: true, intent: true },
++          entries: [
++            {
++              category: skill.category,
++              slug: skill.slug,
++              title: skill.title,
++              description: "Example trending entry.",
++              canonicalUrl: `https://heyclau.de/${skill.category}/${skill.slug}`,
++              platforms: ["Claude"],
++              tags: ["evals"],
++              dateAdded: "2026-05-01",
++              score: 12.5,
++              reasons: ["upvotes", "community_used"],
++              trustSignals: { sourceStatus: "available" },
++            },
++          ],
++        };
++      };
++
++      const resource = await readRegistryResource(
++        { uri: "heyclaude://registry/trending" },
++        { dataDir, fetchPublicApi },
++      );
++      const payload = JSON.parse(resource.contents[0].text);
++      expect(payload).toMatchObject({
++        ok: true,
++        kind: "registry-trending",
++        source: "public-api",
++        signalsAvailable: { votes: true, community: true, intent: true },
++        policy: { readOnly: true },
++      });
++      expect(payload.entries).toHaveLength(1);
++      expect(payload.entries[0]).toMatchObject({
++        key: `${skill.category}:${skill.slug}`,
++        reasons: expect.arrayContaining(["upvotes"]),
++      });
++    });
++
++    it("reads active jobs via an injected public-api fetcher", async () => {
++      const fetchPublicApi = async (apiPath: string) => {
++        expect(apiPath).toContain("/api/jobs");
++        return {
++          schemaVersion: 1,
++          kind: "jobs-index",
++          count: 1,
++          totalAvailable: 1,
++          entries: [
++            {
++              id: "example-job",
++              title: "Example AI Engineer",
++              company: "Example Co",
++              location: "Remote",
++              type: "full-time",
++              isRemote: true,
++              tier: "premium",
++              applyUrl: "https://example.com/jobs/example-job",
++              sourceLabel: "Example",
++              postedAt: "2026-05-20",
++              labels: ["ai"],
++            },
++          ],
++        };
++      };
++
++      const resource = await readRegistryResource(
++        { uri: "heyclaude://jobs/active" },
++        { dataDir, fetchPublicApi },
++      );
++      const payload = JSON.parse(resource.contents[0].text);
++      expect(payload).toMatchObject({
++        ok: true,
++        kind: "jobs-active",
++        source: "public-api",
++        totalAvailable: 1,
++        policy: { readOnly: true, createsIssues: false },
++      });
++      expect(payload.entries).toEqual([
++        expect.objectContaining({
++          id: "example-job",
++          isRemote: true,
++          applyUrl: "https://example.com/jobs/example-job",
++        }),
++      ]);
++    });
++
++    it("treats malformed upstream payloads as unavailable", async () => {
++      const fetchPublicApi = async () => ({ entries: null });
++
++      const trending = await readRegistryResource(
++        { uri: "heyclaude://registry/trending" },
++        { dataDir, fetchPublicApi },
++      );
++      const trendingPayload = JSON.parse(trending.contents[0].text);
++      expect(trendingPayload).toMatchObject({
++        ok: false,
++        error: { code: "unavailable" },
++      });
++
++      const jobs = await readRegistryResource(
++        { uri: "heyclaude://jobs/active" },
++        { dataDir, fetchPublicApi: async () => ({}) },
++      );
++      const jobsPayload = JSON.parse(jobs.contents[0].text);
++      expect(jobsPayload).toMatchObject({
++        ok: false,
++        error: { code: "unavailable" },
++      });
++    });
++
++    it("degrades gracefully when the public api is unavailable", async () => {
++      const fetchPublicApi = async () => {
++        throw new Error("network unreachable");
++      };
++
++      const trending = await readRegistryResource(
++        { uri: "heyclaude://registry/trending" },
++        { dataDir, fetchPublicApi },
++      );
++      const trendingPayload = JSON.parse(trending.contents[0].text);
++      expect(trendingPayload).toMatchObject({
++        ok: false,
++        error: { code: "unavailable" },
++        policy: { readOnly: true },
++      });
++
++      const jobs = await readRegistryResource(
++        { uri: "heyclaude://jobs/active" },
++        { dataDir, fetchPublicApi },
++      );
++      const jobsPayload = JSON.parse(jobs.contents[0].text);
++      expect(jobsPayload).toMatchObject({
++        ok: false,
++        error: { code: "unavailable" },
++        policy: { readOnly: true },
++      });
++    });
++  });
+ });

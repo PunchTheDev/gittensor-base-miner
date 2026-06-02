@@ -1,0 +1,588 @@
+diff --git a/app/controllers/categories_controller.rb b/app/controllers/categories_controller.rb
+index a38e5166ce..2a9aa6402b 100644
+--- a/app/controllers/categories_controller.rb
++++ b/app/controllers/categories_controller.rb
+@@ -14,6 +14,12 @@ def new
+     set_categories
+   end
+ 
++  def merge
++    @categories = Current.family.categories.alphabetically
++
++    render layout: turbo_frame_request? ? false : "settings"
++  end
++
+   def create
+     @category = Current.family.categories.new(category_params)
+ 
+@@ -67,6 +73,29 @@ def bootstrap
+     redirect_back_or_to categories_path, notice: t(".success")
+   end
+ 
++  def perform_merge
++    permitted_params = category_merge_params
++
++    if permitted_params[:target_id].present? && Array(permitted_params[:source_ids]).include?(permitted_params[:target_id])
++      return redirect_to merge_categories_path, alert: t(".target_selected_as_source")
++    end
++
++    target = Current.family.categories.find_by(id: permitted_params[:target_id])
++    return redirect_to merge_categories_path, alert: t(".target_not_found") unless target
++
++    sources = Current.family.categories.where(id: permitted_params[:source_ids])
++    return redirect_to merge_categories_path, alert: t(".invalid_categories") unless sources.any?
++
++    merger = Category::Merger.new(family: Current.family, target_category: target, source_categories: sources)
++    return redirect_to merge_categories_path, alert: t(".no_categories_selected") unless merger.merge!
++
++    redirect_to categories_path, notice: t(".success", count: merger.merged_count)
++  rescue Category::Merger::UnauthorizedCategoryError => e
++    redirect_to merge_categories_path, alert: e.message
++  rescue ActiveRecord::RecordInvalid, ActiveRecord::RecordNotDestroyed => e
++    redirect_to merge_categories_path, alert: record_error_message(e)
++  end
++
+   private
+     def set_category
+       @category = Current.family.categories.find(params[:id])
+@@ -89,4 +118,13 @@ def set_transaction
+     def category_params
+       params.require(:category).permit(:name, :color, :parent_id, :lucide_icon)
+     end
++
++    def category_merge_params
++      params.permit(:target_id, source_ids: [])
++    end
++
++    def record_error_message(error)
++      record = error.respond_to?(:record) ? error.record : nil
++      record&.errors&.full_messages&.to_sentence.presence || error.message
++    end
+ end
+diff --git a/app/models/category/merger.rb b/app/models/category/merger.rb
+new file mode 100644
+index 0000000000..13176a14eb
+--- /dev/null
++++ b/app/models/category/merger.rb
+@@ -0,0 +1,91 @@
++class Category::Merger
++  class UnauthorizedCategoryError < StandardError; end
++
++  attr_reader :family, :target_category, :source_categories, :merged_count
++
++  def initialize(family:, target_category:, source_categories:)
++    @family = family
++    @target_category = target_category
++    @merged_count = 0
++
++    validate_category_belongs_to_family!(target_category, "Target category")
++
++    sources = Array(source_categories)
++    sources.each { |category| validate_category_belongs_to_family!(category, "Source category '#{category.name}'") }
++
++    @source_categories = sources.reject { |category| category.id == target_category.id }
++    validate_hierarchy!
++    validate_reparenting!
++  end
++
++  def merge!
++    return false if source_categories.empty?
++
++    Category.transaction { merge_sources! }
++    true
++  end
++
++  private
++    def merge_sources!
++      source_categories.each do |source|
++        family.transactions.where(category_id: source.id).update_all(category_id: target_category.id)
++        merge_budget_categories(source)
++        family.categories.where(parent_id: source.id).where.not(id: target_category.id).update_all(parent_id: target_category.id)
++        family.categories.find(source.id).destroy!
++        @merged_count += 1
++      end
++    end
++
++    def validate_category_belongs_to_family!(category, label)
++      return if category&.family_id == family.id
++
++      raise UnauthorizedCategoryError, "#{label} does not belong to this family"
++    end
++
++    def validate_hierarchy!
++      target_ancestor_ids = ancestor_ids_for(target_category)
++      return unless source_categories.any? { |source| target_ancestor_ids.include?(source.id) }
++
++      raise UnauthorizedCategoryError, "A parent category cannot be merged into its own subcategory"
++    end
++
++    def validate_reparenting!
++      return if target_category.parent_id.blank?
++      return unless source_categories.any? { |source| family.categories.exists?(parent_id: source.id) }
++
++      raise UnauthorizedCategoryError, "Cannot merge a category with subcategories into a subcategory"
++    end
++
++    def ancestor_ids_for(category)
++      ids = []
++      seen_ids = Set.new
++      current = category
++
++      while current&.parent_id.present? && seen_ids.exclude?(current.parent_id)
++        ids << current.parent_id
++        seen_ids << current.parent_id
++        current = family.categories.find_by(id: current.parent_id)
++      end
++
++      ids
++    end
++
++    def merge_budget_categories(source)
++      family.budget_categories.where(category_id: source.id).find_each do |source_budget_category|
++        target_budget_category = family.budget_categories.find_by(
++          budget_id: source_budget_category.budget_id,
++          category_id: target_category.id
++        )
++
++        if target_budget_category
++          target_budget_category.update!(
++            budgeted_spending: (target_budget_category.budgeted_spending || 0).to_d +
++              (source_budget_category.budgeted_spending || 0).to_d
++          )
++          source_budget_category.destroy!
++        else
++          source_budget_category.update!(category_id: target_category.id)
++        end
++      end
++    end
++end
+diff --git a/app/views/categories/index.html.erb b/app/views/categories/index.html.erb
+index 7edac37eb2..455b58ae11 100644
+--- a/app/views/categories/index.html.erb
++++ b/app/views/categories/index.html.erb
+@@ -10,6 +10,14 @@
+         confirm: CustomConfirm.for_resource_deletion("all categories", high_severity: true)) %>
+   <% end %>
+ 
++  <%= render DS::Link.new(
++    text: t(".merge"),
++    variant: "outline",
++    icon: "combine",
++    href: merge_categories_path,
++    frame: :modal
++  ) %>
++
+   <%= render DS::Link.new(
+     text: t(".new"),
+     variant: "primary",
+diff --git a/app/views/categories/merge.html.erb b/app/views/categories/merge.html.erb
+new file mode 100644
+index 0000000000..6d8e833007
+--- /dev/null
++++ b/app/views/categories/merge.html.erb
+@@ -0,0 +1,30 @@
++<%= render DS::Dialog.new do |dialog| %>
++  <% dialog.with_header(title: t(".title"), subtitle: t(".description")) %>
++  <% dialog.with_body do %>
++    <%= styled_form_with url: perform_merge_categories_path, method: :post, class: "space-y-4" do |f| %>
++      <%= f.collection_select :target_id,
++            @categories,
++            :id, :name_with_parent,
++            { prompt: t(".select_target"), label: t(".target_label") },
++            { required: true } %>
++
++      <div class="space-y-2">
++        <p class="text-sm font-medium text-primary"><%= t(".sources_label") %></p>
++        <div class="space-y-1 border border-secondary rounded-lg p-2">
++          <% @categories.each do |category| %>
++            <label class="flex items-center gap-2 p-2 hover:bg-surface-hover rounded cursor-pointer">
++              <%= check_box_tag "source_ids[]", category.id, false, class: "rounded border-secondary" %>
++              <span class="text-sm text-primary"><%= category.name_with_parent %></span>
++            </label>
++          <% end %>
++        </div>
++        <p class="text-xs text-subdued"><%= t(".sources_hint") %></p>
++      </div>
++
++      <%= render DS::Button.new(
++        text: t(".submit"),
++        full_width: true
++      ) %>
++    <% end %>
++  <% end %>
++<% end %>
+diff --git a/config/locales/views/categories/en.yml b/config/locales/views/categories/en.yml
+index 0422c07cfb..18ae3170ed 100644
+--- a/config/locales/views/categories/en.yml
++++ b/config/locales/views/categories/en.yml
+@@ -30,11 +30,28 @@ en:
+       categories_incomes: Income categories
+       delete_all: Delete all
+       empty: No categories found
++      merge: Merge categories
+       new: New category
++    merge:
++      title: Merge categories
++      description: Select a target category and the categories to merge into it. Matching transactions and budget lines will move to the target.
++      target_label: Merge into (target)
++      select_target: Select target category...
++      sources_label: Categories to merge
++      sources_hint: Selected categories will be deleted after their transactions and budget lines move to the target. Do not select the target as a source.
++      submit: Merge selected
+     menu:
+       loading: Loading...
+     new:
+       new_category: New category
++    perform_merge:
++      success:
++        one: Successfully merged %{count} category
++        other: Successfully merged %{count} categories
++      no_categories_selected: No categories selected to merge
++      target_not_found: Target category not found
++      invalid_categories: Invalid categories selected
++      target_selected_as_source: Choose different categories for the target and sources.
+     update:
+       success: Category updated successfully
+     virtual:
+diff --git a/config/routes.rb b/config/routes.rb
+index c88e38c534..cc38ccaae8 100644
+--- a/config/routes.rb
++++ b/config/routes.rb
+@@ -282,6 +282,8 @@
+   resources :categories, except: :show do
+     resources :deletions, only: %i[new create], module: :category
+ 
++    get :merge, on: :collection
++    post :perform_merge, on: :collection
+     post :bootstrap, on: :collection
+     delete :destroy_all, on: :collection
+   end
+diff --git a/test/controllers/categories_controller_test.rb b/test/controllers/categories_controller_test.rb
+index 33bdf6641d..2f8bed13d8 100644
+--- a/test/controllers/categories_controller_test.rb
++++ b/test/controllers/categories_controller_test.rb
+@@ -2,7 +2,8 @@
+ 
+ class CategoriesControllerTest < ActionDispatch::IntegrationTest
+   setup do
+-    sign_in users(:family_admin)
++    sign_in @user = users(:family_admin)
++    @family = @user.family
+     @transaction = transactions :one
+     ensure_tailwind_build
+   end
+@@ -95,4 +96,208 @@ class CategoriesControllerTest < ActionDispatch::IntegrationTest
+ 
+     assert_redirected_to categories_url
+   end
++
++  test "merge renders in the settings layout" do
++    get merge_categories_path
++
++    assert_response :success
++    assert_select "#mobile-settings-nav"
++  end
++
++  test "merge renders without the settings layout for modal frame requests" do
++    get merge_categories_path, headers: { "Turbo-Frame" => "modal" }
++
++    assert_response :success
++    assert_no_match(/<html/i, response.body)
++    assert_no_match(/<turbo-frame id="modal"><\/turbo-frame>/, response.body)
++    assert_select "dialog"
++  end
++
++  test "merge selected categories into an existing category" do
++    target = @family.categories.create!(
++      name: "Dining",
++      color: "#111111",
++      lucide_icon: "utensils"
++    )
++    source = @family.categories.create!(
++      name: "Coffee Shops",
++      color: "#000000",
++      lucide_icon: "coffee"
++    )
++    transaction = Transaction.create!(category: source)
++    Entry.create!(
++      account: accounts(:depository),
++      entryable: transaction,
++      name: "Coffee transaction",
++      date: Date.current,
++      amount: 10,
++      currency: "USD"
++    )
++
++    assert_difference "Category.count", -1 do
++      post perform_merge_categories_path, params: {
++        target_id: target.id,
++        source_ids: [ source.id ]
++      }
++    end
++
++    assert_redirected_to categories_path
++    assert_equal target, transaction.reload.category
++    assert_not Category.exists?(source.id)
++  end
++
++  test "merge redirects when a source category cannot be destroyed" do
++    target = @family.categories.create!(
++      name: "Destroy Failure Target",
++      color: "#000000",
++      lucide_icon: "shapes"
++    )
++    source = @family.categories.create!(
++      name: "Destroy Failure Source",
++      color: "#111111",
++      lucide_icon: "shapes"
++    )
++
++    Category::Merger.any_instance
++                    .stubs(:merge!)
++                    .raises(ActiveRecord::RecordNotDestroyed.new("cannot destroy category", source))
++
++    post perform_merge_categories_path, params: {
++      target_id: target.id,
++      source_ids: [ source.id ]
++    }
++
++    assert_redirected_to merge_categories_path
++    assert Category.exists?(source.id)
++  end
++
++  test "merge rejects selecting the target as a source" do
++    target = @family.categories.create!(
++      name: "Self Target",
++      color: "#000000",
++      lucide_icon: "shapes"
++    )
++    source = @family.categories.create!(
++      name: "Self Source",
++      color: "#111111",
++      lucide_icon: "shapes"
++    )
++
++    post perform_merge_categories_path, params: {
++      target_id: target.id,
++      source_ids: [ target.id, source.id ]
++    }
++
++    assert_redirected_to merge_categories_path
++    assert Category.exists?(target.id)
++    assert Category.exists?(source.id)
++  end
++
++  test "merge rejects parent category into any descendant" do
++    parent = @family.categories.create!(
++      name: "Parent Category",
++      color: "#000000",
++      lucide_icon: "folder"
++    )
++    child = @family.categories.create!(
++      name: "Child Category",
++      color: "#111111",
++      lucide_icon: "folder",
++      parent: parent
++    )
++    grandchild = @family.categories.create!(
++      name: "Grandchild Category",
++      color: "#222222",
++      lucide_icon: "folder"
++    )
++    # Category validation normally prevents this depth; the merger still guards
++    # against stale or imported data with deeper hierarchies.
++    grandchild.update_column(:parent_id, child.id)
++
++    post perform_merge_categories_path, params: {
++      target_id: grandchild.id,
++      source_ids: [ parent.id ]
++    }
++
++    assert_redirected_to merge_categories_path
++    assert Category.exists?(parent.id)
++  end
++
++  test "merge reparents source children to target category" do
++    target = @family.categories.create!(
++      name: "Target Category",
++      color: "#000000",
++      lucide_icon: "folder"
++    )
++    source = @family.categories.create!(
++      name: "Source Category",
++      color: "#111111",
++      lucide_icon: "folder"
++    )
++    child = @family.categories.create!(
++      name: "Source Child Category",
++      color: "#222222",
++      lucide_icon: "folder",
++      parent: source
++    )
++
++    post perform_merge_categories_path, params: {
++      target_id: target.id,
++      source_ids: [ source.id ]
++    }
++
++    assert_redirected_to categories_path
++    assert_equal target.id, child.reload.parent_id
++    assert_not Category.exists?(source.id)
++  end
++
++  test "merge rejects moving source children under a subcategory target" do
++    parent = @family.categories.create!(
++      name: "Target Parent Category",
++      color: "#000000",
++      lucide_icon: "folder"
++    )
++    target = @family.categories.create!(
++      name: "Target Subcategory",
++      color: "#111111",
++      lucide_icon: "folder",
++      parent: parent
++    )
++    source = @family.categories.create!(
++      name: "Source With Child",
++      color: "#222222",
++      lucide_icon: "folder"
++    )
++    child = @family.categories.create!(
++      name: "Source Child",
++      color: "#333333",
++      lucide_icon: "folder",
++      parent: source
++    )
++
++    post perform_merge_categories_path, params: {
++      target_id: target.id,
++      source_ids: [ source.id ]
++    }
++
++    assert_redirected_to merge_categories_path
++    assert Category.exists?(source.id)
++    assert_equal source.id, child.reload.parent_id
++  end
++
++  test "merge ignores categories outside current family" do
++    other = families(:empty).categories.create!(
++      name: "Other Family Category",
++      color: "#000000",
++      lucide_icon: "shapes"
++    )
++
++    post perform_merge_categories_path, params: {
++      target_id: categories(:income).id,
++      source_ids: [ other.id ]
++    }
++
++    assert_redirected_to merge_categories_path
++    assert Category.exists?(other.id)
++  end
+ end
+diff --git a/test/models/category/merger_test.rb b/test/models/category/merger_test.rb
+new file mode 100644
+index 0000000000..46e9803cce
+--- /dev/null
++++ b/test/models/category/merger_test.rb
+@@ -0,0 +1,100 @@
++require "test_helper"
++
++class Category::MergerTest < ActiveSupport::TestCase
++  setup do
++    @family = families(:dylan_family)
++    @other_family = families(:empty)
++  end
++
++  test "merge only reassigns and deletes categories inside the current family" do
++    target = create_category(@family, "Cross Family Merge Target")
++    source = create_category(@family, "Cross Family Merge Source")
++    source_child = create_category(@family, "Cross Family Merge Child", parent: source)
++    transaction = create_transaction_for(@family, source)
++    budget = create_budget(@family, 1.month.from_now.to_date.beginning_of_month)
++    target_budget_category = create_budget_category(budget, target, 8)
++    source_budget_category = create_budget_category(budget, source, 12)
++
++    other_target = create_category(@other_family, target.name)
++    other_source = create_category(@other_family, source.name)
++    other_child = create_category(@other_family, source_child.name, parent: other_source)
++    other_transaction = create_transaction_for(@other_family, other_source)
++    other_budget = create_budget(@other_family, 1.month.from_now.to_date.beginning_of_month)
++    other_source_budget_category = create_budget_category(other_budget, other_source, 30)
++
++    other_family_snapshot = -> {
++      {
++        target_exists: Category.exists?(other_target.id),
++        source_exists: Category.exists?(other_source.id),
++        child_parent_id: other_child.reload.parent_id,
++        transaction_category_id: other_transaction.reload.category_id,
++        source_budgeted_spending: other_source_budget_category.reload.budgeted_spending
++      }
++    }
++
++    assert_no_changes other_family_snapshot do
++      merger = Category::Merger.new(
++        family: @family,
++        target_category: target,
++        source_categories: [ source ]
++      )
++
++      assert merger.merge!
++    end
++
++    assert_equal target.id, transaction.reload.category_id
++    assert_equal target.id, source_child.reload.parent_id
++    assert_equal 20.to_d, target_budget_category.reload.budgeted_spending
++    assert_not BudgetCategory.exists?(source_budget_category.id)
++    assert_not Category.exists?(source.id)
++  end
++
++  private
++    def create_category(family, name, parent: nil)
++      family.categories.create!(
++        name: name,
++        color: "#000000",
++        lucide_icon: "shapes",
++        parent: parent
++      )
++    end
++
++    def create_transaction_for(family, category)
++      transaction = Transaction.create!(category: category)
++      Entry.create!(
++        account: account_for(family),
++        entryable: transaction,
++        name: "#{category.name} transaction",
++        date: Date.current,
++        amount: 10,
++        currency: family.currency || "USD"
++      )
++
++      transaction
++    end
++
++    def account_for(family)
++      family.accounts.first || family.accounts.create!(
++        accountable: Depository.create!(subtype: "checking"),
++        name: "#{family.name} Checking",
++        balance: 0,
++        currency: family.currency || "USD"
++      )
++    end
++
++    def create_budget(family, start_date)
++      family.budgets.create!(
++        start_date: start_date,
++        end_date: start_date.end_of_month,
++        currency: family.currency || "USD"
++      )
++    end
++
++    def create_budget_category(budget, category, budgeted_spending)
++      budget.budget_categories.create!(
++        category: category,
++        budgeted_spending: budgeted_spending,
++        currency: budget.currency
++      )
++    end
++end

@@ -1,0 +1,1808 @@
+diff --git a/apps/gittensory-ui/public/openapi.json b/apps/gittensory-ui/public/openapi.json
+index 68c2d57..3975934 100644
+--- a/apps/gittensory-ui/public/openapi.json
++++ b/apps/gittensory-ui/public/openapi.json
+@@ -5746,6 +5746,125 @@
+               "risks"
+             ]
+           },
++          "manifestGuidance": {
++            "type": "object",
++            "properties": {
++              "present": {
++                "type": "boolean"
++              },
++              "source": {
++                "type": "string",
++                "enum": [
++                  "repo_file",
++                  "api_record",
++                  "none"
++                ]
++              },
++              "linkedIssuePolicy": {
++                "type": "string",
++                "enum": [
++                  "required",
++                  "preferred",
++                  "optional"
++                ]
++              },
++              "issueDiscoveryPolicy": {
++                "type": "string",
++                "enum": [
++                  "encouraged",
++                  "neutral",
++                  "discouraged"
++                ]
++              },
++              "matchedWantedPaths": {
++                "type": "array",
++                "items": {
++                  "type": "string"
++                }
++              },
++              "matchedBlockedPaths": {
++                "type": "array",
++                "items": {
++                  "type": "string"
++                }
++              },
++              "preferredLabelHits": {
++                "type": "array",
++                "items": {
++                  "type": "string"
++                }
++              },
++              "findings": {
++                "type": "array",
++                "items": {
++                  "type": "object",
++                  "properties": {
++                    "code": {
++                      "type": "string"
++                    },
++                    "severity": {
++                      "type": "string",
++                      "enum": [
++                        "info",
++                        "warning",
++                        "critical"
++                      ]
++                    },
++                    "title": {
++                      "type": "string"
++                    },
++                    "detail": {
++                      "type": "string"
++                    },
++                    "action": {
++                      "type": "string"
++                    }
++                  },
++                  "required": [
++                    "code",
++                    "severity",
++                    "title",
++                    "detail"
++                  ]
++                }
++              },
++              "publicNextSteps": {
++                "type": "array",
++                "items": {
++                  "type": "string"
++                }
++              },
++              "maintainerNotes": {
++                "type": "array",
++                "items": {
++                  "type": "string"
++                }
++              },
++              "warnings": {
++                "type": "array",
++                "items": {
++                  "type": "string"
++                }
++              },
++              "summary": {
++                "type": "string"
++              }
++            },
++            "required": [
++              "present",
++              "source",
++              "linkedIssuePolicy",
++              "issueDiscoveryPolicy",
++              "matchedWantedPaths",
++              "matchedBlockedPaths",
++              "preferredLabelHits",
++              "findings",
++              "publicNextSteps",
++              "maintainerNotes",
++              "warnings",
++              "summary"
++            ]
++          },
+           "prPacket": {
+             "type": "object",
+             "properties": {
+@@ -5885,6 +6004,7 @@
+           "recommendedRerunCondition",
+           "localFindings",
+           "maintainerFit",
++          "manifestGuidance",
+           "prPacket",
+           "nextActions",
+           "workspaceIntelligence",
+diff --git a/src/api/routes.ts b/src/api/routes.ts
+index fe6b8bd..c967ccb 100644
+--- a/src/api/routes.ts
++++ b/src/api/routes.ts
+@@ -149,6 +149,7 @@ import { attachDataQuality, buildCoreSignalFidelity, buildFreshnessSloReport, bu
+ import { buildContributorOpenPrMonitor } from "../signals/contributor-open-pr-monitor";
+ import { buildPullRequestReviewability } from "../signals/reward-risk";
+ import { buildLocalBranchAnalysis, findCurrentBranchPullRequest } from "../signals/local-branch";
++import { loadRepoFocusManifest } from "../signals/focus-manifest-loader";
+ import { buildRepoSettingsPreview } from "../signals/settings-preview";
+ import { buildGittensorConfigRecommendation, buildRegistrationReadiness, type InstallationHealthSummary } from "../signals/registration-readiness";
+ import { fileUpstreamDriftIssues, loadUpstreamStatus, refreshUpstreamDrift } from "../upstream/ruleset";
+@@ -297,6 +298,7 @@ const localBranchAnalysisSchema = z
+     scenarioNotes: z.array(z.string().max(MAX_LOCAL_BRANCH_TEXT_CHARS)).max(20).optional(),
+     pendingCommitCount: z.number().int().min(0).optional(),
+     ciStatusHints: z.array(z.string().max(MAX_LOCAL_BRANCH_TEXT_CHARS)).max(20).optional(),
++    focusManifest: z.record(z.unknown()).optional(),
+   })
+   .strict();
+ 
+@@ -1424,7 +1426,7 @@ export function createApp() {
+     if (!parsed.success) return c.json({ error: "invalid_local_branch_analysis_request", issues: parsed.error.issues }, 400);
+     const unauthorized = await requireContributorAccess(c, parsed.data.login);
+     if (unauthorized) return unauthorized;
+-    const [context, repo, issues, pullRequests, recentMergedPullRequests, bounties, snapshot, issueQuality] = await Promise.all([
++    const [context, repo, issues, pullRequests, recentMergedPullRequests, bounties, snapshot, issueQuality, repoManifest] = await Promise.all([
+       loadContributorFastContext(c.env, parsed.data.login),
+       getRepository(c.env, parsed.data.repoFullName),
+       listIssues(c.env, parsed.data.repoFullName),
+@@ -1433,12 +1435,17 @@ export function createApp() {
+       listBountiesByRepo(c.env, parsed.data.repoFullName),
+       getOrCreateScoringModelSnapshot(c.env),
+       loadOrComputeIssueQualityResponse(c.env, parsed.data.repoFullName),
++      loadRepoFocusManifest(c.env, parsed.data.repoFullName),
+     ]);
+     const fit = buildContributorFit(context.profile, context.repositories, [], [], context.syncStates, context.repoStats);
+     const scoringProfile = buildContributorScoringProfile({ login: parsed.data.login, fit, scoringSnapshot: snapshot });
+     const checkSummaries = await loadCheckSummariesForPullRequests(c.env, parsed.data.repoFullName, parsed.data, pullRequests);
++    // Caller-supplied focusManifest wins; otherwise fall back to the repo-owned manifest when present.
++    const analysisInput = parsed.data.focusManifest !== undefined || !repoManifest.present
++      ? parsed.data
++      : { ...parsed.data, focusManifest: repoManifest as unknown };
+     const analysis = buildLocalBranchAnalysis({
+-      input: parsed.data,
++      input: analysisInput,
+       repo,
+       issues,
+       pullRequests,
+diff --git a/src/mcp/server.ts b/src/mcp/server.ts
+index eb43e92..9025374 100644
+--- a/src/mcp/server.ts
++++ b/src/mcp/server.ts
+@@ -60,6 +60,7 @@ import {
+ } from "../signals/engine";
+ import { buildContributorOpenPrMonitor } from "../signals/contributor-open-pr-monitor";
+ import { buildLocalBranchAnalysis, findCurrentBranchPullRequest } from "../signals/local-branch";
++import { loadRepoFocusManifest } from "../signals/focus-manifest-loader";
+ import { buildRepoDataQuality } from "../signals/data-quality";
+ import { loadUpstreamStatus } from "../upstream/ruleset";
+ 
+@@ -163,6 +164,7 @@ const localBranchAnalysisShape = {
+   expectedOpenPrCountAfterMerge: z.number().int().min(0).optional(),
+   projectedCredibility: z.number().min(0).max(1).optional(),
+   scenarioNotes: z.array(z.string()).max(20).optional(),
++  focusManifest: z.record(z.unknown()).optional(),
+   localScorer: z
+     .object({
+       mode: z.enum(["metadata_only", "external_command", "gittensor_root"]),
+@@ -931,7 +933,7 @@ export class GittensoryMcp {
+ 
+   private async analyzeLocalBranch(input: z.infer<z.ZodObject<typeof localBranchAnalysisShape>>) {
+     this.requireContributorAccess(input.login);
+-    const [context, repo, issues, pullRequests, recentMergedPullRequests, bounties, snapshot, issueQuality] = await Promise.all([
++    const [context, repo, issues, pullRequests, recentMergedPullRequests, bounties, snapshot, issueQuality, repoManifest] = await Promise.all([
+       this.loadContributorFastContext(input.login),
+       getRepository(this.env, input.repoFullName),
+       listIssues(this.env, input.repoFullName),
+@@ -940,13 +942,18 @@ export class GittensoryMcp {
+       listBountiesByRepo(this.env, input.repoFullName),
+       getOrCreateScoringModelSnapshot(this.env),
+       loadOrComputeIssueQualityResponse(this.env, input.repoFullName),
++      loadRepoFocusManifest(this.env, input.repoFullName),
+     ]);
+     const fit = buildContributorFit(context.profile, context.repositories, [], [], context.syncStates, context.repoStats);
+     const scoringProfile = buildContributorScoringProfile({ login: input.login, fit, scoringSnapshot: snapshot });
+     const checkSummaries = await this.loadCheckSummariesForPullRequests(input.repoFullName, input, pullRequests);
++    // Caller-supplied focusManifest wins; otherwise fall back to the repo-owned manifest when present.
++    const analysisInput = input.focusManifest !== undefined || !repoManifest.present
++      ? input
++      : { ...input, focusManifest: repoManifest as unknown };
+     return {
+       ...buildLocalBranchAnalysis({
+-        input,
++        input: analysisInput,
+         repo,
+         issues,
+         pullRequests,
+diff --git a/src/openapi/schemas.ts b/src/openapi/schemas.ts
+index 0e1ab15..0c4a4a0 100644
+--- a/src/openapi/schemas.ts
++++ b/src/openapi/schemas.ts
+@@ -1605,6 +1605,20 @@ export const LocalBranchAnalysisSchema = z
+       reasons: z.array(z.string()),
+       risks: z.array(z.string()),
+     }),
++    manifestGuidance: z.object({
++      present: z.boolean(),
++      source: z.enum(["repo_file", "api_record", "none"]),
++      linkedIssuePolicy: z.enum(["required", "preferred", "optional"]),
++      issueDiscoveryPolicy: z.enum(["encouraged", "neutral", "discouraged"]),
++      matchedWantedPaths: z.array(z.string()),
++      matchedBlockedPaths: z.array(z.string()),
++      preferredLabelHits: z.array(z.string()),
++      findings: z.array(z.object({ code: z.string(), severity: z.enum(["info", "warning", "critical"]), title: z.string(), detail: z.string(), action: z.string().optional() })),
++      publicNextSteps: z.array(z.string()),
++      maintainerNotes: z.array(z.string()),
++      warnings: z.array(z.string()),
++      summary: z.string(),
++    }),
+     prPacket: z.object({
+       titleSuggestion: z.string(),
+       markdown: z.string(),
+diff --git a/src/services/agent-orchestrator.ts b/src/services/agent-orchestrator.ts
+index 3eca6ce..87cdab4 100644
+--- a/src/services/agent-orchestrator.ts
++++ b/src/services/agent-orchestrator.ts
+@@ -28,6 +28,7 @@ import { summarizeAgentBundleWithAi } from "./ai-summaries";
+ import { buildContributorFit, buildContributorOutcomeHistory, buildContributorProfile, buildContributorScoringProfile } from "../signals/engine";
+ import { buildContributorOpenPrMonitor, type ContributorOpenPrMonitor } from "../signals/contributor-open-pr-monitor";
+ import { buildLocalBranchAnalysis, findCurrentBranchPullRequest, type LocalBranchAnalysis, type LocalBranchAnalysisInput } from "../signals/local-branch";
++import { loadRepoFocusManifest } from "../signals/focus-manifest-loader";
+ import type {
+   AgentActionRecord,
+   AgentActionStatus,
+@@ -290,7 +291,7 @@ async function executeLocalBranchRun(env: Env, run: AgentRunRecord, kind: string
+ }
+ 
+ async function analyzeLocalBranch(env: Env, input: LocalBranchAnalysisInput): Promise<LocalBranchAnalysis & { dataQuality?: { status: "complete" | "degraded" | "blocked" | "unknown"; warnings: string[] } }> {
+-  const [github, contributorPullRequests, contributorIssues, repositories, syncStates, cachedRepoStats, gittensorSnapshot, repo, issues, pullRequests, recentMergedPullRequests, bounties, scoringSnapshot, issueQuality] =
++  const [github, contributorPullRequests, contributorIssues, repositories, syncStates, cachedRepoStats, gittensorSnapshot, repo, issues, pullRequests, recentMergedPullRequests, bounties, scoringSnapshot, issueQuality, repoManifest] =
+     await Promise.all([
+       fetchPublicContributorProfile(input.login),
+       listContributorPullRequests(env, input.login),
+@@ -306,6 +307,7 @@ async function analyzeLocalBranch(env: Env, input: LocalBranchAnalysisInput): Pr
+       listBountiesByRepo(env, input.repoFullName),
+       getOrCreateScoringModelSnapshot(env),
+       loadOrComputeIssueQualityResponse(env, input.repoFullName),
++      loadRepoFocusManifest(env, input.repoFullName),
+     ]);
+   const repoStats = contributorRepoStatsFromGittensor(gittensorSnapshot).length > 0 ? contributorRepoStatsFromGittensor(gittensorSnapshot) : cachedRepoStats;
+   const profile = buildContributorProfile(input.login, github, contributorPullRequests, contributorIssues, repoStats, gittensorSnapshot);
+@@ -313,8 +315,12 @@ async function analyzeLocalBranch(env: Env, input: LocalBranchAnalysisInput): Pr
+   const fit = buildContributorFit(profile, repositories, [], [], syncStates, repoStats);
+   const scoringProfile = buildContributorScoringProfile({ login: input.login, fit, scoringSnapshot });
+   const checkSummaries = await loadCheckSummariesForPullRequests(env, input.repoFullName, input, pullRequests);
++  // Caller-supplied focusManifest wins; otherwise fall back to the repo-owned manifest when present.
++  const analysisInput = input.focusManifest !== undefined || !repoManifest.present
++    ? input
++    : { ...input, focusManifest: repoManifest as unknown };
+   return buildLocalBranchAnalysis({
+-    input,
++    input: analysisInput,
+     repo,
+     issues,
+     pullRequests,
+diff --git a/src/services/decision-pack.ts b/src/services/decision-pack.ts
+index 8f88731..db407db 100644
+--- a/src/services/decision-pack.ts
++++ b/src/services/decision-pack.ts
+@@ -1,3 +1,6 @@
++import { loadRepoFocusManifests } from "../signals/focus-manifest-loader";
++import type { FocusManifest, FocusManifestIssueDiscoveryPolicy, FocusManifestLinkedIssuePolicy, FocusManifestSource } from "../signals/focus-manifest";
++import { isFocusManifestPublicSafe } from "../signals/focus-manifest";
+ import {
+   hasRecentAuditEvent,
+   listAllIssues,
+@@ -140,6 +143,18 @@ export type RepoDecision = {
+   nextActions: string[];
+   publicNextActions: string[];
+   issueQuality?: IssueQualitySummary | undefined;
++  manifestSummary?: RepoDecisionManifestSummary | undefined;
++};
++
++export type RepoDecisionManifestSummary = {
++  present: boolean;
++  source: FocusManifestSource;
++  linkedIssuePolicy: FocusManifestLinkedIssuePolicy;
++  issueDiscoveryPolicy: FocusManifestIssueDiscoveryPolicy;
++  wantedPathCount: number;
++  blockedPathCount: number;
++  preferredLabels: string[];
++  publicNotes: string[];
+ };
+ 
+ export type DecisionAction = {
+@@ -289,6 +304,10 @@ export async function buildAndPersistContributorDecisionPack(env: Env, login: st
+   ]);
+   const repoStats = authoritativeContributorRepoStats(gittensorSnapshot, cachedRepoStats);
+   const issueQualityByRepo = await loadIssueQualityReportMap(env, repositories);
++  const focusManifests = await loadRepoFocusManifests(
++    env,
++    repositories.filter((repo) => repo.isRegistered).map((repo) => repo.fullName),
++  );
+   const profile = buildContributorProfile(login, github, contributorPullRequests, contributorIssues, repoStats, gittensorSnapshot);
+   const outcomeHistory = buildContributorOutcomeHistory({
+     login,
+@@ -316,6 +335,7 @@ export async function buildAndPersistContributorDecisionPack(env: Env, login: st
+     contributorIssues,
+     issueQualityByRepo,
+     openPrMonitor,
++    focusManifests,
+   });
+ 
+   await upsertContributorEvidence(env, {
+@@ -367,6 +387,7 @@ function buildContributorDecisionPack(args: {
+   contributorIssues: Parameters<typeof buildRoleContext>[0]["issues"];
+   issueQualityByRepo?: Map<string, IssueQualityReport> | undefined;
+   openPrMonitor: ContributorOpenPrMonitor;
++  focusManifests?: Map<string, FocusManifest> | undefined;
+ }): ContributorDecisionPack {
+   const registeredRepositories = args.repositories.filter((repo) => repo.isRegistered);
+   const syncByRepo = new Map(args.syncStates.map((state) => [state.repoFullName.toLowerCase(), state]));
+@@ -400,6 +421,7 @@ function buildContributorDecisionPack(args: {
+         languageSet,
+         labelHistory,
+         issueQuality: issueQualityByRepo.get(key),
++        focusManifest: args.focusManifests?.get(key),
+       });
+     })
+     .sort((left, right) => right.priorityScore - left.priorityScore || left.repoFullName.localeCompare(right.repoFullName));
+@@ -455,6 +477,7 @@ function buildRepoDecision(args: {
+   languageSet?: Set<string> | undefined;
+   labelHistory?: Set<string> | undefined;
+   issueQuality?: IssueQualityReport | undefined;
++  focusManifest?: FocusManifest | undefined;
+ }): RepoDecision {
+   const lane = buildLaneAdvice(args.repo, args.repo.fullName);
+   const config = args.repo.registryConfig;
+@@ -504,6 +527,9 @@ function buildRepoDecision(args: {
+     labelFit,
+     issueQuality,
+   };
++  const manifest = args.focusManifest;
++  const manifestSummary = manifest && manifest.present ? buildRepoDecisionManifestSummary(manifest) : undefined;
++  const manifestReasons = manifest && manifest.present ? buildRepoDecisionManifestReasons(manifest) : { whyThisHelps: [], nextActions: [], publicNextActions: [], riskReasons: [] };
+   return {
+     repoFullName: args.repo.fullName,
+     recommendation,
+@@ -516,11 +542,68 @@ function buildRepoDecision(args: {
+     languageMatch,
+     labelFit,
+     scoreBlockers: blockers,
+-    riskReasons,
+-    whyThisHelps: whyThisHelpsFor(recommendation, copyContext),
+-    nextActions: nextActionsFor(recommendation, copyContext),
+-    publicNextActions: publicNextActionsFor(recommendation, copyContext),
++    riskReasons: [...riskReasons, ...manifestReasons.riskReasons],
++    whyThisHelps: [...whyThisHelpsFor(recommendation, copyContext), ...manifestReasons.whyThisHelps],
++    nextActions: [...nextActionsFor(recommendation, copyContext), ...manifestReasons.nextActions],
++    publicNextActions: [...publicNextActionsFor(recommendation, copyContext), ...manifestReasons.publicNextActions],
+     issueQuality,
++    manifestSummary,
++  };
++}
++
++/**
++ * Public-safe per-repo summary of a maintainer's focus manifest, intentionally excluding the
++ * manifest's private `maintainerNotes`. The contributor-facing decision pack must never carry
++ * maintainer-private reviewer text.
++ */
++function buildRepoDecisionManifestSummary(manifest: FocusManifest): RepoDecisionManifestSummary {
++  return {
++    present: true,
++    source: manifest.source,
++    linkedIssuePolicy: manifest.linkedIssuePolicy,
++    issueDiscoveryPolicy: manifest.issueDiscoveryPolicy,
++    wantedPathCount: manifest.wantedPaths.length,
++    blockedPathCount: manifest.blockedPaths.length,
++    preferredLabels: manifest.preferredLabels.slice(0, 8),
++    publicNotes: manifest.publicNotes.filter(isFocusManifestPublicSafe).slice(0, 4),
++  };
++}
++
++function buildRepoDecisionManifestReasons(manifest: FocusManifest): { whyThisHelps: string[]; nextActions: string[]; publicNextActions: string[]; riskReasons: string[] } {
++  const whyThisHelps: string[] = [];
++  const nextActions: string[] = [];
++  const publicNextActions: string[] = [];
++  const riskReasons: string[] = [];
++  if (manifest.wantedPaths.length > 0) {
++    whyThisHelps.push(`Maintainer focus manifest declares ${manifest.wantedPaths.length} wanted path(s) for this repo.`);
++    publicNextActions.push("Target the maintainer-wanted areas for this repo when picking a change.");
++  }
++  if (manifest.blockedPaths.length > 0) {
++    riskReasons.push(`Maintainer focus manifest blocks ${manifest.blockedPaths.length} path pattern(s) for this repo.`);
++    publicNextActions.push("Avoid the maintainer-blocked areas for this repo.");
++  }
++  if (manifest.linkedIssuePolicy === "required") {
++    nextActions.push("Link a tracked issue on every PR; the maintainer's manifest requires it.");
++    publicNextActions.push("Link a tracked issue on every PR; the maintainer requires linked issues.");
++  } else if (manifest.linkedIssuePolicy === "preferred") {
++    publicNextActions.push("Prefer linking a tracked issue; the maintainer prefers linked issues.");
++  }
++  if (manifest.preferredLabels.length > 0) {
++    publicNextActions.push(`Use a maintainer-preferred label when applicable (${manifest.preferredLabels.slice(0, 3).join(", ")}).`);
++  }
++  if (manifest.issueDiscoveryPolicy === "discouraged") {
++    publicNextActions.push("Prefer direct fixes over new issue-discovery reports here.");
++  } else if (manifest.issueDiscoveryPolicy === "encouraged") {
++    publicNextActions.push("High-quality issue-discovery reports are welcomed by the maintainer.");
++  }
++  for (const note of manifest.publicNotes) {
++    if (isFocusManifestPublicSafe(note)) publicNextActions.push(note);
++  }
++  return {
++    whyThisHelps,
++    nextActions,
++    publicNextActions: [...new Set(publicNextActions)].filter(isFocusManifestPublicSafe),
++    riskReasons,
+   };
+ }
+ 
+diff --git a/src/signals/focus-manifest-loader.ts b/src/signals/focus-manifest-loader.ts
+new file mode 100644
+index 0000000..8a7ed68
+--- /dev/null
++++ b/src/signals/focus-manifest-loader.ts
+@@ -0,0 +1,126 @@
++import { listSignalSnapshots, persistSignalSnapshot } from "../db/repositories";
++import type { JsonValue } from "../types";
++import { nowIso } from "../utils/json";
++import { parseFocusManifest, parseFocusManifestContent, type FocusManifest, type FocusManifestSource } from "./focus-manifest";
++
++export const REPO_FOCUS_MANIFEST_SIGNAL = "repo-focus-manifest";
++export const REPO_FOCUS_MANIFEST_MAX_AGE_MS = 6 * 60 * 60 * 1000;
++
++/**
++ * Async source for the raw manifest text of a single repo. Returns null when no manifest is
++ * published. Allows tests and the persisted-record path to swap out the public-GitHub fetcher.
++ */
++export type RepoFocusManifestFetcher = (repoFullName: string) => Promise<string | null>;
++
++const MANIFEST_FILE_CANDIDATES = [".gittensory.json", ".github/gittensory.json"];
++
++/**
++ * Fetch a maintainer-owned manifest file from the public GitHub raw endpoint. Network or HTTP
++ * failures resolve to null so the loader falls back to deterministic signals.
++ */
++export async function fetchRepoFocusManifestFile(repoFullName: string): Promise<string | null> {
++  const slash = repoFullName.indexOf("/");
++  if (slash <= 0 || slash === repoFullName.length - 1) return null;
++  const owner = repoFullName.slice(0, slash);
++  const name = repoFullName.slice(slash + 1);
++  for (const path of MANIFEST_FILE_CANDIDATES) {
++    const url = `https://raw.githubusercontent.com/${encodeURIComponent(owner)}/${encodeURIComponent(name)}/HEAD/${path}`;
++    try {
++      const response = await fetch(url, { headers: { Accept: "application/json", "User-Agent": "gittensory" } });
++      if (response.ok) return await response.text();
++    } catch {
++      // try the next candidate path
++    }
++  }
++  return null;
++}
++
++/**
++ * Load the repo-owned focus manifest for a single repo. Reads a fresh persisted snapshot first
++ * (the "API-backed repo settings record" path); on a miss or stale snapshot, fetches the
++ * `.gittensory.json` file from the repo's default branch and caches the result. Missing or
++ * malformed manifests degrade to a safe empty manifest with warnings rather than throwing.
++ */
++export async function loadRepoFocusManifest(
++  env: Env,
++  repoFullName: string,
++  options: { fetcher?: RepoFocusManifestFetcher; maxAgeMs?: number; refresh?: boolean } = {},
++): Promise<FocusManifest> {
++  const fetcher = options.fetcher ?? fetchRepoFocusManifestFile;
++  const maxAgeMs = options.maxAgeMs ?? REPO_FOCUS_MANIFEST_MAX_AGE_MS;
++  if (!options.refresh) {
++    const cached = await readCachedManifest(env, repoFullName, maxAgeMs);
++    if (cached) return cached;
++  }
++  let manifest: FocusManifest;
++  try {
++    const content = await fetcher(repoFullName);
++    manifest = content === null || content === undefined ? parseFocusManifest(null) : parseFocusManifestContent(content, "repo_file");
++  } catch {
++    manifest = parseFocusManifest(null);
++  }
++  if (manifest.present) {
++    await persistRepoFocusManifest(env, repoFullName, manifest);
++  }
++  return manifest;
++}
++
++/** Bulk loader used by decision-pack and agent-planning paths to fetch many repos in parallel. */
++export async function loadRepoFocusManifests(
++  env: Env,
++  repoFullNames: string[],
++  options: { fetcher?: RepoFocusManifestFetcher; maxAgeMs?: number } = {},
++): Promise<Map<string, FocusManifest>> {
++  const entries = await Promise.all(
++    repoFullNames.map(async (name) => [name.toLowerCase(), await loadRepoFocusManifest(env, name, options)] as const),
++  );
++  return new Map(entries);
++}
++
++/**
++ * Persist a maintainer-supplied manifest (e.g. from a maintainer API/console) so subsequent
++ * decision-pack and branch-analysis paths pick it up without refetching the repo file.
++ */
++export async function upsertRepoFocusManifest(env: Env, repoFullName: string, raw: unknown, source: FocusManifestSource = "api_record"): Promise<FocusManifest> {
++  const manifest = parseFocusManifest(raw, source);
++  await persistRepoFocusManifest(env, repoFullName, manifest);
++  return manifest;
++}
++
++async function readCachedManifest(env: Env, repoFullName: string, maxAgeMs: number): Promise<FocusManifest | null> {
++  const [latest] = await listSignalSnapshots(env, REPO_FOCUS_MANIFEST_SIGNAL, repoFullName);
++  if (!latest) return null;
++  if (snapshotAgeMs(latest.generatedAt) > maxAgeMs) return null;
++  return parseFocusManifest(latest.payload);
++}
++
++async function persistRepoFocusManifest(env: Env, repoFullName: string, manifest: FocusManifest): Promise<void> {
++  await persistSignalSnapshot(env, {
++    id: crypto.randomUUID(),
++    signalType: REPO_FOCUS_MANIFEST_SIGNAL,
++    targetKey: repoFullName,
++    repoFullName,
++    payload: manifestToJson(manifest),
++    generatedAt: nowIso(),
++  });
++}
++
++function manifestToJson(manifest: FocusManifest): Record<string, JsonValue> {
++  return {
++    source: manifest.source,
++    wantedPaths: manifest.wantedPaths,
++    blockedPaths: manifest.blockedPaths,
++    preferredLabels: manifest.preferredLabels,
++    linkedIssuePolicy: manifest.linkedIssuePolicy,
++    testExpectations: manifest.testExpectations,
++    issueDiscoveryPolicy: manifest.issueDiscoveryPolicy,
++    maintainerNotes: manifest.maintainerNotes,
++    publicNotes: manifest.publicNotes,
++  };
++}
++
++function snapshotAgeMs(generatedAt: string | null | undefined): number {
++  if (!generatedAt) return Number.POSITIVE_INFINITY;
++  const parsed = Date.parse(generatedAt);
++  return Number.isFinite(parsed) ? Date.now() - parsed : Number.POSITIVE_INFINITY;
++}
+diff --git a/src/signals/focus-manifest.ts b/src/signals/focus-manifest.ts
+new file mode 100644
+index 0000000..71d6bb1
+--- /dev/null
++++ b/src/signals/focus-manifest.ts
+@@ -0,0 +1,365 @@
++import type { JsonValue } from "../types";
++
++export type FocusManifestSource = "repo_file" | "api_record" | "none";
++export type FocusManifestLinkedIssuePolicy = "required" | "preferred" | "optional";
++export type FocusManifestIssueDiscoveryPolicy = "encouraged" | "neutral" | "discouraged";
++
++/**
++ * Normalized maintainer focus manifest. Repo owners declare which work areas are wanted,
++ * blocked, or preferred so Gittensory guidance can explain why a path is encouraged or
++ * discouraged. `maintainerNotes` are private review context and must never reach a public
++ * GitHub surface; `publicNotes` are explicitly opted into public output by the maintainer.
++ */
++export type FocusManifest = {
++  present: boolean;
++  source: FocusManifestSource;
++  wantedPaths: string[];
++  blockedPaths: string[];
++  preferredLabels: string[];
++  linkedIssuePolicy: FocusManifestLinkedIssuePolicy;
++  testExpectations: string[];
++  issueDiscoveryPolicy: FocusManifestIssueDiscoveryPolicy;
++  maintainerNotes: string[];
++  publicNotes: string[];
++  warnings: string[];
++};
++
++export type FocusManifestFinding = {
++  code:
++    | "manifest_blocked_path"
++    | "manifest_off_focus"
++    | "manifest_preferred_path"
++    | "manifest_missing_preferred_label"
++    | "manifest_linked_issue_required"
++    | "manifest_linked_issue_preferred"
++    | "manifest_missing_tests"
++    | "manifest_issue_discovery_discouraged"
++    | "manifest_malformed";
++  severity: "info" | "warning" | "critical";
++  title: string;
++  detail: string;
++  action?: string | undefined;
++};
++
++export type FocusManifestGuidance = {
++  present: boolean;
++  source: FocusManifestSource;
++  linkedIssuePolicy: FocusManifestLinkedIssuePolicy;
++  issueDiscoveryPolicy: FocusManifestIssueDiscoveryPolicy;
++  matchedWantedPaths: string[];
++  matchedBlockedPaths: string[];
++  preferredLabelHits: string[];
++  findings: FocusManifestFinding[];
++  publicNextSteps: string[];
++  maintainerNotes: string[];
++  warnings: string[];
++  summary: string;
++};
++
++const MAX_LIST_ITEMS = 200;
++const MAX_ITEM_LENGTH = 300;
++
++const EMPTY_MANIFEST: FocusManifest = {
++  present: false,
++  source: "none",
++  wantedPaths: [],
++  blockedPaths: [],
++  preferredLabels: [],
++  linkedIssuePolicy: "optional",
++  testExpectations: [],
++  issueDiscoveryPolicy: "neutral",
++  maintainerNotes: [],
++  publicNotes: [],
++  warnings: [],
++};
++
++/**
++ * Public-safe redaction guard shared with the local-branch packet renderer. Public manifest
++ * text must not leak reward, wallet/key, ranking, or local filesystem path material.
++ */
++export function isFocusManifestPublicSafe(text: string): boolean {
++  return !/\b(reward\w*|score\w*|wallet|hotkey|coldkey|mnemonic|farming|payout|ranking|raw[-\s]?trust|trust score|private[-\s]?reviewability|reviewability)\b|\/Users\/|\/home\/|\/tmp\/|[A-Z]:\\Users\\/i.test(text);
++}
++
++function emptyManifest(source: FocusManifestSource, warnings: string[] = []): FocusManifest {
++  return { ...EMPTY_MANIFEST, source, warnings };
++}
++
++function normalizeStringList(value: JsonValue | undefined, field: string, warnings: string[]): string[] {
++  if (value === undefined || value === null) return [];
++  if (!Array.isArray(value)) {
++    warnings.push(`Manifest field "${field}" must be a list; ignoring a ${typeof value} value.`);
++    return [];
++  }
++  const result: string[] = [];
++  for (const entry of value) {
++    if (typeof entry !== "string") {
++      warnings.push(`Manifest field "${field}" skipped a non-string entry.`);
++      continue;
++    }
++    const trimmed = entry.trim();
++    if (!trimmed) continue;
++    if (trimmed.length > MAX_ITEM_LENGTH) {
++      warnings.push(`Manifest field "${field}" truncated an over-long entry.`);
++      result.push(trimmed.slice(0, MAX_ITEM_LENGTH));
++      continue;
++    }
++    if (!result.includes(trimmed)) result.push(trimmed);
++    if (result.length >= MAX_LIST_ITEMS) {
++      warnings.push(`Manifest field "${field}" exceeded ${MAX_LIST_ITEMS} entries; extra entries ignored.`);
++      break;
++    }
++  }
++  return result;
++}
++
++function normalizeEnum<T extends string>(value: JsonValue | undefined, field: string, allowed: readonly T[], fallback: T, warnings: string[]): T {
++  if (value === undefined || value === null) return fallback;
++  if (typeof value !== "string" || !allowed.includes(value as T)) {
++    warnings.push(`Manifest field "${field}" must be one of ${allowed.join(", ")}; falling back to "${fallback}".`);
++    return fallback;
++  }
++  return value as T;
++}
++
++function normalizeSource(raw: FocusManifestSource | undefined, value: JsonValue | undefined, warnings: string[]): FocusManifestSource {
++  if (raw) return raw;
++  return normalizeEnum<FocusManifestSource>(value, "source", ["repo_file", "api_record", "none"], "api_record", warnings);
++}
++
++/**
++ * Tolerantly normalize an already-parsed manifest object into a {@link FocusManifest}.
++ * Never throws: malformed shapes degrade to safe defaults and accumulate warnings so callers
++ * can surface them instead of crashing.
++ */
++export function parseFocusManifest(raw: unknown, source?: FocusManifestSource): FocusManifest {
++  if (raw === undefined || raw === null) return emptyManifest(source ?? "none");
++  if (typeof raw !== "object" || Array.isArray(raw)) {
++    return emptyManifest(source ?? "api_record", ["Manifest must be a mapping of fields; ignoring malformed manifest and falling back to deterministic signals."]);
++  }
++  const record = raw as Record<string, JsonValue>;
++  const warnings: string[] = [];
++  const manifest: FocusManifest = {
++    present: true,
++    source: normalizeSource(source, record.source, warnings),
++    wantedPaths: normalizeStringList(record.wantedPaths, "wantedPaths", warnings),
++    blockedPaths: normalizeStringList(record.blockedPaths, "blockedPaths", warnings),
++    preferredLabels: normalizeStringList(record.preferredLabels, "preferredLabels", warnings),
++    linkedIssuePolicy: normalizeEnum(record.linkedIssuePolicy, "linkedIssuePolicy", ["required", "preferred", "optional"] as const, "optional", warnings),
++    testExpectations: normalizeStringList(record.testExpectations, "testExpectations", warnings),
++    issueDiscoveryPolicy: normalizeEnum(record.issueDiscoveryPolicy, "issueDiscoveryPolicy", ["encouraged", "neutral", "discouraged"] as const, "neutral", warnings),
++    maintainerNotes: normalizeStringList(record.maintainerNotes, "maintainerNotes", warnings),
++    publicNotes: normalizeStringList(record.publicNotes, "publicNotes", warnings).filter(isFocusManifestPublicSafe),
++    warnings,
++  };
++  if (
++    manifest.wantedPaths.length === 0 &&
++    manifest.blockedPaths.length === 0 &&
++    manifest.preferredLabels.length === 0 &&
++    manifest.testExpectations.length === 0 &&
++    manifest.maintainerNotes.length === 0 &&
++    manifest.publicNotes.length === 0 &&
++    manifest.linkedIssuePolicy === "optional" &&
++    manifest.issueDiscoveryPolicy === "neutral"
++  ) {
++    warnings.push("Manifest contained no recognized focus fields; falling back to deterministic signals.");
++    manifest.present = false;
++  }
++  return manifest;
++}
++
++/**
++ * Parse raw manifest file/record content (JSON). Malformed JSON degrades to an empty manifest
++ * with a warning rather than throwing, so a broken `.gittensory` config never breaks analysis.
++ */
++export function parseFocusManifestContent(content: string | null | undefined, source: FocusManifestSource = "repo_file"): FocusManifest {
++  if (content === undefined || content === null || content.trim() === "") return emptyManifest(source);
++  let parsed: unknown;
++  try {
++    parsed = JSON.parse(content);
++  } catch {
++    return emptyManifest(source, ["Manifest content was not valid JSON; ignoring it and falling back to deterministic signals."]);
++  }
++  return parseFocusManifest(parsed, source);
++}
++
++function normalizePathForMatch(path: string): string {
++  return String(path).replace(/\\/g, "/").replace(/^\.\//, "").replace(/^\/+/, "").toLowerCase();
++}
++
++/**
++ * Match a changed path against a manifest path pattern. Supports exact paths, directory
++ * prefixes (`src/` or `src`), and `*` wildcards (`**` collapses to `*`).
++ */
++export function matchesManifestPath(path: string, pattern: string): boolean {
++  const normalizedPath = normalizePathForMatch(path);
++  const normalizedPattern = normalizePathForMatch(pattern);
++  if (!normalizedPath || !normalizedPattern) return false;
++  if (normalizedPattern.includes("*")) {
++    const escaped = normalizedPattern.replace(/[.+?^${}()|[\]\\]/g, "\\$&").replace(/\*+/g, ".*");
++    return new RegExp(`^${escaped}$`).test(normalizedPath);
++  }
++  if (normalizedPath === normalizedPattern) return true;
++  const dirPattern = normalizedPattern.endsWith("/") ? normalizedPattern : `${normalizedPattern}/`;
++  return normalizedPath.startsWith(dirPattern);
++}
++
++function matchedPatterns(paths: string[], patterns: string[]): string[] {
++  return patterns.filter((pattern) => paths.some((path) => matchesManifestPath(path, pattern)));
++}
++
++/**
++ * Build deterministic, public-safe guidance from a focus manifest for a concrete change set.
++ * Explains why changed paths are preferred or discouraged and surfaces manifest-driven blockers
++ * without leaking maintainer-private notes into public next steps.
++ */
++export function buildFocusManifestGuidance(args: {
++  manifest: FocusManifest;
++  changedPaths: string[];
++  labels?: string[] | undefined;
++  linkedIssueCount?: number | undefined;
++  testFileCount?: number | undefined;
++  passedValidationCount?: number | undefined;
++}): FocusManifestGuidance {
++  const { manifest } = args;
++  const changedPaths = args.changedPaths.filter((path) => typeof path === "string" && path.length > 0);
++  const labels = (args.labels ?? []).map((label) => label.toLowerCase());
++  const linkedIssueCount = Math.max(0, args.linkedIssueCount ?? 0);
++  const testFileCount = Math.max(0, args.testFileCount ?? 0);
++  const passedValidationCount = Math.max(0, args.passedValidationCount ?? 0);
++
++  const matchedBlockedPaths = matchedPatterns(changedPaths, manifest.blockedPaths);
++  const matchedWantedPaths = matchedPatterns(changedPaths, manifest.wantedPaths);
++  const preferredLabelHits = manifest.preferredLabels.filter((label) => labels.includes(label.toLowerCase()));
++
++  const findings: FocusManifestFinding[] = [];
++  const publicNextSteps: string[] = [];
++
++  if (!manifest.present) {
++    for (const warning of manifest.warnings) {
++      findings.push({ code: "manifest_malformed", severity: "info", title: "Maintainer focus manifest not applied", detail: warning });
++    }
++    return {
++      present: false,
++      source: manifest.source,
++      linkedIssuePolicy: manifest.linkedIssuePolicy,
++      issueDiscoveryPolicy: manifest.issueDiscoveryPolicy,
++      matchedWantedPaths: [],
++      matchedBlockedPaths: [],
++      preferredLabelHits: [],
++      findings,
++      publicNextSteps: [],
++      maintainerNotes: [],
++      warnings: manifest.warnings,
++      summary: "No maintainer focus manifest applied; using deterministic signals only.",
++    };
++  }
++
++  if (matchedBlockedPaths.length > 0) {
++    findings.push({
++      code: "manifest_blocked_path",
++      severity: "critical",
++      title: "Change touches a maintainer-blocked area",
++      detail: `Changed paths match maintainer-blocked patterns: ${matchedBlockedPaths.slice(0, 5).join(", ")}.`,
++      action: "Move this work out of the maintainer-blocked area or confirm with the maintainer before opening a PR.",
++    });
++    publicNextSteps.push("Avoid the maintainer-blocked areas this branch currently touches; confirm scope with the maintainer first.");
++  } else if (manifest.wantedPaths.length > 0 && matchedWantedPaths.length === 0 && changedPaths.length > 0) {
++    findings.push({
++      code: "manifest_off_focus",
++      severity: "warning",
++      title: "Change is outside maintainer-wanted areas",
++      detail: `No changed path matches the maintainer-wanted patterns (${manifest.wantedPaths.slice(0, 5).join(", ")}).`,
++      action: "Refocus the change onto a maintainer-wanted area or explain why this out-of-focus work is needed.",
++    });
++    publicNextSteps.push("Refocus onto the maintainer-wanted areas, or explain why this out-of-focus change is needed.");
++  }
++
++  if (matchedWantedPaths.length > 0) {
++    findings.push({
++      code: "manifest_preferred_path",
++      severity: "info",
++      title: "Change aligns with maintainer-wanted areas",
++      detail: `Changed paths match maintainer-wanted patterns: ${matchedWantedPaths.slice(0, 5).join(", ")}.`,
++    });
++    publicNextSteps.push("Changed paths align with the maintainer's wanted areas for this repo.");
++  }
++
++  if (manifest.preferredLabels.length > 0 && preferredLabelHits.length === 0) {
++    findings.push({
++      code: "manifest_missing_preferred_label",
++      severity: "info",
++      title: "No maintainer-preferred label applied",
++      detail: `Maintainer prefers labels: ${manifest.preferredLabels.slice(0, 5).join(", ")}.`,
++      action: "Consider applying a maintainer-preferred label so triage stays aligned.",
++    });
++    publicNextSteps.push(`Consider a maintainer-preferred label (${manifest.preferredLabels.slice(0, 3).join(", ")}).`);
++  }
++
++  if (manifest.linkedIssuePolicy === "required" && linkedIssueCount === 0) {
++    findings.push({
++      code: "manifest_linked_issue_required",
++      severity: "warning",
++      title: "Maintainer requires a linked issue",
++      detail: "This repo's maintainer focus manifest requires every PR to reference a tracked issue.",
++      action: "Link the relevant issue (for example `Closes #123`) before opening the PR.",
++    });
++    publicNextSteps.push("Link the relevant tracked issue; the maintainer requires linked issues on PRs.");
++  } else if (manifest.linkedIssuePolicy === "preferred" && linkedIssueCount === 0) {
++    findings.push({
++      code: "manifest_linked_issue_preferred",
++      severity: "info",
++      title: "Maintainer prefers a linked issue",
++      detail: "This repo's maintainer focus manifest prefers PRs to reference a tracked issue.",
++      action: "Link a tracked issue if one exists.",
++    });
++    publicNextSteps.push("Link a tracked issue if one exists; the maintainer prefers linked issues.");
++  }
++
++  if (manifest.testExpectations.length > 0 && testFileCount === 0 && passedValidationCount === 0) {
++    findings.push({
++      code: "manifest_missing_tests",
++      severity: "warning",
++      title: "Maintainer test expectations unmet",
++      detail: `Maintainer expects test evidence: ${manifest.testExpectations.slice(0, 3).join("; ")}.`,
++      action: "Add or update tests, or attach passing validation output that satisfies the maintainer's test expectations.",
++    });
++    publicNextSteps.push("Add tests or attach passing validation that meets the maintainer's test expectations.");
++  }
++
++  if (manifest.issueDiscoveryPolicy === "discouraged") {
++    findings.push({
++      code: "manifest_issue_discovery_discouraged",
++      severity: "info",
++      title: "Maintainer discourages issue-discovery reports",
++      detail: "This repo's maintainer focus manifest discourages new issue-discovery reports; prefer direct fixes.",
++      action: "Prefer a direct PR over filing a new issue-discovery report here.",
++    });
++    publicNextSteps.push("This repo prefers direct fixes over new issue-discovery reports.");
++  }
++
++  const safePublicNotes = manifest.publicNotes.filter(isFocusManifestPublicSafe);
++  const safeNextSteps = [...new Set([...publicNextSteps, ...safePublicNotes])].filter(isFocusManifestPublicSafe);
++
++  return {
++    present: true,
++    source: manifest.source,
++    linkedIssuePolicy: manifest.linkedIssuePolicy,
++    issueDiscoveryPolicy: manifest.issueDiscoveryPolicy,
++    matchedWantedPaths,
++    matchedBlockedPaths,
++    preferredLabelHits,
++    findings,
++    publicNextSteps: safeNextSteps,
++    maintainerNotes: manifest.maintainerNotes,
++    warnings: manifest.warnings,
++    summary: summarize(manifest, matchedBlockedPaths, matchedWantedPaths),
++  };
++}
++
++function summarize(manifest: FocusManifest, blocked: string[], wanted: string[]): string {
++  if (blocked.length > 0) return "Maintainer focus manifest: change touches a blocked area.";
++  if (wanted.length > 0) return "Maintainer focus manifest: change aligns with a wanted area.";
++  if (manifest.wantedPaths.length > 0) return "Maintainer focus manifest: change is outside the wanted areas.";
++  return "Maintainer focus manifest applied with no path-specific verdict.";
++}
+diff --git a/src/signals/local-branch.ts b/src/signals/local-branch.ts
+index ede8aac..5b46002 100644
+--- a/src/signals/local-branch.ts
++++ b/src/signals/local-branch.ts
+@@ -17,6 +17,7 @@ import {
+ } from "./engine";
+ import { buildRepoRewardRisk, type RepoRewardRisk, type RewardRiskAction } from "./reward-risk";
+ import { buildLocalWorkspaceIntelligence, type LocalWorkspaceIntelligence } from "./local-workspace-intelligence";
++import { buildFocusManifestGuidance, parseFocusManifest, type FocusManifestGuidance } from "./focus-manifest";
+ 
+ export type LocalBranchChangedFile = {
+   path: string;
+@@ -72,6 +73,7 @@ export type LocalBranchAnalysisInput = {
+   scenarioNotes?: string[] | undefined;
+   pendingCommitCount?: number | undefined;
+   ciStatusHints?: string[] | undefined;
++  focusManifest?: unknown;
+ };
+ 
+ type ObservedPullRequestScenarios = {
+@@ -149,6 +151,7 @@ export type LocalBranchAnalysis = {
+     reasons: string[];
+     risks: string[];
+   };
++  manifestGuidance: FocusManifestGuidance;
+   prPacket: {
+     titleSuggestion: string;
+     markdown: string;
+@@ -273,7 +276,25 @@ export function buildLocalBranchAnalysis(args: {
+     issues: args.issues,
+     pullRequests: args.pullRequests,
+   });
+-  const localFindings = buildLocalFindings(args.input, changedFiles, preflight, scorePreview, baseFreshness, githubBranchStatus);
++  const manifest = parseFocusManifest(args.input.focusManifest);
++  const manifestGuidance = buildFocusManifestGuidance({
++    manifest,
++    changedPaths,
++    labels: args.input.labels,
++    linkedIssueCount: preflight.linkedIssues.length,
++    testFileCount: testFiles.length,
++    passedValidationCount: validationSummary.passed,
++  });
++  const localFindings = [
++    ...buildLocalFindings(args.input, changedFiles, preflight, scorePreview, baseFreshness, githubBranchStatus),
++    ...manifestGuidance.findings.map((finding) => ({
++      code: finding.code,
++      severity: finding.severity,
++      title: finding.title,
++      detail: finding.detail,
++      action: finding.action,
++    })),
++  ];
+   const branchQualityBlockers = branchQualityBlockersFor(preflight, localFindings);
+   const accountStateBlockers = accountStateBlockersFor(scorePreview);
+   /* v8 ignore next -- buildScorePreview always emits a current scenario; this fallback protects malformed scorer adapters. */
+@@ -301,6 +322,7 @@ export function buildLocalBranchAnalysis(args: {
+     baseFreshness,
+     githubBranchStatus,
+     recommendedRerunCondition,
++    manifestGuidance,
+   });
+   const scoreBlockers = [
+     ...rewardRisk.scoreBlockers,
+@@ -336,6 +358,7 @@ export function buildLocalBranchAnalysis(args: {
+       reasons: recommendation.reasons,
+       risks: recommendation.risks,
+     },
++    manifestGuidance,
+     prPacket,
+     nextActions: withSituationalAction(rewardRisk.actions, branchQualityBlockers, accountStateBlockers, scorePreview).slice(0, 6),
+     workspaceIntelligence: buildLocalWorkspaceIntelligence({
+@@ -926,6 +949,7 @@ function buildPublicSafePrPacket(args: {
+   baseFreshness: LocalBranchAnalysis["baseFreshness"];
+   githubBranchStatus: GitHubBranchStatus;
+   recommendedRerunCondition: string;
++  manifestGuidance: FocusManifestGuidance;
+ }): LocalBranchAnalysis["prPacket"] {
+   const topPaths = args.changedFiles.slice(0, 8).map(changedFileSummary);
+   const publicSafeWarnings = [
+@@ -943,9 +967,14 @@ function buildPublicSafePrPacket(args: {
+         return finding.action ? [finding.action] : [finding.title];
+       }),
+   ].filter(isPublicSafeText);
+-  const nextSteps = [...publicSafeWarnings, args.baseFreshness.recommendation, args.recommendedRerunCondition, "Keep source upload disabled; this packet is based on local git metadata only."].filter(
+-    (line): line is string => Boolean(line && isPublicSafeText(line)),
+-  );
++  const nextSteps = [
++    ...publicSafeWarnings,
++    ...args.manifestGuidance.publicNextSteps,
++    args.baseFreshness.recommendation,
++    args.recommendedRerunCondition,
++    "Keep source upload disabled; this packet is based on local git metadata only.",
++  ].filter((line): line is string => Boolean(line && isPublicSafeText(line)));
++  const manifestFocus = manifestFocusLines(args.manifestGuidance);
+   const validationLines =
+     args.validationSummary.commands.length > 0
+       ? args.validationSummary.commands.map((entry) => `- ${entry.status}: ${entry.command}${entry.durationMs !== undefined ? ` [${entry.durationMs}ms]` : ""}${entry.summary ? ` (${entry.summary})` : ""}`)
+@@ -961,6 +990,7 @@ function buildPublicSafePrPacket(args: {
+       },
+       { heading: "Branch Freshness", lines: branchFreshnessLines(args.baseFreshness) },
+       { heading: "GitHub Status", lines: githubStatusLines(args.githubBranchStatus) },
++      ...(manifestFocus.length > 0 ? [{ heading: "Maintainer Focus", lines: manifestFocus }] : []),
+       { heading: "Overlap/WIP Check", lines: overlapCautionLines(args.preflight.collisions) },
+       {
+         heading: "Changed Paths",
+@@ -995,6 +1025,12 @@ function githubStatusLines(status: GitHubBranchStatus): string[] {
+   return [`- PR #${status.pullNumber}: ${status.status.replace(/_/g, " ")}.`, ...status.notes.map((note) => `- ${note}`)].filter(isPublicSafeText);
+ }
+ 
++function manifestFocusLines(guidance: FocusManifestGuidance): string[] {
++  if (!guidance.present) return [];
++  const lines = guidance.publicNextSteps.map((step) => `- ${step}`).filter(isPublicSafeText);
++  return [...new Set(lines)].slice(0, 6);
++}
++
+ function overlapCautionLines(collisions: LocalDiffPreflightResult["collisions"]): string[] {
+   if (collisions.length === 0) return ["- No active overlap or WIP was detected from cached issue/PR metadata."];
+   return collisions
+diff --git a/test/unit/decision-pack.test.ts b/test/unit/decision-pack.test.ts
+index 793dc39..da8a3f0 100644
+--- a/test/unit/decision-pack.test.ts
++++ b/test/unit/decision-pack.test.ts
+@@ -1054,6 +1054,141 @@ describe("decision-pack service", () => {
+     expect(packA.repoDecisions.map((d) => d.nextActions)).toEqual(packB.repoDecisions.map((d) => d.nextActions));
+     expect(packA.topActions.map((a) => `${a.actionKind}:${a.repoFullName}`)).toEqual(packB.topActions.map((a) => `${a.actionKind}:${a.repoFullName}`));
+   });
++
++  it("threads a maintainer focus manifest into RepoDecision without leaking maintainer-private notes", async () => {
++    const { parseFocusManifest } = await import("../../src/signals/focus-manifest");
++    const manifest = parseFocusManifest({
++      source: "repo_file",
++      wantedPaths: ["src/"],
++      blockedPaths: ["migrations/"],
++      preferredLabels: ["bug"],
++      linkedIssuePolicy: "required",
++      issueDiscoveryPolicy: "discouraged",
++      maintainerNotes: ["Internal: ping @owner before touching the queue processor."],
++      publicNotes: ["Prefer small, focused PRs."],
++    });
++    const decision = __decisionPackInternals.buildRepoDecision({
++      repo: repoWithLabels("owner/manifested", 0.04, 0, { bug: 1 }),
++      roleContext: { maintainerLane: false } as any,
++      outcome: { mergedPullRequests: 1, openPullRequests: 0, closedPullRequestRate: 0, credibility: 1 } as any,
++      syncState: { primaryLanguage: "TypeScript" } as any,
++      languageSet: new Set(["typescript"]),
++      labelHistory: new Set(["bug"]),
++      focusManifest: manifest,
++    });
++    expect(decision.manifestSummary).toMatchObject({
++      present: true,
++      source: "repo_file",
++      linkedIssuePolicy: "required",
++      issueDiscoveryPolicy: "discouraged",
++      wantedPathCount: 1,
++      blockedPathCount: 1,
++      preferredLabels: ["bug"],
++      publicNotes: ["Prefer small, focused PRs."],
++    });
++    expect(decision.riskReasons.join(" ")).toMatch(/maintainer focus manifest blocks/i);
++    expect(decision.whyThisHelps.join(" ")).toMatch(/wanted path/i);
++    expect(decision.publicNextActions.join(" ")).toMatch(/maintainer requires linked issues/i);
++    expect(decision.publicNextActions.join(" ")).toMatch(/Prefer small, focused PRs/);
++    // Privacy boundary: maintainer-private notes must not appear anywhere on RepoDecision.
++    const decisionJson = JSON.stringify(decision);
++    expect(decisionJson).not.toMatch(/ping @owner/);
++    expect(decisionJson).not.toMatch(/Internal:/);
++    expect(noStructuralCountLeak(decision.publicNextActions)).toBe(true);
++  });
++
++  it("covers the preferred linked-issue and encouraged issue-discovery manifest arms", async () => {
++    const { parseFocusManifest } = await import("../../src/signals/focus-manifest");
++    const manifest = parseFocusManifest({
++      source: "api_record",
++      wantedPaths: ["src/"],
++      preferredLabels: ["bug"],
++      linkedIssuePolicy: "preferred",
++      issueDiscoveryPolicy: "encouraged",
++    });
++    const decision = __decisionPackInternals.buildRepoDecision({
++      repo: repoWithLabels("owner/preferred", 0.04, 0, { bug: 1 }),
++      roleContext: { maintainerLane: false } as any,
++      outcome: { mergedPullRequests: 1, openPullRequests: 0, closedPullRequestRate: 0, credibility: 1 } as any,
++      syncState: { primaryLanguage: "TypeScript" } as any,
++      languageSet: new Set(["typescript"]),
++      labelHistory: new Set(["bug"]),
++      focusManifest: manifest,
++    });
++    expect(decision.manifestSummary?.linkedIssuePolicy).toBe("preferred");
++    expect(decision.publicNextActions.join(" ")).toMatch(/prefers linked issues/i);
++    expect(decision.publicNextActions.join(" ")).toMatch(/issue-discovery reports are welcomed/i);
++    expect(decision.publicNextActions.join(" ")).toMatch(/maintainer-preferred label/i);
++    expect(noStructuralCountLeak(decision.publicNextActions)).toBe(true);
++  });
++
++  it("covers the optional linked-issue, neutral issue-discovery, and unlabeled manifest arms", async () => {
++    const { parseFocusManifest } = await import("../../src/signals/focus-manifest");
++    const manifest = parseFocusManifest({
++      source: "api_record",
++      blockedPaths: ["migrations/"],
++      linkedIssuePolicy: "optional",
++      issueDiscoveryPolicy: "neutral",
++    });
++    const decision = __decisionPackInternals.buildRepoDecision({
++      repo: repoWithLabels("owner/neutral", 0.04, 0, { bug: 1 }),
++      roleContext: { maintainerLane: false } as any,
++      outcome: { mergedPullRequests: 1, openPullRequests: 0, closedPullRequestRate: 0, credibility: 1 } as any,
++      syncState: { primaryLanguage: "TypeScript" } as any,
++      languageSet: new Set(["typescript"]),
++      labelHistory: new Set(["bug"]),
++      focusManifest: manifest,
++    });
++    expect(decision.manifestSummary?.linkedIssuePolicy).toBe("optional");
++    expect(decision.manifestSummary?.issueDiscoveryPolicy).toBe("neutral");
++    // Optional/neutral policies and absent preferred labels emit no policy-specific public actions.
++    expect(decision.publicNextActions.join(" ")).not.toMatch(/requires linked issues|prefers linked issues/i);
++    expect(decision.publicNextActions.join(" ")).not.toMatch(/issue-discovery reports are welcomed|Prefer direct fixes over new issue-discovery/i);
++    expect(decision.publicNextActions.join(" ")).not.toMatch(/maintainer-preferred label/i);
++    expect(noStructuralCountLeak(decision.publicNextActions)).toBe(true);
++  });
++
++  it("drops a non-public-safe manifest note before it reaches public next actions", () => {
++    // Defense-in-depth: even if a present manifest carries an unsafe public note, the
++    // per-note redaction guard keeps it out of the contributor-facing actions.
++    const manifest = {
++      present: true,
++      source: "repo_file",
++      wantedPaths: ["src/"],
++      blockedPaths: [],
++      preferredLabels: [],
++      linkedIssuePolicy: "optional",
++      testExpectations: [],
++      issueDiscoveryPolicy: "neutral",
++      maintainerNotes: [],
++      publicNotes: ["Maximize your reward payout", "Keep PRs small"],
++      warnings: [],
++    } as const;
++    const decision = __decisionPackInternals.buildRepoDecision({
++      repo: repoWithLabels("owner/unsafe-note", 0.04, 0, { bug: 1 }),
++      roleContext: { maintainerLane: false } as any,
++      outcome: { mergedPullRequests: 1, openPullRequests: 0, closedPullRequestRate: 0, credibility: 1 } as any,
++      syncState: { primaryLanguage: "TypeScript" } as any,
++      languageSet: new Set(["typescript"]),
++      labelHistory: new Set(["bug"]),
++      focusManifest: manifest as any,
++    });
++    expect(decision.publicNextActions.join(" ")).not.toMatch(/reward payout/i);
++    expect(decision.publicNextActions).toContain("Keep PRs small");
++    expect(noStructuralCountLeak(decision.publicNextActions)).toBe(true);
++  });
++
++  it("omits manifestSummary when no manifest is configured", () => {
++    const decision = __decisionPackInternals.buildRepoDecision({
++      repo: repoWithLabels("owner/no-manifest", 0.04, 0, { bug: 1 }),
++      roleContext: { maintainerLane: false } as any,
++      outcome: { mergedPullRequests: 1, openPullRequests: 0, closedPullRequestRate: 0, credibility: 1 } as any,
++      syncState: { primaryLanguage: "TypeScript" } as any,
++      languageSet: new Set(["typescript"]),
++      labelHistory: new Set(["bug"]),
++    });
++    expect(decision.manifestSummary).toBeUndefined();
++  });
+ });
+ 
+ function emptyOpenPrMonitor(login: string) {
+diff --git a/test/unit/focus-manifest-loader.test.ts b/test/unit/focus-manifest-loader.test.ts
+new file mode 100644
+index 0000000..8c57af1
+--- /dev/null
++++ b/test/unit/focus-manifest-loader.test.ts
+@@ -0,0 +1,182 @@
++import { afterEach, describe, expect, it, vi } from "vitest";
++import { createTestEnv } from "../helpers/d1";
++import {
++  fetchRepoFocusManifestFile,
++  loadRepoFocusManifest,
++  loadRepoFocusManifests,
++  upsertRepoFocusManifest,
++  REPO_FOCUS_MANIFEST_MAX_AGE_MS,
++} from "../../src/signals/focus-manifest-loader";
++
++describe("focus-manifest loader", () => {
++  afterEach(() => vi.restoreAllMocks());
++
++  it("ingests a repo-owned manifest from a stubbed fetcher and caches it", async () => {
++    const env = createTestEnv();
++    const fetched: string[] = [];
++    const fetcher = async (repoFullName: string) => {
++      fetched.push(repoFullName);
++      return JSON.stringify({ wantedPaths: ["src/"], linkedIssuePolicy: "required" });
++    };
++    const first = await loadRepoFocusManifest(env, "owner/repo", { fetcher });
++    expect(first.present).toBe(true);
++    expect(first.source).toBe("repo_file");
++    expect(first.wantedPaths).toEqual(["src/"]);
++    expect(first.linkedIssuePolicy).toBe("required");
++    expect(fetched).toEqual(["owner/repo"]);
++
++    // Second call should hit the cached snapshot, not the fetcher.
++    const second = await loadRepoFocusManifest(env, "owner/repo", { fetcher });
++    expect(second.wantedPaths).toEqual(["src/"]);
++    expect(fetched).toEqual(["owner/repo"]);
++  });
++
++  it("falls back to an empty manifest when no repo file is published and never throws", async () => {
++    const env = createTestEnv();
++    const manifest = await loadRepoFocusManifest(env, "owner/missing", { fetcher: async () => null });
++    expect(manifest.present).toBe(false);
++    expect(manifest.source).toBe("none");
++  });
++
++  it("survives a fetcher that throws", async () => {
++    const env = createTestEnv();
++    const manifest = await loadRepoFocusManifest(env, "owner/broken", {
++      fetcher: async () => {
++        throw new Error("network down");
++      },
++    });
++    expect(manifest.present).toBe(false);
++  });
++
++  it("warns instead of crashing on malformed manifest content", async () => {
++    const env = createTestEnv();
++    const manifest = await loadRepoFocusManifest(env, "owner/malformed", { fetcher: async () => "{ broken json" });
++    expect(manifest.present).toBe(false);
++    expect(manifest.warnings.join(" ")).toMatch(/not valid JSON/i);
++  });
++
++  it("re-fetches when the cached snapshot is older than the max age", async () => {
++    const env = createTestEnv();
++    let calls = 0;
++    const fetcher = async () => {
++      calls += 1;
++      return JSON.stringify({ wantedPaths: ["src/"] });
++    };
++    await loadRepoFocusManifest(env, "owner/stale", { fetcher });
++    expect(calls).toBe(1);
++    await loadRepoFocusManifest(env, "owner/stale", { fetcher, maxAgeMs: -1 });
++    expect(calls).toBe(2);
++  });
++
++  it("supports an API-backed persisted manifest record", async () => {
++    const env = createTestEnv();
++    const saved = await upsertRepoFocusManifest(env, "owner/api", { wantedPaths: ["lib/"] });
++    expect(saved.present).toBe(true);
++    expect(saved.source).toBe("api_record");
++    // A subsequent load (without forcing refresh) returns the persisted manifest without calling the fetcher.
++    const reloaded = await loadRepoFocusManifest(env, "owner/api", {
++      fetcher: async () => {
++        throw new Error("should not be called");
++      },
++    });
++    expect(reloaded.wantedPaths).toEqual(["lib/"]);
++    expect(reloaded.source).toBe("api_record");
++  });
++
++  it("bulk-loads manifests for many repos in parallel", async () => {
++    const env = createTestEnv();
++    const fetcher = async (repoFullName: string) =>
++      repoFullName === "owner/a"
++        ? JSON.stringify({ wantedPaths: ["src/"] })
++        : repoFullName === "owner/b"
++          ? JSON.stringify({ blockedPaths: ["dist/"] })
++          : null;
++    const map = await loadRepoFocusManifests(env, ["owner/a", "owner/b", "owner/c"], { fetcher });
++    expect(map.get("owner/a")?.wantedPaths).toEqual(["src/"]);
++    expect(map.get("owner/b")?.blockedPaths).toEqual(["dist/"]);
++    expect(map.get("owner/c")?.present).toBe(false);
++  });
++
++  it("rejects an invalid repoFullName from the public fetcher without throwing", async () => {
++    expect(await fetchRepoFocusManifestFile("")).toBeNull();
++    expect(await fetchRepoFocusManifestFile("no-slash")).toBeNull();
++    expect(await fetchRepoFocusManifestFile("trailing/")).toBeNull();
++  });
++
++  it("returns raw text from the first 200 OK candidate path", async () => {
++    const fetchSpy = vi.spyOn(globalThis, "fetch").mockImplementation(async (url) => {
++      const stringUrl = String(url);
++      if (stringUrl.endsWith("/.gittensory.json")) return new Response("not found", { status: 404 });
++      if (stringUrl.endsWith("/.github/gittensory.json")) return new Response('{"wantedPaths":["src/"]}', { status: 200 });
++      return new Response("not found", { status: 404 });
++    });
++    const text = await fetchRepoFocusManifestFile("owner/repo");
++    expect(text).toBe('{"wantedPaths":["src/"]}');
++    expect(fetchSpy).toHaveBeenCalledTimes(2);
++  });
++
++  it("returns null when every candidate path responds non-ok", async () => {
++    vi.spyOn(globalThis, "fetch").mockImplementation(async () => new Response("nope", { status: 404 }));
++    expect(await fetchRepoFocusManifestFile("owner/repo")).toBeNull();
++  });
++
++  it("ignores a fetch that throws and continues to the next candidate", async () => {
++    let call = 0;
++    vi.spyOn(globalThis, "fetch").mockImplementation(async () => {
++      call += 1;
++      if (call === 1) throw new Error("network down");
++      return new Response('{"blockedPaths":["dist/"]}', { status: 200 });
++    });
++    const text = await fetchRepoFocusManifestFile("owner/repo");
++    expect(text).toBe('{"blockedPaths":["dist/"]}');
++  });
++
++  it("exposes a reasonable default max-age", () => {
++    expect(REPO_FOCUS_MANIFEST_MAX_AGE_MS).toBeGreaterThan(60 * 1000);
++  });
++
++  it("bypasses the cache when refresh is requested", async () => {
++    const env = createTestEnv();
++    let calls = 0;
++    const fetcher = async () => {
++      calls += 1;
++      return JSON.stringify({ wantedPaths: ["src/"] });
++    };
++    await loadRepoFocusManifest(env, "owner/refresh", { fetcher });
++    expect(calls).toBe(1);
++    await loadRepoFocusManifest(env, "owner/refresh", { fetcher, refresh: true });
++    expect(calls).toBe(2);
++  });
++
++  it("treats a cached snapshot with a missing or unparseable timestamp as stale", async () => {
++    const env = createTestEnv();
++    const { persistSignalSnapshot } = await import("../../src/db/repositories");
++    const { REPO_FOCUS_MANIFEST_SIGNAL } = await import("../../src/signals/focus-manifest-loader");
++    await persistSignalSnapshot(env, {
++      id: crypto.randomUUID(),
++      signalType: REPO_FOCUS_MANIFEST_SIGNAL,
++      targetKey: "owner/notime",
++      repoFullName: "owner/notime",
++      payload: { wantedPaths: ["old/"] },
++      generatedAt: "not-a-date",
++    });
++    await persistSignalSnapshot(env, {
++      id: crypto.randomUUID(),
++      signalType: REPO_FOCUS_MANIFEST_SIGNAL,
++      targetKey: "owner/emptytime",
++      repoFullName: "owner/emptytime",
++      payload: { wantedPaths: ["old/"] },
++      generatedAt: "",
++    });
++    let calls = 0;
++    const fetcher = async () => {
++      calls += 1;
++      return JSON.stringify({ wantedPaths: ["fresh/"] });
++    };
++    const unparseable = await loadRepoFocusManifest(env, "owner/notime", { fetcher });
++    expect(unparseable.wantedPaths).toEqual(["fresh/"]);
++    const emptyTime = await loadRepoFocusManifest(env, "owner/emptytime", { fetcher });
++    expect(emptyTime.wantedPaths).toEqual(["fresh/"]);
++    expect(calls).toBe(2);
++  });
++});
+diff --git a/test/unit/focus-manifest.test.ts b/test/unit/focus-manifest.test.ts
+new file mode 100644
+index 0000000..fc0ad47
+--- /dev/null
++++ b/test/unit/focus-manifest.test.ts
+@@ -0,0 +1,287 @@
++import { describe, expect, it } from "vitest";
++import {
++  buildFocusManifestGuidance,
++  isFocusManifestPublicSafe,
++  matchesManifestPath,
++  parseFocusManifest,
++  parseFocusManifestContent,
++  type FocusManifest,
++} from "../../src/signals/focus-manifest";
++
++const FULL_MANIFEST = {
++  source: "repo_file",
++  wantedPaths: ["src/", "packages/*/lib"],
++  blockedPaths: ["migrations/", "infra/secrets.tf"],
++  preferredLabels: ["bug", "good first issue"],
++  linkedIssuePolicy: "required",
++  testExpectations: ["unit tests for new branches"],
++  issueDiscoveryPolicy: "discouraged",
++  maintainerNotes: ["Internal: ping @owner before touching the queue processor."],
++  publicNotes: ["Prefer small, focused PRs."],
++};
++
++describe("parseFocusManifest", () => {
++  it("normalizes a fully specified manifest", () => {
++    const manifest = parseFocusManifest(FULL_MANIFEST);
++    expect(manifest).toMatchObject({
++      present: true,
++      source: "repo_file",
++      wantedPaths: ["src/", "packages/*/lib"],
++      blockedPaths: ["migrations/", "infra/secrets.tf"],
++      preferredLabels: ["bug", "good first issue"],
++      linkedIssuePolicy: "required",
++      issueDiscoveryPolicy: "discouraged",
++      publicNotes: ["Prefer small, focused PRs."],
++    });
++    expect(manifest.warnings).toEqual([]);
++  });
++
++  it("treats null/undefined as an absent manifest", () => {
++    for (const value of [null, undefined]) {
++      const manifest = parseFocusManifest(value);
++      expect(manifest.present).toBe(false);
++      expect(manifest.source).toBe("none");
++    }
++  });
++
++  it("falls back safely when the manifest is not an object", () => {
++    for (const value of [["a", "b"], "string", 42, true]) {
++      const manifest = parseFocusManifest(value);
++      expect(manifest.present).toBe(false);
++      expect(manifest.warnings.join(" ")).toMatch(/must be a mapping/i);
++    }
++  });
++
++  it("warns and skips malformed field shapes without throwing", () => {
++    const manifest = parseFocusManifest({
++      wantedPaths: "src/",
++      blockedPaths: [123, "ok", "", "  "],
++      preferredLabels: ["a".repeat(400)],
++      linkedIssuePolicy: "sometimes",
++      issueDiscoveryPolicy: 7,
++    });
++    expect(manifest.wantedPaths).toEqual([]);
++    expect(manifest.blockedPaths).toEqual(["ok"]);
++    expect(manifest.preferredLabels[0]).toHaveLength(300);
++    expect(manifest.linkedIssuePolicy).toBe("optional");
++    expect(manifest.issueDiscoveryPolicy).toBe("neutral");
++    expect(manifest.warnings.length).toBeGreaterThanOrEqual(4);
++  });
++
++  it("caps over-long lists and de-duplicates entries", () => {
++    const many = Array.from({ length: 250 }, (_, index) => `path-${index}`);
++    const manifest = parseFocusManifest({ wantedPaths: [...many, "path-0"] });
++    expect(manifest.wantedPaths.length).toBe(200);
++    expect(manifest.warnings.join(" ")).toMatch(/exceeded 200 entries/);
++  });
++
++  it("de-duplicates repeated entries within the list cap", () => {
++    const manifest = parseFocusManifest({ wantedPaths: ["src/", "src/", "lib/"] });
++    expect(manifest.wantedPaths).toEqual(["src/", "lib/"]);
++  });
++
++  it("marks a manifest with no recognized fields as absent", () => {
++    const manifest = parseFocusManifest({ unrelated: "value" });
++    expect(manifest.present).toBe(false);
++    expect(manifest.warnings.join(" ")).toMatch(/no recognized focus fields/i);
++  });
++
++  it("redacts public notes that contain forbidden language", () => {
++    const manifest = parseFocusManifest({ publicNotes: ["Maximize your reward payout", "Keep PRs small"] });
++    expect(manifest.publicNotes).toEqual(["Keep PRs small"]);
++  });
++
++  it("respects an explicit source override and defaults to api_record otherwise", () => {
++    expect(parseFocusManifest({ wantedPaths: ["src/"] }, "api_record").source).toBe("api_record");
++    expect(parseFocusManifest({ wantedPaths: ["src/"] }).source).toBe("api_record");
++    expect(parseFocusManifest({ source: "repo_file", wantedPaths: ["src/"] }).source).toBe("repo_file");
++    expect(parseFocusManifest({ source: "bogus", wantedPaths: ["src/"] }).source).toBe("api_record");
++  });
++});
++
++describe("parseFocusManifestContent", () => {
++  it("returns an absent manifest for empty content", () => {
++    for (const value of ["", "   ", null, undefined]) {
++      expect(parseFocusManifestContent(value).present).toBe(false);
++    }
++  });
++
++  it("parses valid JSON content", () => {
++    const manifest = parseFocusManifestContent(JSON.stringify(FULL_MANIFEST));
++    expect(manifest.present).toBe(true);
++    expect(manifest.source).toBe("repo_file");
++    expect(manifest.blockedPaths).toContain("migrations/");
++  });
++
++  it("warns instead of throwing on malformed JSON", () => {
++    const manifest = parseFocusManifestContent("{ not: valid json");
++    expect(manifest.present).toBe(false);
++    expect(manifest.warnings.join(" ")).toMatch(/not valid JSON/i);
++  });
++});
++
++describe("matchesManifestPath", () => {
++  it("matches exact paths and directory prefixes", () => {
++    expect(matchesManifestPath("src/index.ts", "src/index.ts")).toBe(true);
++    expect(matchesManifestPath("src/nested/file.ts", "src/")).toBe(true);
++    expect(matchesManifestPath("src/nested/file.ts", "src")).toBe(true);
++    expect(matchesManifestPath("docs/readme.md", "src/")).toBe(false);
++  });
++
++  it("matches wildcard patterns and normalizes separators", () => {
++    expect(matchesManifestPath("packages/mcp/lib/x.ts", "packages/*/lib/*.ts")).toBe(true);
++    expect(matchesManifestPath("packages\\mcp\\lib\\x.ts", "packages/*/lib/*.ts")).toBe(true);
++    expect(matchesManifestPath("./src/Index.ts", "src/index.ts")).toBe(true);
++    expect(matchesManifestPath("src/a.ts", "**/*.go")).toBe(false);
++  });
++
++  it("returns false for empty path or pattern", () => {
++    expect(matchesManifestPath("", "src/")).toBe(false);
++    expect(matchesManifestPath("src/x.ts", "")).toBe(false);
++  });
++});
++
++describe("buildFocusManifestGuidance", () => {
++  const wanted = parseFocusManifest(FULL_MANIFEST);
++
++  it("emits a malformed info finding when an absent manifest carries warnings", () => {
++    const manifest = parseFocusManifestContent("{ broken");
++    const guidance = buildFocusManifestGuidance({ manifest, changedPaths: ["src/x.ts"] });
++    expect(guidance.present).toBe(false);
++    expect(guidance.findings.some((finding) => finding.code === "manifest_malformed")).toBe(true);
++    expect(guidance.summary).toMatch(/deterministic signals only/i);
++  });
++
++  it("returns a no-op guidance for an absent manifest with no warnings", () => {
++    const guidance = buildFocusManifestGuidance({ manifest: parseFocusManifest(null), changedPaths: ["src/x.ts"] });
++    expect(guidance.present).toBe(false);
++    expect(guidance.findings).toEqual([]);
++    expect(guidance.publicNextSteps).toEqual([]);
++  });
++
++  it("flags a critical blocked-path finding and public next step", () => {
++    const guidance = buildFocusManifestGuidance({ manifest: wanted, changedPaths: ["migrations/0099_x.sql"] });
++    const blocked = guidance.findings.find((finding) => finding.code === "manifest_blocked_path");
++    expect(blocked?.severity).toBe("critical");
++    expect(guidance.matchedBlockedPaths).toEqual(["migrations/"]);
++    expect(guidance.publicNextSteps.join(" ")).toMatch(/maintainer-blocked/i);
++    expect(guidance.summary).toMatch(/blocked area/i);
++  });
++
++  it("recommends preferred paths when the change is in a wanted area", () => {
++    const guidance = buildFocusManifestGuidance({
++      manifest: wanted,
++      changedPaths: ["src/feature.ts"],
++      labels: ["bug"],
++      linkedIssueCount: 1,
++      testFileCount: 1,
++    });
++    expect(guidance.matchedWantedPaths).toContain("src/");
++    expect(guidance.findings.some((finding) => finding.code === "manifest_preferred_path")).toBe(true);
++    expect(guidance.preferredLabelHits).toContain("bug");
++    expect(guidance.summary).toMatch(/aligns with a wanted area/i);
++  });
++
++  it("warns when a change is outside the wanted areas", () => {
++    const guidance = buildFocusManifestGuidance({ manifest: wanted, changedPaths: ["docs/readme.md"], linkedIssueCount: 1, testFileCount: 1 });
++    const offFocus = guidance.findings.find((finding) => finding.code === "manifest_off_focus");
++    expect(offFocus?.severity).toBe("warning");
++    expect(guidance.summary).toMatch(/outside the wanted areas/i);
++  });
++
++  it("requires a linked issue when the policy demands it", () => {
++    const guidance = buildFocusManifestGuidance({ manifest: wanted, changedPaths: ["src/x.ts"], linkedIssueCount: 0, testFileCount: 1 });
++    expect(guidance.findings.some((finding) => finding.code === "manifest_linked_issue_required")).toBe(true);
++  });
++
++  it("prefers a linked issue under the preferred policy", () => {
++    const manifest = parseFocusManifest({ wantedPaths: ["src/"], linkedIssuePolicy: "preferred" });
++    const guidance = buildFocusManifestGuidance({ manifest, changedPaths: ["src/x.ts"], linkedIssueCount: 0, testFileCount: 1 });
++    expect(guidance.findings.some((finding) => finding.code === "manifest_linked_issue_preferred")).toBe(true);
++  });
++
++  it("surfaces missing preferred labels and test expectations", () => {
++    const guidance = buildFocusManifestGuidance({ manifest: wanted, changedPaths: ["src/x.ts"], labels: [], linkedIssueCount: 1, testFileCount: 0, passedValidationCount: 0 });
++    expect(guidance.findings.some((finding) => finding.code === "manifest_missing_preferred_label")).toBe(true);
++    expect(guidance.findings.some((finding) => finding.code === "manifest_missing_tests")).toBe(true);
++  });
++
++  it("treats passing validation as satisfying test expectations", () => {
++    const guidance = buildFocusManifestGuidance({ manifest: wanted, changedPaths: ["src/x.ts"], linkedIssueCount: 1, testFileCount: 0, passedValidationCount: 2 });
++    expect(guidance.findings.some((finding) => finding.code === "manifest_missing_tests")).toBe(false);
++  });
++
++  it("notes when issue-discovery is discouraged", () => {
++    const guidance = buildFocusManifestGuidance({ manifest: wanted, changedPaths: ["src/x.ts"], labels: ["bug"], linkedIssueCount: 1, testFileCount: 1 });
++    expect(guidance.findings.some((finding) => finding.code === "manifest_issue_discovery_discouraged")).toBe(true);
++  });
++
++  it("never leaks maintainer-private notes into public next steps", () => {
++    const guidance = buildFocusManifestGuidance({ manifest: wanted, changedPaths: ["migrations/x.sql"] });
++    expect(guidance.maintainerNotes.join(" ")).toMatch(/ping @owner/);
++    expect(guidance.publicNextSteps.join(" ")).not.toMatch(/ping @owner/);
++    expect(guidance.publicNextSteps.every(isFocusManifestPublicSafe)).toBe(true);
++  });
++
++  it("produces a neutral summary when no wanted paths are configured", () => {
++    const manifest = parseFocusManifest({ preferredLabels: ["bug"] });
++    const guidance = buildFocusManifestGuidance({ manifest, changedPaths: ["src/x.ts"], labels: ["bug"] });
++    expect(guidance.summary).toMatch(/no path-specific verdict/i);
++  });
++});
++
++describe("public-safe invariant", () => {
++  it("rejects forbidden compensation/secret language", () => {
++    expect(isFocusManifestPublicSafe("Keep PRs focused")).toBe(true);
++    expect(isFocusManifestPublicSafe("estimate your reward")).toBe(false);
++    expect(isFocusManifestPublicSafe("paste your hotkey")).toBe(false);
++  });
++
++  it("never emits public next steps that contain forbidden language for generated manifests", () => {
++    // Deterministic property-style check (seeded LCG, no external generator dependency):
++    // build a wide range of manifests/changed-paths from a fixture pool that deliberately
++    // mixes forbidden language in, and assert the public next steps stay redaction-safe.
++    const stringPool = [
++      "",
++      "   ",
++      "src/",
++      "migrations/",
++      "Keep PRs focused",
++      "Prefer small, focused PRs.",
++      "Maximize your reward payout",
++      "Internal: ping @owner before touching the queue processor.",
++      "estimate your reward",
++      "paste your hotkey",
++      "a".repeat(400),
++      "packages/*/lib/*.ts",
++    ];
++    const linkedIssuePolicies = ["required", "preferred", "optional"];
++    const issueDiscoveryPolicies = ["encouraged", "neutral", "discouraged"];
++
++    let seed = 0x2545f491;
++    const next = () => {
++      // 32-bit LCG (Numerical Recipes constants), kept fully deterministic across runs.
++      seed = (Math.imul(seed, 1664525) + 1013904223) >>> 0;
++      return seed / 0x100000000;
++    };
++    const pick = <T>(items: readonly T[]): T => items[Math.floor(next() * items.length)] as T;
++    const sample = (max: number): string[] =>
++      Array.from({ length: Math.floor(next() * (max + 1)) }, () => pick(stringPool));
++
++    for (let iteration = 0; iteration < 400; iteration += 1) {
++      const raw = {
++        wantedPaths: sample(4),
++        blockedPaths: sample(4),
++        preferredLabels: sample(4),
++        linkedIssuePolicy: pick(linkedIssuePolicies),
++        issueDiscoveryPolicy: pick(issueDiscoveryPolicies),
++        maintainerNotes: sample(4),
++        publicNotes: sample(4),
++      };
++      const changedPaths = sample(6);
++      const manifest: FocusManifest = parseFocusManifest(raw);
++      const guidance = buildFocusManifestGuidance({ manifest, changedPaths });
++      expect(guidance.publicNextSteps.every(isFocusManifestPublicSafe)).toBe(true);
++    }
++  });
++});
+diff --git a/test/unit/local-branch.test.ts b/test/unit/local-branch.test.ts
+index 595addc..b97c3d8 100644
+--- a/test/unit/local-branch.test.ts
++++ b/test/unit/local-branch.test.ts
+@@ -1165,6 +1165,96 @@ describe("local branch analysis", () => {
+     expect(analysis.summary).toContain("is the top private next action");
+     expect(JSON.stringify(analysis.prPacket)).not.toMatch(/reward|score|wallet|hotkey|farming|payout|ranking|trust score/i);
+   });
++
++  it("applies a maintainer focus manifest: preferred path, label, and a public-safe focus section", () => {
++    const analysis = buildLocalBranchAnalysis({
++      input: {
++        login: "oktofeesh1",
++        repoFullName: "entrius/allways-ui",
++        branchName: "fix-cache",
++        body: "Fixes #7",
++        labels: ["bug"],
++        changedFiles: [
++          { path: "src/cache.ts", additions: 12, deletions: 1, status: "modified" },
++          { path: "test/cache.test.ts", additions: 8, deletions: 0, status: "added" },
++        ],
++        validation: [{ command: "npm test -- cache", status: "passed" }],
++        focusManifest: {
++          source: "repo_file",
++          wantedPaths: ["src/"],
++          preferredLabels: ["bug"],
++          linkedIssuePolicy: "required",
++          maintainerNotes: ["Internal: ping @owner before touching the cache layer."],
++          publicNotes: ["Prefer small, focused PRs."],
++        },
++      },
++      repo,
++      issues: [{ repoFullName: repo.fullName, number: 7, title: "Cache refresh", state: "open", labels: ["bug"], linkedPrs: [] }],
++      pullRequests: [],
++      profile,
++      outcomeHistory,
++      scoringSnapshot,
++      scoringProfile,
++    });
++
++    expect(analysis.manifestGuidance.present).toBe(true);
++    expect(analysis.manifestGuidance.matchedWantedPaths).toContain("src/");
++    expect(analysis.manifestGuidance.preferredLabelHits).toContain("bug");
++    expect(analysis.localFindings).toEqual(expect.arrayContaining([expect.objectContaining({ code: "manifest_preferred_path" })]));
++    expect(analysis.prPacket.markdown).toContain("## Maintainer Focus");
++    expect(analysis.prPacket.markdown).toContain("Prefer small, focused PRs.");
++    expect(analysis.prPacket.markdown).not.toMatch(/ping @owner/);
++    expect(JSON.stringify(analysis.prPacket)).not.toMatch(/ping @owner/);
++    expect(JSON.stringify(analysis.prPacket)).not.toMatch(/reward|score|wallet|hotkey|farming|payout|ranking|trust score/i);
++  });
++
++  it("treats a maintainer-blocked path as a branch-quality blocker", () => {
++    const analysis = buildLocalBranchAnalysis({
++      input: {
++        login: "oktofeesh1",
++        repoFullName: "entrius/allways-ui",
++        branchName: "touch-migrations",
++        body: "Fixes #7",
++        changedFiles: [{ path: "migrations/0099_change.sql", additions: 20, deletions: 0, status: "added" }],
++        focusManifest: { blockedPaths: ["migrations/"] },
++      },
++      repo,
++      issues: [{ repoFullName: repo.fullName, number: 7, title: "Cache refresh", state: "open", labels: [], linkedPrs: [] }],
++      pullRequests: [],
++      profile,
++      outcomeHistory,
++      scoringSnapshot,
++      scoringProfile,
++    });
++
++    expect(analysis.manifestGuidance.matchedBlockedPaths).toEqual(["migrations/"]);
++    expect(analysis.localFindings).toEqual(expect.arrayContaining([expect.objectContaining({ code: "manifest_blocked_path", severity: "critical" })]));
++    expect(analysis.branchQualityBlockers).toEqual(expect.arrayContaining([expect.stringContaining("maintainer-blocked area")]));
++    expect(JSON.stringify(analysis.prPacket)).not.toMatch(/reward|score|wallet|hotkey|farming|payout|ranking|trust score/i);
++  });
++
++  it("ignores a malformed focus manifest without breaking analysis", () => {
++    const analysis = buildLocalBranchAnalysis({
++      input: {
++        login: "oktofeesh1",
++        repoFullName: "entrius/allways-ui",
++        branchName: "fix-cache",
++        changedFiles: [{ path: "src/cache.ts", additions: 4, deletions: 0, status: "modified" }],
++        focusManifest: { wantedPaths: "src/", linkedIssuePolicy: "sometimes" },
++      },
++      repo,
++      issues: [],
++      pullRequests: [],
++      profile,
++      outcomeHistory,
++      scoringSnapshot,
++      scoringProfile,
++    });
++
++    expect(analysis.manifestGuidance.present).toBe(false);
++    expect(analysis.manifestGuidance.warnings.length).toBeGreaterThan(0);
++    expect(analysis.prPacket.bodySections.some((section) => section.heading === "Maintainer Focus")).toBe(false);
++  });
+ });
+ 
+ describe("local MCP git metadata collection", () => {

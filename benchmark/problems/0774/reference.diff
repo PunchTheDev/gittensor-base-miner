@@ -1,0 +1,202 @@
+diff --git a/gittensor/cli/issue_commands/helpers.py b/gittensor/cli/issue_commands/helpers.py
+index 918f52da..ca185f91 100644
+--- a/gittensor/cli/issue_commands/helpers.py
++++ b/gittensor/cli/issue_commands/helpers.py
+@@ -281,7 +281,7 @@ def fetch_open_issue_pull_requests(
+     """Fetch open PR submissions for a GitHub issue."""
+     token = get_github_pat() or ''
+     if not token and not as_json:
+-        print_warning('No GitHub token (GITTENSOR_MINER_PAT) found; using unauthenticated requests (lower rate limits)')
++        print_warning('No GitHub token found; set GITTENSOR_MINER_PAT to fetch GitHub issue submissions')
+ 
+     try:
+         from gittensor.utils.github_api_tools import find_prs_for_issue
+diff --git a/gittensor/utils/github_api_tools.py b/gittensor/utils/github_api_tools.py
+index 4704f912..75a0e3d7 100644
+--- a/gittensor/utils/github_api_tools.py
++++ b/gittensor/utils/github_api_tools.py
+@@ -521,93 +521,20 @@ def _search_issue_referencing_prs_graphql(
+     return out
+ 
+ 
+-def _search_issue_referencing_prs_rest(
+-    repo: str, issue_number: int, token: Optional[str] = None, state: str = 'open'
+-) -> List[PRInfo]:
+-    """Search PRs via GitHub REST search API."""
+-    if issue_number < 1:
+-        return []
+-
+-    session = get_session(token or '')
+-
+-    state_clause = f' state:{state}' if state != 'all' else ''
+-    max_attempts = 3
+-    for attempt in range(max_attempts):
+-        try:
+-            resp = session.get(
+-                f'{BASE_GITHUB_API_URL}/search/issues',
+-                params={'q': f'repo:{repo} type:pr{state_clause} {issue_number} in:title,body', 'per_page': '50'},
+-                timeout=10,
+-            )
+-            resp.raise_for_status()
+-
+-            out: List[PRInfo] = []
+-            for item in resp.json().get('items', []):
+-                number = item.get('number')
+-                if number is None:
+-                    continue
+-                user = item.get('user') or {}
+-                pr_info: PRInfo = {
+-                    'number': number,
+-                    'title': item.get('title') or '',
+-                    'author_login': user.get('login') or 'ghost',
+-                    'author_id': user.get('id'),
+-                    'created_at': item.get('created_at') or '',
+-                    'merged_at': None,
+-                    'state': _resolve_pr_state(item.get('state', 'open')),
+-                    'url': item.get('html_url') or '',
+-                    'review_count': 0,
+-                    'closing_numbers': [],
+-                }
+-                out.append(pr_info)
+-            return out
+-
+-        except requests.exceptions.RequestException as e:
+-            if attempt < max_attempts - 1:
+-                backoff = 2 * (attempt + 1)
+-                bt.logging.warning(
+-                    f'REST search failed for {repo}#{issue_number} (attempt {attempt + 1}/{max_attempts}): {e}, '
+-                    f'retrying in {backoff}s...'
+-                )
+-                time.sleep(backoff)
+-            else:
+-                raise
+-
+-    return []
+-
+-
+ def find_prs_for_issue(
+     repo: str,
+     issue_number: int,
+     open_only: bool = True,
+     token: Optional[str] = None,
+ ) -> List[PRInfo]:
+-    """Cascading PR discovery: GraphQL -> authenticated REST -> unauthenticated REST."""
+-    rest_state = 'open' if open_only else 'all'
+-
++    """Find PRs that reference an issue via GraphQL cross-reference data."""
+     if token:
+         try:
+             prs = _search_issue_referencing_prs_graphql(repo, issue_number, token, open_only=open_only)
+-            if prs:
+-                return prs
++            return prs or []
+         except Exception as exc:
+             bt.logging.debug(f'GraphQL PR fetch failed for {repo}#{issue_number}: {exc}')
+ 
+-    if token:
+-        try:
+-            prs = _search_issue_referencing_prs_rest(repo, issue_number, token=token, state=rest_state)
+-            if prs:
+-                return prs
+-        except Exception as exc:
+-            bt.logging.debug(f'Authenticated REST search failed for {repo}#{issue_number}: {exc}')
+-
+-    try:
+-        prs = _search_issue_referencing_prs_rest(repo, issue_number, token=None, state=rest_state)
+-        if prs:
+-            return prs
+-    except Exception as exc:
+-        bt.logging.debug(f'Unauthenticated REST search failed for {repo}#{issue_number}: {exc}')
+-
+     return []
+ 
+ 
+diff --git a/tests/utils/test_github_api_tools.py b/tests/utils/test_github_api_tools.py
+index b68560e2..7f74a0b2 100644
+--- a/tests/utils/test_github_api_tools.py
++++ b/tests/utils/test_github_api_tools.py
+@@ -744,9 +744,8 @@ def test_exception_backoff_capped_at_30s(self, mock_logging, mock_sleep, mock_po
+ # ============================================================================
+ 
+ 
+-@patch('gittensor.utils.github_api_tools._search_issue_referencing_prs_rest')
+ @patch('gittensor.utils.github_api_tools._search_issue_referencing_prs_graphql')
+-def test_find_prs_prefers_graphql_when_results_found(mock_graphql, mock_rest):
++def test_find_prs_returns_graphql_results(mock_graphql):
+     graphql_prs = [{'number': 101, 'state': 'OPEN'}]
+     mock_graphql.return_value = graphql_prs
+ 
+@@ -754,63 +753,44 @@ def test_find_prs_prefers_graphql_when_results_found(mock_graphql, mock_rest):
+ 
+     assert result == graphql_prs
+     mock_graphql.assert_called_once_with('owner/repo', 12, 'fake_token', open_only=True)
+-    mock_rest.assert_not_called()
+ 
+ 
+-@patch('gittensor.utils.github_api_tools._search_issue_referencing_prs_rest')
+ @patch('gittensor.utils.github_api_tools._search_issue_referencing_prs_graphql')
+-def test_find_prs_falls_back_to_authenticated_rest_when_graphql_empty(mock_graphql, mock_rest):
++def test_find_prs_returns_empty_when_graphql_empty(mock_graphql):
+     mock_graphql.return_value = []
+-    rest_prs = [{'number': 102, 'state': 'OPEN'}]
+-    mock_rest.side_effect = [rest_prs]
+ 
+     result = find_prs_for_issue('owner/repo', 12, open_only=True, token='fake_token')
+ 
+-    assert result == rest_prs
++    assert result == []
+     mock_graphql.assert_called_once_with('owner/repo', 12, 'fake_token', open_only=True)
+-    mock_rest.assert_called_once_with('owner/repo', 12, token='fake_token', state='open')
+ 
+ 
+-@patch('gittensor.utils.github_api_tools._search_issue_referencing_prs_rest')
+ @patch('gittensor.utils.github_api_tools._search_issue_referencing_prs_graphql')
+-def test_find_prs_falls_back_to_unauthenticated_rest_when_auth_paths_empty(mock_graphql, mock_rest):
+-    mock_graphql.return_value = []
+-    unauth_prs = [{'number': 103, 'state': 'OPEN'}]
+-    mock_rest.side_effect = [[], unauth_prs]
++def test_find_prs_returns_empty_when_graphql_errors(mock_graphql):
++    mock_graphql.side_effect = RuntimeError('boom')
+ 
+     result = find_prs_for_issue('owner/repo', 12, open_only=True, token='fake_token')
+ 
+-    assert result == unauth_prs
+-    assert mock_rest.call_count == 2
+-    assert mock_rest.call_args_list[0].kwargs == {'token': 'fake_token', 'state': 'open'}
+-    assert mock_rest.call_args_list[1].kwargs == {'token': None, 'state': 'open'}
++    assert result == []
++    mock_graphql.assert_called_once_with('owner/repo', 12, 'fake_token', open_only=True)
+ 
+ 
+-@patch('gittensor.utils.github_api_tools._search_issue_referencing_prs_rest')
+ @patch('gittensor.utils.github_api_tools._search_issue_referencing_prs_graphql')
+-def test_find_prs_uses_all_state_for_non_open_only(mock_graphql, mock_rest):
++def test_find_prs_passes_open_only_false_to_graphql(mock_graphql):
+     mock_graphql.return_value = []
+-    mock_rest.side_effect = [[], []]
+ 
+     result = find_prs_for_issue('owner/repo', 12, open_only=False, token='fake_token')
+ 
+     assert result == []
+-    assert mock_rest.call_count == 2
+-    assert mock_rest.call_args_list[0].kwargs == {'token': 'fake_token', 'state': 'all'}
+-    assert mock_rest.call_args_list[1].kwargs == {'token': None, 'state': 'all'}
++    mock_graphql.assert_called_once_with('owner/repo', 12, 'fake_token', open_only=False)
+ 
+ 
+-@patch('gittensor.utils.github_api_tools._search_issue_referencing_prs_rest')
+ @patch('gittensor.utils.github_api_tools._search_issue_referencing_prs_graphql')
+-def test_find_prs_without_token_only_uses_unauth_rest(mock_graphql, mock_rest):
+-    unauth_prs = [{'number': 104, 'state': 'OPEN'}]
+-    mock_rest.return_value = unauth_prs
+-
++def test_find_prs_without_token_returns_empty(mock_graphql):
+     result = find_prs_for_issue('owner/repo', 12, open_only=True, token=None)
+ 
+-    assert result == unauth_prs
++    assert result == []
+     mock_graphql.assert_not_called()
+-    mock_rest.assert_called_once_with('owner/repo', 12, token=None, state='open')
+ 
+ 
+ # ============================================================================

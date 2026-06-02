@@ -1,0 +1,975 @@
+diff --git a/app/build.gradle.kts b/app/build.gradle.kts
+index 3ebf29e..05d3b91 100644
+--- a/app/build.gradle.kts
++++ b/app/build.gradle.kts
+@@ -15,6 +15,7 @@ android {
+         targetSdk = 35
+         versionCode = 1
+         versionName = "0.1.0"
++        testInstrumentationRunner = "androidx.test.runner.AndroidJUnitRunner"
+     }
+ 
+     buildTypes {
+@@ -37,6 +38,8 @@ dependencies {
+     implementation("com.google.ai.edge.litert:litert:1.4.2")
+     testImplementation("org.json:json:20250517")
+     testImplementation(kotlin("test"))
++    androidTestImplementation("androidx.test:runner:1.6.2")
++    androidTestImplementation("androidx.test.ext:junit:1.2.1")
+ }
+ 
+ kotlin {
+diff --git a/app/src/androidTest/java/dev/touchpilot/app/screen/ocr/OcrFallbackBoundaryLiveTest.kt b/app/src/androidTest/java/dev/touchpilot/app/screen/ocr/OcrFallbackBoundaryLiveTest.kt
+new file mode 100644
+index 0000000..30e4c8c
+--- /dev/null
++++ b/app/src/androidTest/java/dev/touchpilot/app/screen/ocr/OcrFallbackBoundaryLiveTest.kt
+@@ -0,0 +1,143 @@
++package dev.touchpilot.app.screen.ocr
++
++import android.accessibilityservice.AccessibilityService
++import android.app.UiAutomation
++import android.content.Intent
++import android.provider.Settings
++import android.util.Log
++import android.view.accessibility.AccessibilityNodeInfo
++import androidx.test.ext.junit.runners.AndroidJUnit4
++import androidx.test.platform.app.InstrumentationRegistry
++import org.junit.After
++import org.junit.Assert.assertNotNull
++import org.junit.Assert.assertTrue
++import org.junit.Test
++import org.junit.runner.RunWith
++
++/**
++ * Live behavior proof for issue #42. Runs on a real Android device/emulator.
++ *
++ * The test:
++ * 1. Sends the device to the launcher to start from a known state.
++ * 2. Launches the Android Settings app via Intent so the recorded run has a
++ *    visible app transition rather than a no-op HOME press.
++ * 3. Walks the live `AccessibilityNodeInfo` root with the same counting rules
++ *    the new `ContextQualityDetector` expects.
++ * 4. Classifies and prints the result so the gradle `connectedDebugAndroidTest`
++ *    log captures real on-device evidence for the PR.
++ * 5. Returns to HOME so subsequent runs start clean.
++ *
++ * The test does not depend on TouchPilot's own `AccessibilityService` being
++ * enabled — `UiAutomation` is granted the same view of the tree by the
++ * instrumentation framework.
++ */
++@RunWith(AndroidJUnit4::class)
++class OcrFallbackBoundaryLiveTest {
++    private val tag = "OcrFallbackBoundary"
++
++    @Test
++    fun settingsScreenClassifiesAsStrongOrWeakNotEmpty() {
++        val instrumentation = InstrumentationRegistry.getInstrumentation()
++        val uiAutomation: UiAutomation = instrumentation.uiAutomation
++
++        // Start from a known state so the recording has a clean home screen.
++        uiAutomation.performGlobalAction(AccessibilityService.GLOBAL_ACTION_HOME)
++        Thread.sleep(1_500L)
++
++        // Visible app transition: launch the system Settings activity.
++        val context = instrumentation.targetContext
++        val settingsIntent = Intent(Settings.ACTION_SETTINGS).apply {
++            addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
++        }
++        context.startActivity(settingsIntent)
++        Thread.sleep(2_500L)
++
++        val root: AccessibilityNodeInfo? = uiAutomation.rootInActiveWindow
++        assertNotNull("rootInActiveWindow was null on the live device", root)
++
++        val signals = countSignals(root!!)
++        val packageName = root.packageName?.toString()
++        val annotated = signals.copy(packageName = packageName)
++
++        val detector = ContextQualityDetector()
++        val quality = detector.classify(annotated)
++
++        Log.i(tag, "live signals: $annotated")
++        Log.i(tag, "live quality: $quality")
++
++        when (quality) {
++            ContextQuality.Strong -> {
++                Log.i(tag, "Strong context — summary/suggestions would run directly.")
++            }
++
++            is ContextQuality.Weak -> {
++                val fallback = NoOpOcrFallback().attempt(
++                    OcrRequest(reason = quality.reason, packageName = packageName)
++                )
++                val response = WeakContextResponse.forWeak(quality, fallback)
++                Log.i(tag, "Weak context (${quality.reason}) — fallback=$fallback")
++                Log.i(tag, "agent response: $response")
++            }
++
++            ContextQuality.Empty -> {
++                Log.i(tag, "agent response: ${WeakContextResponse.forEmpty()}")
++            }
++        }
++
++        // The Settings screen renders an app-like UI; an Empty classification
++        // would indicate the live tree was not observable at all, which is the
++        // failure mode we are guarding against.
++        assertTrue(
++            "Live Settings screen classified as Empty: $annotated",
++            quality !is ContextQuality.Empty,
++        )
++    }
++
++    @After
++    fun returnHome() {
++        InstrumentationRegistry.getInstrumentation().uiAutomation
++            .performGlobalAction(AccessibilityService.GLOBAL_ACTION_HOME)
++    }
++
++    private fun countSignals(root: AccessibilityNodeInfo): ObservedScreenSignals {
++        var total = 0
++        var visibleText = 0
++        var clickable = 0
++        var inputs = 0
++        var maxDepth = 0
++
++        fun walk(node: AccessibilityNodeInfo, depth: Int) {
++            total += 1
++            if (depth > maxDepth) maxDepth = depth
++
++            val text = node.text?.toString().orEmpty()
++            val desc = node.contentDescription?.toString().orEmpty()
++            if (text.isNotBlank() || desc.isNotBlank()) visibleText += 1
++
++            if (node.isClickable) clickable += 1
++
++            val className = node.className?.toString().orEmpty()
++            if (
++                className.contains("EditText", ignoreCase = true) ||
++                className.contains("AutoCompleteTextView", ignoreCase = true)
++            ) {
++                inputs += 1
++            }
++
++            for (index in 0 until node.childCount) {
++                val child = node.getChild(index) ?: continue
++                walk(child, depth + 1)
++            }
++        }
++
++        walk(root, depth = 0)
++
++        return ObservedScreenSignals(
++            totalNodeCount = total,
++            visibleTextCount = visibleText,
++            clickableNodeCount = clickable,
++            inputFieldCount = inputs,
++            maxTreeDepth = maxDepth,
++        )
++    }
++}
+diff --git a/app/src/main/java/dev/touchpilot/app/screen/ocr/ContextQuality.kt b/app/src/main/java/dev/touchpilot/app/screen/ocr/ContextQuality.kt
+new file mode 100644
+index 0000000..c8c87a3
+--- /dev/null
++++ b/app/src/main/java/dev/touchpilot/app/screen/ocr/ContextQuality.kt
+@@ -0,0 +1,29 @@
++package dev.touchpilot.app.screen.ocr
++
++/**
++ * Classification of an Accessibility observation's usefulness for local screen
++ * understanding. Strong context can drive summary + suggestions directly. Weak
++ * context should be marked for OCR fallback. Empty context should not produce
++ * guesses.
++ */
++sealed class ContextQuality {
++    object Strong : ContextQuality()
++
++    data class Weak(val reason: WeakReason) : ContextQuality()
++
++    object Empty : ContextQuality()
++}
++
++enum class WeakReason {
++    /** Tree has nodes but almost none expose readable text or content descriptions. */
++    NO_VISIBLE_TEXT,
++
++    /** Tree exposes text but no clickable affordances, so no actions can be suggested. */
++    NO_CLICKABLE_NODES,
++
++    /** Tree is shallow enough that the surface likely renders custom views. */
++    SHALLOW_TREE,
++
++    /** Tree has nodes, but the ratio of readable signals to total nodes is low. */
++    MOSTLY_EMPTY,
++}
+diff --git a/app/src/main/java/dev/touchpilot/app/screen/ocr/ContextQualityDetector.kt b/app/src/main/java/dev/touchpilot/app/screen/ocr/ContextQualityDetector.kt
+new file mode 100644
+index 0000000..e86b891
+--- /dev/null
++++ b/app/src/main/java/dev/touchpilot/app/screen/ocr/ContextQualityDetector.kt
+@@ -0,0 +1,66 @@
++package dev.touchpilot.app.screen.ocr
++
++/**
++ * Classifies an Accessibility observation as [ContextQuality.Strong], [ContextQuality.Weak],
++ * or [ContextQuality.Empty]. The detector is intentionally conservative: weak detection
++ * should bias toward marking OCR fallback rather than letting summarizers guess from
++ * insufficient data.
++ *
++ * Thresholds are injectable so callers (or tests) can tune behavior per surface without
++ * touching the detector itself.
++ */
++class ContextQualityDetector(
++    private val thresholds: Thresholds = Thresholds.DEFAULT,
++) {
++    data class Thresholds(
++        val minVisibleText: Int,
++        val minClickable: Int,
++        val minTreeDepth: Int,
++        val minReadableRatio: Double,
++    ) {
++        init {
++            require(minVisibleText >= 0) { "minVisibleText must be non-negative" }
++            require(minClickable >= 0) { "minClickable must be non-negative" }
++            require(minTreeDepth >= 0) { "minTreeDepth must be non-negative" }
++            require(minReadableRatio in 0.0..1.0) {
++                "minReadableRatio must be in [0.0, 1.0]"
++            }
++        }
++
++        companion object {
++            val DEFAULT: Thresholds = Thresholds(
++                minVisibleText = 2,
++                minClickable = 1,
++                minTreeDepth = 2,
++                minReadableRatio = 0.15,
++            )
++        }
++    }
++
++    fun classify(signals: ObservedScreenSignals): ContextQuality {
++        if (signals.totalNodeCount == 0) return ContextQuality.Empty
++
++        if (signals.visibleTextCount < thresholds.minVisibleText) {
++            return ContextQuality.Weak(WeakReason.NO_VISIBLE_TEXT)
++        }
++
++        if (signals.clickableNodeCount < thresholds.minClickable &&
++            signals.inputFieldCount < thresholds.minClickable
++        ) {
++            return ContextQuality.Weak(WeakReason.NO_CLICKABLE_NODES)
++        }
++
++        if (signals.maxTreeDepth < thresholds.minTreeDepth) {
++            return ContextQuality.Weak(WeakReason.SHALLOW_TREE)
++        }
++
++        val readable = signals.visibleTextCount + signals.clickableNodeCount +
++            signals.inputFieldCount
++        val ratio = readable.toDouble() / signals.totalNodeCount.toDouble()
++        if (ratio < thresholds.minReadableRatio) {
++            return ContextQuality.Weak(WeakReason.MOSTLY_EMPTY)
++        }
++
++        return ContextQuality.Strong
++    }
++}
+diff --git a/app/src/main/java/dev/touchpilot/app/screen/ocr/ObservedScreenSignals.kt b/app/src/main/java/dev/touchpilot/app/screen/ocr/ObservedScreenSignals.kt
+new file mode 100644
+index 0000000..ffcd971
+--- /dev/null
++++ b/app/src/main/java/dev/touchpilot/app/screen/ocr/ObservedScreenSignals.kt
+@@ -0,0 +1,33 @@
++package dev.touchpilot.app.screen.ocr
++
++/**
++ * Minimal counts derived from one Accessibility observation. Kept platform-free so
++ * detector logic can run as a JVM unit test, and so a future caller can build it from
++ * either an `AccessibilityNodeInfo` walk or a higher-level screen context model.
++ */
++data class ObservedScreenSignals(
++    val totalNodeCount: Int,
++    val visibleTextCount: Int,
++    val clickableNodeCount: Int,
++    val inputFieldCount: Int,
++    val maxTreeDepth: Int,
++    val packageName: String? = null,
++) {
++    init {
++        require(totalNodeCount >= 0) { "totalNodeCount must be non-negative" }
++        require(visibleTextCount >= 0) { "visibleTextCount must be non-negative" }
++        require(clickableNodeCount >= 0) { "clickableNodeCount must be non-negative" }
++        require(inputFieldCount >= 0) { "inputFieldCount must be non-negative" }
++        require(maxTreeDepth >= 0) { "maxTreeDepth must be non-negative" }
++    }
++
++    companion object {
++        val EMPTY: ObservedScreenSignals = ObservedScreenSignals(
++            totalNodeCount = 0,
++            visibleTextCount = 0,
++            clickableNodeCount = 0,
++            inputFieldCount = 0,
++            maxTreeDepth = 0,
++        )
++    }
++}
+diff --git a/app/src/main/java/dev/touchpilot/app/screen/ocr/OcrFallback.kt b/app/src/main/java/dev/touchpilot/app/screen/ocr/OcrFallback.kt
+new file mode 100644
+index 0000000..25a8dc8
+--- /dev/null
++++ b/app/src/main/java/dev/touchpilot/app/screen/ocr/OcrFallback.kt
+@@ -0,0 +1,66 @@
++package dev.touchpilot.app.screen.ocr
++
++/**
++ * Boundary interface for an on-device OCR pass. Milestone 3 defines this contract
++ * but does not pick a runtime: an OCR implementation can be added behind this
++ * interface when a local OCR/VLM runtime is selected.
++ *
++ * Implementations MUST:
++ * - run fully on device (no network calls)
++ * - treat their own output as untrusted and noisy
++ * - return [OcrFallbackResult.Unavailable] rather than throw when the runtime is
++ *   not present
++ *
++ * Callers MUST run any [OcrFallbackResult.Recognized] text through the existing
++ * sensitive-text redactor before logging or tracing it.
++ */
++interface OcrFallback {
++    fun attempt(request: OcrRequest): OcrFallbackResult
++}
++
++/**
++ * Request to the OCR boundary. Carries only the metadata an OCR runtime needs to
++ * decide whether to run; pixel data is intentionally not part of this contract and
++ * must be sourced by a future runtime-side capture step under the same local-only
++ * constraints.
++ */
++data class OcrRequest(
++    val reason: WeakReason,
++    val packageName: String? = null,
++)
++
++/**
++ * Placeholder result type for the OCR boundary. New variants must keep the
++ * "all output is untrusted" property: nothing here is treated as a tool argument
++ * without passing through the standard validation and policy pipeline.
++ */
++sealed interface OcrFallbackResult {
++    /** No OCR pass was performed; the caller should fall back to a conservative path. */
++    object NotAttempted : OcrFallbackResult
++
++    /** OCR runtime is not configured or could not run. */
++    data class Unavailable(val reason: String) : OcrFallbackResult
++
++    /**
++     * OCR returned text. The list is the raw, untrusted recognizer output. Confidence
++     * is a 0.0-1.0 scalar reported by the runtime; callers should still redact and
++     * treat low confidence as additional evidence of weak context.
++     */
++    data class Recognized(val text: List<String>, val confidence: Float) : OcrFallbackResult {
++        init {
++            require(confidence in 0.0f..1.0f) { "confidence must be in [0.0, 1.0]" }
++        }
++    }
++}
++
++/**
++ * Default boundary implementation used when no local OCR runtime is wired up.
++ * Always returns [OcrFallbackResult.Unavailable] so callers degrade to honest
++ * "I can see this screen but cannot read it" copy.
++ */
++class NoOpOcrFallback : OcrFallback {
++    override fun attempt(request: OcrRequest): OcrFallbackResult =
++        OcrFallbackResult.Unavailable(
++            "OCR runtime not configured. Local OCR/VLM is a future fallback."
++        )
++}
+diff --git a/app/src/main/java/dev/touchpilot/app/screen/ocr/ScreenSignalsExtractor.kt b/app/src/main/java/dev/touchpilot/app/screen/ocr/ScreenSignalsExtractor.kt
+new file mode 100644
+index 0000000..fac6d4f
+--- /dev/null
++++ b/app/src/main/java/dev/touchpilot/app/screen/ocr/ScreenSignalsExtractor.kt
+@@ -0,0 +1,69 @@
++package dev.touchpilot.app.screen.ocr
++
++/**
++ * Parses the text dump produced by `AccessibilityBridge.observeScreen()` into an
++ * [ObservedScreenSignals]. The dump format is the per-line tree representation
++ * emitted by `TouchPilotAccessibilityService.appendNode`, e.g.:
++ *
++ * ```
++ * TouchPilot screen snapshot
++ * - FrameLayout node_id="0" bounds="0,0,1080,2400"
++ *   - LinearLayout node_id="0.0" clickable bounds="..."
++ *     - EditText node_id="0.0.1" text="user@example.com" focused bounds="..."
++ * ```
++ *
++ * The extractor is platform-free so it can run in JVM unit tests and in
++ * instrumented tests, and so a future caller can feed it from either the live
++ * Accessibility dump or a captured fixture.
++ */
++object ScreenSignalsExtractor {
++    private val NODE_LINE = Regex("^( *)- (.*)$")
++    private val CLASS_NAME = Regex("^(\\S+)")
++    private val TEXT_ATTR = Regex("\\btext=\"([^\"]*)\"")
++    private val DESC_ATTR = Regex("\\bdesc=\"([^\"]*)\"")
++
++    private val INPUT_CLASS_HINTS = listOf(
++        "EditText",
++        "AutoCompleteTextView",
++        "TextInputEditText",
++        "SearchAutoComplete",
++    )
++
++    fun fromObserveDump(dump: String, packageName: String? = null): ObservedScreenSignals {
++        var totalNodes = 0
++        var visibleText = 0
++        var clickable = 0
++        var inputFields = 0
++        var maxDepth = 0
++
++        for (rawLine in dump.lineSequence()) {
++            val match = NODE_LINE.matchEntire(rawLine) ?: continue
++            val indentSpaces = match.groupValues[1].length
++            val body = match.groupValues[2]
++
++            totalNodes += 1
++            val depth = indentSpaces / 2
++            if (depth > maxDepth) maxDepth = depth
++
++            val hasText = TEXT_ATTR.find(body)?.groupValues?.get(1)?.isNotBlank() == true
++            val hasDesc = DESC_ATTR.find(body)?.groupValues?.get(1)?.isNotBlank() == true
++            if (hasText || hasDesc) visibleText += 1
++
++            if (" clickable" in " $body") clickable += 1
++
++            val className = CLASS_NAME.find(body)?.groupValues?.get(1).orEmpty()
++            if (INPUT_CLASS_HINTS.any { className.contains(it, ignoreCase = true) }) {
++                inputFields += 1
++            }
++        }
++
++        return ObservedScreenSignals(
++            totalNodeCount = totalNodes,
++            visibleTextCount = visibleText,
++            clickableNodeCount = clickable,
++            inputFieldCount = inputFields,
++            maxTreeDepth = maxDepth,
++            packageName = packageName,
++        )
++    }
++}
+diff --git a/app/src/main/java/dev/touchpilot/app/screen/ocr/WeakContextResponse.kt b/app/src/main/java/dev/touchpilot/app/screen/ocr/WeakContextResponse.kt
+new file mode 100644
+index 0000000..437a5d6
+--- /dev/null
++++ b/app/src/main/java/dev/touchpilot/app/screen/ocr/WeakContextResponse.kt
+@@ -0,0 +1,38 @@
++package dev.touchpilot.app.screen.ocr
++
++/**
++ * Generates the honest, conservative response copy TouchPilot should produce when
++ * Accessibility data is too thin to summarize a screen. Keeping this in one place
++ * makes it straightforward to test phrasing and to keep the agent from inventing
++ * detail it cannot see.
++ */
++object WeakContextResponse {
++    private const val GENERIC_WEAK =
++        "I can see this screen, but the app exposes limited readable UI data. " +
++            "OCR support is needed for better understanding here."
++
++    private const val EMPTY =
++        "I cannot see any usable screen information right now. " +
++            "I will not guess what is on screen."
++
++    fun forWeak(quality: ContextQuality.Weak, fallback: OcrFallbackResult): String {
++        return when (fallback) {
++            OcrFallbackResult.NotAttempted -> GENERIC_WEAK
++            is OcrFallbackResult.Unavailable -> GENERIC_WEAK
++            is OcrFallbackResult.Recognized -> {
++                if (fallback.text.isEmpty()) {
++                    GENERIC_WEAK
++                } else {
++                    val snippet = fallback.text.joinToString(separator = " | ")
++                        .take(160)
++                    "I cannot read this screen reliably from Accessibility data " +
++                        "(${quality.reason.name.lowercase().replace('_', ' ')}). " +
++                        "OCR returned text I have not verified: \"$snippet\". " +
++                        "I will not act on it without confirmation."
++                }
++            }
++        }
++    }
++
++    fun forEmpty(): String = EMPTY
++}
+diff --git a/app/src/test/java/dev/touchpilot/app/screen/ocr/ContextQualityDetectorTest.kt b/app/src/test/java/dev/touchpilot/app/screen/ocr/ContextQualityDetectorTest.kt
+new file mode 100644
+index 0000000..3af9e48
+--- /dev/null
++++ b/app/src/test/java/dev/touchpilot/app/screen/ocr/ContextQualityDetectorTest.kt
+@@ -0,0 +1,143 @@
++package dev.touchpilot.app.screen.ocr
++
++import kotlin.test.Test
++import kotlin.test.assertEquals
++import kotlin.test.assertIs
++import kotlin.test.assertSame
++
++class ContextQualityDetectorTest {
++    private val detector = ContextQualityDetector()
++
++    @Test
++    fun emptyTreeClassifiesAsEmpty() {
++        val quality = detector.classify(ObservedScreenSignals.EMPTY)
++        assertSame(ContextQuality.Empty, quality)
++    }
++
++    @Test
++    fun nodesWithoutReadableTextAreWeakNoVisibleText() {
++        val signals = ObservedScreenSignals(
++            totalNodeCount = 40,
++            visibleTextCount = 0,
++            clickableNodeCount = 4,
++            inputFieldCount = 0,
++            maxTreeDepth = 6,
++        )
++
++        val weak = assertIs<ContextQuality.Weak>(detector.classify(signals))
++        assertEquals(WeakReason.NO_VISIBLE_TEXT, weak.reason)
++    }
++
++    @Test
++    fun textWithoutClickablesIsWeakNoClickableNodes() {
++        val signals = ObservedScreenSignals(
++            totalNodeCount = 30,
++            visibleTextCount = 8,
++            clickableNodeCount = 0,
++            inputFieldCount = 0,
++            maxTreeDepth = 5,
++        )
++
++        val weak = assertIs<ContextQuality.Weak>(detector.classify(signals))
++        assertEquals(WeakReason.NO_CLICKABLE_NODES, weak.reason)
++    }
++
++    @Test
++    fun inputFieldCountsAsAffordance() {
++        // An input-only screen (e.g., password field) should not be flagged as
++        // NO_CLICKABLE_NODES — the user can still type into it.
++        val signals = ObservedScreenSignals(
++            totalNodeCount = 10,
++            visibleTextCount = 2,
++            clickableNodeCount = 0,
++            inputFieldCount = 1,
++            maxTreeDepth = 4,
++        )
++
++        assertSame(ContextQuality.Strong, detector.classify(signals))
++    }
++
++    @Test
++    fun shallowTreeIsWeakShallowTree() {
++        val signals = ObservedScreenSignals(
++            totalNodeCount = 5,
++            visibleTextCount = 2,
++            clickableNodeCount = 1,
++            inputFieldCount = 0,
++            maxTreeDepth = 1,
++        )
++
++        val weak = assertIs<ContextQuality.Weak>(detector.classify(signals))
++        assertEquals(WeakReason.SHALLOW_TREE, weak.reason)
++    }
++
++    @Test
++    fun lowReadableRatioIsWeakMostlyEmpty() {
++        // 100 nodes but only ~5% have any readable signal — typical of a surface
++        // rendered through Canvas/SurfaceView where Accessibility sees scaffolding.
++        val signals = ObservedScreenSignals(
++            totalNodeCount = 100,
++            visibleTextCount = 3,
++            clickableNodeCount = 2,
++            inputFieldCount = 0,
++            maxTreeDepth = 6,
++        )
++
++        val weak = assertIs<ContextQuality.Weak>(detector.classify(signals))
++        assertEquals(WeakReason.MOSTLY_EMPTY, weak.reason)
++    }
++
++    @Test
++    fun typicalSettingsScreenIsStrong() {
++        val signals = ObservedScreenSignals(
++            totalNodeCount = 50,
++            visibleTextCount = 18,
++            clickableNodeCount = 9,
++            inputFieldCount = 0,
++            maxTreeDepth = 7,
++            packageName = "com.android.settings",
++        )
++
++        assertSame(ContextQuality.Strong, detector.classify(signals))
++    }
++
++    @Test
++    fun customThresholdsLetCallersTighten() {
++        val strict = ContextQualityDetector(
++            ContextQualityDetector.Thresholds(
++                minVisibleText = 10,
++                minClickable = 5,
++                minTreeDepth = 4,
++                minReadableRatio = 0.30,
++            )
++        )
++
++        val borderline = ObservedScreenSignals(
++            totalNodeCount = 30,
++            visibleTextCount = 6,
++            clickableNodeCount = 3,
++            inputFieldCount = 0,
++            maxTreeDepth = 6,
++        )
++
++        val weak = assertIs<ContextQuality.Weak>(strict.classify(borderline))
++        assertEquals(WeakReason.NO_VISIBLE_TEXT, weak.reason)
++    }
++
++    @Test
++    fun firstFailingCheckWinsToKeepReasonStable() {
++        // No visible text AND no clickables AND shallow — detector should report
++        // the first weak reason (NO_VISIBLE_TEXT) so callers can act without
++        // having to enumerate every possible cause.
++        val signals = ObservedScreenSignals(
++            totalNodeCount = 4,
++            visibleTextCount = 0,
++            clickableNodeCount = 0,
++            inputFieldCount = 0,
++            maxTreeDepth = 1,
++        )
++
++        val weak = assertIs<ContextQuality.Weak>(detector.classify(signals))
++        assertEquals(WeakReason.NO_VISIBLE_TEXT, weak.reason)
++    }
++}
+diff --git a/app/src/test/java/dev/touchpilot/app/screen/ocr/OcrFallbackTest.kt b/app/src/test/java/dev/touchpilot/app/screen/ocr/OcrFallbackTest.kt
+new file mode 100644
+index 0000000..c5a4397
+--- /dev/null
++++ b/app/src/test/java/dev/touchpilot/app/screen/ocr/OcrFallbackTest.kt
+@@ -0,0 +1,53 @@
++package dev.touchpilot.app.screen.ocr
++
++import kotlin.test.Test
++import kotlin.test.assertEquals
++import kotlin.test.assertFailsWith
++import kotlin.test.assertIs
++import kotlin.test.assertTrue
++
++class OcrFallbackTest {
++    @Test
++    fun noOpFallbackReturnsUnavailable() {
++        val fallback: OcrFallback = NoOpOcrFallback()
++
++        val result = fallback.attempt(
++            OcrRequest(reason = WeakReason.NO_VISIBLE_TEXT, packageName = "com.example")
++        )
++
++        val unavailable = assertIs<OcrFallbackResult.Unavailable>(result)
++        assertTrue("OCR runtime not configured" in unavailable.reason)
++        assertTrue("future fallback" in unavailable.reason)
++    }
++
++    @Test
++    fun recognizedResultRejectsOutOfRangeConfidence() {
++        assertFailsWith<IllegalArgumentException> {
++            OcrFallbackResult.Recognized(text = listOf("hello"), confidence = 1.5f)
++        }
++        assertFailsWith<IllegalArgumentException> {
++            OcrFallbackResult.Recognized(text = listOf("hello"), confidence = -0.1f)
++        }
++    }
++
++    @Test
++    fun resultTypesAreDistinguishable() {
++        // Sanity check: callers can pattern-match on the sealed hierarchy without
++        // a default branch.
++        val results: List<OcrFallbackResult> = listOf(
++            OcrFallbackResult.NotAttempted,
++            OcrFallbackResult.Unavailable("no runtime"),
++            OcrFallbackResult.Recognized(listOf("Settings"), 0.42f),
++        )
++
++        val labels = results.map { result ->
++            when (result) {
++                OcrFallbackResult.NotAttempted -> "not-attempted"
++                is OcrFallbackResult.Unavailable -> "unavailable"
++                is OcrFallbackResult.Recognized -> "recognized"
++            }
++        }
++
++        assertEquals(listOf("not-attempted", "unavailable", "recognized"), labels)
++    }
++}
+diff --git a/app/src/test/java/dev/touchpilot/app/screen/ocr/ScreenSignalsExtractorTest.kt b/app/src/test/java/dev/touchpilot/app/screen/ocr/ScreenSignalsExtractorTest.kt
+new file mode 100644
+index 0000000..7e54bef
+--- /dev/null
++++ b/app/src/test/java/dev/touchpilot/app/screen/ocr/ScreenSignalsExtractorTest.kt
+@@ -0,0 +1,80 @@
++package dev.touchpilot.app.screen.ocr
++
++import kotlin.test.Test
++import kotlin.test.assertEquals
++
++class ScreenSignalsExtractorTest {
++    @Test
++    fun extractsCountsFromTypicalSettingsDump() {
++        val dump = """
++            TouchPilot screen snapshot
++            - FrameLayout node_id="0" bounds="0,0,1080,2400"
++              - LinearLayout node_id="0.0" bounds="0,0,1080,2400"
++                - TextView node_id="0.0.0" text="Settings" bounds="0,0,1080,200"
++                - RecyclerView node_id="0.0.1" bounds="0,200,1080,2400"
++                  - LinearLayout node_id="0.0.1.0" clickable bounds="0,200,1080,400"
++                    - TextView node_id="0.0.1.0.0" text="Network & internet" bounds="0,200,800,400"
++                  - LinearLayout node_id="0.0.1.1" clickable bounds="0,400,1080,600"
++                    - TextView node_id="0.0.1.1.0" text="Apps" bounds="0,400,800,600"
++        """.trimIndent()
++
++        val signals = ScreenSignalsExtractor.fromObserveDump(dump, packageName = "com.android.settings")
++
++        assertEquals(8, signals.totalNodeCount)
++        assertEquals(3, signals.visibleTextCount)
++        assertEquals(2, signals.clickableNodeCount)
++        assertEquals(0, signals.inputFieldCount)
++        assertEquals(4, signals.maxTreeDepth)
++        assertEquals("com.android.settings", signals.packageName)
++    }
++
++    @Test
++    fun emptyDumpYieldsEmptySignals() {
++        val signals = ScreenSignalsExtractor.fromObserveDump("TouchPilot screen snapshot")
++        assertEquals(ObservedScreenSignals.EMPTY.copy(packageName = null), signals)
++    }
++
++    @Test
++    fun blankTextDoesNotCountAsVisibleText() {
++        val dump = """
++            TouchPilot screen snapshot
++            - TextView node_id="0" text=""
++            - TextView node_id="1" desc=""
++        """.trimIndent()
++
++        val signals = ScreenSignalsExtractor.fromObserveDump(dump)
++
++        assertEquals(2, signals.totalNodeCount)
++        assertEquals(0, signals.visibleTextCount)
++    }
++
++    @Test
++    fun editTextIsCountedAsInputField() {
++        val dump = """
++            TouchPilot screen snapshot
++            - EditText node_id="0" text="user@example.com" focused
++            - androidx.appcompat.widget.AppCompatAutoCompleteTextView node_id="1"
++        """.trimIndent()
++
++        val signals = ScreenSignalsExtractor.fromObserveDump(dump)
++
++        assertEquals(2, signals.totalNodeCount)
++        assertEquals(2, signals.inputFieldCount)
++        assertEquals(1, signals.visibleTextCount)
++    }
++
++    @Test
++    fun nonNodeLinesAreIgnored() {
++        val dump = """
++            TouchPilot screen snapshot
++            some debug header line
++            - FrameLayout node_id="0"
++              - TextView node_id="0.0" text="hello"
++        """.trimIndent()
++
++        val signals = ScreenSignalsExtractor.fromObserveDump(dump)
++
++        assertEquals(2, signals.totalNodeCount)
++        assertEquals(1, signals.visibleTextCount)
++    }
++}
+diff --git a/app/src/test/java/dev/touchpilot/app/screen/ocr/WeakContextResponseTest.kt b/app/src/test/java/dev/touchpilot/app/screen/ocr/WeakContextResponseTest.kt
+new file mode 100644
+index 0000000..18a737f
+--- /dev/null
++++ b/app/src/test/java/dev/touchpilot/app/screen/ocr/WeakContextResponseTest.kt
+@@ -0,0 +1,82 @@
++package dev.touchpilot.app.screen.ocr
++
++import kotlin.test.Test
++import kotlin.test.assertEquals
++import kotlin.test.assertFalse
++import kotlin.test.assertTrue
++
++class WeakContextResponseTest {
++    @Test
++    fun weakContextWithoutOcrProducesHonestMessage() {
++        val message = WeakContextResponse.forWeak(
++            quality = ContextQuality.Weak(WeakReason.NO_VISIBLE_TEXT),
++            fallback = OcrFallbackResult.Unavailable("OCR runtime not configured."),
++        )
++
++        assertTrue("limited readable UI data" in message)
++        assertTrue("OCR support is needed" in message)
++    }
++
++    @Test
++    fun weakContextWithNotAttemptedFallbackUsesSameHonestMessage() {
++        val message = WeakContextResponse.forWeak(
++            quality = ContextQuality.Weak(WeakReason.SHALLOW_TREE),
++            fallback = OcrFallbackResult.NotAttempted,
++        )
++
++        assertTrue("limited readable UI data" in message)
++    }
++
++    @Test
++    fun recognizedTextIsSurfacedAsUntrustedAndNotActedOn() {
++        val message = WeakContextResponse.forWeak(
++            quality = ContextQuality.Weak(WeakReason.MOSTLY_EMPTY),
++            fallback = OcrFallbackResult.Recognized(
++                text = listOf("Confirm payment", "Cancel"),
++                confidence = 0.55f,
++            ),
++        )
++
++        assertTrue("have not verified" in message)
++        assertTrue("Confirm payment" in message)
++        assertTrue("will not act on it without confirmation" in message)
++    }
++
++    @Test
++    fun recognizedEmptyTextFallsBackToGenericWeakMessage() {
++        val message = WeakContextResponse.forWeak(
++            quality = ContextQuality.Weak(WeakReason.NO_VISIBLE_TEXT),
++            fallback = OcrFallbackResult.Recognized(
++                text = emptyList(),
++                confidence = 0.10f,
++            ),
++        )
++
++        assertTrue("limited readable UI data" in message)
++        assertFalse("have not verified" in message)
++    }
++
++    @Test
++    fun recognizedTextIsTruncatedToAvoidLongMessages() {
++        val longSnippet = "abcd".repeat(80) // 320 chars
++        val message = WeakContextResponse.forWeak(
++            quality = ContextQuality.Weak(WeakReason.MOSTLY_EMPTY),
++            fallback = OcrFallbackResult.Recognized(listOf(longSnippet), 0.5f),
++        )
++
++        // The recognizer snippet inside the quotes must be at most 160 chars.
++        val quoted = Regex("\"([^\"]*)\"").find(message)?.groupValues?.get(1)
++            ?: error("no quoted snippet in: $message")
++        assertTrue(quoted.length <= 160)
++    }
++
++    @Test
++    fun emptyContextProducesRefusalNotGuess() {
++        val message = WeakContextResponse.forEmpty()
++        assertEquals(
++            "I cannot see any usable screen information right now. " +
++                "I will not guess what is on screen.",
++            message,
++        )
++    }
++}
+diff --git a/docs/OCR_FALLBACK.md b/docs/OCR_FALLBACK.md
+new file mode 100644
+index 0000000..e239431
+--- /dev/null
++++ b/docs/OCR_FALLBACK.md
+@@ -0,0 +1,80 @@
++# OCR Fallback Boundary
++
++TouchPilot's primary local screen-understanding path is the Android Accessibility
++service. Some surfaces (Canvas/SurfaceView rendering, custom views, games,
++intentionally obfuscated screens) expose weak or empty Accessibility trees. The
++OCR fallback boundary defined here exists so the rest of the agent has one place
++to ask "is what I am seeing usable, and if not, can OCR help?" without making OCR
++or a local VLM a Milestone 3 dependency.
++
++## Pipeline
++
++```text
++Accessibility observation
++   ─► screen context builder
++   ─► ContextQualityDetector
++       ─► Strong  ─► summarize / suggest directly
++       ─► Weak    ─► OcrFallback.attempt(...)
++                    ─► Recognized: surface as untrusted text, do not act on it
++                    ─► Unavailable: respond honestly that the screen cannot be read
++                    ─► NotAttempted: same conservative copy as Unavailable
++       ─► Empty   ─► refuse to guess
++```
++
++## Package
++
++All boundary types live under `dev.touchpilot.app.screen.ocr`:
++
++- `ObservedScreenSignals` — small, platform-free value type carrying the counts
++  the detector needs (total nodes, visible text count, clickable count, input
++  field count, max depth, package name).
++- `ContextQualityDetector` — returns `ContextQuality.Strong`,
++  `ContextQuality.Weak(reason)`, or `ContextQuality.Empty`. Thresholds are
++  injectable.
++- `WeakReason` — `NO_VISIBLE_TEXT`, `NO_CLICKABLE_NODES`, `SHALLOW_TREE`,
++  `MOSTLY_EMPTY`.
++- `OcrFallback` — interface with `attempt(OcrRequest): OcrFallbackResult`.
++- `OcrFallbackResult` — sealed: `NotAttempted`, `Unavailable(reason)`,
++  `Recognized(text, confidence)`.
++- `NoOpOcrFallback` — default boundary that always returns `Unavailable`.
++- `WeakContextResponse` — generates the honest copy callers should emit for
++  weak/empty contexts.
++
++The detector takes counts, not Android types, so it runs as a JVM unit test and
++so a future caller can derive signals from either an `AccessibilityNodeInfo`
++walk or a higher-level screen context model (for example the one being added in
++[#39](https://github.com/touchpilot/touchpilot/issues/39)).
++
++## Local-only constraint
++
++OCR and VLM implementations behind this interface MUST run fully on device. The
++project direction (see `ROADMAP.md`, `LOCAL_INFERENCE.md`) is 100% local for
++core product behavior, and OCR is no exception. Cloud OCR is not part of this
++boundary and should not be added behind it.
++
++A future LiteRT, ExecuTorch, or llama.cpp-backed OCR/VLM runtime can implement
++`OcrFallback` once the runtime is selected. Until then, the bundled
++implementation is `NoOpOcrFallback`, which returns `Unavailable` and lets the
++agent respond honestly instead of guessing.
++
++## Safety
++
++- OCR output is untrusted noise. Any `Recognized.text` MUST pass through the
++  existing `SensitiveTextRedactor` before being written to logs or traces, and
++  MUST NOT be used as a tool argument without passing through validation, the
++  active skill allowlist, and the safety policy — the same pipeline that
++  protects against any other untrusted command source.
++- Weak context must not cause unsafe guessing or blind tapping. The
++  `WeakContextResponse` copy is intentionally conservative and includes "I will
++  not act on it without confirmation" when recognized text is surfaced.
++- Empty context produces a refusal rather than a guess.
++
++## What is intentionally out of scope here
++
++- Wiring the detector into the live `AccessibilityService` observation path —
++  that belongs with the screen context builder
++  ([#40](https://github.com/touchpilot/touchpilot/issues/40)).
++- Choosing an OCR runtime and shipping a real `OcrFallback` implementation —
++  deferred to the local OCR/VLM milestone.
++- Capturing screen pixels for OCR — also deferred, and gated behind the same
++  local-only and policy constraints when it lands.

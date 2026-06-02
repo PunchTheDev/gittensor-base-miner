@@ -1,0 +1,277 @@
+diff --git a/.cursor/rules/api-endpoint-consistency.mdc b/.cursor/rules/api-endpoint-consistency.mdc
+new file mode 100644
+index 0000000000..75bd06f20a
+--- /dev/null
++++ b/.cursor/rules/api-endpoint-consistency.mdc
+@@ -0,0 +1,46 @@
++---
++description: API endpoint consistency — checklist to run after every API endpoint commit (Minitest behavior, rswag docs-only, API key auth).
++globs: app/controllers/api/v1/**/*.rb, spec/requests/api/v1/**/*.rb, test/controllers/api/v1/**/*.rb
++alwaysApply: false
++---
++
++# API endpoint consistency (post-commit checklist)
++
++When adding or modifying API v1 endpoints, ensure the following so behavior, docs, and auth stay consistent.
++
++## 1. Minitest behavioral coverage
++
++- **Location**: `test/controllers/api/v1/{resource}_controller_test.rb`
++- **Scope**: All new or changed actions must have Minitest coverage here. Do not rely on rswag specs for behavioral assertions.
++- **Pattern**:
++  - Use `ApiKey.create!` (read and read_write scopes) and `api_headers(api_key)` → `{ "X-Api-Key" => api_key.display_key }`. Do not use OAuth/Bearer in these tests.
++  - Cover: index/show (and create/update/destroy for write endpoints), read-only key blocking writes (403), invalid params (422), invalid date (422), not found (404), missing auth (401).
++  - Follow existing API v1 test style: see [valuations_controller_test.rb](mdc:test/controllers/api/v1/valuations_controller_test.rb) and [transactions_controller_test.rb](mdc:test/controllers/api/v1/transactions_controller_test.rb).
++
++## 2. rswag is docs-only
++
++- **Location**: `spec/requests/api/v1/{resource}_spec.rb`
++- **Rule**: These specs exist only for OpenAPI generation. Do not add `expect(...)` or `assert_*` (or any behavioral assertions). Use `run_test!` without custom assertion blocks so the spec only documents request/response and regenerates `docs/api/openapi.yaml`.
++- **Regenerate**: After edits, run `RAILS_ENV=test bundle exec rake rswag:specs:swaggerize`.
++
++## 3. Same API key auth in all rswag specs
++
++- **Rule**: Every request spec in `spec/requests/api/v1/` must use the same API key auth pattern so generated docs are consistent.
++- **Pattern** (match holdings_spec, trades_spec, transactions_spec, etc.):
++
++  ```ruby
++  let(:api_key) do
++    key = ApiKey.generate_secure_key
++    ApiKey.create!(
++      user: user,
++      name: 'API Docs Key',
++      key: key,
++      scopes: %w[read_write],
++      source: 'web'
++    )
++  end
++
++  let(:'X-Api-Key') { api_key.plain_key }
++  ```
++
++- Do not use Doorkeeper/OAuth in these specs (no `Doorkeeper::Application`, `Doorkeeper::AccessToken`, or `Authorization: "Bearer ..."`). Use API key only. Note: [valuations_spec.rb](mdc:spec/requests/api/v1/valuations_spec.rb) currently uses OAuth; update it to the API key pattern above when editing that file.
+diff --git a/AGENTS.md b/AGENTS.md
+index 0d6500834b..d3e52c168b 100644
+--- a/AGENTS.md
++++ b/AGENTS.md
+@@ -45,6 +45,9 @@ When adding or modifying API endpoints in `app/controllers/api/v1/`, you **MUST*
+ 4. **Generated Docs**: `docs/api/openapi.yaml`
+ 5. **Regenerate**: Run `RAILS_ENV=test bundle exec rake rswag:specs:swaggerize` after changes
+ 
++### Post-commit API consistency (LLM checklist)
++After every API endpoint commit, ensure: (1) **Minitest** behavioral coverage in `test/controllers/api/v1/{resource}_controller_test.rb` (no behavioral assertions in rswag); (2) **rswag** remains docs-only (no `expect`/`assert_*` in `spec/requests/api/v1/`); (3) **rswag auth** uses the same API key pattern everywhere (`X-Api-Key`, not OAuth/Bearer). Full checklist: [.cursor/rules/api-endpoint-consistency.mdc](.cursor/rules/api-endpoint-consistency.mdc).
++
+ ## Providers: Pending Transactions and FX Metadata (SimpleFIN/Plaid/Lunchflow)
+ 
+ - Pending detection
+diff --git a/CLAUDE.md b/CLAUDE.md
+index 10e448f227..1e2bcc3212 100644
+--- a/CLAUDE.md
++++ b/CLAUDE.md
+@@ -361,4 +361,17 @@ end
+ **Regenerate OpenAPI docs after changes:**
+ ```bash
+ RAILS_ENV=test bundle exec rake rswag:specs:swaggerize
+-```
+\ No newline at end of file
++```
++
++### Post-commit API consistency (issue #944)
++After every API endpoint commit, ensure:
++
++1. **Minitest behavioral coverage** — Add or update tests in `test/controllers/api/v1/{resource}_controller_test.rb`. Use API key and `api_headers` (X-Api-Key). Cover index/show, CRUD where relevant, 401/403/422/404. Do not rely on rswag for behavioral assertions.
++
++2. **rswag docs-only** — Do not add `expect(...)` or `assert_*` in `spec/requests/api/v1/`. Use `run_test!` only so specs document request/response and regenerate `docs/api/openapi.yaml`.
++
++3. **Same API key auth in rswag** — Every request spec in `spec/requests/api/v1/` must use the same API key pattern (`ApiKey.generate_secure_key`, `ApiKey.create!(...)`, `let(:'X-Api-Key') { api_key.plain_key }`). Do not use Doorkeeper/OAuth in those specs so generated docs stay consistent.
++
++Full checklist and pattern: [.cursor/rules/api-endpoint-consistency.mdc](.cursor/rules/api-endpoint-consistency.mdc).
++
++To verify the implementation: `ruby test/support/verify_api_endpoint_consistency.rb`. To scan the current APIs for violations: `ruby test/support/verify_api_endpoint_consistency.rb --compliance`.
+\ No newline at end of file
+diff --git a/test/api_endpoint_consistency_rule_test.rb b/test/api_endpoint_consistency_rule_test.rb
+new file mode 100644
+index 0000000000..8169ebed31
+--- /dev/null
++++ b/test/api_endpoint_consistency_rule_test.rb
+@@ -0,0 +1,62 @@
++# frozen_string_literal: true
++
++# Verifies the API endpoint consistency implementation (issue #944): rule file and AGENTS.md.
++# If Rails fails to load (e.g. Sidekiq::Throttled), run the standalone script instead:
++#   ruby test/support/verify_api_endpoint_consistency.rb
++
++require "test_helper"
++
++class ApiEndpointConsistencyRuleTest < ActiveSupport::TestCase
++  RULE_PATH = ".cursor/rules/api-endpoint-consistency.mdc"
++  AGENTS_PATH = "AGENTS.md"
++
++  def root
++    @root ||= Rails.root
++  end
++
++  test "rule file exists" do
++    assert File.exist?(root.join(RULE_PATH)), "Expected #{RULE_PATH} to exist"
++  end
++
++  test "rule has globs for API v1 paths" do
++    content = File.read(root.join(RULE_PATH))
++    assert_includes content, "app/controllers/api/v1"
++    assert_includes content, "spec/requests/api/v1"
++    assert_includes content, "test/controllers/api/v1"
++  end
++
++  test "rule includes Minitest behavioral coverage section" do
++    content = File.read(root.join(RULE_PATH))
++    assert_includes content, "Minitest behavioral coverage"
++    assert_includes content, "test/controllers/api/v1/{resource}_controller_test.rb"
++    assert_includes content, "api_headers"
++    assert_includes content, "X-Api-Key"
++  end
++
++  test "rule includes rswag docs-only section" do
++    content = File.read(root.join(RULE_PATH))
++    assert_includes content, "rswag is docs-only"
++    assert_includes content, "expect"
++    assert_includes content, "assert_"
++    assert_includes content, "run_test!"
++    assert_includes content, "rswag:specs:swaggerize"
++  end
++
++  test "rule includes same API key auth section" do
++    content = File.read(root.join(RULE_PATH))
++    assert_includes content, "Same API key auth"
++    assert_includes content, "ApiKey.generate_secure_key"
++    assert_includes content, "plain_key"
++    assert_includes content, "Doorkeeper"
++  end
++
++  test "AGENTS.md references post-commit API consistency" do
++    assert File.exist?(root.join(AGENTS_PATH)), "Expected #{AGENTS_PATH} to exist"
++    content = File.read(root.join(AGENTS_PATH))
++    assert_includes content, "Post-commit API consistency"
++    assert_includes content, "api-endpoint-consistency.mdc"
++    assert_includes content, "Minitest"
++    assert_includes content, "rswag"
++    assert_includes content, "X-Api-Key"
++  end
++end
+diff --git a/test/support/verify_api_endpoint_consistency.rb b/test/support/verify_api_endpoint_consistency.rb
+new file mode 100644
+index 0000000000..a4dae297bf
+--- /dev/null
++++ b/test/support/verify_api_endpoint_consistency.rb
+@@ -0,0 +1,112 @@
++# frozen_string_literal: true
++
++# Standalone verification of the API endpoint consistency implementation (issue #944).
++# Run without loading Rails: ruby test/support/verify_api_endpoint_consistency.rb
++# Or with bundle: bundle exec ruby test/support/verify_api_endpoint_consistency.rb
++#
++# Option: pass --compliance to also scan the current API codebase and report violations
++# (rswag specs using OAuth instead of API key, missing Minitest for API controllers,
++# rswag specs with expect/assert).
++
++def project_root
++  dir = File.dirname(File.expand_path(__FILE__))
++  loop do
++    return dir if File.exist?(File.join(dir, "AGENTS.md")) && File.directory?(File.join(dir, ".cursor", "rules"))
++    parent = File.dirname(dir)
++    raise "Could not find project root (AGENTS.md + .cursor/rules)" if parent == dir
++    dir = parent
++  end
++end
++
++def assert(condition, message)
++  raise "FAIL: #{message}" unless condition
++end
++
++def assert_includes(content, substring, message)
++  assert content.include?(substring), "#{message} (missing: #{substring.inspect})"
++end
++
++root = project_root
++rule_path = File.join(root, ".cursor", "rules", "api-endpoint-consistency.mdc")
++agents_path = File.join(root, "AGENTS.md")
++
++assert File.exist?(rule_path), "Rule file should exist at #{rule_path}"
++rule_content = File.read(rule_path)
++
++assert_includes rule_content, "app/controllers/api/v1", "Rule must have glob for app/controllers/api/v1"
++assert_includes rule_content, "spec/requests/api/v1", "Rule must have glob for spec/requests/api/v1"
++assert_includes rule_content, "test/controllers/api/v1", "Rule must have glob for test/controllers/api/v1"
++assert_includes rule_content, "Minitest behavioral coverage", "Rule must include Minitest section"
++assert_includes rule_content, "test/controllers/api/v1/{resource}_controller_test.rb", "Rule must specify Minitest location"
++assert_includes rule_content, "api_headers", "Rule must mention api_headers"
++assert_includes rule_content, "X-Api-Key", "Rule must mention X-Api-Key"
++assert_includes rule_content, "rswag is docs-only", "Rule must include rswag docs-only section"
++assert_includes rule_content, "run_test!", "Rule must mention run_test!"
++assert_includes rule_content, "rswag:specs:swaggerize", "Rule must mention swaggerize task"
++assert_includes rule_content, "Same API key auth", "Rule must include API key auth section"
++assert_includes rule_content, "ApiKey.generate_secure_key", "Rule must show API key pattern"
++assert_includes rule_content, "plain_key", "Rule must mention plain_key"
++assert_includes rule_content, "Doorkeeper", "Rule must mention Doorkeeper (to avoid OAuth in specs)"
++
++assert File.exist?(agents_path), "AGENTS.md should exist"
++agents_content = File.read(agents_path)
++assert_includes agents_content, "Post-commit API consistency", "AGENTS.md must reference post-commit checklist"
++assert_includes agents_content, "api-endpoint-consistency.mdc", "AGENTS.md must link to rule file"
++assert_includes agents_content, "Minitest", "AGENTS.md must mention Minitest"
++assert_includes agents_content, "rswag", "AGENTS.md must mention rswag"
++assert_includes agents_content, "X-Api-Key", "AGENTS.md must mention X-Api-Key"
++
++puts "OK: API endpoint consistency implementation verified (rule + AGENTS.md)."
++
++if ARGV.include?("--compliance")
++  puts "\n--- Compliance check (current APIs) ---"
++  spec_dir = File.join(root, "spec", "requests", "api", "v1")
++  test_dir = File.join(root, "test", "controllers", "api", "v1")
++  app_controllers_dir = File.join(root, "app", "controllers", "api", "v1")
++
++  rswag_oauth = []
++  rswag_assertions = []
++  missing_minitest = []
++
++  if File.directory?(spec_dir)
++    Dir.glob(File.join(spec_dir, "*_spec.rb")).each do |path|
++      basename = File.basename(path, "_spec.rb")
++      next if basename == "auth"
++      content = File.read(path)
++      if content.include?("Doorkeeper") || content.include?("Bearer") || content.include?("access_token")
++        rswag_oauth << "#{basename}_spec.rb"
++      end
++      rswag_assertions << "#{basename}_spec.rb" if content.include?("expect(") || content.include?("assert_")
++    end
++  end
++
++  skip_controllers = %w[base_controller test_controller]
++  if File.directory?(app_controllers_dir)
++    Dir.glob(File.join(app_controllers_dir, "*_controller.rb")).each do |path|
++      basename = File.basename(path, ".rb")
++      next if skip_controllers.include?(basename)
++      test_path = File.join(test_dir, "#{basename}_test.rb")
++      missing_minitest << basename unless File.exist?(test_path)
++    end
++  end
++
++  if rswag_oauth.any?
++    puts "rswag using OAuth (should use API key per rule): #{rswag_oauth.join(", ")}"
++  else
++    puts "rswag auth: all specs use API key."
++  end
++
++  if rswag_assertions.any?
++    puts "rswag with expect/assert (should be docs-only): #{rswag_assertions.join(", ")}"
++  else
++    puts "rswag: no expect/assert found (docs-only)."
++  end
++
++  if missing_minitest.any?
++    puts "API v1 controllers missing Minitest: #{missing_minitest.join(", ")}"
++  else
++    puts "Minitest: all API v1 controllers have a test file."
++  end
++
++  puts "---"
++end

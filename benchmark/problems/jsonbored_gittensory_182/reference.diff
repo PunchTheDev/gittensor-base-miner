@@ -1,0 +1,1610 @@
+diff --git a/migrations/0015_product_usage_events.sql b/migrations/0015_product_usage_events.sql
+new file mode 100644
+index 0000000..bd90dc4
+--- /dev/null
++++ b/migrations/0015_product_usage_events.sql
+@@ -0,0 +1,28 @@
++CREATE TABLE IF NOT EXISTS product_usage_events (
++  id TEXT PRIMARY KEY,
++  surface TEXT NOT NULL,
++  event_name TEXT NOT NULL,
++  route TEXT,
++  actor_hash TEXT,
++  session_hash TEXT,
++  repo_full_name TEXT,
++  target_key TEXT,
++  outcome TEXT NOT NULL,
++  latency_ms INTEGER,
++  client_name TEXT,
++  client_version TEXT,
++  metadata_json TEXT NOT NULL DEFAULT '{}',
++  occurred_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
++);
++
++CREATE INDEX IF NOT EXISTS product_usage_events_surface_occurred_idx
++  ON product_usage_events(surface, occurred_at);
++
++CREATE INDEX IF NOT EXISTS product_usage_events_event_occurred_idx
++  ON product_usage_events(event_name, occurred_at);
++
++CREATE INDEX IF NOT EXISTS product_usage_events_actor_occurred_idx
++  ON product_usage_events(actor_hash, occurred_at);
++
++CREATE INDEX IF NOT EXISTS product_usage_events_repo_occurred_idx
++  ON product_usage_events(repo_full_name, occurred_at);
+diff --git a/src/api/routes.ts b/src/api/routes.ts
+index f38da5e..f67eb74 100644
+--- a/src/api/routes.ts
++++ b/src/api/routes.ts
+@@ -1,4 +1,4 @@
+-import { Hono } from "hono";
++import { Hono, type Context } from "hono";
+ import { z } from "zod";
+ import { analyzePRQueue, type AuthorRole, type ChecksStatus } from "../queue-intelligence";
+ import { completeGitHubWebOAuth, createSessionFromGitHubToken, pollGitHubDeviceFlow, startGitHubDeviceFlow, startGitHubWebOAuth } from "../auth/github-oauth";
+@@ -69,6 +69,8 @@ import {
+   persistBountyLifecycleEvent,
+   persistScorePreview,
+   persistSignalSnapshot,
++  recordProductUsageEvent,
++  summarizeProductUsageEvents,
+   upsertDigestSubscription,
+   upsertBounty,
+   upsertContributorEvidence,
+@@ -144,10 +146,58 @@ import { buildLocalBranchAnalysis, findCurrentBranchPullRequest } from "../signa
+ import { buildRepoSettingsPreview } from "../signals/settings-preview";
+ import { buildGittensorConfigRecommendation, buildRegistrationReadiness, type InstallationHealthSummary } from "../signals/registration-readiness";
+ import { fileUpstreamDriftIssues, loadUpstreamStatus, refreshUpstreamDrift } from "../upstream/ruleset";
+-import type { BountyLifecycleEventRecord, ControlPanelRoleName, ContributorEvidenceRecord, DataQuality, InstallationHealthRecord, JobMessage, JsonValue, RegistrySnapshot, RepoSyncSegmentRecord, RepositoryRecord, ScoringModelSnapshotRecord } from "../types";
++import type {
++  BountyLifecycleEventRecord,
++  ControlPanelRoleName,
++  ContributorEvidenceRecord,
++  DataQuality,
++  InstallationHealthRecord,
++  JobMessage,
++  JsonValue,
++  ProductUsageOutcome,
++  ProductUsageSurface,
++  RegistrySnapshot,
++  RepoSyncSegmentRecord,
++  RepositoryRecord,
++  ScoringModelSnapshotRecord,
++} from "../types";
+ import { errorMessage, nowIso } from "../utils/json";
+ 
+ type AppBindings = { Bindings: Env };
++type AppContext = Context<AppBindings>;
++
++async function recordRouteProductUsage(
++  c: AppContext,
++  event: {
++    surface: ProductUsageSurface;
++    eventName: string;
++    outcome?: ProductUsageOutcome;
++    identity?: AuthIdentity | null | undefined;
++    actor?: string | null | undefined;
++    sessionId?: string | null | undefined;
++    repoFullName?: string | null | undefined;
++    targetKey?: string | null | undefined;
++    latencyMs?: number | null | undefined;
++    clientName?: string | null | undefined;
++    clientVersion?: string | null | undefined;
++    metadata?: Record<string, unknown> | null | undefined;
++  },
++): Promise<void> {
++  await recordProductUsageEvent(c.env, {
++    surface: event.surface,
++    eventName: event.eventName,
++    route: c.req.path,
++    actor: event.actor ?? event.identity?.actor,
++    sessionId: event.sessionId ?? (event.identity?.kind === "session" ? event.identity.session.id : undefined),
++    repoFullName: event.repoFullName,
++    targetKey: event.targetKey,
++    outcome: event.outcome,
++    latencyMs: event.latencyMs,
++    clientName: event.clientName,
++    clientVersion: event.clientVersion,
++    metadata: event.metadata,
++  }).catch(() => undefined);
++}
+ 
+ const MAX_LOCAL_BRANCH_REF_CHARS = 256;
+ const MAX_LOCAL_BRANCH_TEXT_CHARS = 4000;
+@@ -487,7 +537,15 @@ export function createApp() {
+     const githubToken = typeof body?.githubToken === "string" ? body.githubToken : "";
+     if (!githubToken) return c.json({ error: "github_token_required" }, 400);
+     try {
+-      return c.json(await createSessionFromGitHubToken(c.env, githubToken, { source: "github_token_exchange" }), 201);
++      const session = await createSessionFromGitHubToken(c.env, githubToken, { source: "github_token_exchange" });
++      await recordRouteProductUsage(c, {
++        surface: "api",
++        eventName: "auth_session_created",
++        actor: session.login,
++        outcome: "success",
++        metadata: { source: "github_token_exchange", scopeCount: session.scopes.length },
++      });
++      return c.json(session, 201);
+     } catch (error) {
+       return c.json({ error: errorMessage(error, "github_session_create_failed") }, 401);
+     }
+@@ -524,6 +582,15 @@ export function createApp() {
+         },
+       },
+     );
++    await recordRouteProductUsage(c, {
++      surface: "browser_extension",
++      eventName: "extension_session_created",
++      identity,
++      sessionId: session.id,
++      outcome: "success",
++      clientName: "browser_extension",
++      metadata: { scopeCount: session.scopes.length },
++    });
+     return c.json(
+       {
+         token,
+@@ -684,7 +751,8 @@ export function createApp() {
+   app.get("/v1/app/operator-dashboard", async (c) => {
+     const forbidden = await requireAppRole(c, ["operator"]);
+     if (forbidden) return forbidden;
+-    const [repositories, installations, health, registry, scoring, upstreamDrift, activeSessions, digestSubscriptions, rateLimits] = await Promise.all([
++    const usageSince = new Date(Date.now() - 7 * 24 * 60 * 60 * 1000).toISOString();
++    const [repositories, installations, health, registry, scoring, upstreamDrift, activeSessions, digestSubscriptions, rateLimits, usageSummary] = await Promise.all([
+       listRepositories(c.env),
+       listInstallations(c.env),
+       listInstallationHealth(c.env),
+@@ -694,6 +762,7 @@ export function createApp() {
+       countActiveAuthSessions(c.env),
+       countActiveDigestSubscriptions(c.env),
+       listLatestGitHubRateLimitObservations(c.env, 20),
++      summarizeProductUsageEvents(c.env, usageSince),
+     ]);
+     const installedRepos = repositories.filter((repo) => repo.isInstalled).length;
+     const registeredRepos = repositories.filter((repo) => repo.isRegistered).length;
+@@ -704,6 +773,8 @@ export function createApp() {
+         { label: "Installations", value: String(installations.length), delta: `${installedRepos} installed repos` },
+         { label: "Registered repos", value: String(registeredRepos), delta: registry ? `${registry.repoCount} in latest registry` : "registry missing" },
+         { label: "Digest subscriptions", value: String(digestSubscriptions), delta: "store-only" },
++        { label: "Product events", value: String(usageSummary.totalEvents), delta: "last 7 days" },
++        { label: "Active users", value: String(usageSummary.activeActors), delta: "hashed, last 7 days" },
+         { label: "Install issues", value: String(health.filter((record) => record.status !== "healthy").length), delta: "current health cache" },
+         { label: "Rate-limit events", value: String(rateLimits.length), delta: "latest observations" },
+       ],
+@@ -713,6 +784,7 @@ export function createApp() {
+         { label: "Installed coverage", value: installedRepos, spark: sparklineFromCounts(installedRepos, Math.max(repositories.length, 1)) },
+       ],
+       weeklyReport: buildOperatorWeeklyReport({ repositories, installations, health, registry, scoring, upstreamDrift }),
++      usageSummary,
+       registry,
+       scoringModel: scoring,
+       upstreamDrift,
+@@ -732,11 +804,22 @@ export function createApp() {
+     if (!parsed.success) return c.json({ error: "invalid_command_preview_request", issues: parsed.error.issues }, 400);
+     const command = APP_COMMANDS.find((candidate) => candidate.command === parsed.data.command || candidate.id === parsed.data.command.replace(/^@gittensory\s+/, ""));
+     if (!command) return c.json({ error: "command_not_found" }, 404);
++    const identity = await authenticateRequestIdentity(c).catch(() => null);
++    const preview = buildCommandPreview(command, parsed.data);
++    await recordRouteProductUsage(c, {
++      surface: "control_panel",
++      eventName: "command_previewed",
++      identity,
++      repoFullName: parsed.data.repoFullName,
++      targetKey: parsed.data.pullNumber ? `${parsed.data.repoFullName ?? "unknown"}#${parsed.data.pullNumber}` : parsed.data.repoFullName,
++      outcome: "success",
++      metadata: { command: command.id, audience: command.audience, boundary: command.boundary },
++    });
+     return c.json({
+       generatedAt: nowIso(),
+       command,
+       request: parsed.data,
+-      preview: buildCommandPreview(command, parsed.data),
++      preview,
+     });
+   });
+ 
+@@ -772,6 +855,13 @@ export function createApp() {
+     const parsed = digestSubscriptionSchema.safeParse(body);
+     if (!parsed.success) return c.json({ error: "invalid_digest_subscription_request", issues: parsed.error.issues }, 400);
+     const subscription = await upsertDigestSubscription(c.env, { login: identity.actor, email: parsed.data.email, source: "app" });
++    await recordRouteProductUsage(c, {
++      surface: "control_panel",
++      eventName: "digest_subscription_stored",
++      identity,
++      outcome: "success",
++      metadata: { source: "app", deliveryMode: "store_only" },
++    });
+     return c.json({ status: "stored", subscription, delivery: { mode: "store_only", emailDeliveryEnabled: false } }, 201);
+   });
+ 
+@@ -809,6 +899,16 @@ export function createApp() {
+       profile: contributorContext?.profile,
+       outcomeHistory: contributorContext?.outcomeHistory,
+     });
++    await recordRouteProductUsage(c, {
++      surface: "browser_extension",
++      eventName: "pull_context_viewed",
++      identity,
++      repoFullName: fullName,
++      targetKey: `${fullName}#${pullNumber}`,
++      outcome: "success",
++      clientName: "browser_extension",
++      metadata: { hasContributorContext: Boolean(contributorContext), hasCachedPullRequest: Boolean(pullRequest) },
++    });
+     return c.json({
+       generatedAt: nowIso(),
+       repoFullName: fullName,
+@@ -1287,6 +1387,15 @@ export function createApp() {
+     });
+     const response = { ...analysis, dataQuality: await loadRepoDataQuality(c.env, parsed.data.repoFullName) };
+     await persistSignal(c.env, "local-branch-analysis", `${parsed.data.login}:${parsed.data.repoFullName}:${parsed.data.branchName ?? parsed.data.headRef ?? "local"}`, parsed.data.repoFullName, response as unknown as Record<string, JsonValue>, analysis.generatedAt);
++    await recordRouteProductUsage(c, {
++      surface: "api",
++      eventName: "local_branch_analysis_completed",
++      actor: parsed.data.login,
++      repoFullName: parsed.data.repoFullName,
++      targetKey: `${parsed.data.login}:${parsed.data.repoFullName}:${parsed.data.branchName ?? parsed.data.headRef ?? "local"}`,
++      outcome: "success",
++      metadata: { hasLocalScorer: Boolean(parsed.data.localScorer), changedFileCount: parsed.data.changedFiles?.length ?? 0, linkedIssueCount: parsed.data.linkedIssues?.length ?? 0 },
++    });
+     return c.json(response);
+   });
+ 
+@@ -1297,6 +1406,17 @@ export function createApp() {
+     const unauthorized = await requireContributorAccess(c, parsed.data.actorLogin);
+     if (unauthorized) return unauthorized;
+     const bundle = await startAgentRun(c.env, parsed.data);
++    await recordRouteProductUsage(c, {
++      surface: "api",
++      eventName: "agent_run_started",
++      actor: parsed.data.actorLogin,
++      repoFullName: parsed.data.target?.repoFullName,
++      targetKey: parsed.data.target?.repoFullName
++        ? `${parsed.data.target.repoFullName}${parsed.data.target.pullNumber ? `#${parsed.data.target.pullNumber}` : parsed.data.target.issueNumber ? `#${parsed.data.target.issueNumber}` : ""}`
++        : undefined,
++      outcome: "queued",
++      metadata: { surface: parsed.data.surface ?? "api", status: bundle.run.status },
++    });
+     return c.json(bundle, 202);
+   });
+ 
+@@ -1327,6 +1447,15 @@ export function createApp() {
+     const unauthorized = await requireContributorAccess(c, parsed.data.login);
+     if (unauthorized) return unauthorized;
+     const bundle = await planNextWork(c.env, parsed.data);
++    await recordRouteProductUsage(c, {
++      surface: "api",
++      eventName: "agent_plan_next_work_completed",
++      actor: parsed.data.login,
++      repoFullName: parsed.data.repoFullName,
++      targetKey: parsed.data.repoFullName,
++      outcome: bundle.run.status === "needs_snapshot_refresh" ? "queued" : "success",
++      metadata: { requestedSurface: parsed.data.surface ?? "api", status: bundle.run.status },
++    });
+     return c.json(bundle, bundle.run.status === "needs_snapshot_refresh" ? 202 : 200);
+   });
+ 
+@@ -1337,6 +1466,15 @@ export function createApp() {
+     const unauthorized = await requireContributorAccess(c, parsed.data.login);
+     if (unauthorized) return unauthorized;
+     const bundle = await preflightBranchWithAgent(c.env, parsed.data);
++    await recordRouteProductUsage(c, {
++      surface: "api",
++      eventName: "agent_preflight_branch_completed",
++      actor: parsed.data.login,
++      repoFullName: parsed.data.repoFullName,
++      targetKey: `${parsed.data.login}:${parsed.data.repoFullName}:${parsed.data.branchName ?? parsed.data.headRef ?? "local"}`,
++      outcome: bundle.run.status === "needs_snapshot_refresh" ? "queued" : "success",
++      metadata: { status: bundle.run.status },
++    });
+     return c.json(bundle);
+   });
+ 
+@@ -1347,6 +1485,15 @@ export function createApp() {
+     const unauthorized = await requireContributorAccess(c, parsed.data.login);
+     if (unauthorized) return unauthorized;
+     const bundle = await preparePrPacketWithAgent(c.env, parsed.data);
++    await recordRouteProductUsage(c, {
++      surface: "api",
++      eventName: "agent_pr_packet_completed",
++      actor: parsed.data.login,
++      repoFullName: parsed.data.repoFullName,
++      targetKey: `${parsed.data.login}:${parsed.data.repoFullName}:${parsed.data.branchName ?? parsed.data.headRef ?? "local"}`,
++      outcome: bundle.run.status === "needs_snapshot_refresh" ? "queued" : "success",
++      metadata: { status: bundle.run.status },
++    });
+     return c.json(bundle);
+   });
+ 
+@@ -1357,6 +1504,15 @@ export function createApp() {
+     const unauthorized = await requireContributorAccess(c, parsed.data.login);
+     if (unauthorized) return unauthorized;
+     const bundle = await explainBlockersWithAgent(c.env, parsed.data);
++    await recordRouteProductUsage(c, {
++      surface: "api",
++      eventName: "agent_blockers_completed",
++      actor: parsed.data.login,
++      repoFullName: "repoFullName" in parsed.data ? parsed.data.repoFullName : undefined,
++      targetKey: "repoFullName" in parsed.data ? parsed.data.repoFullName : undefined,
++      outcome: bundle.run.status === "needs_snapshot_refresh" ? "queued" : "success",
++      metadata: { requestedSurface: "surface" in parsed.data ? (parsed.data.surface ?? "api") : "api", status: bundle.run.status },
++    });
+     return c.json(bundle, bundle.run.status === "needs_snapshot_refresh" ? 202 : 200);
+   });
+ 
+diff --git a/src/db/repositories.ts b/src/db/repositories.ts
+index 1675847..af55094 100644
+--- a/src/db/repositories.ts
++++ b/src/db/repositories.ts
+@@ -28,6 +28,7 @@ import {
+   pullRequestDetailSyncState,
+   pullRequestReviews,
+   pullRequests,
++  productUsageEvents,
+   recentMergedPullRequests,
+   repositories,
+   repoGithubTotalsSnapshots,
+@@ -78,6 +79,10 @@ import type {
+   IssueRecord,
+   IssueQualityReportRecord,
+   JsonValue,
++  ProductUsageEventRecord,
++  ProductUsageOutcome,
++  ProductUsageSummary,
++  ProductUsageSurface,
+   PullRequestFileRecord,
+   PullRequestDetailSyncStateRecord,
+   PullRequestRecord,
+@@ -104,6 +109,7 @@ import type {
+   UpstreamSourceStatus,
+ } from "../types";
+ import type { GittensorContributorSnapshot, OfficialGittensorMinerDetection } from "../gittensor/api";
++import { sha256Hex } from "../utils/crypto";
+ import { jsonString, nowIso, parseJson, repoParts } from "../utils/json";
+ 
+ const MAX_STORED_BODY_CHARS = 4000;
+@@ -942,6 +948,130 @@ export async function countActiveDigestSubscriptions(env: Env): Promise<number>
+   return Number(row?.count ?? 0);
+ }
+ 
++export async function recordProductUsageEvent(
++  env: Env,
++  event: {
++    surface: ProductUsageSurface;
++    eventName: string;
++    actor?: string | null | undefined;
++    sessionId?: string | null | undefined;
++    route?: string | null | undefined;
++    repoFullName?: string | null | undefined;
++    targetKey?: string | null | undefined;
++    outcome?: ProductUsageOutcome | null | undefined;
++    latencyMs?: number | null | undefined;
++    clientName?: string | null | undefined;
++    clientVersion?: string | null | undefined;
++    metadata?: Record<string, unknown> | null | undefined;
++    occurredAt?: string | null | undefined;
++  },
++): Promise<ProductUsageEventRecord> {
++  const db = getDb(env.DB);
++  const actorRedactor = buildProductUsageActorRedactor(event.actor);
++  const record: ProductUsageEventRecord = {
++    id: crypto.randomUUID(),
++    surface: normalizeProductUsageSurface(event.surface),
++    eventName: boundedProductUsageField(event.eventName, 96) ?? "unknown",
++    route: boundedProductUsageField(event.route, 160),
++    actorHash: await hashProductUsageIdentifier(env, "actor", event.actor),
++    sessionHash: await hashProductUsageIdentifier(env, "session", event.sessionId),
++    repoFullName: redactProductUsageActor(boundedProductUsageField(event.repoFullName, 256), actorRedactor),
++    targetKey: redactProductUsageActor(boundedProductUsageField(event.targetKey, 256), actorRedactor),
++    outcome: normalizeProductUsageOutcome(event.outcome),
++    latencyMs: normalizeProductUsageLatency(event.latencyMs),
++    clientName: boundedProductUsageField(event.clientName, 80),
++    clientVersion: boundedProductUsageField(event.clientVersion, 80),
++    metadata: sanitizeProductUsageMetadata(event.metadata, actorRedactor),
++    occurredAt: event.occurredAt ?? nowIso(),
++  };
++  await db.insert(productUsageEvents).values({
++    id: record.id,
++    surface: record.surface,
++    eventName: record.eventName,
++    route: record.route ?? null,
++    actorHash: record.actorHash ?? null,
++    sessionHash: record.sessionHash ?? null,
++    repoFullName: record.repoFullName ?? null,
++    targetKey: record.targetKey ?? null,
++    outcome: record.outcome,
++    latencyMs: record.latencyMs ?? null,
++    clientName: record.clientName ?? null,
++    clientVersion: record.clientVersion ?? null,
++    metadataJson: jsonString(record.metadata),
++    occurredAt: record.occurredAt,
++  });
++  return record;
++}
++
++export async function listProductUsageEvents(
++  env: Env,
++  options: { limit?: number; sinceIso?: string } = {},
++): Promise<ProductUsageEventRecord[]> {
++  const db = getDb(env.DB);
++  const limit = Math.max(1, Math.min(500, Math.round(options.limit ?? 100)));
++  const rows = options.sinceIso
++    ? await db
++        .select()
++        .from(productUsageEvents)
++        .where(gte(productUsageEvents.occurredAt, options.sinceIso))
++        .orderBy(desc(productUsageEvents.occurredAt))
++        .limit(limit)
++    : await db.select().from(productUsageEvents).orderBy(desc(productUsageEvents.occurredAt)).limit(limit);
++  return rows.map(toProductUsageEventRecord);
++}
++
++export async function summarizeProductUsageEvents(env: Env, sinceIso?: string): Promise<ProductUsageSummary> {
++  const db = getDb(env.DB);
++  const [totalRow] = sinceIso
++    ? await db.select({ count: sql<number>`count(*)` }).from(productUsageEvents).where(gte(productUsageEvents.occurredAt, sinceIso))
++    : await db.select({ count: sql<number>`count(*)` }).from(productUsageEvents);
++  const [activeActorRow] = sinceIso
++    ? await db
++        .select({ count: sql<number>`count(distinct ${productUsageEvents.actorHash})` })
++        .from(productUsageEvents)
++        .where(and(gte(productUsageEvents.occurredAt, sinceIso), sql`${productUsageEvents.actorHash} is not null`))
++    : await db
++        .select({ count: sql<number>`count(distinct ${productUsageEvents.actorHash})` })
++        .from(productUsageEvents)
++        .where(sql`${productUsageEvents.actorHash} is not null`);
++  const bySurfaceRows = sinceIso
++    ? await db
++        .select({ surface: productUsageEvents.surface, count: sql<number>`count(*)` })
++        .from(productUsageEvents)
++        .where(gte(productUsageEvents.occurredAt, sinceIso))
++        .groupBy(productUsageEvents.surface)
++    : await db.select({ surface: productUsageEvents.surface, count: sql<number>`count(*)` }).from(productUsageEvents).groupBy(productUsageEvents.surface);
++  const byOutcomeRows = sinceIso
++    ? await db
++        .select({ outcome: productUsageEvents.outcome, count: sql<number>`count(*)` })
++        .from(productUsageEvents)
++        .where(gte(productUsageEvents.occurredAt, sinceIso))
++        .groupBy(productUsageEvents.outcome)
++    : await db.select({ outcome: productUsageEvents.outcome, count: sql<number>`count(*)` }).from(productUsageEvents).groupBy(productUsageEvents.outcome);
++  const byEventRows = sinceIso
++    ? await db
++        .select({ eventName: productUsageEvents.eventName, count: sql<number>`count(*)` })
++        .from(productUsageEvents)
++        .where(gte(productUsageEvents.occurredAt, sinceIso))
++        .groupBy(productUsageEvents.eventName)
++        .orderBy(sql`count(*) desc`)
++        .limit(20)
++    : await db
++        .select({ eventName: productUsageEvents.eventName, count: sql<number>`count(*)` })
++        .from(productUsageEvents)
++        .groupBy(productUsageEvents.eventName)
++        .orderBy(sql`count(*) desc`)
++        .limit(20);
++  return {
++    since: sinceIso,
++    totalEvents: Number(totalRow?.count ?? 0),
++    activeActors: Number(activeActorRow?.count ?? 0),
++    bySurface: bySurfaceRows.map((row) => ({ surface: normalizeProductUsageSurface(row.surface), count: Number(row.count ?? 0) })),
++    byOutcome: byOutcomeRows.map((row) => ({ outcome: normalizeProductUsageOutcome(row.outcome), count: Number(row.count ?? 0) })),
++    byEvent: byEventRows.map((row) => ({ eventName: row.eventName, count: Number(row.count ?? 0) })),
++  };
++}
++
+ export async function recordAuditEvent(env: Env, event: AuditEventRecord): Promise<void> {
+   const db = getDb(env.DB);
+   await db.insert(auditEvents).values({
+@@ -2625,6 +2755,129 @@ function toDigestSubscriptionRecord(row: typeof digestSubscriptions.$inferSelect
+   };
+ }
+ 
++function toProductUsageEventRecord(row: typeof productUsageEvents.$inferSelect): ProductUsageEventRecord {
++  return {
++    id: row.id,
++    surface: normalizeProductUsageSurface(row.surface),
++    eventName: row.eventName,
++    route: row.route,
++    actorHash: row.actorHash,
++    sessionHash: row.sessionHash,
++    repoFullName: row.repoFullName,
++    targetKey: row.targetKey,
++    outcome: normalizeProductUsageOutcome(row.outcome),
++    latencyMs: row.latencyMs,
++    clientName: row.clientName,
++    clientVersion: row.clientVersion,
++    metadata: parseJson<Record<string, JsonValue>>(row.metadataJson, {}),
++    occurredAt: row.occurredAt,
++  };
++}
++
++function normalizeProductUsageSurface(surface: unknown): ProductUsageSurface {
++  if (typeof surface === "string" && PRODUCT_USAGE_SURFACES.has(surface as ProductUsageSurface)) return surface as ProductUsageSurface;
++  return "api";
++}
++
++function normalizeProductUsageOutcome(outcome: unknown): ProductUsageOutcome {
++  if (typeof outcome === "string" && PRODUCT_USAGE_OUTCOMES.has(outcome as ProductUsageOutcome)) return outcome as ProductUsageOutcome;
++  return "success";
++}
++
++function normalizeProductUsageLatency(latencyMs: unknown): number | null {
++  return typeof latencyMs === "number" && Number.isFinite(latencyMs) ? Math.max(0, Math.round(latencyMs)) : null;
++}
++
++async function hashProductUsageIdentifier(env: Env, kind: "actor" | "session", value: unknown): Promise<string | null> {
++  const normalized = typeof value === "string" ? value.trim().toLowerCase() : "";
++  if (!normalized) return null;
++  const salt = env.PRODUCT_USAGE_HASH_SALT;
++  if (!salt) return null;
++  return sha256Hex(`gittensory:product-usage:v1:${kind}:${salt}:${normalized}`);
++}
++
++function boundedProductUsageField(value: unknown, maxLength: number): string | null {
++  if (typeof value !== "string") return null;
++  const safe = sanitizeProductUsageString(value.trim(), maxLength);
++  return safe ? safe : null;
++}
++
++function buildProductUsageActorRedactor(actor: unknown): RegExp | null {
++  const normalized = typeof actor === "string" ? actor.trim() : "";
++  if (normalized.length < 4) return null;
++  return new RegExp(escapeRegExp(normalized), "gi");
++}
++
++function redactProductUsageActor(value: string | null, actorRedactor: RegExp | null): string | null {
++  return value && actorRedactor ? value.replace(actorRedactor, "<redacted-actor>") : value;
++}
++
++function escapeRegExp(value: string): string {
++  return value.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
++}
++
++const PRODUCT_USAGE_METADATA_MAX_DEPTH = 3;
++const PRODUCT_USAGE_METADATA_MAX_KEYS = 20;
++const PRODUCT_USAGE_METADATA_MAX_ARRAY_ITEMS = 20;
++const PRODUCT_USAGE_METADATA_MAX_KEY_CHARS = 64;
++const PRODUCT_USAGE_METADATA_MAX_STRING_CHARS = 200;
++const PRODUCT_USAGE_SURFACES = new Set<ProductUsageSurface>(["api", "mcp", "github_app", "control_panel", "browser_extension", "internal"]);
++const PRODUCT_USAGE_OUTCOMES = new Set<ProductUsageOutcome>(["success", "denied", "error", "queued", "completed", "skipped"]);
++const PRODUCT_USAGE_SENSITIVE_KEY =
++  /authorization|cookie|token|secret|password|private[_-]?key|source|body|diff|patch|raw[_-]?trust|trust[_-]?score|wallet|hotkey|coldkey|seed|mnemonic|local[_-]?path|repo[_-]?root|cwd/i;
++const PRODUCT_USAGE_SENSITIVE_VALUE = /\b(seed phrase|mnemonic|private key|raw trust|trust score|wallet|hotkey|coldkey)\b/i;
++const PRODUCT_USAGE_LOCAL_PATH = /(?:\/Users|\/home|\/tmp)\/[^\s"',;)]*|[A-Za-z]:\\Users\\[^\s"',;)]*/g;
++const PRODUCT_USAGE_TOKEN_VALUE = /\b(?:ghp_|github_pat_|gts_|glpat-|sk-)[A-Za-z0-9_=-]{8,}/g;
++const PRODUCT_USAGE_BEARER_VALUE = /\bBearer\s+[A-Za-z0-9._~+/=-]{12,}/gi;
++
++function sanitizeProductUsageMetadata(value: Record<string, unknown> | null | undefined, actorRedactor: RegExp | null): Record<string, JsonValue> {
++  if (!value || typeof value !== "object" || Array.isArray(value)) return {};
++  const output: Record<string, JsonValue> = {};
++  for (const [key, entryValue] of Object.entries(value).slice(0, PRODUCT_USAGE_METADATA_MAX_KEYS)) {
++    if (PRODUCT_USAGE_SENSITIVE_KEY.test(key)) continue;
++    const safeKey = redactProductUsageActor(sanitizeProductUsageString(key, PRODUCT_USAGE_METADATA_MAX_KEY_CHARS), actorRedactor);
++    if (!safeKey) continue;
++    const safeValue = sanitizeProductUsageJson(entryValue, 0, actorRedactor);
++    if (safeValue !== undefined) output[safeKey] = safeValue;
++  }
++  return output;
++}
++
++function sanitizeProductUsageJson(value: unknown, depth: number, actorRedactor: RegExp | null): JsonValue | undefined {
++  if (value === undefined || typeof value === "function" || typeof value === "symbol") return undefined;
++  if (value === null) return null;
++  if (typeof value === "boolean") return value;
++  if (typeof value === "number") return Number.isFinite(value) ? value : null;
++  if (typeof value === "bigint") return redactProductUsageActor(sanitizeProductUsageString(String(value), PRODUCT_USAGE_METADATA_MAX_STRING_CHARS), actorRedactor);
++  if (typeof value === "string") return redactProductUsageActor(sanitizeProductUsageString(value, PRODUCT_USAGE_METADATA_MAX_STRING_CHARS), actorRedactor);
++  if (value instanceof Date) return value.toISOString();
++  if (depth >= PRODUCT_USAGE_METADATA_MAX_DEPTH) return "[truncated]";
++  if (Array.isArray(value)) {
++    return value
++      .slice(0, PRODUCT_USAGE_METADATA_MAX_ARRAY_ITEMS)
++      .map((item) => sanitizeProductUsageJson(item, depth + 1, actorRedactor))
++      .filter((item): item is JsonValue => item !== undefined);
++  }
++  const output: Record<string, JsonValue> = {};
++  for (const [key, entryValue] of Object.entries(value as Record<string, unknown>).slice(0, PRODUCT_USAGE_METADATA_MAX_KEYS)) {
++    if (PRODUCT_USAGE_SENSITIVE_KEY.test(key)) continue;
++    const safeKey = redactProductUsageActor(sanitizeProductUsageString(key, PRODUCT_USAGE_METADATA_MAX_KEY_CHARS), actorRedactor);
++    if (!safeKey) continue;
++    const safeValue = sanitizeProductUsageJson(entryValue, depth + 1, actorRedactor);
++    if (safeValue !== undefined) output[safeKey] = safeValue;
++  }
++  return output;
++}
++
++function sanitizeProductUsageString(value: string, maxLength: number): string {
++  const redacted = value
++    .replace(PRODUCT_USAGE_LOCAL_PATH, "<redacted-path>")
++    .replace(PRODUCT_USAGE_TOKEN_VALUE, "<redacted-token>")
++    .replace(PRODUCT_USAGE_BEARER_VALUE, "Bearer <redacted-token>");
++  if (PRODUCT_USAGE_SENSITIVE_VALUE.test(redacted)) return "<redacted>";
++  return redacted.slice(0, maxLength);
++}
++
+ function parseAgentSurface(value: string): AgentSurface {
+   if (value === "mcp" || value === "github_comment") return value;
+   return "api";
+diff --git a/src/db/schema.ts b/src/db/schema.ts
+index 4f377a8..dec97a1 100644
+--- a/src/db/schema.ts
++++ b/src/db/schema.ts
+@@ -749,6 +749,32 @@ export const auditEvents = sqliteTable(
+   }),
+ );
+ 
++export const productUsageEvents = sqliteTable(
++  "product_usage_events",
++  {
++    id: text("id").primaryKey(),
++    surface: text("surface").notNull(),
++    eventName: text("event_name").notNull(),
++    route: text("route"),
++    actorHash: text("actor_hash"),
++    sessionHash: text("session_hash"),
++    repoFullName: text("repo_full_name"),
++    targetKey: text("target_key"),
++    outcome: text("outcome").notNull(),
++    latencyMs: integer("latency_ms"),
++    clientName: text("client_name"),
++    clientVersion: text("client_version"),
++    metadataJson: text("metadata_json").notNull().default("{}"),
++    occurredAt: text("occurred_at").notNull().default("CURRENT_TIMESTAMP"),
++  },
++  (table) => ({
++    surfaceOccurred: index("product_usage_events_surface_occurred_idx").on(table.surface, table.occurredAt),
++    eventOccurred: index("product_usage_events_event_occurred_idx").on(table.eventName, table.occurredAt),
++    actorOccurred: index("product_usage_events_actor_occurred_idx").on(table.actorHash, table.occurredAt),
++    repoOccurred: index("product_usage_events_repo_occurred_idx").on(table.repoFullName, table.occurredAt),
++  }),
++);
++
+ export const aiUsageEvents = sqliteTable(
+   "ai_usage_events",
+   {
+diff --git a/src/env.d.ts b/src/env.d.ts
+index 94101f6..4880fc1 100644
+--- a/src/env.d.ts
++++ b/src/env.d.ts
+@@ -25,6 +25,7 @@ declare global {
+     GITTENSORY_AUTO_FILE_DRIFT_ISSUES?: string;
+     GITTENSORY_DRIFT_ISSUE_REPO?: string;
+     GITTENSORY_DRIFT_ISSUE_TOKEN?: string;
++    PRODUCT_USAGE_HASH_SALT?: string;
+     GITTENSORY_API_TOKEN: string;
+     GITTENSORY_MCP_TOKEN: string;
+     INTERNAL_JOB_TOKEN: string;
+diff --git a/src/mcp/server.ts b/src/mcp/server.ts
+index d4b2f05..d67fdae 100644
+--- a/src/mcp/server.ts
++++ b/src/mcp/server.ts
+@@ -25,6 +25,7 @@ import {
+   listRepoSyncSegments,
+   listRepoSyncStates,
+   listRepositories,
++  recordProductUsageEvent,
+ } from "../db/repositories";
+ import { contributorRepoStatsFromGittensor, fetchGittensorContributorSnapshot } from "../gittensor/api";
+ import { fetchPublicContributorProfile } from "../github/public";
+@@ -242,8 +243,52 @@ export async function handleMcpRequest(c: AppContext): Promise<Response> {
+   const identity = await authenticateMcpRequest(c);
+   if (!identity) return c.json({ error: "unauthorized" }, 401);
+ 
++  const usageMetadata = await describeMcpUsageRequest(c.req.raw);
++  const startedAt = Date.now();
+   const server = new GittensoryMcp(c.env, identity).createServer();
+-  return createMcpHandler(server, { route: "/mcp", enableJsonResponse: true })(c.req.raw, c.env, getExecutionContext(c));
++  try {
++    const response = await createMcpHandler(server, { route: "/mcp", enableJsonResponse: true })(c.req.raw, c.env, getExecutionContext(c));
++    await recordProductUsageEvent(c.env, {
++      surface: "mcp",
++      eventName: typeof usageMetadata.toolName === "string" ? "mcp_tool_called" : "mcp_request",
++      route: "/mcp",
++      actor: identity.actor,
++      sessionId: identity.kind === "session" ? identity.session.id : undefined,
++      outcome: response.status >= 400 ? "error" : "success",
++      latencyMs: Date.now() - startedAt,
++      clientName: "mcp",
++      clientVersion: c.req.header("mcp-protocol-version"),
++      metadata: usageMetadata,
++    }).catch(() => undefined);
++    return response;
++  } catch (error) {
++    await recordProductUsageEvent(c.env, {
++      surface: "mcp",
++      eventName: typeof usageMetadata.toolName === "string" ? "mcp_tool_called" : "mcp_request",
++      route: "/mcp",
++      actor: identity.actor,
++      sessionId: identity.kind === "session" ? identity.session.id : undefined,
++      outcome: "error",
++      latencyMs: Date.now() - startedAt,
++      clientName: "mcp",
++      clientVersion: c.req.header("mcp-protocol-version"),
++      metadata: usageMetadata,
++    }).catch(() => undefined);
++    throw error;
++  }
++}
++
++async function describeMcpUsageRequest(request: Request): Promise<Record<string, unknown>> {
++  const body = await request.clone().json().catch(() => null);
++  if (!body || typeof body !== "object") return { transport: "http", method: request.method };
++  const envelope = body as { method?: unknown; params?: { name?: unknown } };
++  const rpcMethod = typeof envelope.method === "string" ? envelope.method : undefined;
++  const toolName = envelope.params && typeof envelope.params.name === "string" ? envelope.params.name : undefined;
++  return {
++    transport: "http",
++    rpcMethod,
++    toolName,
++  };
+ }
+ 
+ export class GittensoryMcp {
+diff --git a/src/queue/processors.ts b/src/queue/processors.ts
+index 691fb79..0bb074e 100644
+--- a/src/queue/processors.ts
++++ b/src/queue/processors.ts
+@@ -27,6 +27,7 @@ import {
+   markInstallationDeleted,
+   persistAdvisory,
+   recordAuditEvent,
++  recordProductUsageEvent,
+   persistSignalSnapshot,
+   recordWebhookEvent,
+   replaceCollisionEdges,
+@@ -687,6 +688,40 @@ async function maybePublishPrPublicSurface(
+       checkRunMode: settings.checkRunMode,
+     },
+   });
++  await recordGithubProductUsage(env, "pr_public_surface_published", {
++    actor: author,
++    repoFullName,
++    targetKey: `${repoFullName}#${pr.number}`,
++    outcome: "completed",
++    metadata: {
++      publicSurface: settings.publicSurface,
++      labelApplied: decision.willLabel,
++      checkRunMode: settings.checkRunMode,
++    },
++  });
++}
++
++async function recordGithubProductUsage(
++  env: Env,
++  eventName: string,
++  event: {
++    actor?: string | null | undefined;
++    repoFullName?: string | null | undefined;
++    targetKey?: string | null | undefined;
++    outcome?: "success" | "denied" | "error" | "queued" | "completed" | "skipped";
++    metadata?: Record<string, unknown>;
++  },
++): Promise<void> {
++  await recordProductUsageEvent(env, {
++    surface: "github_app",
++    eventName,
++    actor: event.actor,
++    repoFullName: event.repoFullName,
++    targetKey: event.targetKey,
++    outcome: event.outcome,
++    clientName: "github_app",
++    metadata: event.metadata,
++  }).catch(() => undefined);
+ }
+ 
+ async function maybeProcessGittensoryMentionCommand(env: Env, deliveryId: string, payload: GitHubWebhookPayload): Promise<boolean> {
+@@ -715,6 +750,13 @@ async function maybeProcessGittensoryMentionCommand(env: Env, deliveryId: string
+       outcome: "skipped",
+       detail: "missing_repo_issue_installation_or_actor",
+     });
++    await recordGithubProductUsage(env, "agent_command_skipped", {
++      actor: commenter,
++      repoFullName,
++      targetKey: repoFullName,
++      outcome: "skipped",
++      metadata: { command: command.name, reason: "missing_repo_issue_installation_or_actor" },
++    });
+     return true;
+   }
+   if (payload.comment?.user?.type === "Bot" || /\[bot\]$/i.test(commenter)) {
+@@ -727,6 +769,13 @@ async function maybeProcessGittensoryMentionCommand(env: Env, deliveryId: string
+       metadata: { deliveryId, command: command.name },
+     });
+     await recordAgentCommandUsage(env, { repoFullName, targetKey, actor: commenter, command: command.name, actorKind: "none", outcome: "skipped", detail: "bot_author" });
++    await recordGithubProductUsage(env, "agent_command_skipped", {
++      actor: commenter,
++      repoFullName,
++      targetKey: `${repoFullName}#${issue.number}`,
++      outcome: "skipped",
++      metadata: { command: command.name, reason: "bot_author" },
++    });
+     return true;
+   }
+   if (!issue.pull_request) {
+@@ -739,6 +788,13 @@ async function maybeProcessGittensoryMentionCommand(env: Env, deliveryId: string
+       metadata: { deliveryId, command: command.name },
+     });
+     await recordAgentCommandUsage(env, { repoFullName, targetKey, actor: commenter, command: command.name, actorKind: "none", outcome: "skipped", detail: "not_a_pull_request_thread" });
++    await recordGithubProductUsage(env, "agent_command_skipped", {
++      actor: commenter,
++      repoFullName,
++      targetKey: `${repoFullName}#${issue.number}`,
++      outcome: "skipped",
++      metadata: { command: command.name, reason: "not_a_pull_request_thread" },
++    });
+     return true;
+   }
+ 
+@@ -771,6 +827,13 @@ async function maybeProcessGittensoryMentionCommand(env: Env, deliveryId: string
+       outcome: authorization.reason === "miner_detection_unavailable" ? "error" : "skipped",
+       detail: authorization.reason,
+     });
++    await recordGithubProductUsage(env, "agent_command_skipped", {
++      actor: commenter,
++      repoFullName,
++      targetKey: `${repoFullName}#${issue.number}`,
++      outcome: authorization.reason === "miner_detection_unavailable" ? "error" : "skipped",
++      metadata: { command: command.name, reason: authorization.reason },
++    });
+     return true;
+   }
+ 
+@@ -808,6 +871,13 @@ async function maybeProcessGittensoryMentionCommand(env: Env, deliveryId: string
+     detail: bundle?.run.status ?? "no_run",
+     runId: bundle?.run.id ?? null,
+   });
++  await recordGithubProductUsage(env, "agent_command_replied", {
++    actor: commenter,
++    repoFullName,
++    targetKey: `${repoFullName}#${issue.number}`,
++    outcome: "completed",
++    metadata: { command: command.name, actorKind: authorization.actorKind, hasAgentRun: Boolean(bundle) },
++  });
+   return true;
+ }
+ 
+@@ -903,6 +973,13 @@ async function auditPrVisibilitySkip(
+     detail: reason,
+     metadata: { deliveryId },
+   });
++  await recordGithubProductUsage(env, "pr_visibility_skipped", {
++    actor: author,
++    repoFullName,
++    targetKey: `${repoFullName}#${pullNumber}`,
++    outcome: "skipped",
++    metadata: { reason },
++  });
+ }
+ 
+ async function getCachedOfficialMinerDetection(env: Env, login: string, context: { targetKey: string; deliveryId: string }): Promise<OfficialGittensorMinerDetection> {
+diff --git a/src/types.ts b/src/types.ts
+index 806eb5e..d38c43f 100644
+--- a/src/types.ts
++++ b/src/types.ts
+@@ -861,3 +861,33 @@ export type AuditEventRecord = {
+   metadata?: Record<string, JsonValue> | undefined;
+   createdAt?: string | null | undefined;
+ };
++
++export type ProductUsageSurface = "api" | "mcp" | "github_app" | "control_panel" | "browser_extension" | "internal";
++
++export type ProductUsageOutcome = "success" | "denied" | "error" | "queued" | "completed" | "skipped";
++
++export type ProductUsageEventRecord = {
++  id: string;
++  surface: ProductUsageSurface;
++  eventName: string;
++  route?: string | null | undefined;
++  actorHash?: string | null | undefined;
++  sessionHash?: string | null | undefined;
++  repoFullName?: string | null | undefined;
++  targetKey?: string | null | undefined;
++  outcome: ProductUsageOutcome;
++  latencyMs?: number | null | undefined;
++  clientName?: string | null | undefined;
++  clientVersion?: string | null | undefined;
++  metadata: Record<string, JsonValue>;
++  occurredAt: string;
++};
++
++export type ProductUsageSummary = {
++  since?: string | null | undefined;
++  totalEvents: number;
++  activeActors: number;
++  bySurface: Array<{ surface: ProductUsageSurface; count: number }>;
++  byOutcome: Array<{ outcome: ProductUsageOutcome; count: number }>;
++  byEvent: Array<{ eventName: string; count: number }>;
++};
+diff --git a/test/integration/api.test.ts b/test/integration/api.test.ts
+index a64283b..ae6c047 100644
+--- a/test/integration/api.test.ts
++++ b/test/integration/api.test.ts
+@@ -13,6 +13,7 @@ import {
+   persistRepoGithubTotalsSnapshot,
+   persistSignalSnapshot,
+   recordGitHubRateLimitObservation,
++  listProductUsageEvents,
+   listLatestSignalSnapshotsByTarget,
+   persistUpstreamRulesetSnapshot,
+   upsertRepoLabel,
+@@ -1223,6 +1224,28 @@ describe("api routes", () => {
+       mcp: { snapshot: "scoring-1", lastRun: null },
+     });
+ 
++    await persistSignalSnapshot(env, {
++      id: "empty-fit-pack",
++      signalType: "contributor-decision-pack",
++      targetKey: "empty-fit-user",
++      payload: {
++        status: "ready",
++        source: "computed",
++        login: "empty-fit-user",
++        generatedAt: new Date().toISOString(),
++        stale: false,
++        freshness: "fresh",
++        rebuildEnqueued: false,
++        scoringModelSnapshotId: "scoring-1",
++        repoDecisions: [],
++        dataQuality: { signalFidelity: { status: "complete" } },
++      } as never,
++      generatedAt: new Date().toISOString(),
++    });
++    const minerWithEmptyFit = await app.request("/v1/app/miner-dashboard?login=empty-fit-user", { headers: apiHeaders(env) }, env);
++    expect(minerWithEmptyFit.status).toBe(200);
++    await expect(minerWithEmptyFit.json()).resolves.toMatchObject({ status: "ready", repoFit: [] });
++
+     await recordGitHubRateLimitObservation(env, {
+       id: "rate-limit-healthy",
+       repoFullName: "entrius/allways-ui",
+@@ -1310,6 +1333,29 @@ describe("api routes", () => {
+       preview: { body: expect.stringContaining("selected target") },
+     });
+ 
++    const previewWithoutRepo = await app.request(
++      "/v1/app/commands/preview",
++      {
++        method: "POST",
++        headers: apiHeaders(env),
++        body: JSON.stringify({ command: "public-summary", pullNumber: 12 }),
++      },
++      env,
++    );
++    expect(previewWithoutRepo.status).toBe(200);
++
++    const telemetryDownPreviewEnv = withProductUsageInsertFailure(createTestEnv());
++    const telemetryDownPreview = await app.request(
++      "/v1/app/commands/preview",
++      {
++        method: "POST",
++        headers: apiHeaders(telemetryDownPreviewEnv),
++        body: JSON.stringify({ command: "public-summary", repoFullName: "entrius/allways-ui", pullNumber: 12 }),
++      },
++      telemetryDownPreviewEnv,
++    );
++    expect(telemetryDownPreview.status).toBe(200);
++
+     expect((await app.request("/v1/app/commands/preview", { method: "POST", headers: apiHeaders(env), body: "{}" }, env)).status).toBe(400);
+     expect((await app.request("/v1/app/commands/preview", { method: "POST", headers: apiHeaders(env), body: JSON.stringify({ command: "unknown" }) }, env)).status).toBe(404);
+ 
+@@ -1412,6 +1458,50 @@ describe("api routes", () => {
+     const invalidLimitRuns = await app.request("/v1/agent/runs?actorLogin=oktofeesh1&limit=not-a-number", { headers: cookieHeaders }, env);
+     expect(invalidLimitRuns.status).toBe(200);
+ 
++    const queuedAgentRun = await app.request(
++      "/v1/agent/runs",
++      { method: "POST", headers: apiHeaders(env), body: JSON.stringify({ objective: "Plan work without a repo target", actorLogin: "oktofeesh1" }) },
++      env,
++    );
++    expect(queuedAgentRun.status).toBe(202);
++    const queuedPullAgentRun = await app.request(
++      "/v1/agent/runs",
++      { method: "POST", headers: apiHeaders(env), body: JSON.stringify({ objective: "Plan PR work", actorLogin: "oktofeesh1", target: { repoFullName: "entrius/allways-ui", pullNumber: 12 } }) },
++      env,
++    );
++    expect(queuedPullAgentRun.status).toBe(202);
++    const queuedIssueAgentRun = await app.request(
++      "/v1/agent/runs",
++      { method: "POST", headers: apiHeaders(env), body: JSON.stringify({ objective: "Plan issue work", actorLogin: "oktofeesh1", target: { repoFullName: "entrius/allways-ui", issueNumber: 1 } }) },
++      env,
++    );
++    expect(queuedIssueAgentRun.status).toBe(202);
++
++    const localAnalysis = await app.request(
++      "/v1/local/branch-analysis",
++      { method: "POST", headers: apiHeaders(env), body: JSON.stringify({ login: "oktofeesh1", repoFullName: "entrius/allways-ui", branchName: "usage-spine" }) },
++      env,
++    );
++    expect(localAnalysis.status).toBe(200);
++    const agentPreflight = await app.request(
++      "/v1/agent/preflight-branch",
++      { method: "POST", headers: apiHeaders(env), body: JSON.stringify({ login: "oktofeesh1", repoFullName: "entrius/allways-ui" }) },
++      env,
++    );
++    expect(agentPreflight.status).toBe(200);
++    const agentPacket = await app.request(
++      "/v1/agent/prepare-pr-packet",
++      { method: "POST", headers: apiHeaders(env), body: JSON.stringify({ login: "oktofeesh1", repoFullName: "entrius/allways-ui", headRef: "usage-spine" }) },
++      env,
++    );
++    expect(agentPacket.status).toBe(200);
++    const agentBlockers = await app.request(
++      "/v1/agent/explain-blockers",
++      { method: "POST", headers: apiHeaders(env), body: JSON.stringify({ login: "oktofeesh1", repoFullName: "entrius/allways-ui", branchName: "usage-spine" }) },
++      env,
++    );
++    expect(agentBlockers.status).toBe(200);
++
+     const staticExtensionSession = await app.request("/v1/auth/extension/session", { method: "POST", headers: apiHeaders(env) }, env);
+     expect(staticExtensionSession.status).toBe(403);
+ 
+@@ -1511,6 +1601,28 @@ describe("api routes", () => {
+     );
+     expect(revokedExtensionContext.status).toBe(401);
+     await expect(revokedExtensionContext.json()).resolves.toMatchObject({ error: "unauthorized" });
++
++    const productUsageEvents = await listProductUsageEvents(env, { limit: 20 });
++    expect(productUsageEvents).toEqual(
++      expect.arrayContaining([
++        expect.objectContaining({ surface: "control_panel", eventName: "command_previewed", outcome: "success" }),
++        expect.objectContaining({ surface: "control_panel", eventName: "digest_subscription_stored", outcome: "success" }),
++        expect.objectContaining({ surface: "browser_extension", eventName: "extension_session_created", outcome: "success" }),
++        expect.objectContaining({ surface: "browser_extension", eventName: "pull_context_viewed", outcome: "success" }),
++      ]),
++    );
++    expect(JSON.stringify(productUsageEvents)).not.toMatch(/oktofeesh1|operator@example.com|gittensory_session|\/Users|github_pat|ghp_|source code|raw trust|wallet|hotkey/i);
++
++    const usageOperator = await app.request("/v1/app/operator-dashboard", { headers: apiHeaders(env) }, env);
++    expect(usageOperator.status).toBe(200);
++    const usageOperatorBody = (await usageOperator.json()) as { metrics: Array<{ label: string; value: string }>; usageSummary: { totalEvents: number } };
++    expect(usageOperatorBody.metrics).toEqual(
++      expect.arrayContaining([
++        expect.objectContaining({ label: "Product events", value: String(productUsageEvents.length) }),
++        expect.objectContaining({ label: "Active users" }),
++      ]),
++    );
++    expect(usageOperatorBody.usageSummary.totalEvents).toBe(productUsageEvents.length);
+   });
+ 
+   it("covers live app auth, validation, and internal job queue edge routes", async () => {
+@@ -2055,6 +2167,49 @@ describe("api routes", () => {
+       },
+     });
+ 
++    const malformedMcp = await app.request(
++      "/mcp",
++      {
++        method: "POST",
++        headers: mcpHeaders(env),
++        body: "not-json",
++      },
++      env,
++    );
++    expect(malformedMcp.status).toBeGreaterThanOrEqual(400);
++
++    const missingMethodMcp = await app.request(
++      "/mcp",
++      {
++        method: "POST",
++        headers: mcpHeaders(env),
++        body: JSON.stringify({ jsonrpc: "2.0", id: "missing-method", params: { name: "gittensory_get_repo_context" } }),
++      },
++      env,
++    );
++    expect(missingMethodMcp.status).toBeGreaterThanOrEqual(400);
++
++    const telemetryDownEnv = withProductUsageInsertFailure(createTestEnv());
++    const telemetryDownInitialize = await app.request(
++      "/mcp",
++      {
++        method: "POST",
++        headers: mcpHeaders(telemetryDownEnv),
++        body: JSON.stringify({
++          jsonrpc: "2.0",
++          id: "telemetry-down",
++          method: "initialize",
++          params: {
++            protocolVersion: "2024-11-05",
++            capabilities: {},
++            clientInfo: { name: "gittensory-tests", version: "0.1.0" },
++          },
++        }),
++      },
++      telemetryDownEnv,
++    );
++    expect(telemetryDownInitialize.status).toBe(200);
++
+     const tools = await app.request(
+       "/mcp",
+       {
+@@ -2680,6 +2835,29 @@ describe("api routes", () => {
+     expect(missingBounty.status).toBe(200);
+     const missingBountyPayload = await mcpJson(missingBounty);
+     expect(JSON.stringify(missingBountyPayload)).toMatch(/Bounty not found|error|isError/i);
++
++    const sessionEnv = createTestEnv({ ADMIN_GITHUB_LOGINS: "oktofeesh1" });
++    const { token: mcpSessionToken } = await createSessionForGitHubUser(sessionEnv, { login: "oktofeesh1", id: 12345 });
++    const forbiddenSessionTool = await app.request(
++      "/mcp",
++      {
++        method: "POST",
++        headers: { ...mcpHeaders(sessionEnv), authorization: `Bearer ${mcpSessionToken}` },
++        body: JSON.stringify({ jsonrpc: "2.0", id: "forbidden-session-tool", method: "tools/call", params: { name: "gittensory_get_decision_pack", arguments: { login: "other-user" } } }),
++      },
++      sessionEnv,
++    );
++    expect(forbiddenSessionTool.status).toBe(200);
++    expect(JSON.stringify(await mcpJson(forbiddenSessionTool))).toMatch(/Forbidden|session can only access/i);
++
++    const mcpUsageEvents = await listProductUsageEvents(env, { limit: 100 });
++    expect(mcpUsageEvents).toEqual(
++      expect.arrayContaining([
++        expect.objectContaining({ surface: "mcp", eventName: "mcp_request", outcome: "success" }),
++        expect.objectContaining({ surface: "mcp", eventName: "mcp_tool_called", outcome: "success", metadata: expect.objectContaining({ toolName: "gittensory_get_bounty_advisory" }) }),
++      ]),
++    );
++    expect(JSON.stringify(mcpUsageEvents)).not.toMatch(/oktofeesh1|\/Users|github_pat|ghp_|source code|wallet|hotkey|raw trust/i);
+   }, 15_000);
+ 
+   it("covers registration-readiness policy variants for repo-owner launch planning", async () => {
+@@ -3148,6 +3326,22 @@ function internalHeaders(env: Env): Record<string, string> {
+   };
+ }
+ 
++function withProductUsageInsertFailure(env: Env): Env {
++  const db = env.DB as unknown as { prepare(sql: string): unknown; batch(statements: unknown[]): Promise<unknown> };
++  return {
++    ...env,
++    DB: {
++      prepare(sql: string) {
++        if (sql.includes("product_usage_events")) throw new Error("product usage insert failed");
++        return db.prepare.call(db, sql);
++      },
++      batch(statements: unknown[]) {
++        return db.batch.call(db, statements);
++      },
++    } as unknown as D1Database,
++  };
++}
++
+ function apiHeaders(env: Env): Record<string, string> {
+   return {
+     authorization: `Bearer ${env.GITTENSORY_API_TOKEN}`,
+diff --git a/test/integration/routes-errors.test.ts b/test/integration/routes-errors.test.ts
+index 89a35c8..4c92463 100644
+--- a/test/integration/routes-errors.test.ts
++++ b/test/integration/routes-errors.test.ts
+@@ -780,6 +780,52 @@ describe("api route guards and error branches", () => {
+ 
+     expect((await app.request("/mcp", { method: "OPTIONS" }, env)).status).toBe(204);
+     expect(await handleMcpRequest({ req: { method: "OPTIONS" } } as never)).toMatchObject({ status: 204 });
++    const defensiveEnv = withProductUsageInsertFailure(createTestEnv({ ADMIN_GITHUB_LOGINS: "oktofeesh1" }));
++    const { token: defensiveSessionToken } = await createSessionForGitHubUser(defensiveEnv, { login: "oktofeesh1", id: 12345 });
++    const rawRequest = new Request("http://localhost/mcp", {
++      method: "POST",
++      headers: { authorization: `Bearer ${defensiveSessionToken}`, "content-type": "application/json" },
++      body: JSON.stringify({ jsonrpc: "2.0", id: "raw-failure", method: "tools/call", params: { name: "gittensory_get_repo_context", arguments: { owner: "JSONbored", repo: "gittensory" } } }),
++    });
++    let rawReads = 0;
++    await expect(
++      handleMcpRequest({
++        env: defensiveEnv,
++        req: {
++          method: "POST",
++          header(name: string) {
++            return name.toLowerCase() === "authorization" ? `Bearer ${defensiveSessionToken}` : undefined;
++          },
++          get raw() {
++            rawReads += 1;
++            if (rawReads === 1) return rawRequest;
++            throw new Error("raw request unavailable");
++          },
++        },
++      } as never),
++    ).rejects.toThrow("raw request unavailable");
++    const staticRawRequest = new Request("http://localhost/mcp", {
++      method: "POST",
++      headers: { authorization: `Bearer ${defensiveEnv.GITTENSORY_MCP_TOKEN}`, "content-type": "application/json" },
++      body: JSON.stringify({ jsonrpc: "2.0", id: "static-raw-failure", method: "tools/list" }),
++    });
++    let staticRawReads = 0;
++    await expect(
++      handleMcpRequest({
++        env: createTestEnv(),
++        req: {
++          method: "POST",
++          header(name: string) {
++            return name.toLowerCase() === "authorization" ? `Bearer ${defensiveEnv.GITTENSORY_MCP_TOKEN}` : undefined;
++          },
++          get raw() {
++            staticRawReads += 1;
++            if (staticRawReads === 1) return staticRawRequest;
++            throw new Error("static raw request unavailable");
++          },
++        },
++      } as never),
++    ).rejects.toThrow("static raw request unavailable");
+     expect(
+       (
+         await app.request(
+@@ -831,6 +877,22 @@ function internalHeaders(env: Env): Record<string, string> {
+   };
+ }
+ 
++function withProductUsageInsertFailure(env: Env): Env {
++  const db = env.DB as unknown as { prepare(sql: string): unknown; batch(statements: unknown[]): Promise<unknown> };
++  return {
++    ...env,
++    DB: {
++      prepare(sql: string) {
++        if (sql.includes("product_usage_events")) throw new Error("product usage insert failed");
++        return db.prepare.call(db, sql);
++      },
++      batch(statements: unknown[]) {
++        return db.batch.call(db, statements);
++      },
++    } as unknown as D1Database,
++  };
++}
++
+ function firstCookiePair(header: string, name?: string): string {
+   const cookies = header.split(/,(?=\s*[^;,]+=)/).map((part) => part.trim());
+   const cookie = name ? cookies.find((part) => part.startsWith(`${name}=`)) : cookies[0];
+diff --git a/test/unit/product-usage.test.ts b/test/unit/product-usage.test.ts
+new file mode 100644
+index 0000000..3a51122
+--- /dev/null
++++ b/test/unit/product-usage.test.ts
+@@ -0,0 +1,243 @@
++import { describe, expect, it } from "vitest";
++import {
++  getContributorScoringProfile,
++  listDigestSubscriptionsForLogin,
++  listProductUsageEvents,
++  recordAiUsageEvent,
++  recordProductUsageEvent,
++  summarizeProductUsageEvents,
++  upsertDigestSubscription,
++} from "../../src/db/repositories";
++import { createTestEnv } from "../helpers/d1";
++
++describe("product usage events", () => {
++  it("hashes actors and sessions before persistence", async () => {
++    const env = createTestEnv({ PRODUCT_USAGE_HASH_SALT: "fixed-test-salt" });
++
++    const recorded = await recordProductUsageEvent(env, {
++      surface: "control_panel",
++      eventName: "command_previewed",
++      actor: "Oktofeesh1",
++      sessionId: "gts_session_secret",
++      route: "/v1/app/commands/preview",
++      repoFullName: "oktofeesh1/private-tool",
++      targetKey: "Oktofeesh1:private-tool#136",
++      outcome: "success",
++      metadata: { command: "packet", viewer: "Oktofeesh1", nested: { note: "for oktofeesh1" } },
++    });
++
++    expect(recorded.actorHash).toMatch(/^[0-9a-f]{64}$/);
++    expect(recorded.sessionHash).toMatch(/^[0-9a-f]{64}$/);
++    expect(recorded.actorHash).not.toBe(recorded.sessionHash);
++
++    const [row] = await listProductUsageEvents(env);
++    expect(row).toBeDefined();
++    if (!row) throw new Error("expected product usage event");
++    expect(row).toMatchObject({
++      surface: "control_panel",
++      eventName: "command_previewed",
++      route: "/v1/app/commands/preview",
++      repoFullName: "<redacted-actor>/private-tool",
++      targetKey: "<redacted-actor>:private-tool#136",
++      metadata: { command: "packet", viewer: "<redacted-actor>", nested: { note: "for <redacted-actor>" } },
++    });
++    expect(JSON.stringify(row)).not.toMatch(/Oktofeesh1|gts_session_secret/i);
++  });
++
++  it("redacts sensitive metadata before it reaches D1", async () => {
++    const env = createTestEnv({ PRODUCT_USAGE_HASH_SALT: "fixed-test-salt" });
++
++    await recordProductUsageEvent(env, {
++      surface: "api",
++      eventName: "local_branch_analysis_completed",
++      actor: "oktofeesh1",
++      repoFullName: "JSONbored/gittensory",
++      targetKey: "JSONbored/gittensory#136",
++      metadata: {
++        command: "packet",
++        authorization: "Bearer github_pat_secret",
++        token: "ghp_1234567890abcdef",
++        body: "source code should never be analytics metadata",
++        diff: "+ private patch",
++        cwd: "/Users/example/private/project",
++        nested: {
++          localPath: "/Users/example/private/project/file.ts",
++          values: ["see /Users/example/private/file.ts", "github_pat_1234567890abcdef"],
++          safe: "kept",
++        },
++        trustScore: 1,
++        note: "No raw trust or wallet data here.",
++      },
++    });
++
++    const [row] = await listProductUsageEvents(env);
++    expect(row).toBeDefined();
++    if (!row) throw new Error("expected product usage event");
++    expect(row.metadata).toMatchObject({
++      command: "packet",
++      nested: { values: ["see <redacted-path>", "<redacted-token>"], safe: "kept" },
++      note: "<redacted>",
++    });
++    expect(row.metadata).not.toHaveProperty("authorization");
++    expect(row.metadata).not.toHaveProperty("token");
++    expect(row.metadata).not.toHaveProperty("body");
++    expect(row.metadata).not.toHaveProperty("diff");
++    expect(row.metadata).not.toHaveProperty("cwd");
++    expect(JSON.stringify(row.metadata)).not.toMatch(/\/Users|github_pat|ghp_|source code|private patch|trustScore|wallet/i);
++  });
++
++  it("does not use API credentials as hash salt fallback", async () => {
++    const env = createTestEnv({ PRODUCT_USAGE_HASH_SALT: "", GITTENSORY_API_TOKEN: "private-api-token" });
++
++    await recordProductUsageEvent(env, {
++      surface: "api",
++      eventName: "credential_salt_regression",
++      actor: "oktofeesh1",
++      sessionId: "session-id",
++    });
++
++    const [row] = await listProductUsageEvents(env);
++    expect(row).toMatchObject({ actorHash: null, sessionHash: null });
++  });
++
++  it("normalizes invalid event fields and bounds unusual metadata shapes", async () => {
++    const env = createTestEnv({ GITTENSORY_API_TOKEN: "" });
++    await recordProductUsageEvent(env, {
++      surface: "invalid" as never,
++      eventName: "",
++      actor: "no-salt-user",
++      sessionId: "no-salt-session",
++      outcome: "unknown" as never,
++      latencyMs: Number.NaN,
++      clientName: "mcp-client Bearer abcdefghijklmnop",
++      clientVersion: "/Users/example/.local/bin/tool",
++      metadata: {
++        nothing: undefined,
++        callback: () => "ignore",
++        symbol: Symbol("ignore"),
++        nil: null,
++        enabled: true,
++        finite: 4,
++        infinite: Number.POSITIVE_INFINITY,
++        big: BigInt(42),
++        at: new Date("2026-05-31T00:00:00.000Z"),
++        list: [1, undefined, "Bearer abcdefghijklmnop", Number.NaN],
++        deep: { a: { b: { c: { d: "truncated" } } } },
++        "": "dropped",
++        keyed: { "": "dropped", dropped: undefined, callback: () => "ignore", kept: "ok" },
++      },
++    });
++
++    const [row] = await listProductUsageEvents(env, { sinceIso: "2026-01-01T00:00:00.000Z" });
++    expect(row).toBeDefined();
++    if (!row) throw new Error("expected product usage event");
++    expect(row).toMatchObject({
++      surface: "api",
++      eventName: "unknown",
++      outcome: "success",
++      actorHash: null,
++      sessionHash: null,
++      latencyMs: null,
++      clientName: "mcp-client Bearer <redacted-token>",
++      clientVersion: "<redacted-path>",
++    });
++    expect(row.metadata).toMatchObject({
++      nil: null,
++      enabled: true,
++      finite: 4,
++      infinite: null,
++      big: "42",
++      at: "2026-05-31T00:00:00.000Z",
++      list: [1, "Bearer <redacted-token>", null],
++      deep: { a: { b: { c: "[truncated]" } } },
++      keyed: { kept: "ok" },
++    });
++    expect(row.metadata).not.toHaveProperty("nothing");
++    expect(row.metadata).not.toHaveProperty("callback");
++    expect(row.metadata).not.toHaveProperty("symbol");
++    expect(Object.prototype.hasOwnProperty.call(row.metadata, "")).toBe(false);
++    expect(row.metadata.keyed).toEqual({ kept: "ok" });
++  });
++
++  it("accepts the full product surface and outcome catalogs", async () => {
++    const env = createTestEnv({ PRODUCT_USAGE_HASH_SALT: "fixed-test-salt" });
++    const surfaces = ["api", "mcp", "github_app", "control_panel", "browser_extension", "internal"] as const;
++    const outcomes = ["success", "denied", "error", "queued", "completed", "skipped"] as const;
++
++    for (const [index, surface] of surfaces.entries()) {
++      await recordProductUsageEvent(env, {
++        surface,
++        eventName: `surface_${surface}`,
++        outcome: outcomes[index],
++        metadata: { surface },
++      });
++    }
++
++    const events = await listProductUsageEvents(env, { limit: 10 });
++    expect(events.map((event) => event.surface)).toEqual(expect.arrayContaining([...surfaces]));
++    expect(events.map((event) => event.outcome)).toEqual(expect.arrayContaining([...outcomes]));
++  });
++
++  it("keeps adjacent persistence parser fallbacks covered", async () => {
++    const env = createTestEnv();
++    await expect(getContributorScoringProfile(env, "missing-user")).resolves.toBeNull();
++    await upsertDigestSubscription(env, { login: "oktofeesh1", email: "paused@example.com", status: "paused" });
++    await expect(listDigestSubscriptionsForLogin(env, "oktofeesh1")).resolves.toEqual([
++      expect.objectContaining({ status: "paused", email: "paused@example.com" }),
++    ]);
++    await expect(
++      recordAiUsageEvent(env, {
++        feature: "test",
++        model: "none",
++        status: "skipped",
++        estimatedNeurons: -4,
++      }),
++    ).resolves.toBeUndefined();
++  });
++
++  it("summarizes recent events without counting stale records", async () => {
++    const env = createTestEnv({ PRODUCT_USAGE_HASH_SALT: "fixed-test-salt" });
++    await recordProductUsageEvent(env, {
++      surface: "mcp",
++      eventName: "mcp_tool_called",
++      actor: "oktofeesh1",
++      outcome: "success",
++      occurredAt: "2026-05-31T00:00:00.000Z",
++    });
++    await recordProductUsageEvent(env, {
++      surface: "github_app",
++      eventName: "agent_command_replied",
++      actor: "maintainer",
++      outcome: "completed",
++      occurredAt: "2026-05-31T12:00:00.000Z",
++    });
++    await recordProductUsageEvent(env, {
++      surface: "api",
++      eventName: "stale_event",
++      actor: "old-user",
++      outcome: "success",
++      occurredAt: "2026-05-01T00:00:00.000Z",
++    });
++
++    const summary = await summarizeProductUsageEvents(env, "2026-05-30T00:00:00.000Z");
++    expect(summary).toMatchObject({ totalEvents: 2, activeActors: 2 });
++    expect(summary.bySurface).toEqual(
++      expect.arrayContaining([
++        { surface: "mcp", count: 1 },
++        { surface: "github_app", count: 1 },
++      ]),
++    );
++    expect(summary.byOutcome).toEqual(expect.arrayContaining([{ outcome: "success", count: 1 }, { outcome: "completed", count: 1 }]));
++    expect(summary.byEvent).toEqual(expect.arrayContaining([{ eventName: "mcp_tool_called", count: 1 }, { eventName: "agent_command_replied", count: 1 }]));
++
++    const fullSummary = await summarizeProductUsageEvents(env);
++    expect(fullSummary).toMatchObject({ totalEvents: 3, activeActors: 3, since: undefined });
++    expect(fullSummary.bySurface).toEqual(
++      expect.arrayContaining([
++        { surface: "mcp", count: 1 },
++        { surface: "github_app", count: 1 },
++        { surface: "api", count: 1 },
++      ]),
++    );
++  });
++});
+diff --git a/test/unit/queue.test.ts b/test/unit/queue.test.ts
+index fc4f965..06430b3 100644
+--- a/test/unit/queue.test.ts
++++ b/test/unit/queue.test.ts
+@@ -9,6 +9,7 @@ import {
+   getLatestUpstreamRulesetSnapshot,
+   listUpstreamDriftReports,
+   listInstallationHealth,
++  listProductUsageEvents,
+   listPullRequests,
+   listRepoSyncStates,
+   listSignalSnapshots,
+@@ -1464,6 +1465,13 @@ describe("queue processors", () => {
+     expect(usagePayloads.every((payload) => typeof payload.actorHash === "string" && /^[a-f0-9]{64}$/.test(payload.actorHash))).toBe(true);
+     expect(JSON.stringify(usagePayloads)).not.toContain('"actor":');
+     expect(JSON.stringify(usagePayloads)).not.toMatch(/wallet|hotkey|raw trust score|payout|reward estimate|farming|private reviewability|public score estimate|@gittensory|oktofeesh1/i);
++    const usageEvents = await listProductUsageEvents(env, { limit: 10 });
++    expect(usageEvents).toEqual(
++      expect.arrayContaining([
++        expect.objectContaining({ surface: "github_app", eventName: "agent_command_replied", outcome: "completed", repoFullName: "JSONbored/gittensory" }),
++      ]),
++    );
++    expect(JSON.stringify(usageEvents)).not.toMatch(/wallet|hotkey|raw trust|deliveryId|installation-token/i);
+   });
+ 
+   it("skips unauthorized, bot, and non-PR @gittensory mention commands without public output", async () => {
+@@ -1549,6 +1557,61 @@ describe("queue processors", () => {
+       .bind("github_app.agent_command_skipped")
+       .all<{ detail: string }>();
+     expect(skips.results.map((entry) => entry.detail)).toEqual(expect.arrayContaining(["bot_author", "not_a_pull_request_thread", "pr_author_not_confirmed_miner"]));
++    const usageEvents = await listProductUsageEvents(env, { limit: 10 });
++    expect(usageEvents).toEqual(
++      expect.arrayContaining([
++        expect.objectContaining({ surface: "github_app", eventName: "agent_command_skipped", outcome: "skipped" }),
++      ]),
++    );
++    expect(JSON.stringify(usageEvents)).not.toMatch(/deliveryId|wallet|hotkey|raw trust/i);
++  });
++
++  it("records command usage as an error when miner authorization cannot be checked", async () => {
++    const env = createTestEnv({ GITHUB_APP_PRIVATE_KEY: await generatePrivateKeyPem() });
++    vi.stubGlobal("fetch", async (input: RequestInfo | URL) => {
++      const url = input.toString();
++      if (url === "https://api.gittensor.io/miners") return new Response("api down", { status: 503 });
++      return new Response("not found", { status: 404 });
++    });
++
++    await processJob(env, {
++      type: "github-webhook",
++      deliveryId: "agent-command-miner-unavailable",
++      eventName: "issue_comment",
++      payload: {
++        action: "created",
++        installation: { id: 123, account: { login: "JSONbored", id: 1, type: "User" } },
++        repository: { name: "gittensory", full_name: "JSONbored/gittensory", private: false, owner: { login: "JSONbored" } },
++        issue: { number: 84, title: "Miner unavailable PR", state: "open", pull_request: {}, user: { login: "oktofeesh1" }, author_association: "NONE" },
++        comment: { id: 5, body: "@gittensory preflight", user: { login: "oktofeesh1", type: "User" }, author_association: "NONE" },
++      },
++    });
++
++    const usageEvents = await listProductUsageEvents(env, { limit: 5 });
++    expect(usageEvents).toEqual([
++      expect.objectContaining({ surface: "github_app", eventName: "agent_command_skipped", outcome: "error", metadata: expect.objectContaining({ reason: "miner_detection_unavailable" }) }),
++    ]);
++  });
++
++  it("does not let product usage write failures block GitHub command audits", async () => {
++    const env = withProductUsageInsertFailure(createTestEnv());
++    await processJob(env, {
++      type: "github-webhook",
++      deliveryId: "agent-command-product-usage-down",
++      eventName: "issue_comment",
++      payload: {
++        action: "created",
++        installation: { id: 123, account: { login: "JSONbored", id: 1, type: "User" } },
++        repository: { name: "gittensory", full_name: "JSONbored/gittensory", private: false, owner: { login: "JSONbored" } },
++        issue: { number: 90, title: "Plain issue", state: "open", user: { login: "reporter" } },
++        comment: { id: 1, body: "@gittensory preflight", user: { login: "reporter", type: "User" }, author_association: "NONE" },
++      },
++    });
++
++    const audit = await env.DB.prepare("select event_type, detail from audit_events where target_key = ?")
++      .bind("JSONbored/gittensory#90")
++      .all<{ event_type: string; detail: string }>();
++    expect(audit.results).toEqual([expect.objectContaining({ event_type: "github_app.agent_command_skipped", detail: "not_a_pull_request_thread" })]);
+   });
+ });
+ 
+@@ -1571,6 +1634,22 @@ function b64(value: string): string {
+   return Buffer.from(value, "utf8").toString("base64");
+ }
+ 
++function withProductUsageInsertFailure(env: Env): Env {
++  const db = env.DB as unknown as { prepare(sql: string): unknown; batch(statements: unknown[]): Promise<unknown> };
++  return {
++    ...env,
++    DB: {
++      prepare(sql: string) {
++        if (sql.includes("product_usage_events")) throw new Error("product usage insert failed");
++        return db.prepare.call(db, sql);
++      },
++      batch(statements: unknown[]) {
++        return db.batch.call(db, statements);
++      },
++    } as unknown as D1Database,
++  };
++}
++
+ async function generatePrivateKeyPem(): Promise<string> {
+   const key = (await crypto.subtle.generateKey(
+     {

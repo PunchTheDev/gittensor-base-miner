@@ -1,0 +1,138 @@
+diff --git a/crates/genie-core/src/chat_ui.html b/crates/genie-core/src/chat_ui.html
+index b0dc4c0..256e741 100644
+--- a/crates/genie-core/src/chat_ui.html
++++ b/crates/genie-core/src/chat_ui.html
+@@ -60,9 +60,26 @@
+   align-self: flex-start; background: var(--bot-bg);
+   border: 1px solid var(--border); border-bottom-left-radius: 4px;
+ }
+-.msg.bot.streaming:empty::before {
+-  content: '...';
++.msg.bot.streaming {
+   color: var(--text2);
++  display: flex; align-items: center; gap: .5rem;
++}
++.writing-dots {
++  display: inline-flex; align-items: center; gap: 4px;
++}
++.writing-dots span {
++  width: 6px; height: 6px; border-radius: 50%;
++  background: var(--accent); opacity: .35;
++  animation: writing-pulse 1.2s infinite ease-in-out;
++}
++.writing-dots span:nth-child(2) { animation-delay: .16s; }
++.writing-dots span:nth-child(3) { animation-delay: .32s; }
++@keyframes writing-pulse {
++  0%, 80%, 100% { opacity: .35; transform: translateY(0); }
++  40% { opacity: 1; transform: translateY(-5px); }
++}
++@media (prefers-reduced-motion: reduce) {
++  .writing-dots span { animation: none; opacity: .75; }
+ }
+ .msg.tool {
+   align-self: flex-start; background: var(--tool-bg);
+@@ -184,6 +201,12 @@ <h1>GeniePod</h1>
+ function addStreamingMessage() {
+   const div = document.createElement('div');
+   div.className = 'msg bot streaming';
++  div.setAttribute('aria-busy', 'true');
++  div.setAttribute('aria-live', 'polite');
++  div.innerHTML = [
++    '<span class="writing-label">Agent writing</span>',
++    '<span class="writing-dots" aria-hidden="true"><span></span><span></span><span></span></span>'
++  ].join('');
+   messagesEl.appendChild(div);
+   messagesEl.scrollTop = messagesEl.scrollHeight;
+   return div;
+@@ -191,12 +214,14 @@ <h1>GeniePod</h1>
+ 
+ function setMessageText(div, content) {
+   div.className = 'msg bot';
++  div.removeAttribute('aria-busy');
+   div.textContent = content;
+   messagesEl.scrollTop = messagesEl.scrollHeight;
+ }
+ 
+ function setMessageTool(div, toolName, content) {
+   div.className = 'msg tool';
++  div.removeAttribute('aria-busy');
+   div.innerHTML = `<div class="label">Tool: <span class="tool-name">${esc(toolName)}</span></div>${esc(content)}`;
+   messagesEl.scrollTop = messagesEl.scrollHeight;
+ }
+diff --git a/crates/genie-core/src/server.rs b/crates/genie-core/src/server.rs
+index ebfe0d5..9d5f39c 100644
+--- a/crates/genie-core/src/server.rs
++++ b/crates/genie-core/src/server.rs
+@@ -13,6 +13,24 @@ use crate::reasoning::InteractionKind;
+ use crate::tools::ToolDispatcher;
+ use crate::tools::{RequestOrigin, ToolExecutionContext};
+ 
++const HTML_CONTENT_TYPE: &str = "text/html; charset=utf-8";
++
++struct StaticHtml {
++    body: &'static str,
++}
++
++impl StaticHtml {
++    const fn new(body: &'static str) -> Self {
++        Self { body }
++    }
++
++    fn response(&self) -> (u16, &'static str, String) {
++        (200, HTML_CONTENT_TYPE, self.body.to_owned())
++    }
++}
++
++const CHAT_UI: StaticHtml = StaticHtml::new(include_str!("chat_ui.html"));
++
+ /// HTTP chat server for genie-core.
+ ///
+ /// Endpoints:
+@@ -195,11 +213,7 @@ async fn handle_request(stream: tokio::net::TcpStream, ctx: &ChatServer) -> Resu
+     }
+ 
+     let (status, content_type, response_body) = match (method, path) {
+-        ("GET", "/" | "/index.html") => (
+-            200,
+-            "text/html; charset=utf-8",
+-            include_str!("chat_ui.html").into(),
+-        ),
++        ("GET", "/" | "/index.html") => CHAT_UI.response(),
+         ("POST", "/api/chat") => {
+             handle_chat(
+                 body.as_deref(),
+diff --git a/crates/genie-core/tests/tool_dispatch_test.rs b/crates/genie-core/tests/tool_dispatch_test.rs
+index 1f8755c..81da692 100644
+--- a/crates/genie-core/tests/tool_dispatch_test.rs
++++ b/crates/genie-core/tests/tool_dispatch_test.rs
+@@ -314,6 +314,30 @@ fn genie_ai_runtime_service_preserves_model_page_cache() {
+     );
+ }
+ 
++/// Verify the chat UI keeps an animated in-flight state before streamed tokens arrive.
++#[test]
++fn chat_ui_uses_animated_writing_indicator() {
++    let path = workspace_root().join("crates/genie-core/src/chat_ui.html");
++    let contents = std::fs::read_to_string(&path).unwrap();
++
++    assert!(
++        contents.contains("Agent writing"),
++        "chat UI should show the in-flight agent state"
++    );
++    assert!(
++        contents.contains("writing-dots") && contents.contains("@keyframes writing-pulse"),
++        "chat UI should animate the in-flight state instead of rendering static dots"
++    );
++    assert!(
++        contents.contains("aria-busy") && contents.contains("aria-live"),
++        "chat UI should expose the in-flight state to assistive technology"
++    );
++    assert!(
++        !contents.contains(".msg.bot.streaming:empty::before"),
++        "chat UI should not rely on an empty pseudo-element placeholder"
++    );
++}
++
+ /// Verify the model cache helper can inspect GGUF page-cache residency.
+ #[test]
+ fn model_cache_status_helper_reports_residency() {
