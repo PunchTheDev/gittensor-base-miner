@@ -4,8 +4,10 @@ Docker-sandboxed problem runner.
 Executes scoring for a single benchmark problem inside an isolated container:
   - Hard time limit enforced via subprocess timeout + docker kill
   - Memory cap via --memory
-  - Setup phase: network allowed for git clone / apt-get / pip install
-  - Score phase: network blocked (--network none) — scorer only reads staging files
+  - Phase 1 (setup + test): language-specific image — Python/Node/Rust/JDK;
+    network allowed for git clone, package manager fetches, dep installs
+  - Phase 2 (score): python:3.12-slim, network blocked (--network none);
+    scorer reads only staging files produced in Phase 1
   - Secrets (OPENROUTER_KEY etc.) never passed to containers — no model cheating
   - Ephemeral: container is removed after each run (--rm)
 
@@ -30,8 +32,18 @@ from pathlib import Path
 
 MEMORY_LIMIT = "2g"
 CPU_LIMIT = "2.0"
-EVAL_IMAGE = "python:3.12-slim"
+SCORE_IMAGE = "python:3.12-slim"  # always Python — scorer is stdlib-only Python
 KILL_GRACE = 15  # seconds docker waits after stop signal before SIGKILL
+
+# Language-specific Docker images for Phase 1 (clone → install deps → run tests).
+# Images are chosen to match the dominant toolchain version on the repos in the pool.
+_LANG_IMAGES: dict[str, str] = {
+    "python": "python:3.12-slim",
+    "npm":    "node:20-slim",
+    "cargo":  "rust:1.82-slim",
+    # gradlew wrapper ships its own Gradle; we only need a JDK.
+    "./gradlew": "eclipse-temurin:21-jdk-jammy",
+}
 
 
 def _docker_available() -> bool:
@@ -62,33 +74,90 @@ def run_in_sandbox(problem_dir: Path, patch_path: Path) -> dict:
 # Internals
 # ---------------------------------------------------------------------------
 
+def _lang_image(test_cmd: list[str]) -> str:
+    """Return the Docker image best suited for the given test command."""
+    runner = test_cmd[0] if test_cmd else "python"
+    return _LANG_IMAGES.get(runner, "python:3.12-slim")
+
+
+def _install_block(test_cmd: list[str]) -> str:
+    """Return the language-specific dependency installation commands."""
+    runner = test_cmd[0] if test_cmd else "python"
+
+    if runner == "python":
+        return textwrap.dedent("""\
+            pip install pytest --quiet >/dev/null 2>&1 || true
+            if [ -f pyproject.toml ]; then
+                pip install -e ".[dev]" --quiet >/dev/null 2>&1 || \\
+                pip install -e . --quiet >/dev/null 2>&1 || true
+            elif [ -f requirements.txt ]; then
+                pip install -r requirements.txt --quiet >/dev/null 2>&1 || true
+            elif [ -f setup.py ]; then
+                pip install -e . --quiet >/dev/null 2>&1 || true
+            fi
+        """)
+
+    if runner == "npm":
+        return textwrap.dedent("""\
+            if [ -f package-lock.json ]; then
+                npm ci --silent 2>/dev/null || npm install --silent 2>/dev/null || true
+            else
+                npm install --silent 2>/dev/null || true
+            fi
+        """)
+
+    if runner == "cargo":
+        # Rust: warm the registry cache so test compile doesn't time out
+        return textwrap.dedent("""\
+            cargo fetch --quiet 2>/dev/null || true
+        """)
+
+    if runner == "./gradlew":
+        return textwrap.dedent("""\
+            chmod +x gradlew
+            ./gradlew dependencies --quiet 2>/dev/null || true
+        """)
+
+    return ""  # unknown runner — no install step
+
+
+def _git_apt_block(runner: str) -> str:
+    """Packages needed beyond git for the given runner's base image."""
+    # node:20-slim and rust:1.82-slim ship without git; eclipse-temurin has it.
+    if runner in ("npm", "cargo"):
+        return "apt-get update -qq >/dev/null && apt-get install -y -qq git >/dev/null"
+    if runner == "./gradlew":
+        # eclipse-temurin:21-jdk-jammy has git already; still safe to skip reinstall
+        return "git --version >/dev/null 2>&1 || (apt-get update -qq >/dev/null && apt-get install -y -qq git >/dev/null)"
+    # python:3.12-slim
+    return "apt-get update -qq >/dev/null && apt-get install -y -qq git >/dev/null"
+
+
 def _prepare_staging(staging: Path, meta: dict, patch_path: Path) -> None:
     """Write all files the container needs into the staging directory."""
     shutil.copy(patch_path, staging / "candidate.diff")
     (staging / "meta.json").write_text(json.dumps(meta))
 
-    # Shell script: clone → checkout → install → apply → test → emit exit code
-    test_cmd = " ".join(meta.get("test_cmd", ["python", "-m", "pytest", "--tb=short", "-q"]))
+    test_cmd: list[str] = meta.get("test_cmd", ["python", "-m", "pytest", "--tb=short", "-q"])
+    test_cmd_str = " ".join(test_cmd)
+    runner = test_cmd[0] if test_cmd else "python"
+
+    git_block = _git_apt_block(runner)
+    install_block = _install_block(test_cmd)
+
     (staging / "setup_and_test.sh").write_text(textwrap.dedent(f"""\
         #!/usr/bin/env bash
         set -euo pipefail
         export DEBIAN_FRONTEND=noninteractive
 
-        apt-get update -qq >/dev/null
-        apt-get install -y -qq git >/dev/null
+        {git_block}
 
         git clone --quiet {meta["repo_url"]} /repo
         cd /repo
         git checkout --quiet {meta["base_commit"]}
 
-        # Install deps (best-effort)
-        pip install pytest --quiet >/dev/null 2>&1 || true
-        if [ -f pyproject.toml ]; then
-            pip install -e ".[dev]" --quiet >/dev/null 2>&1 || \
-            pip install -e . --quiet >/dev/null 2>&1 || true
-        elif [ -f requirements.txt ]; then
-            pip install -r requirements.txt --quiet >/dev/null 2>&1 || true
-        fi
+        # Install dependencies (best-effort — a failed install still allows scoring)
+        {install_block.rstrip()}
 
         # Apply patch — write outcome so scorer can read it
         if git apply /staging/candidate.diff; then
@@ -99,7 +168,7 @@ def _prepare_staging(staging: Path, meta: dict, patch_path: Path) -> None:
         fi
 
         # Run tests — capture output + exit code
-        {test_cmd} > /staging/test_out.txt 2>&1
+        {test_cmd_str} > /staging/test_out.txt 2>&1
         echo $? > /staging/test_rc
     """))
     (staging / "setup_and_test.sh").chmod(0o755)
@@ -197,10 +266,13 @@ def _run_container(staging: Path, meta: dict, time_limit: int) -> dict:
     container_name = f"bminer_{problem_id}_{os.getpid()}"
     host_timeout = time_limit + KILL_GRACE + 60
 
-    # Phase 1: setup + test
-    # Network is allowed here so git clone, apt-get, and pip install succeed.
-    # OPENROUTER_KEY and other secrets are not passed to the container, so the
-    # agent's patch cannot call external model APIs even with network access.
+    test_cmd: list[str] = meta.get("test_cmd", ["python", "-m", "pytest", "--tb=short", "-q"])
+    setup_image = _lang_image(test_cmd)
+
+    # Phase 1: setup + test — use the language-specific image so the right
+    # toolchain (Node, Rust, JDK, Python) is available without installing it.
+    # Network is allowed here for git clone, package manager, and dep fetches.
+    # Secrets are never passed so the agent can't call external model APIs.
     setup_cmd = [
         "docker", "run", "--rm",
         "--name", container_name,
@@ -208,7 +280,7 @@ def _run_container(staging: Path, meta: dict, time_limit: int) -> dict:
         "--cpus", CPU_LIMIT,
         "--stop-timeout", str(KILL_GRACE),
         "-v", f"{staging}:/staging",
-        EVAL_IMAGE,
+        setup_image,
         "/bin/bash", "/staging/setup_and_test.sh",
     ]
 
@@ -223,12 +295,13 @@ def _run_container(staging: Path, meta: dict, time_limit: int) -> dict:
         subprocess.run(["docker", "kill", container_name], capture_output=True)
         return _timeout_result(problem_id)
 
-    # Phase 2: score from artifacts written to staging
+    # Phase 2: score from artifacts written to staging.
+    # Always uses SCORE_IMAGE (Python) — scorer is stdlib-only Python regardless of language.
     score_cmd = [
         "docker", "run", "--rm",
         "--network", "none",
         "-v", f"{staging}:/staging",
-        EVAL_IMAGE,
+        SCORE_IMAGE,
         "python3", "/staging/score_result.py",
     ]
 
