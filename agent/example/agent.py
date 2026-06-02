@@ -291,6 +291,11 @@ Improvements over a naive single-shot approach:
 - `_extract_assertions` deduplication: the same assertion line appearing in multiple test files
   now counts only once toward the 50-line limit. Cross-file duplicate assertions (shared helpers,
   parameterised test setup blocks) no longer waste lines that could show unique edge cases.
+- `_window_file` no-hit path now adds line numbers when `show_line_numbers=True`: when a long
+  file has no keyword matches, the header fallback (import block + first type defs) was returned
+  without `N | ` line-number prefixes — inconsistent with every other windowing path. Fixed: the
+  same `{i:{width}d} | line` format is now applied to the no-hit header section too, so the
+  model sees consistent line numbers regardless of whether keyword hits were found.
 """
 
 from __future__ import annotations
@@ -1345,6 +1350,12 @@ def _window_file(
         peek = max(_compute_header_end(lines, ext), min(80, len(lines)))
         peek = min(peek, len(lines))
         suffix = f"\n... [lines {peek + 1}-{len(lines)} omitted — no keyword hits in this file]"
+        if show_line_numbers:
+            width = len(str(len(lines)))
+            numbered = []
+            for i, line in enumerate(lines[:peek], start=1):
+                numbered.append(f"{i:{width}d} | {line}" if line.endswith("\n") else f"{i:{width}d} | {line}\n")
+            return "".join(numbered) + suffix, True
         return "".join(lines[:peek]) + suffix, True
 
     # Force the header section into the window set so imports/class defs are visible.
