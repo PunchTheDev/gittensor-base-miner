@@ -85,7 +85,7 @@ Improvements over a naive single-shot approach:
   patterns in `.rs` files, resolving to `module.rs` or `module/mod.rs` in the same
   directory. Previously Rust problems got no sibling expansion — 57 pool problems affected.
 - Assertion injection in verify: `_extract_assertions()` pulls the assert/expect/assertEquals
-  lines (up to 30) from test files and injects them directly into the verify prompt. The
+  lines (up to 50) from test files and injects them directly into the verify prompt. The
   model no longer relies on conversation context to recall what assertions must pass —
   they're explicitly listed so the model can check each one against the diff.
 - Non-uniform timeout allocation: plan gets 15% of wall-clock budget (~18s), act gets 40%
@@ -176,9 +176,9 @@ Improvements over a naive single-shot approach:
 - Verify criterion 7: hunk-map completeness check added to `VERIFY_PROMPT`. Explicitly asks the
   model to look back at its step 6 hunk map and confirm every planned file appears in the diff.
   Previously the model could LGTM a diff that omitted a file it had planned to change.
-- `_extract_diff` fence regex generalised: was `\`\`\`(?:diff|patch)?` — now accepts any fence
-  language tag (`\`\`\`\w*`). Handles `\`\`\`text`, `\`\`\`udiff`, `\`\`\`unidiff`, etc. so
-  diffs wrapped in non-standard fences are extracted rather than silently dropped.
+- `_extract_diff` fence regex generalised: was triple-backtick(?:diff|patch)? — now accepts any
+  fence language tag (triple-backtick + any word chars). Handles text, udiff, unidiff fences, etc.
+  so diffs wrapped in non-standard fences are extracted rather than silently dropped.
 - API error resilience in `_call`: OpenRouter sometimes returns a 200 with an error body
   (e.g. `{"error": {"message": "No endpoints found..."}}` instead of `choices`) — previously
   this caused a `KeyError: 'choices'` that propagated as an exception, scoring the problem 0.
@@ -1473,10 +1473,8 @@ def _extract_assertions(test_files: list[FileContext], limit: int = 50) -> str:
 
     Caps at `limit` lines to keep the verify prompt compact.  Recognises
     assert styles for Python (pytest + unittest.TestCase self.assert*), Rust,
-    Go (testify), TypeScript/Jest, Kotlin, Java, Ruby Minitest, and Python
-    mock/spy assertions (mock_obj.assert_called_once_with(...) — contains check).
-    Limit raised from 30 to 50: large test suites put the most specific
-    edge-case assertions near the end, which the old cap would drop.
+    Go (testify), TypeScript/Jest, Kotlin (kotlin.test), Java, Ruby Minitest,
+    Rails integration tests, and Python mock/spy assertions (contains check).
     """
     _ASSERT_PREFIXES = (
         "assert ",          # Python / general
@@ -1552,6 +1550,12 @@ def _extract_assertions(test_files: list[FileContext], limit: int = 50) -> str:
         "assert_respond_to ", "assert_respond_to(",
         "assert_kind_of ",  "assert_kind_of(",
         "assert_instance_of ", "assert_instance_of(",
+        # Ruby / Rails additional patterns
+        "assert_not_equal ",   "assert_not_equal(",   # Rails / ActiveSupport
+        "assert_difference(",                          # Rails: assert_difference("Model.count", 1)
+        "assert_no_difference(",                       # Rails: assert_no_difference("Model.count")
+        "assert_response ",                            # Rails integration: assert_response :created
+        "assert_redirected_to ",                       # Rails: assert_redirected_to root_path
         # Ruby Minitest refute_* — both space and parens calling conventions
         "refute ",             # bare: `refute value`, `refute obj.nil?`
         "refute_equal ",   "refute_equal(",
@@ -1559,6 +1563,9 @@ def _extract_assertions(test_files: list[FileContext], limit: int = 50) -> str:
         "refute_includes ","refute_includes(",
         "refute_match ",   "refute_match(",
         "refute_empty ",   "refute_empty(",
+        # Kotlin kotlin.test — not matched by bare "assert" (no space/paren suffix)
+        "assertIs<",           # type assertion: assertIs<AgentEvent.FinalAnswer>(result)
+        "assertContains(",     # collection/string contains: assertContains(list, item)
     )
     # Mock/spy assertions: `mock_obj.assert_called_once_with(...)` — variable name varies
     # so we can't match by prefix.  Check if the stripped line contains these substrings.
