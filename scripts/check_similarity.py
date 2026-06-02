@@ -1,8 +1,13 @@
 """
 Compare a submitted agent.py against all existing submissions.
 
-Uses token-level Jaccard similarity on the source code. Submissions above
-the threshold are flagged as potential copies and reported to the caller.
+Uses two complementary signals:
+  1. AST structural fingerprint — node-type bigrams from a normalized AST.
+     Catches structural copies even when all identifiers are renamed.
+  2. Token-level Jaccard — lowercased identifier set.
+     Catches copy-paste with minor edits.
+
+A submission is flagged if EITHER signal exceeds the threshold.
 
 Exit codes:
   0  — all similarities below threshold (clean)
@@ -15,6 +20,7 @@ Usage:
 from __future__ import annotations
 
 import argparse
+import ast
 import os
 import re
 import sys
@@ -24,10 +30,44 @@ REPO_ROOT = Path(__file__).parent.parent
 DEFAULT_THRESHOLD = 0.85
 
 
+# ---------------------------------------------------------------------------
+# AST structural fingerprint
+# ---------------------------------------------------------------------------
+
+def ast_bigrams(source: str) -> frozenset[str]:
+    """Return a set of parent→child node-type bigrams from the source AST.
+
+    Identifiers and string literals are stripped — only the structural shape
+    of the code is captured. Two files with the same logic but renamed
+    variables will produce nearly identical bigrams.
+    """
+    try:
+        tree = ast.parse(source)
+    except SyntaxError:
+        return frozenset()
+
+    bigrams: set[str] = set()
+    for node in ast.walk(tree):
+        parent_type = type(node).__name__
+        for child in ast.iter_child_nodes(node):
+            child_type = type(child).__name__
+            bigrams.add(f"{parent_type}>{child_type}")
+
+    return frozenset(bigrams)
+
+
+# ---------------------------------------------------------------------------
+# Token fingerprint (original signal)
+# ---------------------------------------------------------------------------
+
 def tokenize(text: str) -> frozenset[str]:
     """Split source into a token set (lowercased identifiers/keywords)."""
     return frozenset(t.lower() for t in re.split(r"[^a-zA-Z0-9_]", text) if len(t) > 1)
 
+
+# ---------------------------------------------------------------------------
+# Similarity metric
+# ---------------------------------------------------------------------------
 
 def jaccard(a: frozenset[str], b: frozenset[str]) -> float:
     union = a | b
@@ -35,6 +75,10 @@ def jaccard(a: frozenset[str], b: frozenset[str]) -> float:
         return 0.0
     return len(a & b) / len(union)
 
+
+# ---------------------------------------------------------------------------
+# CI reporting
+# ---------------------------------------------------------------------------
 
 def write_summary(lines: list[str]) -> None:
     """Write to $GITHUB_STEP_SUMMARY if running in CI, otherwise print."""
@@ -45,6 +89,10 @@ def write_summary(lines: list[str]) -> None:
     else:
         print("\n".join(lines))
 
+
+# ---------------------------------------------------------------------------
+# Main
+# ---------------------------------------------------------------------------
 
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
@@ -67,40 +115,50 @@ def main() -> None:
         print(f"ERROR: agent file not found: {new_path}", file=sys.stderr)
         sys.exit(2)
 
-    new_handle = new_path.parent.name
-    new_tokens = tokenize(new_path.read_text())
+    new_source = new_path.read_text()
+    new_tokens = tokenize(new_source)
+    new_bigrams = ast_bigrams(new_source)
 
+    new_handle = new_path.parent.name
     submissions_dir = Path(args.submissions_dir)
-    flagged: list[tuple[str, float]] = []
+
+    flagged: list[tuple[str, float, float, str]] = []  # handle, token_sim, ast_sim, reason
     checked = 0
 
     for existing in sorted(submissions_dir.glob("*/agent.py")):
         handle = existing.parent.name
         if handle == new_handle:
-            continue  # skip self (re-submissions updating their own entry)
-        tokens = tokenize(existing.read_text())
-        sim = jaccard(new_tokens, tokens)
+            continue  # skip self (re-submissions)
+
+        source = existing.read_text()
+        token_sim = jaccard(new_tokens, tokenize(source))
+        ast_sim = jaccard(new_bigrams, ast_bigrams(source))
         checked += 1
-        if sim >= args.threshold:
-            flagged.append((handle, sim))
+
+        if token_sim >= args.threshold:
+            flagged.append((handle, token_sim, ast_sim, "token"))
+        elif ast_sim >= args.threshold:
+            flagged.append((handle, token_sim, ast_sim, "structure"))
 
     report: list[str] = []
     report.append("## Similarity Check")
-    report.append(f"Compared `{new_handle}` against **{checked}** existing submission(s).")
-    report.append(f"Threshold: {args.threshold:.0%} Jaccard similarity")
+    report.append(
+        f"Compared `{new_handle}` against **{checked}** existing submission(s) "
+        f"(token + AST structural fingerprint)."
+    )
+    report.append(f"Threshold: {args.threshold:.0%} on either signal")
     report.append("")
 
     if flagged:
         report.append(f"> **WARNING** — {len(flagged)} submission(s) flagged as too similar:")
         report.append("")
-        report.append("| Existing handle | Similarity |")
-        report.append("|----------------|-----------|")
-        for handle, sim in sorted(flagged, key=lambda x: -x[1]):
-            report.append(f"| `{handle}` | {sim:.1%} |")
+        report.append("| Existing handle | Token sim | AST sim | Flagged by |")
+        report.append("|----------------|----------|---------|------------|")
+        for handle, tsim, asim, reason in sorted(flagged, key=lambda x: -max(x[1], x[2])):
+            report.append(f"| `{handle}` | {tsim:.1%} | {asim:.1%} | {reason} |")
         report.append("")
         report.append("A maintainer should inspect this before merging.")
         write_summary(report)
-        # Also print to stderr so it's visible in logs even without summary
         print("\n".join(report), file=sys.stderr)
         sys.exit(1)
     else:
