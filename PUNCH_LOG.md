@@ -4,6 +4,27 @@ Milestone trail for the base-miner benchmark. Discord is the primary channel; th
 
 ---
 
+## 2026-06-02 — Agent: sibling imports + new test file creation (commits 9cd3e74, ed46bb2)
+
+### Agent: sibling import expansion (commit 9cd3e74)
+- **`_expand_sibling_imports()`**: after ranking, scans the top-3 implementation files for local imports (`from .helpers import X`, `from pkg.sub.helpers import X`, TypeScript relative imports, same-dir Go files) and adds those sibling modules to context (up to 6 KB extra)
+- **Key fix**: prevents the agent from hallucinating helper functions that already exist in the package. Without this, `view.py` is shown but not `helpers.py` — the agent doesn't know `emit_error_json` exists and tries to define it inline (wrong) or imports from the wrong path
+- Tested on problem 0335 pattern: correctly identifies `gittensor/cli/issue_commands/helpers.py` as a sibling of `view.py`
+
+### Agent: new test file detection (commit ed46bb2)
+- **Root cause found**: 243/400 pool problems have test files in context that don't exist at `base_commit` (they were added by the PR). Without detection, the agent treats them as read-only context but never creates them — `git apply` succeeds but `pytest` fails with "file not found" → correctness score 0
+- **`_new_test_files()`**: compares context test files against `file_tree` (repo at base_commit). Files not in file_tree are new
+- **`_new_test_diff()`**: generates pre-formatted diff blocks (new file mode, `/dev/null` header, `@@ -0,0 +1,N @@`) that the agent can copy verbatim
+- **`NEW_TEST_FILES_TEMPLATE`**: new prompt section shown when new test files detected — instructs agent to include pre-formatted diff blocks in output
+- Affects ~60% of all pool problems
+
+### Status
+- Benchmark: 400 problems, oracle 23.08, 20 repos (commit ed46bb2)
+- Pool: all 16 DAS repos saturated; next refresh check ~2026-06-09
+- Pending: registration (operator), nginx hookup (operator)
+
+---
+
 ## 2026-06-02 — Pool 397→400 + Kotlin/Java agent support (commits 8cab7e5, 96af7c8)
 
 ### Agent: Kotlin/Java language notes and import resolution (commit 8cab7e5)
