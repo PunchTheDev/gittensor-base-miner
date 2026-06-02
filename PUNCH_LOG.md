@@ -4,6 +4,31 @@ Milestone trail for the base-miner benchmark. Discord is the primary channel; th
 
 ---
 
+## 2026-06-02 — Pool 349→352, test-repair loop, DAS calibration (commits 2c0e46c, 737cc57)
+
+### Pool expansion (+3 problems)
+- `1330` (entrius/gittensor#1330): per-repo `min_token_score` eligibility fix — validator scoring test
+- `1354` (entrius/gittensor#1354): `_is_valid_linked_issue` solver attribution bug — scoring test
+- `infiniflow_ragflow_15443`: OpenAI-compat streaming duplicate response fix — 202-line Python test
+- Oracle mean: 22.81 → 22.80 (recomputed across 352 problems)
+
+### build_pool.py fixes (commit 737cc57)
+- `extract_issue_numbers`: regex now matches `Close #N` (not just "closes"), expanded to also cover `close[sd]?` and bare `PR #N` references
+- Fallback to GitHub PR body if DAS body has no issue reference — catches maintainer PRs that describe instead of using keywords
+- Reordered: GitHub PR fetch now comes before issue extraction for earlier fallback
+- `--pr-numbers N,N,...` flag: targeted refresh of specific PRs (requires `--repo`) — much faster than full repo scan
+
+### Agent: test-failure repair loop (commit 2c0e46c)
+- `BaseAgent.repair(problem, failed_patch, test_output)`: default impl retries `solve()` with failure context injected into issue body
+- `ExampleAgent.repair()`: override — builds a targeted repair conversation showing the exact failed diff + last 3k chars of test output; temperature=0 for precision; one structural validation pass
+- `gitminer run --repair N`: after test failure, calls agent.repair() up to N times (--no-sandbox only); shows re-score after each attempt
+- Fixed bug: oracle lookup in `cmd_run` used wrong keys (`b["problem_id"]`/`b["score"]` instead of `b["id"]`/`b["base_score"]`)
+
+### DAS calibration display (commit 2c0e46c)
+- `gitminer run --score` now shows `DAS ref: X.XX` — the Gittensor validator base score for the reference PR — alongside the local score
+- Corrected inflation note: "~3-5× above Docker CI" (was ~2×; measured median ratio is 7x)
+- "Avg oracle" label → "Pool mean" (clearer)
+
 ## 2026-06-02 — Pool refresh 347→349, score-aware prompts (commits 342d874, 72b622a)
 
 ### Pool expansion (+2 phase-rs/phase problems)
