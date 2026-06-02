@@ -997,3 +997,26 @@ Recognises assert styles for: Python, Rust (assert_eq!, assert!), Go (assert.Equ
 - Benchmark: 400 problems, oracle 23.08 (unchanged)
 - Pool: all repos saturated — next check 2026-06-09
 - Pending: Gittensor registration, nginx hookup
+
+## 2026-06-02 — Agent: verify hardening + timeout reliability (commits 4d97f89, 361fdde)
+
+### New-file presence check in verify (criterion 6) (commit 4d97f89)
+
+When the problem requires new files (`new_tests` or `new_impls`), the verify prompt now lists them explicitly under "Required new files" and adds criterion 6: "Does the diff add ALL N required new file(s) as `new file mode 100644` blocks?" Previously verify had no visibility into new-file requirements — it would say LGTM even if the agent forgot to add a required new file, which immediately fails the test command. Affects ~60% of pool problems (new test files) and ~33% (new impl files).
+
+### Verify body snippet extended 1500 → 3000 chars (commit 4d97f89)
+
+The issue body is now passed up to 3000 characters to the verify step (was 1500). Requirements stated after character 1500 were invisible to verify, causing incomplete-implementation misses on longer issues.
+
+### Partial repair: feedback loop instead of silent break (commit 4d97f89)
+
+When verify returns a diff covering fewer files than the current diff, the previous behavior was `break` — accepting the unchanged multi-file diff silently. Now: targeted feedback is sent ("your fix only covered N/M files, include all M files in your response") and the loop continues. Gives the model a chance to produce a complete multi-file correction rather than just keeping the unverified original.
+
+### Timeout retry in `_call` (commit 361fdde)
+
+`httpx.TimeoutException` was previously unhandled — it propagated up from `solve()` and the benchmark's broad except gave the problem a 0 score. Now: retry once on timeout; on a second timeout return `""`. The `_diagnose_diff` → format-repair path handles empty strings gracefully without aborting the problem.
+
+### Status
+- Benchmark: 423 problems, oracle 23.36 (unchanged)
+- Pool: all repos saturated — next check 2026-06-09
+- Pending: Gittensor registration, nginx hookup
