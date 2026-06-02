@@ -4,6 +4,22 @@ Milestone trail for the base-miner benchmark. Discord is the primary channel; th
 
 ---
 
+## 2026-06-02 — Verify token budget, assertion limit, hunk search radius (commit a5d1235)
+
+### Verify token budget raised to match act
+
+`verify_tokens` was `token_budget // 4 = 12,500`. When the verify step produces a corrected diff (not LGTM), it needs the same token headroom as the act step — otherwise a large multi-file diff gets truncated mid-output, producing a partial patch worse than the original. Fix: `verify_tokens = act_tokens = 25,000`.
+
+### `_extract_assertions` limit 30 → 50
+
+Large test suites often place parameterised and edge-case assertions near the end. The old 30-line cap silently dropped them, leaving the verify step blind to those requirements. Raised to 50 without materially inflating the verify prompt size.
+
+### `_fix_hunk_offsets` search radius ±25 → ±50
+
+Large Go/TS files (500+ lines) are more likely to have model-estimated offsets that are off by more than 25 lines when the file is shown windowed. The unambiguous-match safety guard (single match required) prevents false positives — a wider radius finds more correct offsets without introducing wrong ones.
+
+---
+
 ## 2026-06-02 — Removal-line whitespace fix, verify hunk-map check, fence regex (commit a07d86f)
 
 ### `_fix_context_lines` extended to removal lines
