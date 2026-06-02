@@ -11,6 +11,8 @@ complete, well-structured implementations — not minimal one-liners — because
 a thorough fix that passes tests scores significantly higher than a bare stub.
 
 Improvements over a naive single-shot approach:
+- Test-first reasoning: plan step analyzes what each test assertion requires before
+  deciding what to implement — anchors the implementation to the ground truth
 - Context files ranked by keyword relevance: issue tokens + test-file symbols
   (names the tests import/call are 2× weighted — they pinpoint the module under test)
   over-long context truncated rather than blindly dumped into the prompt
@@ -90,21 +92,26 @@ The harness runs this command to determine correctness. Your patch must make it 
 
 ---
 
-Analyse the issue carefully. Answer in order:
+Analyse this test-first, then plan. Answer in order:
 
-1. **Root cause** — one or two sentences.
-2. **Hypothesis** — which specific file(s) and line range(s) need to change?
-3. **Implementation plan** — describe what you will add/change precisely, including \
-   any helper functions, error handling, or edge cases needed for a complete fix.
-4. **Completeness check** — what else might need to change to ensure nothing \
-   related is broken? List any secondary files.
-5. **Test check** — given the test above, will `{test_cmd_short}` pass? Walk through the assertion.
+1. **Test contract** — what exactly does the test assert? List each assertion, \
+   the function/class/method it calls, the expected input → output or behaviour. \
+   This is the ground truth your implementation must satisfy.
+2. **Root cause** — given the test contract, what is currently missing or wrong in \
+   the source files?
+3. **Hypothesis** — which specific file(s) and line range(s) need to change? Be exact.
+4. **Implementation plan** — starting from the test contract, describe what you will \
+   add/change: function signatures, return types, helper logic, error handling, \
+   edge cases. Every assertion in the test must map to something in your plan.
+5. **Completeness check** — what secondary files or side effects (imports, exports, \
+   constants, type annotations) also need updating?
 
-Be precise and thorough — a complete implementation scores higher than a minimal stub.
+Be precise and thorough — a complete implementation that handles all test cases and \
+edge cases scores higher than a minimal stub.
 """
 
 TEST_SECTION_TEMPLATE = """\
-## Test files (must pass — read these first to understand expected behaviour)
+## Test files (read first — these define the contract your implementation must satisfy)
 {test_files}
 
 """
@@ -112,12 +119,15 @@ TEST_SECTION_TEMPLATE = """\
 ACT_PROMPT = """\
 Based on your analysis above, produce the unified diff.
 
+Before writing: mentally verify each test assertion from step 1 of your analysis \
+maps to a concrete line in your diff. If any assertion is unaccounted for, add it.
+
 Requirements:
 - Start with `diff --git a/<path> b/<path>`
 - Include `--- a/<path>` and `+++ b/<path>` headers
 - Each hunk starts with `@@ -<start>,<count> +<start>,<count> @@`
-- Implement the fix completely — include helper functions, proper error \
-  handling, and any secondary changes identified in your plan
+- Every test assertion from your plan must be satisfied by your diff
+- Include helper functions, proper error handling, and secondary file changes
 - Do NOT change unrelated logic, but do implement the full fix as described
 - Higher-quality, complete implementations score better than minimal stubs
 - Output ONLY the diff — no markdown fences, no prose
