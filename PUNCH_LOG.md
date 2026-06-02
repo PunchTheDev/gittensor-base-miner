@@ -4,6 +4,30 @@ Milestone trail for the base-miner benchmark. Discord is the primary channel; th
 
 ---
 
+## 2026-06-02 — Three agent correctness fixes (commits ceaccbd, 3e7abea)
+
+**What shipped**:
+
+**Plan-early-act extraction** (`agent/example/agent.py`):
+- Root cause: DeepSeek/deepseek-chat sometimes generates the full diff inside the PLAN response instead of waiting for the ACT prompt. The ACT step then returns nothing because the model thinks it already answered. This caused 4 wasted API calls (1 ACT + 3 empty-retry repair loops) and a zero-score result.
+- Fix: after the PLAN call, check if the response contains a valid diff (`_looks_valid`). If yes, extract it and use it directly — skip the ACT call entirely. The plan diff is stored in history as the ACT turn so the verify/repair loop proceeds normally.
+- Problem 0774 now produces a real patch instead of an empty one.
+
+**Trailing whitespace stripped from diff lines** (`agent/example/agent.py`):
+- Root cause: models generate blank continuation lines inside diffs as `+    ` (spaces) instead of `+` (empty). `git apply` rejects these with "corrupt patch" when the source file has no trailing whitespace.
+- Fix: added `_strip_diff_trailing_whitespace` as the final step of `_post_process`. Strips trailing whitespace from `+` and ` ` (context) lines only — never touches `-` lines since those must match the file exactly.
+
+**Baselines lookup format fix** (`gitminer.py`):
+- Root cause: `baselines.json` format is `{"count": N, "mean_score": X, "problems": [...]}` (dict with nested list), but `cmd_run` was iterating over the top-level dict (iterating its string keys) and calling `.get()` on them — causing `AttributeError: 'str' object has no attribute 'get'`.
+- Fix: read `baselines_data["problems"]` when `baselines_data` is a dict; fall back to direct list iteration for backward compat.
+
+### Status
+- Agent: plan-early-act + trailing whitespace + baseline lookup bugs fixed (commits ceaccbd, 3e7abea)
+- All fixes pushed to GitHub main branch
+- Next DAS pool check: ~2026-06-16
+
+---
+
 ## 2026-06-02 — Agent on-ramp, PM2 management, pipeline hardening
 
 **What shipped**:
