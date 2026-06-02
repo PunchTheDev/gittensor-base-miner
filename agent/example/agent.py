@@ -342,8 +342,13 @@ The diff you produced is not a valid unified diff.
 
 Problem: {problem}
 
-Please output a valid unified diff starting with `diff --git` and containing \
-at least one `@@` hunk. Nothing else.
+Your last diff:
+```
+{diff}
+```
+
+Fix the specific problem listed above and output a corrected unified diff \
+starting with `diff --git` and containing at least one `@@` hunk. Nothing else.
 """
 
 # Language-specific notes appended to SYSTEM_PROMPT when detected
@@ -1510,7 +1515,7 @@ class ExampleAgent(BaseAgent):
 
             if problem_desc:
                 # Structural problem — give targeted feedback before asking for repair
-                repair_msg = REPAIR_FORMAT_PROMPT.format(problem=problem_desc)
+                repair_msg = REPAIR_FORMAT_PROMPT.format(problem=problem_desc, diff=diff)
                 history.append({"role": "user", "content": repair_msg})
                 raw_diff = _call(history, self.model, api_key, act_tokens, act_timeout, temperature=0)
                 diff = _post_process(_extract_diff(raw_diff))
@@ -1604,8 +1609,8 @@ class ExampleAgent(BaseAgent):
         # One structural validation pass
         if not _looks_valid(diff):
             problem_desc = _diagnose_diff(diff)
-            history.append({"role": "assistant", "content": raw_diff})
-            history.append({"role": "user", "content": REPAIR_FORMAT_PROMPT.format(problem=problem_desc)})
+            history.append({"role": "assistant", "content": diff})
+            history.append({"role": "user", "content": REPAIR_FORMAT_PROMPT.format(problem=problem_desc, diff=diff)})
             raw_diff = _call(history, self.model, api_key, act_tokens, act_timeout, temperature=0)
             diff = _post_process(_extract_diff(raw_diff))
             log.append(f"[repair format fix]\n{diff}")
