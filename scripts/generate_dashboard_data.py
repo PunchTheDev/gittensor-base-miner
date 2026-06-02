@@ -122,7 +122,7 @@ def main(out_path: str | None = None):
         "generated_at": date.today().isoformat(),
         "pool_size": len(problems),
         "shard_size": 30,
-        "oracle_score": 22.76,
+        "oracle_score": 22.83,
         "repos": by_repo,
         "leaderboard": leaderboard,
         "history": history,

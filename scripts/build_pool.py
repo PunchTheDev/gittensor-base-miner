@@ -92,6 +92,19 @@ def has_test_files(diff: str) -> bool:
     )
 
 
+def has_additions(diff: str) -> bool:
+    """True if the diff adds at least 5 lines of code (not deletion-only).
+
+    Deletion-only diffs score 0 on our token-overlap metric regardless of
+    whether the agent solves the problem correctly, so they make bad benchmarks.
+    """
+    added = [
+        line for line in diff.splitlines()
+        if line.startswith("+") and not line.startswith("+++")
+    ]
+    return len(added) >= 5
+
+
 def is_substantive(pr: dict) -> bool:
     """True if the PR has meaningful scored code changes."""
     return (
@@ -302,6 +315,10 @@ def curate_pr(
 
     if not has_test_files(diff):
         print(f"  Skip {repo}#{pr_number}: no test files in diff")
+        return False
+
+    if not has_additions(diff):
+        print(f"  Skip {repo}#{pr_number}: deletion-only diff (scores 0 on token-overlap)")
         return False
 
     if dry_run:
