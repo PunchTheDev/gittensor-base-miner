@@ -314,6 +314,16 @@ Improvements over a naive single-shot approach:
   `.assert_not_called()`, `.assert_any_call()`, `.assert_has_calls()`.  Root cause: mock
   assertions appear as `variable.method.assert_*()` — the variable name is not fixed, so prefix
   matching is impossible.  452 occurrences in pool; now visible to the verify cross-check.
+- `_extract_assertions` async Jest/Vitest + Node.js assert module patterns: added
+  `await expect(` (async Jest/Vitest expectations — 1,627 occurrences in pool across 52
+  problems, completely invisible before), `assert.equal(`, `assert.deepEqual(`,
+  `assert.notEqual(`, `assert.throws(`, `assert.match(`, `assert.doesNotMatch(` (Node.js
+  built-in assert module, distinct from Go testify's `assert.Equal`), and `t.Error(` (Go
+  standard testing non-fatal counterpart to `t.Fatal`).  Root causes: `await expect(` starts
+  with `await`, not `expect`, so the bare `expect(` prefix missed every async assertion;
+  Node.js `assert.*` uses lowercase which doesn't match testify's `assert.Equal(` (uppercase).
+  Affected repos: jsonbored/gittensory (31 problems), jsonbored/awesome-claude (21 problems),
+  infiniflow/ragflow async test suites, and any Go test using `t.Error`.
 """
 
 from __future__ import annotations
@@ -1473,8 +1483,9 @@ def _extract_assertions(test_files: list[FileContext], limit: int = 50) -> str:
 
     Caps at `limit` lines to keep the verify prompt compact.  Recognises
     assert styles for Python (pytest + unittest.TestCase self.assert*), Rust,
-    Go (testify), TypeScript/Jest, Kotlin (kotlin.test), Java, Ruby Minitest,
-    Rails integration tests, and Python mock/spy assertions (contains check).
+    Go (testify + t.Error/t.Fatal), TypeScript/Jest (sync + async await expect),
+    Kotlin (kotlin.test), Java, Ruby Minitest, Rails integration tests,
+    Node.js built-in assert module, and Python mock/spy assertions (contains check).
     """
     _ASSERT_PREFIXES = (
         "assert ",          # Python / general
@@ -1566,6 +1577,21 @@ def _extract_assertions(test_files: list[FileContext], limit: int = 50) -> str:
         # Kotlin kotlin.test — not matched by bare "assert" (no space/paren suffix)
         "assertIs<",           # type assertion: assertIs<AgentEvent.FinalAnswer>(result)
         "assertContains(",     # collection/string contains: assertContains(list, item)
+        # Jest / Vitest async assertions — `await expect(promise).resolves.toBe(…)`
+        # The bare `expect(` prefix above only captures synchronous calls starting with
+        # `expect(`; async variants start with `await`, so they need a separate prefix.
+        "await expect(",
+        # Node.js built-in `assert` module (lowercase) — distinct from testify `assert.Equal`
+        # These appear in JS/TS test suites that import `assert` from 'node:assert'.
+        "assert.equal(",       # strict equality
+        "assert.deepEqual(",   # deep structural equality
+        "assert.notEqual(",    # strict not-equal
+        "assert.throws(",      # sync throw check
+        "assert.match(",       # regex match (Node 16+)
+        "assert.doesNotMatch(", # regex non-match
+        # Go standard `testing.T` non-fatal assertion variant
+        # `t.Fatal` is already covered; `t.Error` is the non-aborting counterpart.
+        "t.Error(",
     )
     # Mock/spy assertions: `mock_obj.assert_called_once_with(...)` — variable name varies
     # so we can't match by prefix.  Check if the stripped line contains these substrings.
