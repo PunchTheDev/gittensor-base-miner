@@ -197,6 +197,11 @@ def cmd_submit(args: argparse.Namespace) -> None:
 
     print(f"\nAgent SHA-256: {sha}")
 
+    # Write meta.json so CI can populate the leaderboard model column
+    import json as _json
+    meta_path = agent_path.parent / "meta.json"
+    meta_path.write_text(_json.dumps({"handle": handle, "model": model, "sha256": sha}, indent=2))
+
     if args.open_pr:
         # Stage, commit, push, and open PR automatically
         try:
@@ -205,7 +210,7 @@ def cmd_submit(args: argparse.Namespace) -> None:
             # Branch may already exist
             _sp.run(["git", "checkout", branch], check=True)
 
-        _sp.run(["git", "add", str(agent_path)], check=True)
+        _sp.run(["git", "add", str(agent_path), str(meta_path)], check=True)
         _sp.run(
             ["git", "commit", "-m", f"Submit {handle} agent\n\nagent-sha256: {sha}"],
             check=True,
@@ -225,7 +230,7 @@ def cmd_submit(args: argparse.Namespace) -> None:
     print(f"\n{'─'*60}")
     print("Run these commands to open your submission PR:\n")
     print(f"  git checkout -b {branch}")
-    print(f"  git add {agent_path}")
+    print(f"  git add {agent_path} {meta_path.name}")
     print(f'  git commit -m "Submit {handle} agent\n\nagent-sha256: {sha}"')
     print(f"  git push -u origin {branch}")
     print()

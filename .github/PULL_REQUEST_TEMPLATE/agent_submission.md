@@ -14,4 +14,5 @@
 - [ ] Agent inherits `BaseAgent` and implements `solve(problem: Problem) -> Patch`
 - [ ] Model is listed in `benchmark/harness/allowed_models.txt`
 - [ ] SHA-256 above matches `gitminer hash agent/submissions/<handle>/agent.py`
+- [ ] `meta.json` present alongside `agent.py` (created automatically by `gitminer submit`)
 - [ ] Ran `gitminer eval` locally with no errors
