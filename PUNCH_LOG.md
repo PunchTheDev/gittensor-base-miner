@@ -198,3 +198,23 @@ Added `gitminer run` command (commit dddee08) — the missing inner development 
 **README + CONTRIBUTING.md** updated with examples.
 
 Pending: OPENROUTER_KEY verification, Gittensor registration.
+
+---
+
+## 2026-06-02 — Improved example agent + calibration correction
+
+### Example agent upgrade (commit 1722327)
+
+Rewrote `agent/example/agent.py` with three meaningful improvements over the old observe→plan→act→verify baseline:
+
+1. **Context file ranking** — `_rank_files()` scores each file by keyword overlap with the issue (paths mentioned, identifiers extracted). Most relevant files go first. `_truncate_context()` caps at 20 files / 40k chars — agents no longer dump all context blindly.
+
+2. **Structural diff validation** — `_diagnose_diff()` goes beyond the basic `@@` presence check. It parses each hunk header against `@@ -N,N +N,N @@` and returns a precise description of the first problem found. The repair loop uses this targeted feedback instead of a generic "invalid diff" message.
+
+3. **Wider repair window** — 3 attempts (up from 2), with format vs. semantic failures handled separately so repair effort isn't wasted on the wrong problem.
+
+### Calibration correction
+
+Updated all 3-5× calibration notes to reflect actual measured data: local scores run ~2× above DAS (measured across 289 reference diffs with known DAS scores: local mean 23.47 vs DAS mean 10.78). Updated in `score.py`, `gitminer.py`, and `results/baselines.json`.
+
+Pending: OPENROUTER_KEY verification, Gittensor registration.
