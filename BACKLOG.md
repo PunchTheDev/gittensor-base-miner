@@ -7,9 +7,11 @@ Items move here from STATE.md when they become long-term improvement opportuniti
 
 ## Operator Actions (blocking registration)
 
-- [ ] Add `OPENROUTER_KEY` as GitHub Actions secret (benchmark repo)
-- [ ] Add `DASHBOARD_DEPLOY_TOKEN` as GitHub Actions secret (benchmark repo)
-- [ ] Confirm frozen model preference (default: `anthropic/claude-3-5-haiku`)
+- [x] Add `OPENROUTER_KEY` GitHub Actions secret — set as environment secret in "Github Actions Environment"
+- [x] Add `DASHBOARD_DEPLOY_TOKEN` GitHub Actions secret — set automatically via gh auth token
+- [x] Add `SHARD_SECRET` GitHub Actions secret — set automatically (random 32-byte hex)
+- [x] Confirm frozen model preference — `deepseek/deepseek-chat` (operator confirmed)
+- [ ] Verify `OPENROUTER_KEY` value in "Github Actions Environment" is the correct production key
 - [ ] Submit repo for Gittensor registration and wait for team approval
 
 See `REGISTRATION.md` for the full step-by-step checklist.
@@ -21,7 +23,7 @@ See `REGISTRATION.md` for the full step-by-step checklist.
 ### Pool Quality
 - [ ] Multi-language test inference: improve `infer_test_cmd` for JS/TS/Rust/Go repos (currently Python-biased)
 - [ ] Issue template: "Nominate a problem" — let community suggest PRs for pool curation
-- [ ] Reference-diff baseline: run Docker scorer against all 325 reference diffs, store baseline scores in `results/baselines.json`
+- [x] Reference-diff baseline: `scripts/baseline_scores.py` scores all 325 reference diffs, stores `results/baselines.json` (mean 22.79, median 26.34)
 
 ### Scoring Calibration
 - [ ] Calibrate 0–30 local scores against Gittensor validator outputs once we have live validator access

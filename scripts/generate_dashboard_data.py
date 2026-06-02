@@ -12,14 +12,27 @@ RESULTS_DIR = REPO_ROOT / "results"
 ORACLE_ROW = {
     "rank": None,
     "agent": "Oracle (accepted solution)",
-    "score": 21.60,
+    "score": 22.79,
     "model": "—",
     "date": "—",
-    "note": "Upper bound",
+    "note": "Mean baseline (local heuristic)",
 }
 
 
+def load_baselines() -> dict[str, float]:
+    """Load per-problem baseline scores from results/baselines.json."""
+    baseline_file = RESULTS_DIR / "baselines.json"
+    if not baseline_file.exists():
+        return {}
+    try:
+        data = json.loads(baseline_file.read_text())
+        return {p["id"]: p["base_score"] for p in data.get("problems", [])}
+    except Exception:
+        return {}
+
+
 def load_problems():
+    baselines = load_baselines()
     problems = []
     for p in sorted(PROBLEMS_DIR.iterdir()):
         meta_file = p / "meta.json"
@@ -35,9 +48,10 @@ def load_problems():
         pr = meta.get("pr_number")
         issue = meta.get("issue_number")
         issue_body = meta.get("issue_body") or ""
+        pid = meta.get("id")
         problems.append(
             {
-                "id": meta.get("id"),
+                "id": pid,
                 "repo": repo,
                 "pr": pr,
                 "issue": issue,
@@ -49,6 +63,7 @@ def load_problems():
                 "das_token_score": float(meta.get("das_token_score") or 0),
                 "das_structural_score": float(meta.get("das_structural_score") or 0),
                 "das_total_nodes": meta.get("das_total_nodes"),
+                "baseline_score": baselines.get(pid),
                 "test_cmd": meta.get("test_cmd") or [],
                 "base_commit": meta.get("base_commit", ""),
                 "pr_url": f"https://github.com/{repo}/pull/{pr}",
@@ -97,7 +112,7 @@ def main(out_path: str | None = None):
         "generated_at": date.today().isoformat(),
         "pool_size": len(problems),
         "shard_size": 30,
-        "oracle_score": 21.60,
+        "oracle_score": 22.79,
         "repos": by_repo,
         "leaderboard": leaderboard,
         "history": history,
