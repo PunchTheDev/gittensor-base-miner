@@ -186,12 +186,17 @@ Your diff:
 {diff}
 ```
 
-Test output (last 60 lines):
+Test output:
 ```
 {test_output}
 ```
 
-Diagnose the failure — look at the assertion error, traceback, or missing import. \
+Diagnose the failure. The most common causes are:
+- Wrong logic: assertion error shows expected vs actual value
+- Missing symbol: `ImportError`, `NameError`, or `AttributeError` — add the import or define the symbol
+- Wrong line numbers in diff: hunk didn't apply → check file line numbers
+- Incomplete implementation: test calls a function/method that isn't defined yet
+
 Then produce a corrected unified diff that fixes the root cause and makes the tests pass.
 
 Requirements:
@@ -559,6 +564,22 @@ def _format_files(files: list[FileContext], keywords: set[str] | None = None) ->
 # ---------------------------------------------------------------------------
 
 
+def _trim_test_output(output: str, head: int = 30, tail: int = 50) -> str:
+    """Return the first `head` + last `tail` lines of test output with a gap marker.
+
+    Pytest and cargo test put the assertion failure near the top (most useful for
+    diagnosing the wrong logic) and the summary at the bottom. Showing both ends
+    beats showing only the last N lines, especially for long test suites.
+    """
+    lines = output.splitlines()
+    if len(lines) <= head + tail:
+        return output
+    omitted = len(lines) - head - tail
+    top = "\n".join(lines[:head])
+    bottom = "\n".join(lines[-tail:])
+    return f"{top}\n... [{omitted} lines omitted] ...\n{bottom}"
+
+
 def _looks_valid(diff: str) -> bool:
     """Must start with `diff --git` and contain at least one hunk."""
     return diff.startswith("diff --git") and "@@" in diff
@@ -801,7 +822,7 @@ class ExampleAgent(BaseAgent):
             title=problem.issue_title,
             test_cmd=test_cmd_str,
             diff=failed_patch.diff,
-            test_output=test_output[-3000:],
+            test_output=_trim_test_output(test_output),
         )
         history: list[dict[str, str]] = [
             {"role": "system", "content": SYSTEM_PROMPT},
