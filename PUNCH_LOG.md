@@ -4,6 +4,37 @@ Milestone trail for the base-miner benchmark. Discord is the primary channel; th
 
 ---
 
+## 2026-06-02 — Marginal-gain mechanics + difficulty weighting (commits 882686f, 8963281, ca98c25, f8cb706)
+
+### Core mechanics gap closed per Lando check-in
+
+**Marginal-gain emission formula** (commit 882686f):
+
+Lando flagged that "top score wins" proportional share wasn't the mechanic he wanted. Fixed:
+
+```
+contribution_weight = (score × 1.0 + max(0, score - sota_at_submission) × 3.0) × label_mult × time_decay
+```
+
+Every passing submission earns the participation term (1.0×). Beating SOTA earns the champion premium (3.0×) on each point above the bar. A copycat at exact SOTA earns only participation — the champion earns 67%+ more for the same score delta. `record_result.py` now captures `sota_at_submission`, `marginal_gain`, and `contribution_weight` per entry.
+
+**Difficulty-weighted mean score** (commit 8963281):
+
+Problems classified by reference diff size: Easy <30 lines (1.0×), Medium 30–149 (1.5×), Hard 150+ (2.0×). `evaluate.py` now computes and returns `weighted_mean_score` alongside `mean_score`. `record_result.py` stores `weighted_score` in leaderboard entries. Ranking sorts by weighted score first.
+
+**Dashboard + CLI** (commits ca98c25, f8cb706):
+
+- Leaderboard table: added Weighted Score and Marginal Gain columns
+- Marginal gain shown in green when >0, muted when 0 (copy/no-improvement)
+- Models section: added OpenRouter wiring snippet with `export OPENROUTER_KEY` and eval command
+- `gitminer.py eval` CLI: now prints both Mean and Weighted Mean scores
+
+### Status
+- All mechanics now answer Lando's marginal-gain question
+- Dashboard visible difference when first submissions arrive
+
+---
+
 ## 2026-06-02 — _fix_hunk_offsets stripped-content fallback (commit eec6a88)
 
 ### Agent: context-line fingerprint now handles indentation mismatches
