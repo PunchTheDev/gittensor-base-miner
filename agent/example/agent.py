@@ -133,6 +133,13 @@ Improvements over a naive single-shot approach:
   actual file content, and corrects N if the match is unambiguous. Handles off-by-N errors
   that `_fix_hunk_counts` cannot fix (it only corrects b/d counts, not the start offset).
   Safe fallback: if no match or multiple matches, the original N is kept.
+- Context line whitespace repair: `_fix_context_lines()` replaces context lines that differ
+  from the source only in whitespace (tabs vs spaces, stripped trailing whitespace). `git
+  apply` rejects hunks where context lines don't match exactly — even a single space/tab
+  difference causes failure. Applied after `_fix_hunk_offsets` so the start offset is
+  already correct; only replaces when the stripped content matches exactly (safety guard
+  ensures we never silently move a hunk to the wrong location). This is stage 5 of 6 in
+  `_post_process`.
 """
 
 from __future__ import annotations
@@ -296,7 +303,8 @@ Requirements:
   NOT include ` N | ` in your diff; write the actual file content only. Test files \
   are windowed without line numbers since you do not write diffs against them.
 - **Context lines**: include exactly 3 unchanged lines before and after each \
-  change — this is required for `git apply` to locate the change correctly
+  change — copy them verbatim from the source file display (same characters, \
+  same whitespace) — even a space/tab difference causes `git apply` to fail
 - Every test assertion from your plan must be satisfied by your diff
 - Include helper functions, proper error handling, and secondary file changes
 - **New test files**: if the prompt shows "New test files", include them verbatim \
@@ -1490,6 +1498,78 @@ def _fix_hunk_offsets(diff: str, file_lookup: dict[str, str]) -> str:
     return "\n".join(result)
 
 
+def _fix_context_lines(diff: str, file_lookup: dict[str, str]) -> str:
+    """Replace context lines that differ from the source only in whitespace.
+
+    `git apply` matches context lines exactly — even a tab-vs-spaces difference
+    causes it to reject an otherwise correct hunk.  This most often happens when:
+      - The model writes leading spaces where the source has tabs (or vice versa)
+      - The model strips trailing whitespace that the source retains
+
+    Safety rule: only replace a context line when its stripped content matches
+    the source exactly (so we never silently move a change to the wrong location).
+
+    Applied after `_fix_hunk_offsets` so the `@@ -N` start offsets are already
+    corrected; using corrected offsets to look up source lines is reliable.
+    New-file hunks (`@@ -0,0 ...`) are skipped — there is no source to compare.
+    """
+    lines = diff.split("\n")
+    result: list[str] = []
+    file_lines: list[str] | None = None
+    hunk_old_start: int = 0
+    line_cursor: int = 0  # tracks current position in the old file (1-indexed)
+
+    i = 0
+    while i < len(lines):
+        line = lines[i]
+
+        m_git = re.match(r"^diff --git a/(.*) b/(.*)$", line)
+        if m_git:
+            b_path = m_git.group(2)
+            content = file_lookup.get(b_path) or file_lookup.get(m_git.group(1))
+            file_lines = content.splitlines() if content else None
+            hunk_old_start = 0
+            line_cursor = 0
+            result.append(line)
+            i += 1
+            continue
+
+        m_hunk = re.match(r"^@@ -(\d+)(?:,\d+)? \+\d+(?:,\d+)? @@", line)
+        if m_hunk:
+            hunk_old_start = int(m_hunk.group(1))
+            line_cursor = hunk_old_start
+            result.append(line)
+            i += 1
+            continue
+
+        # Context line: starts with a space (not +++/---)
+        if (
+            line.startswith(" ")
+            and file_lines is not None
+            and hunk_old_start > 0          # inside a real hunk (not new-file)
+            and line_cursor >= 1
+            and line_cursor <= len(file_lines)
+        ):
+            source_line = file_lines[line_cursor - 1]  # 0-indexed
+            diff_content = line[1:]  # strip leading space
+            # Replace only when stripped content matches — ensures correct location
+            if diff_content.strip() == source_line.strip() and diff_content != source_line:
+                result.append(" " + source_line)
+                line_cursor += 1
+                i += 1
+                continue
+
+        # Advance line_cursor for all diff content lines
+        if line.startswith(" ") or (line.startswith("-") and not line.startswith("---")):
+            line_cursor += 1
+        # `+` lines don't advance old-file cursor
+
+        result.append(line)
+        i += 1
+
+    return "\n".join(result)
+
+
 def _post_process(diff: str, file_lookup: dict[str, str] | None = None) -> str:
     """Strip display artifacts, trim trailing prose, fix headers and hunk metadata.
 
@@ -1501,13 +1581,15 @@ def _post_process(diff: str, file_lookup: dict[str, str] | None = None) -> str:
       2. Trim trailing prose
       3. Insert missing --- a/ +++ b/ headers (before hunk offset correction)
       4. Correct wrong @@ -N start offsets via context-line matching (needs headers)
-      5. Recompute @@ -a,b +c,d counts from actual hunk content
+      5. Fix context lines that differ from source only in whitespace (safe: strip-match guard)
+      6. Recompute @@ -a,b +c,d counts from actual hunk content
     """
     diff = _strip_line_number_prefixes(diff)
     diff = _trim_trailing_prose(diff)
     diff = _fix_diff_headers(diff)
     if file_lookup:
         diff = _fix_hunk_offsets(diff, file_lookup)
+        diff = _fix_context_lines(diff, file_lookup)
     diff = _fix_hunk_counts(diff)
     return diff
 
