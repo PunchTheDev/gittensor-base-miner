@@ -44,21 +44,17 @@ def repo_category(repo: str) -> str:
     return REPO_CATEGORY.get(repo.lower(), REPO_CATEGORY.get(repo, "other"))
 
 
-def difficulty_tier(baseline_score: float | None) -> str:
-    """Classify a problem by difficulty based on oracle (reference) baseline score.
+def difficulty_tier(added_lines: int) -> str:
+    """Classify a problem by difficulty based on reference diff added-line count.
 
-    Higher baseline = richer diff = more AST tokens = harder to fully match.
-    Lower baseline = surgical fix = precise match required = also hard but in a different way.
-    We use three tiers that approximately thirds the pool:
-      easy   >= 15  (rich diffs, many AST changes, agent has more signal)
-      medium  5–15  (moderate-sized fixes)
-      hard   <  5   (tiny or very targeted changes, hardest to reproduce exactly)
+    Mirrors evaluate.py DIFFICULTY_TIERS so dashboard badges match scoring weights:
+      easy   < 30 added lines  (weight 1.0×) — surgical, targeted fixes
+      medium  30–149            (weight 1.5×) — moderate changes
+      hard   >= 150             (weight 2.0×) — substantial additions; highest scoring weight
     """
-    if baseline_score is None:
-        return "medium"
-    if baseline_score >= 15:
+    if added_lines < 30:
         return "easy"
-    if baseline_score >= 5:
+    if added_lines < 150:
         return "medium"
     return "hard"
 
@@ -175,7 +171,7 @@ def load_problems():
                 "id": pid,
                 "repo": repo,
                 "category": cat,
-                "difficulty": difficulty_tier(b_score),
+                "difficulty": difficulty_tier(stats["add"]),
                 "pr": pr,
                 "issue": issue,
                 "title": (meta.get("issue_title") or "")[:120],
