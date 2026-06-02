@@ -231,6 +231,17 @@ Improvements over a naive single-shot approach:
   the model what it needs to spot wrong offsets and context-line whitespace mismatches that
   `_fix_hunk_offsets` / `_fix_context_lines` post-processors may not have caught. Limited
   to 6 hunks (~1 KB addition to the verify prompt) to keep token usage small.
+- Structural summary in compact history: `_structural_summary()` extracts function/class/method
+  declaration lines from implementation files and injects them into the compacted observe
+  message used during verify/repair. Previously, after history compaction the verify model
+  only saw file names ("files in scope: scoring.py, constants.py") with no knowledge of
+  what functions/classes those files contain. The structural summary shows e.g.:
+  `[scoring.py ← changed] / def compute_score / def apply_penalty / def filter_repos`
+  so the verify model can check: "Does the diff add every required symbol?" and "Is there
+  a function that should have been modified but wasn't?" — completeness checks that file
+  names alone cannot support. Prioritises changed files (marked "← changed") over unchanged
+  ones; capped at ~3 KB total so it doesn't blow the verify prompt size budget. Functions
+  `_extract_file_signatures()` and `_changed_paths_from_diff()` support this.
 """
 
 from __future__ import annotations
@@ -1733,6 +1744,111 @@ def _fix_context_lines(diff: str, file_lookup: dict[str, str]) -> str:
     return "\n".join(result)
 
 
+def _extract_file_signatures(content: str, lang: str) -> list[str]:
+    """Return declaration lines (function/class/method) from a source file.
+
+    Extracts structural top-level names so the verify step can confirm the
+    diff adds the expected symbols without re-reading the full file content.
+    Only returns short declaration lines — long signatures are trimmed.
+    """
+    lines = content.splitlines()
+    sigs: list[str] = []
+    pat: re.Pattern | None = None
+
+    if lang == "py":
+        # Match both top-level and class-body declarations (indented methods)
+        pat = re.compile(r"^\s*(class\s+\w|def\s+\w|async def\s+\w)")
+    elif lang == "go":
+        pat = re.compile(r"^(func\s+|type\s+\w+\s+(struct|interface))")
+    elif lang in ("ts", "tsx", "js", "jsx"):
+        pat = re.compile(
+            r"^\s*(export\s+(function|class|interface|type|const|let|enum)\s+\w|"
+            r"(async\s+)?function\s+\w|class\s+\w|"
+            r"(public|private|protected|async|static)(\s+(public|private|protected|async|static))*\s+\w+\s*\()"
+        )
+    elif lang == "rs":
+        pat = re.compile(
+            r"^\s*(pub(\s*\(\s*crate\s*\))?\s+(async\s+)?(fn|struct|enum|trait|type)\s+|"
+            r"(async\s+)?fn\s+\w|impl\s+)"
+        )
+    elif lang in ("kt", "java", "scala"):
+        pat = re.compile(
+            r"^\s*(fun\s+\w|(suspend\s+)?fun\s+\w|class\s+\w|data class\s+\w|"
+            r"interface\s+\w|object\s+\w|enum class\s+\w|abstract class\s+\w|"
+            r"(public|private|protected|override)\s+(fun|class|interface)\s+\w)"
+        )
+    elif lang == "rb":
+        pat = re.compile(r"^\s*(def\s+\w|class\s+\w|module\s+\w)")
+
+    if pat is None:
+        return []
+
+    for line in lines:
+        if pat.match(line.rstrip()):
+            trimmed = line.rstrip()
+            # Trim very long lines (e.g. long parameter lists)
+            if len(trimmed) > 80:
+                trimmed = trimmed[:77] + "..."
+            sigs.append("  " + trimmed.lstrip())
+
+    return sigs
+
+
+def _structural_summary(
+    impl_files: list[FileContext],
+    changed_paths: set[str],
+    max_chars: int = 3000,
+) -> str:
+    """Build a compact structural summary of implementation files.
+
+    Prioritises files that appear in the diff so the verify step can check
+    those files for completeness. Other files get just their path listed.
+
+    The summary replaces the raw source content in the compacted history,
+    giving the verify model enough structural context to answer:
+    "Does the diff add every required function/method to the right file?"
+    without re-reading full file bodies.
+    """
+    parts: list[str] = []
+    chars_used = 0
+
+    # Show signatures for changed files first, then others
+    ordered = sorted(impl_files, key=lambda f: (f.path not in changed_paths, f.path))
+
+    for f in ordered:
+        if chars_used >= max_chars:
+            break
+        ext = f.path.rsplit(".", 1)[-1].lower() if "." in f.path else ""
+        sigs = _extract_file_signatures(f.content, ext)
+
+        if sigs:
+            header = f.path + ("  ← changed" if f.path in changed_paths else "")
+            block = f"[{header}]\n" + "\n".join(sigs[:12])  # cap per-file at 12
+        else:
+            block = f"[{f.path}]"
+
+        if chars_used + len(block) > max_chars:
+            # Add header-only if full block doesn't fit
+            block = f"[{f.path}]"
+        parts.append(block)
+        chars_used += len(block) + 1
+
+    return "\n".join(parts)
+
+
+def _changed_paths_from_diff(diff: str) -> set[str]:
+    """Return the set of file paths that appear in a unified diff."""
+    paths: set[str] = set()
+    for line in diff.splitlines():
+        if line.startswith("diff --git "):
+            m = re.match(r"^diff --git a/.+ b/(.+)$", line)
+            if m:
+                paths.add(m.group(1))
+        elif line.startswith("+++ b/"):
+            paths.add(line[6:].strip())
+    return paths
+
+
 def _hunk_source_snippets(
     diff: str,
     file_lookup: dict[str, str],
@@ -2160,15 +2276,20 @@ class ExampleAgent(BaseAgent):
         # the full source-file context to have any chance of producing a correct
         # diff — compacting here would leave them with only the issue title and
         # file names, which is insufficient to write accurate code.
+        # Build structural summary for compaction: function/class signatures from
+        # implementation files give the verify step enough context to check that
+        # the diff adds the expected symbols — without re-sending full file bodies.
+        # Prioritise files that appear in the diff (mark them "← changed").
+        changed_paths = _changed_paths_from_diff(diff)
+        struct_summary = _structural_summary(selected_impl, changed_paths)
         compact_observe = (
             f"[Earlier context: {problem.repo_name} — issue: {problem.issue_title} — "
-            f"files in scope: {', '.join(f.path for f in all_context[:10])}"
-            + (f" (+{len(all_context) - 10} more)" if len(all_context) > 10 else "")
-            + f" — test: {test_cmd_str}]"
+            f"test: {test_cmd_str}]\n\n"
+            f"File signatures in scope:\n{struct_summary}"
         )
         if _looks_valid(diff):
             history[1] = {"role": "user", "content": compact_observe}
-            log.append("[context] history compacted (act produced valid diff)")
+            log.append(f"[context] history compacted with structural summary ({len(struct_summary)} chars, {len(changed_paths)} changed files)")
         else:
             log.append("[context] history NOT compacted (act returned empty/invalid — keeping source context)")
 
