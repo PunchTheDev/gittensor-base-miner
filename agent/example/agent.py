@@ -168,6 +168,17 @@ Improvements over a naive single-shot approach:
   exception, causing the entire problem to fail with 0. Now the call is retried once on timeout;
   on a second timeout the function returns `""`, which `_diagnose_diff` catches as an empty diff
   and the format-repair loop handles gracefully rather than aborting.
+- `_fix_context_lines` extended to removal lines: `git apply` requires `-` (removal) lines to
+  match the source exactly, not just context (` `) lines. The same whitespace-correction logic
+  now applies to removal lines — if the stripped content matches but whitespace differs, the `-`
+  line is replaced with `- {source_line}`. Same safety guard: only replaces on exact stripped-
+  content match to avoid silently misplacing the removal.
+- Verify criterion 7: hunk-map completeness check added to `VERIFY_PROMPT`. Explicitly asks the
+  model to look back at its step 6 hunk map and confirm every planned file appears in the diff.
+  Previously the model could LGTM a diff that omitted a file it had planned to change.
+- `_extract_diff` fence regex generalised: was `\`\`\`(?:diff|patch)?` — now accepts any fence
+  language tag (`\`\`\`\w*`). Handles `\`\`\`text`, `\`\`\`udiff`, `\`\`\`unidiff`, etc. so
+  diffs wrapped in non-standard fences are extracted rather than silently dropped.
 - API error resilience in `_call`: OpenRouter sometimes returns a 200 with an error body
   (e.g. `{"error": {"message": "No endpoints found..."}}` instead of `choices`) — previously
   this caused a `KeyError: 'choices'` that propagated as an exception, scoring the problem 0.
@@ -386,6 +397,9 @@ Check it against these criteria:
 5. Is the implementation complete — does it handle edge cases, or is it a bare stub that \
    only handles the happy path?
 6. {new_files_check}
+7. Look back at your step 6 hunk map from earlier in this conversation. Does this diff \
+   include a change for every file path listed there? If any planned file is missing \
+   from the diff, add the necessary changes now.
 
 If the diff is correct and complete, respond with exactly: LGTM
 
@@ -1596,15 +1610,16 @@ def _fix_hunk_offsets(diff: str, file_lookup: dict[str, str]) -> str:
 
 
 def _fix_context_lines(diff: str, file_lookup: dict[str, str]) -> str:
-    """Replace context lines that differ from the source only in whitespace.
+    """Replace context/removal lines that differ from the source only in whitespace.
 
-    `git apply` matches context lines exactly — even a tab-vs-spaces difference
-    causes it to reject an otherwise correct hunk.  This most often happens when:
+    `git apply` matches context lines and removal lines exactly — even a tab-vs-spaces
+    difference causes it to reject an otherwise correct hunk.  This most often happens
+    when:
       - The model writes leading spaces where the source has tabs (or vice versa)
       - The model strips trailing whitespace that the source retains
 
-    Safety rule: only replace a context line when its stripped content matches
-    the source exactly (so we never silently move a change to the wrong location).
+    Safety rule: only replace a line when its stripped content matches the source
+    exactly (so we never silently move a change to the wrong location).
 
     Applied after `_fix_hunk_offsets` so the `@@ -N` start offsets are already
     corrected; using corrected offsets to look up source lines is reliable.
@@ -1639,24 +1654,27 @@ def _fix_context_lines(diff: str, file_lookup: dict[str, str]) -> str:
             i += 1
             continue
 
-        # Context line: starts with a space (not +++/---)
+        # Context line or removal line: both must match the source exactly for git apply.
+        is_context = line.startswith(" ")
+        is_removal = line.startswith("-") and not line.startswith("---")
         if (
-            line.startswith(" ")
+            (is_context or is_removal)
             and file_lines is not None
             and hunk_old_start > 0          # inside a real hunk (not new-file)
             and line_cursor >= 1
             and line_cursor <= len(file_lines)
         ):
             source_line = file_lines[line_cursor - 1]  # 0-indexed
-            diff_content = line[1:]  # strip leading space
+            diff_content = line[1:]  # strip leading space or minus
             # Replace only when stripped content matches — ensures correct location
             if diff_content.strip() == source_line.strip() and diff_content != source_line:
-                result.append(" " + source_line)
+                prefix = " " if is_context else "-"
+                result.append(prefix + source_line)
                 line_cursor += 1
                 i += 1
                 continue
 
-        # Advance line_cursor for all diff content lines
+        # Advance line_cursor for context and removal lines
         if line.startswith(" ") or (line.startswith("-") and not line.startswith("---")):
             line_cursor += 1
         # `+` lines don't advance old-file cursor
@@ -1824,7 +1842,7 @@ def _extract_diff(text: str) -> str:
     Also matches ` ```patch ` fences (less common but valid).
     """
     text = text.strip().replace("\r\n", "\n").replace("\r", "\n")
-    fences = list(re.finditer(r"```(?:diff|patch)?\s*\n(diff --git.+?)```", text, re.DOTALL))
+    fences = list(re.finditer(r"```\w*\s*\n(diff --git.+?)```", text, re.DOTALL))
     if fences:
         return "\n".join(m.group(1).strip() for m in fences)
     idx = text.find("diff --git")
