@@ -4,6 +4,48 @@ Milestone trail for the base-miner benchmark. Discord is the primary channel; th
 
 ---
 
+## 2026-06-02 — Verify-loop partial-repair bug fix + Kotlin sibling expansion (commits d9e6edb, a1819de)
+
+### Bug fix: back-to-back user messages on partial repair (commit d9e6edb)
+
+**Root cause**: when the verify model returned a partial repair (fewer files than the current
+diff), the loop appended `user: missing-files-message` then on the next iteration
+unconditionally appended `user: VERIFY_PROMPT` — two consecutive user messages. Some model
+backends (strict OpenAI-style APIs) reject this with a 400 error; others silently merge or
+re-order the messages, confusing the model about which diff is current.
+
+The `pending_prose_critique` flag correctly handled the prose-critique case (sends a short
+`VERIFY_FOLLOWUP_PROMPT` instead of re-appending the full VERIFY_PROMPT). The partial-repair
+case had no equivalent guard — the fix adds `pending_partial_repair = True` which causes the
+next loop iteration to call the model directly against the already-appended missing-files
+message, without prepending another user message.
+
+### Kotlin/Java/Scala sibling import expansion (commit a1819de)
+
+`_expand_sibling_imports` previously had language-specific handling for Python, TS/JS, Go,
+and Rust — but not JVM languages. For `touchpilot/touchpilot` (37 Kotlin problems), the
+agent couldn't see sealed class hierarchies, companion objects, or enum types defined in
+sibling files unless they happened to be in the top-ranked context.
+
+Fix: added `elif ext in ("kt", "java", "scala")` branch — includes all same-directory
+`.kt`/`.java`/`.scala` files within the char budget, mirroring the Go same-package heuristic.
+For a Kotlin file at `src/main/kotlin/com/example/Feature.kt`, the agent now sees all other
+`.kt` files in `src/main/kotlin/com/example/` — the `AgentEvent.kt` sealed classes,
+companion objects, etc. needed to produce a correct implementation.
+
+### Pool check: 3 new DAS repos checked
+- `mkdev11/gittensor-hub` (TypeScript/CSS frontend, UI repo) — subjective, skip
+- `e35ventura/taopedia-articles` (207 PRs, 0 with score > 5) — content repo, skip
+- `entrius/das-github-mirror` (21 PRs, 0 with score > 5) — skip
+Pool still fully saturated. Next check: ~2026-06-09.
+
+### Status
+- Benchmark: 430 problems, oracle **13.34** (tree-sitter), 20 repos (commit a1819de)
+- Agent: partial-repair bug fix, Kotlin/Java/Scala sibling expansion + all prior improvements
+- Pool: 3 new DAS repos checked, none suitable; next check ~2026-06-09
+
+---
+
 ## 2026-06-02 — Fix Ruby test_cmd for all 37 we-promise/sure problems (commit f14a9fe)
 
 ### Root cause
