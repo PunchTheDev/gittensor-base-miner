@@ -1071,3 +1071,28 @@ When verify returns a diff covering fewer files than the current diff, the previ
 - Benchmark: 423 problems, oracle 23.36 (unchanged)
 - Pool: all repos saturated — next check 2026-06-09
 - Pending: Gittensor registration, nginx hookup
+
+## 2026-06-02 — Agent: line numbers for all source files + Rust sibling expansion (commit 004b8c7)
+
+### Line numbers for all source files (commit 004b8c7)
+
+Root cause found: `_window_file` added `N | ` line-number prefixes only when a file exceeded the 300-line windowing threshold. Files under 300 lines (a majority of pool context files) were shown without any line numbers, forcing the model to count manually from the top to determine `@@ -N` hunk offsets. Manual counting under time pressure is a significant source of offset errors.
+
+Fix: when `show_line_numbers=True` and the file is not windowed, the output now also uses `N | content` format. Test files (shown with `show_line_numbers=False`) are unaffected — they don't get line numbers since the agent doesn't write diffs against them.
+
+Also updated ACT_PROMPT: "windowed **source** files show lines as `N | content`" → "all source files show lines as `N | content`" to match the new universal behavior.
+
+The `_strip_line_number_prefixes` post-processor already handles this format, so models that copy `N | ` prefixes into the diff are cleaned correctly.
+
+### Rust `use super::module` sibling import expansion (commit 004b8c7)
+
+`_expand_sibling_imports` now handles Rust `.rs` files. When a ranked impl file contains `use super::module_name;` or `use super::module_name::Symbol;` references, the expansion resolves them to `module_name.rs` or `module_name/mod.rs` in the same directory and promotes them to context if they exist in both `all_impl` and the file tree.
+
+Previously: 0 sibling expansion for Rust (57 pool problems). Go, Python, JS/TS all had sibling expansion — Rust was the only language left out. Now consistent across all 5 main languages.
+
+Also added Ruby-aware header end detection in `_compute_header_end` (last `require`/`require_relative` line + 8-line buffer) as defensive code for when Ruby problems are added to the pool.
+
+### Status
+- Benchmark: 430 problems, oracle 23.46 (unchanged)
+- Pool: all repos saturated — next check 2026-06-09
+- Pending: Gittensor registration, nginx hookup
