@@ -4,6 +4,28 @@ Milestone trail for the base-miner benchmark. Discord is the primary channel; th
 
 ---
 
+## 2026-06-02 — Context line whitespace repair (commit 870de98)
+
+### Agent: `_fix_context_lines` — 6th post-processing stage
+
+`git apply` requires context lines (` `-prefixed unchanged lines surrounding a change) to match the source file exactly. Even a single tab-vs-spaces difference causes rejection, even when the change content itself is correct.
+
+`_fix_context_lines(diff, file_lookup)`:
+- For each context line in each hunk, looks up the expected content from the source file using the (already-corrected) `@@ -N` offset as the anchor
+- If the stripped content matches exactly (`line.strip() == source_line.strip()`) but the full line differs (whitespace mismatch), replaces with the actual source content
+- Safety guard: only replaces on stripped-content match — if content is semantically different, the original is kept. This prevents silently moving a hunk to the wrong location if the offset is still wrong
+- Skips new-file hunks (`@@ -0,0 ...`) — no source to look up
+- Applied as stage 5 of 6 in `_post_process`, after `_fix_hunk_offsets` so start offsets are already corrected
+
+Also tightened ACT_PROMPT: "copy [context lines] verbatim from the source file display (same characters, same whitespace) — even a space/tab difference causes `git apply` to fail."
+
+### Status
+- Benchmark: 423 problems, oracle 23.36, 20 repos
+- Post-processing: 6-stage pipeline (strip N|, trim prose, fix headers, fix offsets, fix context whitespace, fix counts)
+- All 6 stages: deterministic, zero API calls
+
+---
+
 ## 2026-06-02 — Missing-header fix + fuzzy hunk-offset correction (commit 0ad4298)
 
 ### Agent: `_fix_diff_headers` — auto-insert missing `--- a/` / `+++ b/` headers
