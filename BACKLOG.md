@@ -22,7 +22,7 @@ See `REGISTRATION.md` for the full step-by-step checklist.
 
 ### Pool Quality
 - [x] Multi-language Docker runner: Phase 1 now uses language-specific images (node:20-slim, rust:1.82-slim, eclipse-temurin:21-jdk-jammy) so npm/cargo/gradlew tests actually run (commit ea5efe2) — fixes 44% of previously un-runnable problems
-- [ ] Issue template: "Nominate a problem" — let community suggest PRs for pool curation
+- [x] Issue template: "Nominate a problem" — `.github/ISSUE_TEMPLATE/problem_proposal.md` exists, with curation checklist
 - [x] Reference-diff baseline: `scripts/baseline_scores.py` scores all 325 reference diffs, stores `results/baselines.json` (mean 22.79, median 26.34)
 
 ### Scoring Calibration
