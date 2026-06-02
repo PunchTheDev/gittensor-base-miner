@@ -1662,3 +1662,27 @@ Three gaps, all structural:
 - Benchmark: 430 problems, oracle 13.34, 20 repos (commit `a8991c4`)
 - Agent: async Jest + Node.js assert + Go t.Error coverage added to verify
 - Pool: fully saturated; check ~2026-06-09 for new DAS registrations
+
+---
+
+## 2026-06-02 — Keyword-prioritized assertion extraction for large test files
+
+### Summary
+`_extract_assertions` now prioritizes keyword-matching assertions over sequential ones for large test files, ensuring the verify step sees the assertions relevant to the specific issue being fixed.
+
+### Root cause
+For repos like `jsonbored/gittensory`, `api.test.ts` grows as new features are added — each issue appends new `describe` / `await expect(...)` blocks at the end. The file can have 562+ assertions. With a 50-line limit, `_extract_assertions` always captured the first 50, which are the OLD assertions for existing features. The NEW assertions being tested by the current issue — the ones in keyword-relevant sections — were never seen by the verify step.
+
+### Fix (commit `bc1240d`)
+For test files over 200 lines with keywords provided:
+1. Scan all assertion lines and bucket them: **keyword-matching** (stripped line contains a keyword from issue title/body) vs **non-keyword**
+2. Fill the 50-line limit with keyword assertions first, then pad with non-keyword ones
+
+Result: in the example above, all 20 `newFeature.handle()` assertions appear in the first 20 slots, with old `oldFeature` assertions filling slots 21-50.
+
+The `keywords` argument is now passed from the verify loop call site, where it's already available as the union of issue tokens + test symbols.
+
+### Status
+- Benchmark: 430 problems, oracle 13.34, 20 repos (commit `bc1240d`)
+- Agent: keyword-prioritized assertion extraction for 31 gittensory + 21 awesome-claude problems
+- Pool: fully saturated; check ~2026-06-09 for new DAS registrations
