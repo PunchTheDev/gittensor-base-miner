@@ -4,6 +4,25 @@ Milestone trail for the base-miner benchmark. Discord is the primary channel; th
 
 ---
 
+## 2026-06-02 — _fix_hunk_offsets stripped-content fallback (commit eec6a88)
+
+### Agent: context-line fingerprint now handles indentation mismatches
+
+**Problem**: `_fix_hunk_offsets` used exact string matching to find context-line fingerprints in the source file. If the model wrote context lines with wrong indentation (e.g., 4 spaces instead of 1 tab), the fingerprint wouldn't match any source line. Offset correction silently failed. Then `_fix_context_lines` (stage 5) would fix the whitespace, but the `@@ -N` offset remained wrong — `git apply` still fails.
+
+**Fix**: Two-pass search in `find_context_offset`:
+1. Exact match (existing behavior)
+2. Stripped-content fallback when exact finds zero matches — both sides stripped, same unambiguous-match guard
+
+If the exact pass found multiple matches (ambiguous), the stripped fallback is skipped to avoid false positives. Empty-stripped fingerprints (blank lines) are also rejected. The stripped pass only triggers when exact fails cleanly — no risk of weakening the safety guard for well-formed diffs.
+
+### Status
+- Benchmark: 430 problems, oracle 23.46 (unchanged)
+- Post-processing: stage 4 (`_fix_hunk_offsets`) now more robust against indentation mismatches in context lines
+- Pool: fully saturated; check ~2026-06-09 for new DAS registrations
+
+---
+
 ## 2026-06-02 — Structural summary in compacted history (commit b21930b)
 
 ### Verify: structural context for completeness checking
