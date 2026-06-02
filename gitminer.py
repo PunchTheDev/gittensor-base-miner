@@ -360,7 +360,7 @@ def cmd_problems(args: argparse.Namespace) -> None:
             if pid_key:
                 baseline_lookup[pid_key] = entry.get("base_score", 0.0)
 
-    _LANG = {"npm": "js", "cargo": "rs", "./gradlew": "java"}
+    _LANG = {"npm": "js", "cargo": "rs", "./gradlew": "java", "go": "go"}
 
     rows = []
     for meta_path in sorted(pool_dir.glob("*/meta.json")):
@@ -1167,7 +1167,7 @@ def main() -> None:
 
     # problems
     p_problems = sub.add_parser("problems", help="List benchmark problems with optional filters")
-    p_problems.add_argument("--lang", choices=["py", "js", "rs", "java"], help="Filter by language")
+    p_problems.add_argument("--lang", choices=["py", "js", "rs", "java", "go"], help="Filter by language")
     p_problems.add_argument("--difficulty", choices=["easy", "medium", "hard"], help="Filter by difficulty")
     p_problems.add_argument("--repo", metavar="PATTERN", help="Filter by repo name substring")
     p_problems.add_argument("--search", metavar="TEXT", help="Search title or problem ID")

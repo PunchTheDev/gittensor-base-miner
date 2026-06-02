@@ -56,7 +56,9 @@ Improvements over a naive single-shot approach:
   shown pre-formatted diff blocks to copy verbatim. Affects ~60% of pool problems.
 - New implementation file detection: same logic applied to non-test source files.
   When a PR adds a new implementation file (e.g. a new Go driver or Python module),
-  the agent is explicitly notified to create it. Affects ~33% of pool problems.
+  the agent is explicitly notified to create it, with a concrete format example
+  (``new file mode 100644``, ``--- /dev/null`` header, ``@@ -0,0 +1,N @@``).
+  Affects ~33% of pool problems.
 - Hunk count auto-fix: after every diff generation, `_fix_hunk_counts()` recomputes
   the b/d fields in each `@@ -a,b +c,d @@` header from the actual content lines.
   LLMs frequently miscalculate these counts; incorrect counts cause `git apply` to
@@ -174,15 +176,28 @@ NEW_IMPL_FILES_TEMPLATE = """\
 ## New implementation files — MUST be created in your diff
 
 These source files do NOT exist in the repo at base commit — they are new files \
-added by this PR. Your diff must add each one as a new file (use \
-`new file mode 100644`, `--- /dev/null`, `+++ b/<path>`, `@@ -0,0 +1,N @@` format). \
-If any are missing, the test command will fail with an import or "file not found" error.
+added by this PR. Your diff must add each one as a new file. If any are missing, \
+the test command will fail with an import or "file not found" error.
 
 Files to create:
 {new_impl_paths}
 
+Use this exact format for each new file (replace N with total lines added):
+
+```
+diff --git a/path/to/file.ext b/path/to/file.ext
+new file mode 100644
+index 0000000..0000000
+--- /dev/null
++++ b/path/to/file.ext
+@@ -0,0 +1,N @@
++first line of file
++second line
++...
+```
+
 Implement each file fully based on the issue requirements and test contract — do \
-not leave stubs. The source files section above shows their expected structure.
+not leave stubs. The source files section above shows the expected structure.
 """
 
 ACT_PROMPT = """\
