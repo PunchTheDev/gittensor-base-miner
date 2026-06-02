@@ -870,9 +870,10 @@ def cmd_run(args: argparse.Namespace) -> None:
 
             baselines_path = REPO_ROOT / "results" / "baselines.json"
             if baselines_path.exists():
-                baselines = json.loads(baselines_path.read_text())
+                baselines_data = json.loads(baselines_path.read_text())
+                baselines = baselines_data.get("problems", baselines_data) if isinstance(baselines_data, dict) else baselines_data
                 ref_score = next(
-                    (b.get("base_score") for b in baselines if b.get("id") == args.problem),
+                    (b.get("base_score") for b in baselines if isinstance(b, dict) and b.get("id") == args.problem),
                     None,
                 )
                 if ref_score is not None:

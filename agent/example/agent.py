@@ -208,6 +208,11 @@ Improvements over a naive single-shot approach:
   the plan — causing 3 empty-retry repair loops and a wasted API budget. Now the plan diff
   is detected via `_looks_valid`, stored in history as the ACT turn, and passed directly to
   verify. Saves 4 API calls (~1 ACT + 3 empty-retries) on this failure mode.
+- Trailing whitespace stripped from `+` and context diff lines: added `_strip_diff_trailing_whitespace`
+  as the final step of `_post_process`. Models generate blank continuation lines as `+    ` (with
+  spaces) instead of `+` (empty), causing `git apply` to fail with "corrupt patch" when the source
+  file lacks matching trailing whitespace. Safe to strip `+`/` ` lines; `-` lines are never touched
+  (they must match the file exactly for git apply to work).
 - Verify token budget raised to match act: `verify_tokens = act_tokens` (was `token_budget //
   4`). When the verify step must produce a corrected diff rather than LGTM, it needs the same
   token headroom as the act step. The old 12,500-token cap could truncate a large multi-file
@@ -2289,6 +2294,25 @@ def _hunk_source_snippets(
     return HUNK_SOURCE_SECTION_TEMPLATE.format(snippets="\n\n".join(snippets))
 
 
+def _strip_diff_trailing_whitespace(diff: str) -> str:
+    """Strip trailing whitespace from added and context diff lines.
+
+    Models frequently generate blank continuation lines as '+    ' (with spaces)
+    instead of '+' (empty). These cause `git apply` to fail with "corrupt patch"
+    when the source file doesn't have matching trailing whitespace. Safe to strip:
+    we only touch `+` and ` ` (context) lines — never `-` (removed) lines since
+    those must match the file exactly.
+    """
+    lines = diff.split("\n")
+    cleaned = []
+    for line in lines:
+        if line.startswith("+") or line.startswith(" "):
+            cleaned.append(line.rstrip())
+        else:
+            cleaned.append(line)
+    return "\n".join(cleaned)
+
+
 def _post_process(diff: str, file_lookup: dict[str, str] | None = None) -> str:
     """Strip display artifacts, trim trailing prose, fix headers and hunk metadata.
 
@@ -2303,6 +2327,7 @@ def _post_process(diff: str, file_lookup: dict[str, str] | None = None) -> str:
       5. Fix context lines that differ from source only in whitespace (safe: strip-match guard)
       6. Recompute @@ -a,b +c,d counts from actual hunk content
       7. Recalculate +c new-start from corrected -N + cumulative per-file delta
+      8. Strip trailing whitespace from added/context diff lines (model artifact)
     """
     diff = _strip_line_number_prefixes(diff)
     diff = _trim_trailing_prose(diff)
@@ -2312,6 +2337,7 @@ def _post_process(diff: str, file_lookup: dict[str, str] | None = None) -> str:
         diff = _fix_context_lines(diff, file_lookup)
     diff = _fix_hunk_counts(diff)
     diff = _fix_new_starts(diff)
+    diff = _strip_diff_trailing_whitespace(diff)
     return diff
 
 
