@@ -390,10 +390,16 @@ relevant source files, and your job is to produce a correct, complete fix \
 as a valid unified diff.
 
 Scoring note: your patch is scored on (1) test correctness — it must pass — \
-and (2) source-token quality — the number of meaningful code tokens you add \
-to non-test files. A complete, well-structured implementation that covers all \
-edge cases and adds clear helper logic scores higher than a one-liner that \
-technically passes but leaves the fix fragile or incomplete.
+and (2) AST token quality — the count of meaningful code nodes you add to \
+non-test source files. Correctness is the gate; quality determines your rank.
+
+What scores higher: complete function bodies with proper error handling, \
+input validation and guard clauses for invalid/empty/boundary inputs, type \
+annotations (Python, TypeScript, Kotlin), named helper functions, well-named \
+constants, and enum/match exhaustiveness. A 40-line fix that handles every \
+edge case scores much higher than a 5-line stub with the same test pass rate. \
+Docstrings, comments, and blank lines do NOT count toward the score — only \
+executable code nodes matter.
 """
 
 OBSERVE_PROMPT = """\
@@ -442,7 +448,10 @@ Analyse this test-first, then plan. Answer in order:
    This pre-computes your `@@ -N` offsets so the diff is correct on the first try.
 
 Be precise and thorough — a complete implementation that handles all test cases and \
-edge cases scores higher than a minimal stub.
+edge cases scores higher than a minimal stub. Remember: the diff is scored by AST \
+token count in non-test source files. More complete code (edge case handling, type \
+annotations, named helpers) scores higher — but only after tests pass. Plan for \
+both correctness and completeness.
 """
 
 TEST_SECTION_TEMPLATE = """\
@@ -520,7 +529,10 @@ Requirements:
   add each one as a new file (`new file mode 100644`, `--- /dev/null`, \
   `+++ b/<path>`, `@@ -0,0 +1,N @@`) — implement fully, no stubs
 - Do NOT change unrelated logic, but do implement the full fix as described
-- Higher-quality, complete implementations score better than minimal stubs
+- **Quality matters**: the diff is scored by AST token count in non-test files. \
+  Guard against invalid/nil/empty inputs, add type annotations where the language \
+  supports them, split complex logic into named helpers. More complete code = \
+  higher score. Docstrings and comments do NOT count — only executable code nodes.
 - Output ONLY the diff — no markdown fences, no prose
 """
 
@@ -544,8 +556,12 @@ Check it against these criteria:
    exactly (same content, same whitespace). Wrong offsets cause `git apply` to fail.
 3. Are there missing changes or accidental deletions that would break unrelated tests?
 4. Are all new symbols, functions, or classes properly imported in every file that uses them?
-5. Is the implementation complete — does it handle edge cases, or is it a bare stub that \
-   only handles the happy path?
+5. Is the implementation production-quality? Specifically: are edge cases handled \
+   (invalid/nil/empty inputs, boundary values, error paths)? Are type annotations \
+   present where the language supports them (Python, TypeScript, Kotlin)? Could a \
+   named helper function make the logic clearer while adding meaningful tokens? \
+   If the implementation is a minimal stub that only handles the happy path — expand \
+   it so it handles real-world usage, then return the improved diff.
 6. {new_files_check}
 7. Look back at your step 6 hunk map from earlier in this conversation. Does this diff \
    include a change for every file path listed there? If any planned file is missing \
