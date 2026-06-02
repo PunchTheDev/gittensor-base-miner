@@ -1198,3 +1198,20 @@ Also added Ruby-aware header end detection in `_compute_header_end` (last `requi
 - Benchmark: 430 problems, oracle 23.46 (unchanged)
 - Pool: all repos saturated — next check 2026-06-09
 - Pending: Gittensor registration, nginx hookup
+
+### Verify criterion 8: structural summary symbol check (commit 00084ff)
+
+After history compaction the verify model has access to the "File signatures in scope" section (function/class/method declaration lines) injected into the compact observe. Previously no verify criterion explicitly directed the model to cross-reference this section against the diff — the structural summary was available in context but not actively consulted.
+
+VERIFY_PROMPT criterion 8 added: "Look at the 'File signatures in scope' section from earlier in this conversation. If the issue requires adding or modifying a specific function/method, confirm that symbol appears in your diff as a `+` line (e.g. `+def foo`, `+func Foo`, `+fn foo`). If a required symbol is absent, add it."
+
+This closes the loop: the structural summary (added two steps ago) now has a criterion that actively invokes it. The verify model can now answer "Did the diff add `+def filter_repos`?" rather than only checking test assertions and hunk offsets.
+
+### Hunk source context extended to 10 hunks (commit 00084ff)
+
+`_hunk_source_snippets(max_hunks=6)` → `max_hunks=10`. Large diffs (multi-file, many hunks) had the first 6 hunks verified against actual source lines and the rest verified only by plausibility. Each hunk snippet is ~300 chars; extending from 6 to 10 adds ~1.3 KB to the verify prompt — well within the 25k-token budget.
+
+### Status
+- Benchmark: 430 problems, oracle 23.46 (unchanged)
+- Pool: all repos saturated — next check 2026-06-09
+- Pending: Gittensor registration, nginx hookup
