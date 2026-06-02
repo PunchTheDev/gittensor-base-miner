@@ -423,6 +423,14 @@ LANG_NOTES: dict[str, str] = {
         "their filename exactly; use `@Override` on interface method implementations; "
         "checked exceptions must be declared or caught — don't swallow them silently."
     ),
+    "scala": (
+        "This is a Scala codebase. Key reminders: traits and abstract classes must have "
+        "all abstract methods implemented — no partial overrides; use `override def` for "
+        "trait implementations; case classes auto-generate equals/hashCode/copy; "
+        "companion objects hold factory methods and implicits; add the correct `import` "
+        "for any new symbol; sealed traits must cover every subcase the pattern-matches "
+        "reference; avoid `???` (NotImplementedError) stubs — implement fully."
+    ),
 }
 
 
@@ -539,8 +547,8 @@ def _is_test_file(f: FileContext) -> bool:
         or ".test." in name or ".spec." in name
         # Ruby: foo_spec.rb
         or name.startswith("spec_") or name.endswith("_spec.rb")
-        # Kotlin/Java/Scala: FooTest.kt, FooTest.java
-        or re.search(r"test\.(kt|java|scala)$", name) is not None
+        # Kotlin/Java/Scala: FooTest.kt, FooTest.java, FooSpec.scala
+        or re.search(r"(test|spec)\.(kt|java|scala)$", name) is not None
         # pytest conftest
         or name == "conftest.py"
     )
@@ -572,7 +580,7 @@ def _resolve_test_imports(
     - TypeScript/JS: ``import { X } from './utils/helpers'`` → resolved relative path
     - Ruby: ``require_relative '../lib/foo'`` → resolved relative path
     - Rust: ``use crate::foo::bar;`` → ``src/foo/bar.rs`` or ``src/foo/bar/mod.rs``
-    - Kotlin/Java: ``import dev.foo.bar.MyClass`` → ``src/main/.../MyClass.kt|java``
+    - Kotlin/Java/Scala: ``import dev.foo.bar.MyClass`` → ``src/main/.../MyClass.kt|java|scala``
     """
     tree_set = set(file_tree)
     resolved: set[str] = set()
@@ -669,24 +677,26 @@ def _resolve_test_imports(
                             if f.startswith(local_path + "/") and f.endswith(".go"):
                                 resolved.add(f)
 
-        elif ext in ("kt", "java"):
+        elif ext in ("kt", "java", "scala"):
             # `import dev.touchpilot.app.tools.AndroidToolRetryPolicy` →
             # look for any file named `AndroidToolRetryPolicy.kt` or `.java` anywhere
-            # in the tree (JVM packages don't map 1:1 to directory paths across projects)
+            # in the tree (JVM packages don't map 1:1 to directory paths across projects).
+            # Same pattern applies for Scala imports.
             for m in re.finditer(r"^import\s+([\w.]+)", content, re.MULTILINE):
                 fqn = m.group(1)
                 # Skip standard library and well-known third-party packages
                 if fqn.startswith(("kotlin.", "java.", "android.", "androidx.",
                                     "org.junit", "kotlin.test", "org.mockito",
-                                    "io.mockk", "com.google")):
+                                    "io.mockk", "com.google", "scala.", "org.scalatest",
+                                    "cats.", "zio.", "akka.")):
                     continue
                 class_name = fqn.rsplit(".", 1)[-1]
                 if not class_name or not class_name[0].isupper():
                     continue  # skip package-level imports without a class name
-                # Match any .kt or .java file whose basename matches the class name
+                # Match any .kt, .java, or .scala file whose basename matches the class name
                 for f in tree_set:
                     basename = f.rsplit("/", 1)[-1]
-                    if basename in (class_name + ".kt", class_name + ".java"):
+                    if basename in (class_name + ".kt", class_name + ".java", class_name + ".scala"):
                         resolved.add(f)
                         break
 
@@ -1012,8 +1022,8 @@ def _compute_header_end(lines: list[str], ext: str) -> int:
                 last_import = i
         return min(n, last_import + 1 + POST_IMPORT_BUFFER)
 
-    if ext in ("kt", "java"):
-        # Kotlin/Java: last `import` line.
+    if ext in ("kt", "java", "scala"):
+        # Kotlin/Java/Scala: last `import` line.
         last_import = 0
         for i, raw in enumerate(lines):
             if raw.strip().startswith("import "):
