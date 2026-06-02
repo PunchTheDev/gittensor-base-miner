@@ -103,6 +103,10 @@ Requirements:
 VERIFY_PROMPT = """\
 Issue: {title}
 
+{body}
+
+Test command that must pass: `{test_cmd}`
+
 You produced this diff:
 
 ```diff
@@ -113,6 +117,7 @@ Check it against these criteria:
 1. Does the diff address the root cause described in the issue above?
 2. Is every `@@` hunk header syntactically correct (line numbers make sense)?
 3. Are there missing changes or accidental deletions?
+4. Will running `{test_cmd}` pass after applying this diff?
 
 If the diff is correct and complete, respond with exactly: LGTM
 
@@ -374,10 +379,12 @@ class ExampleAgent(BaseAgent):
                 continue
 
             # Diff looks structurally valid — ask for semantic verification
+            body_snippet = (problem.issue_body or "")[:1500]
             verify_user = VERIFY_PROMPT.format(
                 diff=diff,
                 title=problem.issue_title,
-                body=problem.issue_body,
+                body=body_snippet,
+                test_cmd=test_cmd_str,
             )
             history.append({"role": "user", "content": verify_user})
             verdict = _call(history, self.model, api_key, verify_tokens, timeout)
