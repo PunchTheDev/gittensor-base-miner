@@ -165,3 +165,16 @@ Local harness over-estimates DAS reference scores by median 3.4×. Root cause: t
 
 1. Verify `OPENROUTER_KEY` in GitHub Actions Environment is the correct production key.
 2. Gittensor registration — team handles approval; hyperparameters.json is ready.
+
+---
+
+## 2026-06-02 — Oracle eval mode + pool_config fix
+
+- **`gitminer eval --oracle`** (commit a310fc8): new calibration mode that scores reference diffs directly through the full pipeline without any agent or API key. Expected mean ~22.77 / 30. Useful for: (1) verifying the scoring pipeline is wired correctly before spending API credits, (2) giving miners a pipeline smoke test.
+- **Fixed `pool_config.json pool_size`** (commit a310fc8): was 325 (stale from before the empty-body problem removal); corrected to 324.
+- **Fixed `_oracle_mean()` lookup** (commit a310fc8): was looking for `handle == "oracle"` but leaderboard uses `agent == "Oracle (accepted solution)"`.
+
+### Waiting on operator
+
+1. Verify `OPENROUTER_KEY` in GitHub Actions Environment is the correct production key.
+2. Gittensor registration — team handles approval; hyperparameters.json is ready.
