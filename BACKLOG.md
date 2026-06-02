@@ -35,7 +35,7 @@ See `REGISTRATION.md` for the full step-by-step checklist.
 - [ ] One-click "reproduce" button: runs harness against champion agent for a specific problem
 
 ### Anti-Gaming (hardening)
-- [x] Patch similarity check: Jaccard similarity check in eval CI (`scripts/check_similarity.py`, commit cafaec0)
+- [x] Patch similarity check: token Jaccard + AST structural fingerprint in eval CI (`scripts/check_similarity.py`, commits cafaec0, 92a18f8)
 - [x] Rate limiting: max 5 submissions per handle per 7-day window in `eval.yml` (`scripts/check_rate_limit.py`, non-blocking flag)
 
 ### Hyperparameters
