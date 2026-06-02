@@ -4,6 +4,24 @@ Milestone trail for the base-miner benchmark. Discord is the primary channel; th
 
 ---
 
+## 2026-06-02 — Agent: full-sequence offset disambiguation (benchmark commit 2c49e4c)
+
+### What shipped
+
+**`_fix_hunk_offsets`: Pass 1b — full-sequence disambiguation**
+- Root cause: `find_context_offset` gave up (returned `None`) when leading context lines appeared in multiple identical positions — common in Go/Rust files with factory registrations, config stanzas, or repeated struct patterns
+- Fix: when leading context is ambiguous (>1 exact matches), build the complete old-file sequence from the hunk (all context + removal lines in order) and search for that sequence. This is usually unique even when the leading 2-5 lines are not.
+- E.g.: 3 `func register() { pass }` blocks in a file — leading context matches all 3. The 7-line sequence `register, pass, }, '', gamma, do_old(), }` matches only the correct block.
+- Safety: sequence search only activates when leading match is ambiguous and sequence length ≥ 4; unambiguous leading match returns immediately as before
+- Also streamlined hunk-body collection: now scanned once for both `ctx` and `old_sequence`
+- Smoke tested: 3-location ambiguity resolved correctly; no-sequence case returns `None` (unchanged)
+
+### Status
+- Benchmark: 430 problems, oracle **13.34** (tree-sitter), 20 repos (commit 2c49e4c)
+- Post-processing: `_fix_hunk_offsets` now has 3-pass search (leading ctx → full sequence → stripped fallback)
+- Pool: fully saturated — next check 2026-06-16
+- Pending: Gittensor registration, nginx hookup
+
 ## 2026-06-02 — Agent + Dashboard polish (benchmark commit e787074, dashboard commit 0e36edc)
 
 ### What shipped
