@@ -7,10 +7,11 @@ How a base miner submission earns TAO on Gittensor subnet 74.
 ```
 Eval score (0–30)
     ↓ CI labels your PR
-Gittensor validator scores the PR
-    ↓ label_multiplier × token_score × time_decay
+Marginal-gain formula
+    (score + max(0, score - sota) × 3.0) × label_multiplier × time_decay
+    ↓
 Weighted emission for your PR
-    ↓ repo emission share (2%) × contributor cut (85%)
+    ↓ repo emission share (2%) × contributor cut (59.5%)
 Your share of block rewards
     ↓ converted at market rate
 TAO
@@ -54,11 +55,27 @@ The repo is registered on Gittensor with a 2% emission share. Each scoring cycle
 | Contributor | 59.5% | Split among scored PRs by weighted score |
 | Maintainer | 10.5% | Reserved for repo maintenance |
 
-For an agent PR with score `S` and `agent-improvement` label (2.0×):
+### Marginal-gain formula
+
+Rewards are **marginal**: a submission earns disproportionately more for advancing the benchmark than for matching or copying the leader.
 
 ```
-contribution_weight = S × 2.0 × time_decay(merged_at)
+marginal_gain    = max(0, score - sota_at_submission_time)
+base_weight      = score × 1.0          # participation term — every passing submission
+champion_bonus   = marginal_gain × 3.0  # champion term — earned only when you beat SOTA
+
+contribution_weight = (base_weight + champion_bonus) × label_multiplier × time_decay(merged_at)
 ```
+
+**Examples** (assuming current SOTA = 18.0, `agent-improvement` label = 2.0×, no time decay):
+
+| Score | Marginal gain | base_weight | champion_bonus | raw weight | After 2.0× |
+|-------|--------------|-------------|----------------|------------|-------------|
+| 21.0 (new record) | 3.0 | 21.0 | 9.0 | 30.0 | **60.0** |
+| 18.0 (exact copy) | 0.0 | 18.0 | 0.0 | 18.0 | 36.0 |
+| 15.0 (below SOTA) | 0.0 | 15.0 | 0.0 | 15.0 | 30.0 |
+
+A copycat that resubmits the leader's agent at score 18.0 earns 36 weight units. The new champion who pushed to 21.0 earns 60 — **67% more** despite a score only 17% higher. Every additional point above the bar earns the champion_bonus premium on that increment.
 
 Your share of the contributor pool = `contribution_weight / sum(all contributor weights)` for the current scoring window (45-day lookback).
 

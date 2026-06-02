@@ -43,6 +43,26 @@ def current_sota(leaderboard: list[dict]) -> float:
     return max(real) if real else 0.0
 
 
+def marginal_gain(score: float, sota: float) -> float:
+    """Score delta above current SOTA; zero for submissions at or below SOTA."""
+    return max(0.0, score - sota)
+
+
+def contribution_weight(score: float, sota: float, champion_mult: float = 3.0, participation_mult: float = 1.0) -> float:
+    """
+    Emission weight for this submission.
+
+    contribution_weight = (score × participation_mult
+                          + max(0, score - sota) × champion_mult)
+
+    A submission that copies the leader (score == sota) earns only the
+    participation term.  A new champion earns disproportionately more.
+    Label multiplier and time decay are applied by the Gittensor validator
+    on top of this weight.
+    """
+    return score * participation_mult + marginal_gain(score, sota) * champion_mult
+
+
 def update_leaderboard(leaderboard: list[dict], entry: dict) -> list[dict]:
     """Upsert by agent handle, re-rank by score descending."""
     handle = entry["agent"]
@@ -97,11 +117,19 @@ def main():
     }
 
     prev_sota = current_sota(leaderboard)
+    gain = marginal_gain(float(mean_score), prev_sota)
+    weight = contribution_weight(float(mean_score), prev_sota)
+
+    entry["sota_at_submission"] = round(prev_sota, 4)
+    entry["marginal_gain"] = round(gain, 4)
+    entry["contribution_weight"] = round(weight, 4)
+
     leaderboard = update_leaderboard(leaderboard, entry)
     new_sota = current_sota(leaderboard)
 
     lb_file.write_text(json.dumps(leaderboard, indent=2))
     print(f"Leaderboard updated: {args.handle} scored {mean_score:.4f}")
+    print(f"  SOTA at submission: {prev_sota:.4f}  |  marginal gain: {gain:.4f}  |  weight: {weight:.4f}")
 
     # Append to history if this beats or ties SOTA
     if new_sota >= prev_sota:
