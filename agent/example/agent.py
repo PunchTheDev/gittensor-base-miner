@@ -198,6 +198,18 @@ Improvements over a naive single-shot approach:
   to fix, it resends ACT_PROMPT directly — giving the model another full act-step attempt
   with the complete source-file context still available. Triggers a history compaction on
   success so subsequent verify steps don't re-process the full source context.
+- Verify token budget raised to match act: `verify_tokens = act_tokens` (was `token_budget //
+  4`). When the verify step must produce a corrected diff rather than LGTM, it needs the same
+  token headroom as the act step. The old 12,500-token cap could truncate a large multi-file
+  corrected diff, producing a partial patch worse than the original.
+- `_extract_assertions` limit raised from 30 to 50: large test suites often place edge-case
+  assertions near the end (parameterised tests, negative cases). The old 30-line cap silently
+  dropped them, leaving the verify step blind to those requirements. 50 covers the typical
+  test suite without materially inflating the verify prompt size.
+- `_fix_hunk_offsets` search radius expanded from ±25 to ±50: large Go/TS files (500+ lines)
+  are more likely to have offsets that are more than 25 lines off when the model estimates from
+  a windowed view. The unambiguous-match safety guard (single match required) prevents false
+  positives — a wider radius finds more correct offsets without introducing wrong ones.
 """
 
 from __future__ import annotations
@@ -1325,7 +1337,7 @@ def _format_files(
 # ---------------------------------------------------------------------------
 
 
-def _extract_assertions(test_files: list[FileContext], limit: int = 30) -> str:
+def _extract_assertions(test_files: list[FileContext], limit: int = 50) -> str:
     """Extract assertion lines from test files for the verify prompt.
 
     Assertions are the ground truth the diff must satisfy.  Injecting them
@@ -1334,6 +1346,8 @@ def _extract_assertions(test_files: list[FileContext], limit: int = 30) -> str:
 
     Caps at `limit` lines to keep the verify prompt compact.  Recognises
     assert styles for Python, Rust, Go, TypeScript, Kotlin, and Java.
+    Limit raised from 30 to 50: large test suites put the most specific
+    edge-case assertions near the end, which the old cap would drop.
     """
     _ASSERT_PREFIXES = (
         "assert ",          # Python / general
@@ -1502,14 +1516,14 @@ def _fix_hunk_offsets(diff: str, file_lookup: dict[str, str]) -> str:
 
     Algorithm per hunk:
       1. Extract the first two consecutive context lines (` `-prefixed).
-      2. Search the file for those two consecutive lines within ±25 lines of N.
+      2. Search the file for those two consecutive lines within ±50 lines of N.
       3. If found at a different offset, rewrite @@ -N accordingly.
 
     Only files present in `file_lookup` are checked.  New-file hunks
     (@@ -0,0 ...) are skipped.  If the search finds multiple matches or no
     match, the original N is kept (safe fallback).
     """
-    _SEARCH_RADIUS = 25    # lines either side of stated offset to search
+    _SEARCH_RADIUS = 50    # lines either side of stated offset to search
     _MIN_CTX_LINES = 1    # minimum context lines needed before trying correction
 
     def find_context_offset(file_lines: list[str], ctx: list[str], stated_n: int) -> int | None:
@@ -1883,7 +1897,7 @@ class ExampleAgent(BaseAgent):
         # Allocate wall-clock budget non-uniformly:
         #   plan  15% — analysis output is moderate length (500-2000 tokens)
         #   act   40% — diff output can be large (many hunks across many files)
-        #   each verify/repair  15% — LGTM acknowledgement or corrected diff
+        #   each verify/repair  15% — LGTM or corrected diff (must fit full diff)
         # With default 120s: plan=18s, act=48s, each verify=18s (×3 = 54s) → 120s total.
         total_time = float(problem.time_limit_seconds)
         plan_timeout = total_time * 0.15
@@ -1892,7 +1906,10 @@ class ExampleAgent(BaseAgent):
         token_budget = problem.output_token_budget
         plan_tokens = token_budget // 4    # analysis rarely exceeds 12k tokens
         act_tokens = token_budget // 2
-        verify_tokens = token_budget // 4
+        # Verify needs same budget as act: when it produces a corrected diff rather
+        # than LGTM, it must be able to output the full diff without truncation.
+        # token_budget // 4 was too small for large multi-file corrections.
+        verify_tokens = act_tokens
 
         log: list[str] = []
 
