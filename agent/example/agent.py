@@ -123,6 +123,16 @@ Improvements over a naive single-shot approach:
   file path and `N |` start line before writing the diff, pre-computing `@@ -N` offsets
   so the ACT step can use them directly rather than re-deriving under time pressure. ACT
   prompt references the hunk map to focus attention on using the pre-computed line numbers.
+- Missing `--- a/` / `+++ b/` header auto-insert: `_fix_diff_headers()` detects file blocks
+  that jump straight from `diff --git` to a `@@` hunk without the required path headers and
+  inserts them. `git apply` requires these headers; models in repair mode often omit them.
+  New-file blocks use `--- /dev/null` for the old path. Applied as part of `_post_process`.
+- Fuzzy hunk-offset correction: `_fix_hunk_offsets()` takes the context files as a lookup
+  and, for each hunk, extracts 2+ consecutive context lines (unchanged lines before/after
+  the change), searches for them within ±30 lines of the stated `@@ -N` offset in the
+  actual file content, and corrects N if the match is unambiguous. Handles off-by-N errors
+  that `_fix_hunk_counts` cannot fix (it only corrects b/d counts, not the start offset).
+  Safe fallback: if no match or multiple matches, the original N is kept.
 """
 
 from __future__ import annotations
@@ -1316,16 +1326,188 @@ def _count_diff_files(diff: str) -> int:
     return len(re.findall(r"^diff --git ", diff, re.MULTILINE))
 
 
-def _post_process(diff: str) -> str:
-    """Strip display artifacts, trim trailing prose, fix hunk counts.
+def _fix_diff_headers(diff: str) -> str:
+    """Insert missing --- a/path and +++ b/path headers in each file block.
+
+    `git apply` requires `--- a/<path>` and `+++ b/<path>` lines between the
+    `diff --git` line and the first `@@` hunk.  Models in repair mode often
+    skip these, jumping straight from `diff --git` to `@@`.  Without them
+    git apply exits with "patch does not apply".
+
+    This function rebuilds missing headers from the `diff --git a/<path> b/<path>`
+    line.  Blocks that already have both headers are left untouched.  `new file
+    mode` blocks use `/dev/null` for the old path; all other blocks use the a-path.
+    """
+    lines = diff.splitlines()
+    result: list[str] = []
+    i = 0
+    while i < len(lines):
+        line = lines[i]
+        m = re.match(r"^diff --git a/(.*) b/(.*)$", line)
+        if not m:
+            result.append(line)
+            i += 1
+            continue
+        a_path, b_path = m.group(1), m.group(2)
+        result.append(line)
+        i += 1
+        # Collect the meta-lines that follow: index, mode, new file mode, etc.
+        meta: list[str] = []
+        is_new_file = False
+        while i < len(lines) and not lines[i].startswith("---") and not lines[i].startswith("@@") and not lines[i].startswith("diff --git"):
+            if lines[i].startswith("new file"):
+                is_new_file = True
+            meta.append(lines[i])
+            i += 1
+        result.extend(meta)
+        # Check whether --- / +++ are already present in meta lines
+        has_minus = any(ml.startswith("---") for ml in meta)
+        has_plus = any(ml.startswith("+++") for ml in meta)
+        # Insert headers if either is missing and we're about to hit a @@ hunk
+        if i < len(lines) and lines[i].startswith("@@") and (not has_minus or not has_plus):
+            if not has_minus:
+                old_path = "/dev/null" if is_new_file else f"a/{a_path}"
+                result.append(f"--- {old_path}")
+            if not has_plus:
+                result.append(f"+++ b/{b_path}")
+    return "\n".join(result)
+
+
+def _fix_hunk_offsets(diff: str, file_lookup: dict[str, str]) -> str:
+    """Correct wrong @@ -N start offsets by matching context lines.
+
+    LLMs produce the plan hunk map under reasoning pressure and sometimes
+    get the start line off by a few lines.  `_fix_hunk_counts` corrects the
+    b/d counts but cannot fix N (the start line of the old hunk).  A wrong N
+    causes `git apply` to fail even when the content is correct.
+
+    Algorithm per hunk:
+      1. Extract the first two consecutive context lines (` `-prefixed).
+      2. Search the file for those two consecutive lines within ±30 lines of N.
+      3. If found at a different offset, rewrite @@ -N accordingly.
+
+    Only files present in `file_lookup` are checked.  New-file hunks
+    (@@ -0,0 ...) are skipped.  If the search finds multiple matches or no
+    match, the original N is kept (safe fallback).
+    """
+    _SEARCH_RADIUS = 25    # lines either side of stated offset to search
+    _MIN_CTX_LINES = 1    # minimum context lines needed before trying correction
+
+    def find_context_offset(file_lines: list[str], ctx: list[str], stated_n: int) -> int | None:
+        """Return the 1-indexed line where ctx[0] starts, or None if ambiguous.
+
+        Requires len(ctx) >= 2 for leading-context matching so a single common
+        line (e.g. '}' or '') doesn't produce false positives.  For single-line
+        context (usually a removal line used as fingerprint), still tries but
+        accepts only an unambiguous match within ±10 lines.
+        """
+        if not ctx:
+            return None
+        target = ctx[0]
+        radius = _SEARCH_RADIUS if len(ctx) >= 2 else 10
+        lo = max(0, stated_n - radius - 1)
+        hi = min(len(file_lines), stated_n + radius)
+        matches = []
+        for idx in range(lo, hi):
+            if file_lines[idx] == target:
+                if all(
+                    idx + j < len(file_lines) and file_lines[idx + j] == ctx[j]
+                    for j in range(len(ctx))
+                ):
+                    matches.append(idx + 1)  # convert to 1-indexed
+        if len(matches) == 1:
+            return matches[0]
+        return None
+
+    lines = diff.split("\n")
+    result: list[str] = []
+    file_lines: list[str] | None = None
+    i = 0
+    while i < len(lines):
+        line = lines[i]
+        m_git = re.match(r"^diff --git a/(.*) b/(.*)$", line)
+        if m_git:
+            b_path = m_git.group(2)
+            content = file_lookup.get(b_path) or file_lookup.get(m_git.group(1))
+            file_lines = content.splitlines() if content else None
+            result.append(line)
+            i += 1
+            continue
+        m_hunk = re.match(r"^@@ -(\d+)(?:,\d+)? \+(\d+)(?:,\d+)? @@(.*)", line)
+        if m_hunk and file_lines is not None:
+            old_start = int(m_hunk.group(1))
+            new_start = m_hunk.group(2)
+            suffix = m_hunk.group(3)
+            if old_start == 0:
+                # New-file hunk — nothing to correct
+                result.append(line)
+                i += 1
+                continue
+            # Collect leading context lines (unchanged lines before the first +/-)
+            ctx: list[str] = []
+            j = i + 1
+            while j < len(lines) and len(ctx) < 5:
+                hl = lines[j]
+                if hl.startswith("diff --git") or hl.startswith("@@"):
+                    break
+                if hl.startswith(" "):
+                    ctx.append(hl[1:])  # strip leading space → actual file content
+                else:
+                    break  # first +/- line — stop collecting leading context
+                j += 1
+            # If fewer than 2 leading context lines, also try the first removal line
+            # as a fingerprint (deletion must exist at the stated location).
+            if len(ctx) < 2:
+                j2 = i + 1
+                while j2 < len(lines):
+                    hl = lines[j2]
+                    if hl.startswith("-") and not hl.startswith("---"):
+                        # Use leading context + first removal as the matching sequence
+                        ctx_fallback = ctx + [hl[1:]]
+                        if len(ctx_fallback) >= 1:
+                            ctx = ctx_fallback
+                        break
+                    if hl.startswith(" "):
+                        j2 += 1
+                        continue
+                    break
+                    j2 += 1
+            if len(ctx) >= _MIN_CTX_LINES:
+                correct = find_context_offset(file_lines, ctx, old_start)
+                if correct is not None and correct != old_start:
+                    # Recompute new_start with the same delta
+                    delta = correct - old_start
+                    corrected_new = int(new_start) + delta
+                    m_old = re.match(r"^@@ -\d+(?:,(\d+))? \+\d+(?:,(\d+))? @@", line)
+                    old_count = m_old.group(1) if m_old and m_old.group(1) else "1"
+                    new_count = m_old.group(2) if m_old and m_old.group(2) else "1"
+                    line = f"@@ -{correct},{old_count} +{corrected_new},{new_count} @@{suffix}"
+            result.append(line)
+            i += 1
+            continue
+        result.append(line)
+        i += 1
+    return "\n".join(result)
+
+
+def _post_process(diff: str, file_lookup: dict[str, str] | None = None) -> str:
+    """Strip display artifacts, trim trailing prose, fix headers and hunk metadata.
 
     Applied after every _extract_diff call so that intermediate diffs
-    fed back into the verify/repair loop are always clean.  Verify sees
-    accurate hunk counts and no `N | ` display artifacts — reducing
-    spurious format-repair iterations and improving verify accuracy.
+    fed back into the verify/repair loop are always clean.
+
+    Pipeline order:
+      1. Strip N| display artifacts (must be first — counts computed on clean content)
+      2. Trim trailing prose
+      3. Insert missing --- a/ +++ b/ headers (before hunk offset correction)
+      4. Correct wrong @@ -N start offsets via context-line matching (needs headers)
+      5. Recompute @@ -a,b +c,d counts from actual hunk content
     """
     diff = _strip_line_number_prefixes(diff)
     diff = _trim_trailing_prose(diff)
+    diff = _fix_diff_headers(diff)
+    if file_lookup:
+        diff = _fix_hunk_offsets(diff, file_lookup)
     diff = _fix_hunk_counts(diff)
     return diff
 
@@ -1617,9 +1799,21 @@ class ExampleAgent(BaseAgent):
 
         # --- Turn 2: Act ---
         # temperature=0 for diff generation: format precision matters more than creativity
+        # Build lookup for context-line hunk-offset correction.
+        # Maps both a/path and b/path keys so _fix_hunk_offsets can look up
+        # file content regardless of which path form the model uses.
+        file_lookup: dict[str, str] = {}
+        for f in all_context:
+            file_lookup[f.path] = f.content
+            if "/" in f.path:
+                file_lookup[f.path.rsplit("/", 1)[-1]] = f.content
+
+        def pp(d: str) -> str:
+            return _post_process(d, file_lookup)
+
         history.append({"role": "user", "content": ACT_PROMPT})
         raw_diff = _call(history, self.model, api_key, act_tokens, act_timeout, temperature=0)
-        diff = _post_process(_extract_diff(raw_diff))
+        diff = pp(_extract_diff(raw_diff))
         log.append(f"[diff v0]\n{diff}")
         # Store the cleaned diff in history so the model's "memory" of its own output
         # matches the version shown in the verify prompt — avoids confusion from N|
@@ -1650,7 +1844,7 @@ class ExampleAgent(BaseAgent):
                 repair_msg = REPAIR_FORMAT_PROMPT.format(problem=problem_desc, diff=diff)
                 history.append({"role": "user", "content": repair_msg})
                 raw_diff = _call(history, self.model, api_key, act_tokens, act_timeout, temperature=0)
-                diff = _post_process(_extract_diff(raw_diff))
+                diff = pp(_extract_diff(raw_diff))
                 log.append(f"[repair {attempt} (format)]\n{diff}")
                 history.append({"role": "assistant", "content": diff})
                 continue
@@ -1675,7 +1869,7 @@ class ExampleAgent(BaseAgent):
             verdict = _call(history, self.model, api_key, verify_tokens, verify_timeout, temperature=0)
             log.append(f"[verify {attempt}]\n{verdict}")
 
-            repaired = _post_process(_extract_diff(verdict))
+            repaired = pp(_extract_diff(verdict))
             # LGTM: model approved the diff (no valid diff extracted) or explicitly said LGTM.
             # Check for LGTM before checking for a repaired diff — if the model both says
             # "LGTM" and includes a diff, we treat it as approval (not a replacement).
@@ -1709,7 +1903,7 @@ class ExampleAgent(BaseAgent):
 
         # Final post-process pass to catch any artifacts introduced after the last
         # repair step (e.g. by the prose-critique branch above).
-        diff = _post_process(diff)
+        diff = pp(diff)
 
         reasoning = f"model={self.model}\n\n" + "\n\n".join(log)
         return Patch(diff=diff, reasoning=reasoning)
@@ -1732,6 +1926,16 @@ class ExampleAgent(BaseAgent):
 
         log: list[str] = [f"[repair] test failure detected, starting targeted repair"]
 
+        # Build file_lookup for hunk-offset correction (same as solve())
+        file_lookup: dict[str, str] = {}
+        for f in problem.context_files:
+            file_lookup[f.path] = f.content
+            if "/" in f.path:
+                file_lookup[f.path.rsplit("/", 1)[-1]] = f.content
+
+        def pp(d: str) -> str:
+            return _post_process(d, file_lookup)
+
         # Build a fresh conversation focused on the failure — cheaper than a full re-solve
         repair_user = TEST_REPAIR_PROMPT.format(
             title=problem.issue_title,
@@ -1744,7 +1948,7 @@ class ExampleAgent(BaseAgent):
             {"role": "user", "content": repair_user},
         ]
         raw_diff = _call(history, self.model, api_key, act_tokens, act_timeout, temperature=0)
-        diff = _post_process(_extract_diff(raw_diff))
+        diff = pp(_extract_diff(raw_diff))
         log.append(f"[repair diff]\n{diff}")
 
         # One structural validation pass
@@ -1753,7 +1957,7 @@ class ExampleAgent(BaseAgent):
             history.append({"role": "assistant", "content": diff})
             history.append({"role": "user", "content": REPAIR_FORMAT_PROMPT.format(problem=problem_desc, diff=diff)})
             raw_diff = _call(history, self.model, api_key, act_tokens, act_timeout, temperature=0)
-            diff = _post_process(_extract_diff(raw_diff))
+            diff = pp(_extract_diff(raw_diff))
             log.append(f"[repair format fix]\n{diff}")
 
         reasoning = (failed_patch.reasoning or "") + "\n\n" + f"model={self.model}\n\n" + "\n\n".join(log)
