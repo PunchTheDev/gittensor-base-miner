@@ -151,3 +151,17 @@ Local harness over-estimates DAS reference scores by median 3.4×. Root cause: t
 
 1. Verify `OPENROUTER_KEY` in GitHub Actions Environment is the correct production key.
 2. Gittensor registration — team handles approval; hyperparameters.json is ready.
+
+---
+
+## 2026-06-02 — Test file enrichment: 217 → 324/324 coverage
+
+- **Extended enrich_test_context.py** (commit 7c38605): added a second pass that scans `reference.diff` for test file paths across all languages (npm, cargo, gradlew, Ruby, Kotlin, etc.). Newly-added test files extracted from the diff; pre-existing ones fetched from GitHub.
+- **Enriched 66 more problems**: 217 → 289 problems with test files (by filename), and actually 324/324 when checking full paths (many enriched files live in `tests/` directories).
+- **build_pool.py updated** (commit a69f5ac): future pool additions now automatically include test files found in diffs for all languages, not just Python pytest.
+- All 324 problems now have test files in context — agents can see what they need to pass.
+
+### Waiting on operator
+
+1. Verify `OPENROUTER_KEY` in GitHub Actions Environment is the correct production key.
+2. Gittensor registration — team handles approval; hyperparameters.json is ready.
