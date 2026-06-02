@@ -285,7 +285,8 @@ You produced this diff:
 
 Check it against these criteria:
 1. Does the diff satisfy every test assertion listed above? Map each one to a concrete line.
-2. Are `@@ -N` line numbers accurate? Cross-check with `N |` line markers in the context.
+2. Are `@@ -N` hunk offsets plausible? Check that context lines in the diff match the \
+   surrounding code logic — wrong offsets cause `git apply` to fail.
 3. Are there missing changes or accidental deletions that would break unrelated tests?
 4. Are all new symbols, functions, or classes properly imported in every file that uses them?
 5. Is the implementation complete — does it handle edge cases, or is it a bare stub that \
@@ -1280,7 +1281,7 @@ def _call(
     timeout: float,
     temperature: float = 0.2,
 ) -> str:
-    """Call the OpenRouter API. Retries once on 429 (rate limit)."""
+    """Call the OpenRouter API. Retries once on 429 or 5xx (transient errors)."""
     for attempt in range(2):
         resp = httpx.post(
             OPENROUTER_URL,
@@ -1297,7 +1298,7 @@ def _call(
             },
             timeout=timeout,
         )
-        if resp.status_code == 429 and attempt == 0:
+        if attempt == 0 and resp.status_code in (429, 500, 502, 503):
             retry_after = int(resp.headers.get("retry-after", "5"))
             time.sleep(min(retry_after, 10))
             continue
