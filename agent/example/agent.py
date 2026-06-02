@@ -157,6 +157,11 @@ Improvements over a naive single-shot approach:
   exception, causing the entire problem to fail with 0. Now the call is retried once on timeout;
   on a second timeout the function returns `""`, which `_diagnose_diff` catches as an empty diff
   and the format-repair loop handles gracefully rather than aborting.
+- API error resilience in `_call`: OpenRouter sometimes returns a 200 with an error body
+  (e.g. `{"error": {"message": "No endpoints found..."}}` instead of `choices`) — previously
+  this caused a `KeyError: 'choices'` that propagated as an exception, scoring the problem 0.
+  Now `_call` checks for `choices` presence and retries once; on a second failure returns `""`.
+  Also retries 400 responses (content policy, transient routing errors) once before giving up.
 """
 
 from __future__ import annotations
@@ -1700,7 +1705,7 @@ def _call(
     timeout: float,
     temperature: float = 0.2,
 ) -> str:
-    """Call the OpenRouter API. Retries once on 429, 5xx, or timeout."""
+    """Call the OpenRouter API. Retries once on 429, 5xx, timeout, or missing choices."""
     for attempt in range(2):
         try:
             resp = httpx.post(
@@ -1723,13 +1728,21 @@ def _call(
                 time.sleep(2)
                 continue
             return ""  # second timeout — caller handles empty string gracefully
-        if attempt == 0 and resp.status_code in (429, 500, 502, 503):
+        if attempt == 0 and resp.status_code in (400, 429, 500, 502, 503):
             retry_after = int(resp.headers.get("retry-after", "5"))
             time.sleep(min(retry_after, 10))
             continue
-        resp.raise_for_status()
-        return resp.json()["choices"][0]["message"]["content"]
-    resp.raise_for_status()
+        if resp.status_code >= 400:
+            return ""  # non-retriable error — return empty, score gracefully as 0
+        data = resp.json()
+        if "choices" not in data:
+            # OpenRouter returned an error body (e.g. "No endpoints found")
+            # instead of a completion — retry once then return empty string.
+            if attempt == 0:
+                time.sleep(5)
+                continue
+            return ""
+        return data["choices"][0]["message"]["content"]
     return ""
 
 
