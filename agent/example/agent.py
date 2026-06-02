@@ -271,6 +271,16 @@ Improvements over a naive single-shot approach:
   where the LLM wrote offsets before or after offset correction moved them. Stage 7 of
   `_post_process`; runs after `_fix_hunk_counts` so it sees the final corrected counts.
   New-file hunks (`@@ -0,0`) are skipped.
+- `repair()` source file injection: the repair method now injects original source file content
+  for all files touched by the failed diff. Previously the model repaired blind — it saw the
+  diff it produced and the test error, but not the actual file state. With source context it
+  can spot off-by-one logic errors, missing branches, and wrong type annotations. Capped at
+  3 files × 4 KB each (12 KB max) to keep the repair prompt compact. Files not in the problem
+  context (e.g. generated or vendored files) are silently skipped.
+- `_extract_assertions` Ruby Minitest `refute` patterns: added `refute `, `refute_equal(`,
+  `refute_nil(`, `refute_includes(`, `refute_match(`, `refute_empty(`. The 37 `we-promise/sure`
+  pool problems use Minitest, which has symmetrical `assert`/`refute` negation assertions.
+  Previously `refute` lines were invisible to the verify step's assertion cross-check.
 """
 
 from __future__ import annotations
@@ -521,7 +531,7 @@ Test output:
 ```
 {test_output}
 ```
-
+{source_section}\
 Diagnose the failure. The most common causes are:
 - Wrong logic: assertion error shows expected vs actual value
 - Missing symbol: `ImportError`, `NameError`, or `AttributeError` — add the import or define the symbol
@@ -1472,6 +1482,12 @@ def _extract_assertions(test_files: list[FileContext], limit: int = 50) -> str:
         "require.NotNil(",
         "require.Contains(",
         "require.Len(",
+        "refute ",             # Ruby Minitest: `refute value`, `refute obj.nil?`
+        "refute_equal ",       # `refute_equal expected, actual`
+        "refute_nil ",
+        "refute_includes ",
+        "refute_match ",
+        "refute_empty ",
     )
     lines: list[str] = []
     for f in test_files:
@@ -2643,12 +2659,46 @@ class ExampleAgent(BaseAgent):
         def pp(d: str) -> str:
             return _post_process(d, file_lookup)
 
+        # Inject source file context for files touched by the failed diff.
+        # Without this the model must reason about the failure blind — it can see
+        # the diff it produced and the test error, but not the actual file state.
+        # Providing the original source files (before patch) lets the model spot
+        # off-by-one logic errors, missing branches, and wrong type annotations.
+        # Limited to files in file_lookup (those in the problem context) and capped
+        # at 3 files × 4 KB each to keep the repair prompt compact.
+        diff_paths = _changed_paths_from_diff(failed_patch.diff)
+        repair_source_parts: list[str] = []
+        chars_used = 0
+        for path in sorted(diff_paths):
+            src = file_lookup.get(path) or file_lookup.get(
+                path.rsplit("/", 1)[-1] if "/" in path else path
+            )
+            if not src:
+                continue
+            snippet = src[:4000] if len(src) > 4000 else src
+            if chars_used + len(snippet) > 12_000:
+                break
+            ext = path.rsplit(".", 1)[-1].lower() if "." in path else ""
+            repair_source_parts.append(f"### {path}\n```{ext}\n{snippet}\n```")
+            chars_used += len(snippet)
+            if len(repair_source_parts) >= 3:
+                break
+
+        source_section = ""
+        if repair_source_parts:
+            source_section = (
+                "\nSource files before your patch (check your logic against these):\n\n"
+                + "\n\n".join(repair_source_parts)
+                + "\n\n"
+            )
+
         # Build a fresh conversation focused on the failure — cheaper than a full re-solve
         repair_user = TEST_REPAIR_PROMPT.format(
             title=problem.issue_title,
             test_cmd=test_cmd_str,
             diff=failed_patch.diff,
             test_output=_trim_test_output(test_output),
+            source_section=source_section,
         )
         history: list[dict[str, str]] = [
             {"role": "system", "content": SYSTEM_PROMPT},
