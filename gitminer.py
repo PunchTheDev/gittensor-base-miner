@@ -28,7 +28,7 @@ Usage:
     python gitminer.py validate --problem 0463 --patch my_fix.diff
     python gitminer.py validate --problem 0463 --patch my_fix.diff --run-tests
     python gitminer.py problems
-    python gitminer.py problems --lang py --difficulty hard --limit 10
+    python gitminer.py problems --cat python --difficulty hard --limit 10
     python gitminer.py cache
     python gitminer.py hash my_patch.diff
     python gitminer.py shard
@@ -545,10 +545,10 @@ def cmd_info(args: argparse.Namespace) -> None:
     # Scores
     print(f"\n{BOLD}Scores{RESET}")
     if baseline_score is not None:
-        diff_str = ""
-        if baseline_score >= 25:
+        # Thresholds mirror generate_dashboard_data.py: easy≥15, medium 5–15, hard<5
+        if baseline_score >= 15:
             diff_str = f"  {GREEN}easy{RESET}"
-        elif baseline_score >= 18:
+        elif baseline_score >= 5:
             diff_str = f"  {YELLOW}medium{RESET}"
         else:
             diff_str = f"  {RED}hard{RESET}"
