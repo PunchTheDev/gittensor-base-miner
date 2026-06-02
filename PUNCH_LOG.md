@@ -4,6 +4,24 @@ Milestone trail for the base-miner benchmark. Discord is the primary channel; th
 
 ---
 
+## 2026-06-02 — Pool 397→400 + Kotlin/Java agent support (commits 8cab7e5, 96af7c8)
+
+### Agent: Kotlin/Java language notes and import resolution (commit 8cab7e5)
+- **Kotlin LANG_NOTES** (`kt`): companion objects, data class fields, sealed class coverage, `@Test` annotation, `TODO()` stubs, constructor signature matching
+- **Java LANG_NOTES** (`java`): full interface implementation, correct `import` declarations, `@Override` annotations, checked exception handling
+- **`_is_test_file`**: now detects `*Test.kt`, `*Test.java`, `*Test.scala` via regex — previously only caught files in `/test/` directories
+- **Kotlin/Java import resolution**: `import dev.touchpilot.app.tools.MyClass` → finds `MyClass.kt` or `MyClass.java` in tree (skips stdlib/Android/JUnit imports)
+- **Impact**: 34 Kotlin problems (touchpilot) + 3 Java problems (jvm-live-reload) now get precise file pinning and language-appropriate prompting
+
+### Pool refresh: 397 → 400 (+3 new phase-rs/phase problems) (commit 96af7c8)
+- `phase-rs_phase_1816` — damage assignment modal bug (Rust + TypeScript, React/Vitest test)
+- `phase-rs_phase_1734` — "Clash with an opponent" auto-picks wrong opponent (TypeScript + Rust test)
+- `phase-rs_phase_1691` — Emergence Zone card selection bug (Rust + TypeScript test)
+- Oracle mean: 23.05 → **23.08** (recomputed across all 400 problems)
+- All repos fully saturated as of this run; next pool scan scheduled ~2026-06-09
+
+---
+
 ## 2026-06-02 — Pool 367→397 + Go/TS language support (commits b882b42, a277f65)
 
 ### has_test_files fix: Go, TypeScript, Java, Ruby patterns (commit b882b42)
