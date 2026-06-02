@@ -32,9 +32,17 @@ Improvements over a naive single-shot approach:
 - Score-aware prompting: system prompt and act prompt explain that complete
   implementations score higher than stubs
 - Structural diff validation beyond the basic `@@` presence check — catches
-  malformed hunk headers before committing to the result
-- Wider repair window (3 attempts, up from 2) with targeted feedback per failure mode
-- Verify turn also checks implementation completeness — may expand a bare fix
+  malformed hunk headers before committing to the result; windowed files now
+  show `N | line content` so the model can read `@@ -N` offsets directly
+- Issue title tokens weighted 3× over body tokens in file ranking (titles name
+  the exact function/module; bodies describe the symptom)
+- Language-specific notes: Rust/TypeScript/Ruby/Python system-prompt additions
+  remind the model of language conventions (trait bounds, exports, type hints)
+- Repair loop shows first+last lines of test output (assertion error at top,
+  summary at bottom) rather than only the last N lines
+- Verify criteria cross-check `@@ -N` line numbers against `N |` markers,
+  check for missing imports, and expand bare stubs
+- Wider repair window (3 attempts, up from 2) with failure-mode categorization
 - Structured reasoning log for transparency
 """
 
