@@ -1,0 +1,569 @@
+diff --git a/crates/engine/src/parser/oracle_effect/lower.rs b/crates/engine/src/parser/oracle_effect/lower.rs
+index 2a855fead..13e7b89e7 100644
+--- a/crates/engine/src/parser/oracle_effect/lower.rs
++++ b/crates/engine/src/parser/oracle_effect/lower.rs
+@@ -43,14 +43,25 @@ use super::{
+     attach_alt_cost_to_prior_cast_from_zone, attach_mana_retention_to_prior_mana,
+     attach_repeat_process_keywords, attach_same_is_true_keywords,
+     collapse_ephemeral_color_choice_mana, contains_explicit_tracked_set_pronoun,
+-    contains_implicit_tracked_set_pronoun, fold_cast_copy_of_card_defs, mark_uses_tracked_set,
+-    parse_effect_clause, parse_event_context_ref_with_ctx, parse_for_each_object_copy_parts,
+-    publishes_tracked_set_from_resolution, refine_damage_target_remainder,
++    contains_implicit_tracked_set_pronoun, fold_cast_copy_of_card_defs, has_explicit_player_target,
++    mark_uses_tracked_set, parse_effect_clause, parse_event_context_ref_with_ctx,
++    parse_for_each_object_copy_parts, publishes_tracked_set_from_resolution,
++    refine_damage_target_remainder, replace_player_anaphor_with_parent_target,
+     rewrite_parent_targets_to_tracked_set, rewrite_rounding_mode, rewrite_that_type_mana_instead,
+     scan_contains_phrase, stamp_delayed_returns, target_filter_controller_ref,
+     try_fold_token_repeat_into_count, wire_optional_cast_decline_fallback,
+ };
+ 
++fn rewrite_player_anaphor_targets_in_definition(def: &mut AbilityDefinition) {
++    replace_player_anaphor_with_parent_target(def.effect.as_mut());
++    if let Some(sub) = def.sub_ability.as_deref_mut() {
++        rewrite_player_anaphor_targets_in_definition(sub);
++    }
++    if let Some(else_ability) = def.else_ability.as_deref_mut() {
++        rewrite_player_anaphor_targets_in_definition(else_ability);
++    }
++}
++
+ pub(crate) fn lower_effect_chain_ir(ir: &EffectChainIr) -> AbilityDefinition {
+     let kind = ir.kind;
+ 
+@@ -159,6 +170,9 @@ pub(crate) fn lower_effect_chain_ir(ir: &EffectChainIr) -> AbilityDefinition {
+                             ) {
+                                 instead.target_choice_timing = root.target_choice_timing;
+                             }
++                            if has_explicit_player_target(root.effect.as_ref()) {
++                                rewrite_player_anaphor_targets_in_definition(&mut instead);
++                            }
+                             instead.else_ability = root.sub_ability.take();
+                             root.sub_ability = Some(Box::new(instead));
+                             defs.push(root);
+diff --git a/crates/engine/src/parser/oracle_effect/mod.rs b/crates/engine/src/parser/oracle_effect/mod.rs
+index 023b263a2..828be1216 100644
+--- a/crates/engine/src/parser/oracle_effect/mod.rs
++++ b/crates/engine/src/parser/oracle_effect/mod.rs
+@@ -9008,6 +9008,20 @@ fn has_anaphoric_reference(lower: &str) -> bool {
+     false
+ }
+ 
++/// CR 608.2c: "that player" / "the player" after an earlier explicit player
++/// target binds to that chosen player, not to the triggering-event player and
++/// not to the controller of an object target.
++fn has_player_anaphoric_reference(lower: &str) -> bool {
++    nom_primitives::scan_at_word_boundaries(lower, |input| {
++        alt((
++            tag::<_, _, OracleError<'_>>("that player"),
++            tag("the player"),
++        ))
++        .parse(input)
++    })
++    .is_some()
++}
++
+ fn explicit_any_target_clause(effect: &Effect, lower: &str) -> bool {
+     matches!(effect.target_filter(), Some(TargetFilter::Any))
+         && nom_primitives::scan_contains(lower, "any target")
+@@ -9135,6 +9149,17 @@ fn replace_target_with_self(effect: &mut Effect) {
+     }
+ }
+ 
++fn replace_player_anaphor_with_parent_target(effect: &mut Effect) {
++    each_target_filter_mut(effect, &mut |filter| {
++        if matches!(
++            filter,
++            TargetFilter::TriggeringPlayer | TargetFilter::ParentTargetController
++        ) {
++            *filter = TargetFilter::ParentTarget;
++        }
++    });
++}
++
+ /// CR 608.2k (issue #319): True when `ctx` carries a *typed* trigger subject
+ /// (a non-source object the trigger condition explicitly named, e.g.
+ /// `Typed{Subtype:Elf}` from "Whenever an Elf you control dies"). In this
+@@ -9271,6 +9296,21 @@ fn has_typed_target(effect: &Effect) -> bool {
+     )
+ }
+ 
++fn target_filter_is_explicit_player_target(filter: &TargetFilter) -> bool {
++    if filter.is_context_ref() {
++        return false;
++    }
++    match filter {
++        TargetFilter::Player | TargetFilter::SpecificPlayer { .. } => true,
++        TargetFilter::Typed(tf) => tf.type_filters.is_empty(),
++        TargetFilter::Or { filters } | TargetFilter::And { filters } => {
++            filters.iter().any(target_filter_is_explicit_player_target)
++        }
++        TargetFilter::Not { filter } => target_filter_is_explicit_player_target(filter),
++        _ => false,
++    }
++}
++
+ /// CR 608.2c: An earlier clause whose target filter is a compound shape
+ /// (`And` / `Or` wrapping a `Typed` branch) still introduces a typed object
+ /// referent for a sibling bare-"it" anaphor.
+@@ -9297,6 +9337,12 @@ fn filter_introduces_typed_object(filter: &TargetFilter) -> bool {
+     }
+ }
+ 
++fn has_explicit_player_target(effect: &Effect) -> bool {
++    effect
++        .target_filter()
++        .is_some_and(target_filter_is_explicit_player_target)
++}
++
+ /// CR 608.2c: Variant of `has_typed_target` that accepts compound filter
+ /// shapes (`And` / `Or` wrapping a `Typed`). Effect-kind whitelist mirrors
+ /// `has_typed_target` exactly — only the filter-shape recognition is
+@@ -9380,6 +9426,25 @@ fn chain_has_prior_typed_referent(clauses: &[ClauseIr]) -> bool {
+     false
+ }
+ 
++fn chain_has_prior_player_target_referent(clauses: &[ClauseIr]) -> bool {
++    for prev in clauses.iter().rev() {
++        if prev.condition.is_some() {
++            return false;
++        }
++        if has_explicit_player_target(&prev.parsed.effect) {
++            return true;
++        }
++        if matches!(
++            prev.parsed.effect.target_filter(),
++            Some(TargetFilter::ParentTarget | TargetFilter::ParentTargetController)
++        ) {
++            continue;
++        }
++        return false;
++    }
++    false
++}
++
+ fn lower_subject_predicate_ast(
+     subject: SubjectPhraseAst,
+     predicate: PredicateAst,
+@@ -14898,6 +14963,11 @@ pub(crate) fn parse_effect_chain_ir(
+         {
+             replace_target_with_parent(&mut clause.effect);
+         }
++        if chain_has_prior_player_target_referent(&clauses)
++            && has_player_anaphoric_reference(&text_lower)
++        {
++            replace_player_anaphor_with_parent_target(&mut clause.effect);
++        }
+         if clauses
+             .last()
+             .is_some_and(|prev| matches!(&prev.parsed.effect, Effect::Counter { .. }))
+diff --git a/crates/engine/src/parser/oracle_trigger.rs b/crates/engine/src/parser/oracle_trigger.rs
+index f672d9be9..b0fcb533b 100644
+--- a/crates/engine/src/parser/oracle_trigger.rs
++++ b/crates/engine/src/parser/oracle_trigger.rs
+@@ -14169,6 +14169,39 @@ mod tests {
+         assert_eq!(def.spell_cast_origin, OriginConstraint::Any);
+     }
+ 
++    #[test]
++    fn trigger_you_cast_target_player_mill_instead_keeps_chosen_player() {
++        let def = parse_trigger_line(
++            "Whenever you cast an instant or sorcery spell, target player mills three cards. If five or more mana was spent to cast that spell, that player mills ten cards instead.",
++            "Exhibition Tidecaller",
++        );
++
++        assert_eq!(def.mode, TriggerMode::SpellCast);
++        assert_eq!(def.valid_target, Some(TargetFilter::Controller));
++
++        let execute = def.execute.as_ref().expect("trigger should have an effect");
++        match &*execute.effect {
++            Effect::Mill { target, .. } => assert_eq!(*target, TargetFilter::Player),
++            other => panic!("expected base target-player Mill, got {other:?}"),
++        }
++
++        let instead = execute
++            .sub_ability
++            .as_ref()
++            .expect("mv>=5 clause should lower as an instead sub-ability");
++        assert!(
++            matches!(
++                instead.condition,
++                Some(AbilityCondition::ConditionInstead { .. })
++            ),
++            "mv>=5 clause should be a ConditionInstead override"
++        );
++        match &*instead.effect {
++            Effect::Mill { target, .. } => assert_eq!(*target, TargetFilter::ParentTarget),
++            other => panic!("expected instead target-player Mill, got {other:?}"),
++        }
++    }
++
+     /// CR 601.2a + #538: Ghostly Pilferer. The cast-origin discriminator
+     /// "from anywhere other than their hand" must survive parsing as
+     /// `NotEquals(Hand)`; without it the trigger fires on every opponent
+diff --git a/crates/engine/tests/integration/anaphoric_scope_allowlist_guard.rs b/crates/engine/tests/integration/anaphoric_scope_allowlist_guard.rs
+index e6c25612e..0b524397a 100644
+--- a/crates/engine/tests/integration/anaphoric_scope_allowlist_guard.rs
++++ b/crates/engine/tests/integration/anaphoric_scope_allowlist_guard.rs
+@@ -448,7 +448,8 @@ fn anaphoric_scope_set_is_frozen() {
+          through the recipient/subject rewrite. The category-2 'it deals damage \
+          equal to its power' trigger-subject class (#512) then moved 10 more \
+          cards (Warstorm Surge, Stalking Vengeance, Mage Slayer, et al.) onto \
+-         `Power {{ scope: EventSource }}`, dropping 257 -> 247. Count moved to \
++         `Power {{ scope: EventSource }}`; Sly Spy remains a legitimate \
++         reveal-referent case. Count moved to \
+          {}.",
+         observed.len()
+     );
+diff --git a/crates/engine/tests/integration/elusive_otter_repro.rs b/crates/engine/tests/integration/elusive_otter_repro.rs
+index 99b9224c2..0eb2b0228 100644
+--- a/crates/engine/tests/integration/elusive_otter_repro.rs
++++ b/crates/engine/tests/integration/elusive_otter_repro.rs
+@@ -116,7 +116,7 @@ fn elusive_otter_adventure_face_cast_does_not_panic() {
+     let mut runner = scenario.build();
+     engine::game::rehydrate_game_from_card_db(runner.state_mut(), db);
+ 
+-    add_mana(&mut runner, &[ManaType::Green]);
++    add_mana(&mut runner, &[ManaType::Green, ManaType::Colorless]);
+ 
+     let card_id = runner.state().objects[&otter_id].card_id;
+     runner
+@@ -129,11 +129,11 @@ fn elusive_otter_adventure_face_cast_does_not_panic() {
+     runner
+         .act(GameAction::ChooseAdventureFace { creature: false })
+         .expect("adventure face cast should succeed");
+-    // X-cost commit (X=0; finalize_cast stamps the final variant onto the
+-    // stack entry only after the X choice).
++    // X-cost commit. Grove's Bounty requires each target to receive at least
++    // one +1/+1 counter, so X=1 is the smallest legal adventure cast.
+     runner
+-        .act(GameAction::ChooseX { value: 0 })
+-        .expect("X=0 commit should succeed");
++        .act(GameAction::ChooseX { value: 1 })
++        .expect("X=1 commit should succeed");
+ 
+     // CR 715.3a: finalized on the stack with the Adventure variant so it
+     // resolves to exile (not graveyard) and remembers the alternative-cast
+diff --git a/crates/engine/tests/integration/exhibition_tidecaller_target_player_mill.rs b/crates/engine/tests/integration/exhibition_tidecaller_target_player_mill.rs
+new file mode 100644
+index 000000000..f4d9fc91d
+--- /dev/null
++++ b/crates/engine/tests/integration/exhibition_tidecaller_target_player_mill.rs
+@@ -0,0 +1,222 @@
++//! Reproduction for issue #1373 — Exhibition Tidecaller.
++//!
++//! Oracle:
++//!   "Opus — Whenever you cast an instant or sorcery spell, target player mills
++//!    three cards. If five or more mana was spent to cast that spell, that
++//!    player mills ten cards instead."
++//!
++//! Reported symptom: when you cast a spell with mana value 5+, the card mills
++//! YOU for ten instead of milling the chosen target player.
++//!
++//! CR 603.3d + CR 601.2c: a "you cast … target player …" trigger's controller
++//! restriction ("you cast") gates WHO must cast, while "target player" is the
++//! trigger's chosen target — the milled player is the chosen target, never the
++//! caster.
++
++use engine::game::scenario::{GameScenario, P0, P1};
++use engine::types::ability::TargetRef;
++use engine::types::actions::GameAction;
++use engine::types::game_state::WaitingFor;
++use engine::types::mana::{ManaCost, ManaType, ManaUnit};
++use engine::types::phase::Phase;
++
++const TIDECALLER: &str = "Opus — Whenever you cast an instant or sorcery spell, \
++     target player mills three cards. If five or more mana was spent to cast that \
++     spell, that player mills ten cards instead.";
++
++fn library_count(
++    runner: &engine::game::scenario::GameRunner,
++    player: engine::types::player::PlayerId,
++) -> usize {
++    runner
++        .state()
++        .players
++        .iter()
++        .find(|p| p.id == player)
++        .map(|p| p.library.len())
++        .expect("player exists")
++}
++
++fn graveyard_count(
++    runner: &engine::game::scenario::GameRunner,
++    player: engine::types::player::PlayerId,
++) -> usize {
++    runner
++        .state()
++        .players
++        .iter()
++        .find(|p| p.id == player)
++        .map(|p| p.graveyard.len())
++        .expect("player exists")
++}
++
++/// mv < 5 path: cast a 0-cost instant. The primary "target player mills three"
++/// must mill the CHOSEN target player (P1), never the caster (P0).
++#[test]
++fn tidecaller_mv_below_5_mills_chosen_target_three() {
++    let mut scenario = GameScenario::new_n_player(2, 42);
++    scenario.at_phase(Phase::PreCombatMain);
++
++    // Both players need libraries to mill from.
++    for pid in [P0, P1] {
++        for _ in 0..15 {
++            scenario.add_card_to_library_top(pid, "Lib Card");
++        }
++    }
++
++    // Tidecaller on P0's battlefield, parsed from its real Oracle text.
++    scenario.add_creature_from_oracle(P0, "Exhibition Tidecaller", 0, 2, TIDECALLER);
++
++    // A 0-cost instant in P0's hand to trigger Tidecaller (mv 0 < 5).
++    let spell = scenario
++        .add_spell_to_hand(P0, "Cheap Bolt", true)
++        .with_mana_cost(ManaCost::zero())
++        .id();
++
++    let mut runner = scenario.build();
++    let spell_card = runner.state().objects[&spell].card_id;
++
++    let lib_p0_before = library_count(&runner, P0);
++    let lib_p1_before = library_count(&runner, P1);
++
++    runner
++        .act(GameAction::CastSpell {
++            object_id: spell,
++            card_id: spell_card,
++            targets: vec![],
++        })
++        .expect("casting a 0-cost instant must succeed");
++    runner.advance_until_stack_empty();
++
++    // The trigger must surface a target-player selection — choose the opponent.
++    match runner.state().waiting_for.clone() {
++        WaitingFor::TriggerTargetSelection { target_slots, .. } => {
++            assert!(
++                target_slots[0]
++                    .legal_targets
++                    .contains(&TargetRef::Player(P1)),
++                "opponent must be a legal target for 'target player mills'"
++            );
++            runner
++                .act(GameAction::SelectTargets {
++                    targets: vec![TargetRef::Player(P1)],
++                })
++                .expect("targeting the opponent must succeed");
++            runner.advance_until_stack_empty();
++        }
++        other => panic!("expected TriggerTargetSelection from Tidecaller, got {other:?}"),
++    }
++
++    assert_eq!(
++        lib_p0_before - library_count(&runner, P0),
++        0,
++        "caster (P0) must NOT be milled — they are not the chosen target"
++    );
++    assert_eq!(
++        lib_p1_before - library_count(&runner, P1),
++        3,
++        "chosen target (P1) must be milled three"
++    );
++    assert_eq!(
++        graveyard_count(&runner, P1),
++        3,
++        "P1's milled cards land in graveyard"
++    );
++}
++
++/// mv >= 5 path: cast a 5-mana sorcery. The "instead" clause must mill the
++/// CHOSEN target player (P1) ten cards — never the caster (P0).
++#[test]
++fn tidecaller_mv_5_or_more_mills_chosen_target_ten_not_caster() {
++    let mut scenario = GameScenario::new_n_player(2, 42);
++    scenario.at_phase(Phase::PreCombatMain);
++
++    for pid in [P0, P1] {
++        for _ in 0..15 {
++            scenario.add_card_to_library_top(pid, "Lib Card");
++        }
++    }
++
++    scenario.add_creature_from_oracle(P0, "Exhibition Tidecaller", 0, 2, TIDECALLER);
++
++    // Five colorless mana so casting a {5} sorcery spends exactly five mana.
++    scenario.with_mana_pool(
++        P0,
++        (0..5)
++            .map(|_| {
++                ManaUnit::new(
++                    ManaType::Colorless,
++                    engine::types::identifiers::ObjectId(0),
++                    false,
++                    vec![],
++                )
++            })
++            .collect(),
++    );
++
++    let spell = scenario
++        .add_spell_to_hand(P0, "Big Spell", false)
++        .with_mana_cost(ManaCost::generic(5))
++        .id();
++
++    let mut runner = scenario.build();
++    let spell_card = runner.state().objects[&spell].card_id;
++
++    let lib_p0_before = library_count(&runner, P0);
++    let lib_p1_before = library_count(&runner, P1);
++
++    runner
++        .act(GameAction::CastSpell {
++            object_id: spell,
++            card_id: spell_card,
++            targets: vec![],
++        })
++        .expect("casting a {5} sorcery must succeed");
++
++    // Drive cast/target prompts to completion.
++    let mut targeted = false;
++    for _ in 0..40 {
++        match runner.state().waiting_for.clone() {
++            WaitingFor::TriggerTargetSelection { target_slots, .. } => {
++                assert!(
++                    target_slots[0]
++                        .legal_targets
++                        .contains(&TargetRef::Player(P1)),
++                    "opponent must be a legal target for the Tidecaller trigger"
++                );
++                runner
++                    .act(GameAction::SelectTargets {
++                        targets: vec![TargetRef::Player(P1)],
++                    })
++                    .expect("targeting the opponent must succeed");
++                targeted = true;
++            }
++            WaitingFor::Priority { .. } => {
++                if runner.state().stack.is_empty() {
++                    break;
++                }
++                if runner.act(GameAction::PassPriority).is_err() {
++                    break;
++                }
++            }
++            WaitingFor::ManaPayment { .. } => {
++                // Auto-pay from the floating pool if a payment prompt appears.
++                runner.advance_until_stack_empty();
++            }
++            other => panic!("unexpected waiting state during Big Spell cast: {other:?}"),
++        }
++    }
++    assert!(targeted, "the trigger must have surfaced target selection");
++    runner.advance_until_stack_empty();
++
++    assert_eq!(
++        lib_p0_before - library_count(&runner, P0),
++        0,
++        "caster (P0) must NOT be milled by the 'instead' clause"
++    );
++    assert_eq!(
++        lib_p1_before - library_count(&runner, P1),
++        10,
++        "chosen target (P1) must be milled TEN by the mv>=5 'instead' clause"
++    );
++}
+diff --git a/crates/engine/tests/integration/main.rs b/crates/engine/tests/integration/main.rs
+index d8d19a617..7434b74ad 100644
+--- a/crates/engine/tests/integration/main.rs
++++ b/crates/engine/tests/integration/main.rs
+@@ -47,6 +47,7 @@ mod emissary_green;
+ mod engine_invariants;
+ mod enlightened_tutor_regression;
+ mod evelyn_regression;
++mod exhibition_tidecaller_target_player_mill;
+ mod export_runtime_canaries;
+ mod exquisite_blood_routing;
+ mod flickerwisp_delayed_return;
+diff --git a/crates/engine/tests/integration/yuriko_combat_damage.rs b/crates/engine/tests/integration/yuriko_combat_damage.rs
+index 4275353b7..978db26ed 100644
+--- a/crates/engine/tests/integration/yuriko_combat_damage.rs
++++ b/crates/engine/tests/integration/yuriko_combat_damage.rs
+@@ -169,18 +169,18 @@ fn yuriko_attacks_loses_opponent_life_equal_to_revealed_card_mana_value() {
+ /// CMC of the attacking Ninja must NOT be read; the revealed card is what
+ /// counts.
+ ///
+-/// Discriminator: the attacker is Ingenious Infiltrator (a 2/3 Vedalken
+-/// Ninja, mana value 4), and the revealed library top is a 2-CMC
+-/// `Counterspell`. Combat damage = 2 (Infiltrator's power); trigger life
+-/// loss = 2 (revealed card's CMC). Total: 20 − 4 = 16.
++/// Discriminator: the attacker is Thousand-Faced Shadow (a 1/1 Ninja, mana
++/// value 1), and the revealed library top is a 2-CMC `Counterspell`. Combat
++/// damage = 1 (Shadow's power); trigger life loss = 2 (revealed card's CMC).
++/// Total: 20 − 3 = 17.
+ ///   - Under the pre-fix `CostPaidObject` scope, slot 2 (trigger-event
+-///     source) would be read — that's the attacking Infiltrator (CMC 4) —
+-///     so P1 would lose 2 + 4 = 6 life, ending at 14.
++///     source) would be read — that's the attacking Shadow (CMC 1) —
++///     so P1 would lose 1 + 1 = 2 life, ending at 18.
+ ///   - Under the fixed `Anaphoric` scope, slot 1 (`effect_context_object` =
+-///     the revealed Counterspell snapshot) is read — P1 loses 2 + 2 = 4
+-///     life, ending at 16.
++///     the revealed Counterspell snapshot) is read — P1 loses 1 + 2 = 3
++///     life, ending at 17.
+ ///
+-/// The 16-vs-14 gap proves the chained life-loss reads the revealed card's
++/// The 17-vs-18 gap proves the chained life-loss reads the revealed card's
+ /// CMC and not the attacker's, even when the attacker is not Yuriko herself.
+ ///
+ /// CR 603.3b: Ingenious Infiltrator carries its *own* combat-damage trigger
+@@ -209,11 +209,12 @@ fn another_ninja_attacks_yuriko_still_reads_revealed_card_mana_value() {
+     let _drawn = scenario.add_real_card(P0, "Negate", Zone::Library, db);
+     // Attacker — also a real Ninja so it matches the trigger condition
+     // ("Whenever a Ninja you control deals combat damage to a player").
+-    // Ingenious Infiltrator is a Vedalken Ninja with mana cost {2}{U}{B}
+-    // (mana value 4). The discriminator is the gap to the 2-CMC reveal —
+-    // under the buggy `CostPaidObject` scope P1 would have lost 4 (the
+-    // attacker's CMC); the fixed `Anaphoric` scope makes P1 lose exactly 2.
+-    let attacker = scenario.add_real_card(P0, "Ingenious Infiltrator", Zone::Battlefield, db);
++    // Thousand-Faced Shadow is a Ninja with mana cost {U} (mana value 1) and
++    // no combat-damage trigger that can draw the intended reveal card first.
++    // The discriminator is the gap to the 2-CMC reveal — under the buggy
++    // `CostPaidObject` scope P1 would have lost 1 (the attacker's CMC); the
++    // fixed `Anaphoric` scope makes P1 lose exactly 2.
++    let attacker = scenario.add_real_card(P0, "Thousand-Faced Shadow", Zone::Battlefield, db);
+     let mut runner = scenario.build();
+     engine::game::rehydrate_game_from_card_db(runner.state_mut(), db);
+ 
+@@ -228,6 +229,17 @@ fn another_ninja_attacks_yuriko_still_reads_revealed_card_mana_value() {
+         2,
+         "precondition: the revealed library-top card has CMC 2"
+     );
++    assert_eq!(
++        runner
++            .state()
++            .objects
++            .get(&attacker)
++            .unwrap()
++            .mana_cost
++            .mana_value(),
++        1,
++        "precondition: the attacking Ninja's CMC is 1 (the bug-displaying value)"
++    );
+     assert_eq!(runner.life(P1), 20, "precondition: P1 starts at 20 life");
+ 
+     run_combat(&mut runner, vec![attacker], vec![]);
+@@ -235,10 +247,10 @@ fn another_ninja_attacks_yuriko_still_reads_revealed_card_mana_value() {
+ 
+     assert_eq!(
+         runner.life(P1),
+-        16,
+-        "P1 loses 2 combat damage (Infiltrator's power) + life equal to the \
+-         REVEALED card's mana value (2): 20 - 2 - 2 = 16. The bug-value \
+-         would be 14 (loses 2 + Infiltrator's CMC 4)."
++        17,
++        "P1 loses 1 combat damage (Shadow's power) + life equal to the \
++         REVEALED card's mana value (2): 20 - 1 - 2 = 17. The bug-value \
++         would be 18 (loses 1 + Shadow's CMC 1)."
+     );
+     assert_eq!(
+         runner.state().objects.get(&revealed).unwrap().zone,
