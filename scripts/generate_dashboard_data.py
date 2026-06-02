@@ -126,4 +126,8 @@ def main(out_path: str | None = None):
 
 
 if __name__ == "__main__":
-    main(sys.argv[1] if len(sys.argv) > 1 else None)
+    import argparse
+    ap = argparse.ArgumentParser()
+    ap.add_argument("output", nargs="?", default=None, help="Output path for data.json")
+    args = ap.parse_args()
+    main(args.output)
