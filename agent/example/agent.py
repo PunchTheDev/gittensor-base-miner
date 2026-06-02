@@ -202,6 +202,12 @@ Improvements over a naive single-shot approach:
   to fix, it resends ACT_PROMPT directly — giving the model another full act-step attempt
   with the complete source-file context still available. Triggers a history compaction on
   success so subsequent verify steps don't re-process the full source context.
+- Plan-early-act extraction: when the model produces a valid diff inside the PLAN response
+  (i.e. acts before the explicit ACT prompt), extract it directly and skip the ACT API call.
+  Previously the ACT step returned nothing because the model thought it already answered in
+  the plan — causing 3 empty-retry repair loops and a wasted API budget. Now the plan diff
+  is detected via `_looks_valid`, stored in history as the ACT turn, and passed directly to
+  verify. Saves 4 API calls (~1 ACT + 3 empty-retries) on this failure mode.
 - Verify token budget raised to match act: `verify_tokens = act_tokens` (was `token_budget //
   4`). When the verify step must produce a corrected diff rather than LGTM, it needs the same
   token headroom as the act step. The old 12,500-token cap could truncate a large multi-file
@@ -2668,14 +2674,21 @@ class ExampleAgent(BaseAgent):
         def pp(d: str) -> str:
             return _post_process(d, file_lookup)
 
-        history.append({"role": "user", "content": ACT_PROMPT})
-        raw_diff = _call(history, self.model, api_key, act_tokens, act_timeout, temperature=0)
-        diff = pp(_extract_diff(raw_diff))
-        log.append(f"[diff v0]\n{diff}")
-        # Store the cleaned diff in history so the model's "memory" of its own output
-        # matches the version shown in the verify prompt — avoids confusion from N|
-        # artifacts or trailing prose that _post_process removed.
-        history.append({"role": "assistant", "content": diff})
+        # Check if plan response already contains a valid diff (model "acts early").
+        # When this happens, the ACT step returns nothing because the model thinks
+        # it already answered. Extract the plan diff directly and skip ACT.
+        plan_diff = pp(_extract_diff(plan))
+        if _looks_valid(plan_diff):
+            log.append("[diff v0 (from plan — skipped ACT)]\n" + plan_diff)
+            diff = plan_diff
+            history.append({"role": "user", "content": ACT_PROMPT})
+            history.append({"role": "assistant", "content": diff})
+        else:
+            history.append({"role": "user", "content": ACT_PROMPT})
+            raw_diff = _call(history, self.model, api_key, act_tokens, act_timeout, temperature=0)
+            diff = pp(_extract_diff(raw_diff))
+            log.append(f"[diff v0]\n{diff}")
+            history.append({"role": "assistant", "content": diff})
 
         # --- Compact history before verify ---
         # The observe_user message (history[1]) contains all source files and the
