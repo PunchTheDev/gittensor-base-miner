@@ -1077,8 +1077,11 @@ def _window_file(
             hit[i] = True
 
     if not any(hit):
-        # No hits — return first N lines as a peek (includes header naturally)
-        peek = min(80, len(lines))
+        # No hits — return the header section (import block + first type defs).
+        # Use language-aware detection so Go/TS files show past their large import
+        # blocks; fall back to 80 lines when the header is smaller than that.
+        peek = max(_compute_header_end(lines, ext), min(80, len(lines)))
+        peek = min(peek, len(lines))
         suffix = f"\n... [lines {peek + 1}-{len(lines)} omitted — no keyword hits in this file]"
         return "".join(lines[:peek]) + suffix, True
 
