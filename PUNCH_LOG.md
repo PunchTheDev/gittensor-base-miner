@@ -4,6 +4,28 @@ Milestone trail for the base-miner benchmark. Discord is the primary channel; th
 
 ---
 
+## 2026-06-02 — Agent: hunk count fixer + file tree pruning (commits 470c201, 6049035)
+
+### Agent: deterministic hunk count fixer (commit 470c201)
+- **`_fix_hunk_counts()`**: post-processor that recomputes the b/d fields in every `@@ -a,b +c,d @@` header by counting actual context/remove/add lines in each hunk
+- **Problem**: LLMs frequently miscalculate hunk line counts (b = old-hunk size, d = new-hunk size). Incorrect counts cause `git apply` to reject otherwise correct diffs with a "corrupt patch" error
+- **Applied after every solve() and repair()**: zero API calls, deterministic, applies to the final diff before returning Patch
+- Tested: corrects wrong counts across single-hunk, multi-hunk, multi-file, and new-file diffs; leaves already-correct diffs unchanged
+
+### Agent: file tree pruning (commit 6049035)
+- **`_prune_file_tree()`**: reduces the file_tree shown in the prompt from 500 paths (16-22 KB) to ~30-95 relevant paths (1-3 KB) by keeping only entries in directories that contain context files or their ancestors
+- **Problem**: 211/400 problems have file trees > 10 KB; average 12.6 KB per tree. At 40 KB context budget for code, a 22 KB tree consumes 55% of the budget on irrelevant paths
+- **Algorithm**: for each context file, adds its directory and all ancestor directories to a relevant-dirs set; keeps only tree entries whose parent is in that set; falls back to capped full list if pruning leaves nothing
+- Results: ragflow (500 → 32 entries), gittensor (124 → 27 entries), phase Rust test-only (500 → 95 via capped fallback)
+- **Critically**: `_resolve_test_imports` and `_expand_sibling_imports` still use the full `problem.file_tree` — only the display in the prompt is pruned
+
+### Status
+- Benchmark: 400 problems, oracle 23.08, 20 repos (commit 6049035)
+- Pool: all 16 DAS repos saturated; next refresh check ~2026-06-09
+- Pending: registration (operator), nginx hookup (operator)
+
+---
+
 ## 2026-06-02 — Agent: sibling imports + new test file creation (commits 9cd3e74, ed46bb2)
 
 ### Agent: sibling import expansion (commit 9cd3e74)
