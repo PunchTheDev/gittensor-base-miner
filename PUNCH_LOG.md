@@ -2004,3 +2004,44 @@ Repos evaluated and rejected: `celery/celery` (Redis/RabbitMQ integration tests)
 - Benchmark: **430 problems**, oracle **11.83**, 18 DAS repos, commit 9359b69
 - API: `category` field consistent across CLI/dashboard/API
 - Dashboard: quickstart comment fixed (commit 5536863 in gittensor-miner-dashboard)
+
+---
+
+## 2026-06-02 — Agent on-ramp + API server PM2 migration
+
+**Agent on-ramp (`GET /api/agents`)**:
+- New endpoint in `api/server.py` — returns structured JSON discovery document for autonomous AI agents
+- Includes: pool summary, scoring formula, oracle/champion scores, allowed model list, quickstart CLI commands, all API endpoints
+- Static `agents.json` added to dashboard repo — served at GitHub Pages, no API server needed to discover the benchmark
+- Dashboard hero: "For Agents ↗" CTA button; Quick Start: info box explaining the entry point
+
+**API server → PM2**:
+- Previous: raw `nohup` background process — would die silently, not auto-restart
+- Now: PM2-managed as `gitminer-api` (port 8083), auto-restart on failure, `pm2 save` persisted
+- Also fixed: the live server was running stale code pre-consistency-fix (`by_language` instead of `by_category`); restarted under PM2 with current code
+
+**Dashboard**: `python` → `python3` in quickstart commands (portability fix)
+
+### Status
+- Benchmark: **430 problems**, oracle **11.83**, commit `8e49c96`
+- API: PM2-managed (`gitminer-api`), all 8 endpoints verified including `/api/agents`
+- Dashboard: agents.json live at GitHub Pages; agents entry point in hero
+- Next DAS check: ~2026-06-09
+
+---
+
+## 2026-06-02 — DAS pool check + new repo survey
+
+**New DAS repos detected** (5 registered since last check):
+- `cogniax/tao-pulse-app`: 19 PRs, 0 merged — not yet qualifying
+- `e35ventura/taopedia`: 15 PRs, 0 merged — not yet qualifying
+- `e35ventura/taopedia-articles`: 294 PRs, 207 merged — content-only (markdown articles, no test suite)
+- `entrius/das-github-mirror`: 66 PRs, 21 merged — TypeScript NestJS API, no test files
+- `mkdev11/gittensor-hub`: 69 PRs, 41 merged — TypeScript Next.js frontend, no test files
+
+**Result**: Pool stays at **430 problems** (DAS repos with qualifying problems: linked issue + test suite). None of the 5 new repos qualify. Next meaningful check: ~2026-06-16 (allow more merged PRs to accumulate).
+
+### Status
+- Pool: 430 problems, DAS-only, all pool repos cached locally
+- All CLI commands verified: `info`, `shard`, `validate`, `problems`, `run`, `mine`
+- Pipeline fully operational — awaiting Gittensor registration approval
