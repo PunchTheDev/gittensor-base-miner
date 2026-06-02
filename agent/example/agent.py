@@ -186,8 +186,8 @@ Analyse this test-first, then plan. Answer in order:
    edge cases. Every assertion in the test must map to something in your plan.
 5. **Completeness check** — what secondary files or side effects (imports, exports, \
    constants, type annotations) also need updating? If you add a new public symbol, \
-   check whether any `__init__.py` or `index.ts`/`index.js` in the hint below \
-   needs a new export line.
+   check whether any `__init__.py` or `index.ts`/`index.js` listed in the \
+   "Module export files" section above needs a new export line.
 
 Be precise and thorough — a complete implementation that handles all test cases and \
 edge cases scores higher than a minimal stub.
