@@ -305,6 +305,7 @@ def _resolve_test_imports(
     - Python: ``from foo.bar.baz import X`` → ``foo/bar/baz.py``
     - TypeScript/JS: ``import { X } from './utils/helpers'`` → resolved relative path
     - Ruby: ``require_relative '../lib/foo'`` → resolved relative path
+    - Rust: ``use crate::foo::bar;`` → ``src/foo/bar.rs`` or ``src/foo/bar/mod.rs``
     """
     tree_set = set(file_tree)
     resolved: set[str] = set()
@@ -360,6 +361,32 @@ def _resolve_test_imports(
                         resolved.add(candidate)
                         break
 
+        elif ext == "rs":
+            # `use crate::foo::bar;` or `use super::baz;` or `use engine::game::X;`
+            # Heuristic: strip crate-level prefix and try src/<path>.rs or src/<path>/mod.rs
+            for m in re.finditer(r"^use\s+([\w:]+)", content, re.MULTILINE):
+                module = m.group(1)
+                # Drop leading crate:: or super:: — we only know the path segments
+                segments = re.split(r"::", module)
+                # Skip single-segment (e.g. `use std;`) and crate/super keywords
+                segments = [s for s in segments if s not in ("crate", "super", "self", "std", "core")]
+                if len(segments) < 2:
+                    continue
+                # Try src/<segments>.rs and src/<segments>/mod.rs
+                path_base = "src/" + "/".join(segments)
+                for suffix in (".rs", "/mod.rs"):
+                    candidate = path_base + suffix
+                    if candidate in tree_set:
+                        resolved.add(candidate)
+                        break
+                # Also try without "src/" prefix — some crates are flat
+                path_base2 = "/".join(segments)
+                for suffix in (".rs", "/mod.rs"):
+                    candidate = path_base2 + suffix
+                    if candidate in tree_set:
+                        resolved.add(candidate)
+                        break
+
     return resolved
 
 
@@ -380,7 +407,7 @@ def _index_hint(top_files: list[FileContext], file_tree: list[str]) -> str:
             dirs.append(d)
             seen.add(d)
 
-    index_names = {"__init__.py", "index.ts", "index.js", "index.tsx"}
+    index_names = {"__init__.py", "index.ts", "index.js", "index.tsx", "mod.rs"}
     found: list[str] = []
     tree_set = set(file_tree)
     for d in dirs:
