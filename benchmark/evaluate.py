@@ -30,6 +30,7 @@ import argparse
 import hashlib
 import importlib.util
 import json
+import os
 import random
 import sys
 import time
@@ -66,6 +67,13 @@ def select_shard(all_problem_dirs: list[Path], config: dict) -> list[Path]:
         seed = base_seed ^ week_number
     else:  # per_eval
         seed = random.randint(0, 2**32)
+
+    # CI anti-gaming: SHARD_SECRET env var (GitHub secret) XORs into the seed
+    # so miners cannot predict the evaluated shard from public parameters alone.
+    secret = os.environ.get("SHARD_SECRET", "")
+    if secret:
+        secret_int = int(hashlib.sha256(secret.encode()).hexdigest()[:8], 16)
+        seed ^= secret_int
 
     rng = random.Random(seed)
     pool = list(all_problem_dirs)

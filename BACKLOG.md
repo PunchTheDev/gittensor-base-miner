@@ -19,7 +19,6 @@ See `REGISTRATION.md` for the full step-by-step checklist.
 ## Post-Registration Improvements
 
 ### Pool Quality
-- [ ] Time-segmentation guard: assert each problem's `merged_at` is after `model_cutoff_date` at `build_pool.py` build time
 - [ ] Multi-language test inference: improve `infer_test_cmd` for JS/TS/Rust/Go repos (currently Python-biased)
 - [ ] Issue template: "Nominate a problem" — let community suggest PRs for pool curation
 - [ ] Reference-diff baseline: run Docker scorer against all 325 reference diffs, store baseline scores in `results/baselines.json`
@@ -36,7 +35,6 @@ See `REGISTRATION.md` for the full step-by-step checklist.
 ### Anti-Gaming (hardening)
 - [ ] Patch similarity check: cosine similarity between submitted patch and prior submissions to catch near-copies
 - [ ] Rate limiting: enforce max N submissions per handle per week in `record_submission.yml`
-- [ ] Shard rotation secret: move rotation seed to a GitHub secret so active shard is not predictable from public CI logs
 
 ### Hyperparameters
 - [ ] Map `issue_discovery_share` to pool curation reward mechanics once registration is approved

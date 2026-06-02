@@ -8,12 +8,13 @@ Everything the operator needs to do to register this repo on Gittensor and go li
 
 Go to: `https://github.com/PunchTheDev/gittensor-base-miner/settings/secrets/actions`
 
-Add two repository secrets:
+Add three repository secrets:
 
 | Secret | Value | Purpose |
 |--------|-------|---------|
 | `OPENROUTER_KEY` | OpenRouter API key | CI eval runs the example agent via OpenRouter |
 | `DASHBOARD_DEPLOY_TOKEN` | PAT with `repo` scope on `gittensor-miner-dashboard` | CI pushes updated `data.json` to dashboard repo after each merged submission |
+| `SHARD_SECRET` | Any random string (e.g. `openssl rand -hex 32`) | XORed into the weekly shard seed so miners cannot predict the evaluated shard from public parameters |
 
 **Creating the PAT**: GitHub → Settings → Developer settings → Personal access tokens → Fine-grained → `gittensor-miner-dashboard` → Contents: read+write.
 
@@ -65,6 +66,7 @@ Once registered and CI is live:
 |------|-----|--------|
 | Add `OPENROUTER_KEY` secret | Operator | Pending |
 | Add `DASHBOARD_DEPLOY_TOKEN` secret | Operator | Pending |
+| Add `SHARD_SECRET` secret | Operator | Pending |
 | Confirm frozen model | Operator | Pending |
 | Gittensor registration + approval | Operator | Pending |
 | Trigger test workflow run after secrets | Operator | Pending |
