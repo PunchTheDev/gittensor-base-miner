@@ -56,19 +56,19 @@ OBSERVE_PROMPT = """\
 
 ## Repository: {repo}
 
-## Test command
+## Scoring test command
 ```
 {test_cmd}
 ```
-The scoring harness runs this command on your patched repo. Your fix must make it pass.
+The harness runs this command to determine correctness. Your patch must make it pass.
 
 ## File tree
 ```
 {tree}
 ```
-
-## Context files (ranked by relevance)
-{files}
+{test_section}
+## Source files (ranked by relevance)
+{impl_files}
 
 ---
 
@@ -76,10 +76,16 @@ Analyse the issue carefully. Answer in order:
 
 1. **Root cause** — one or two sentences.
 2. **Hypothesis** — which specific file(s) and line range(s) need to change?
-3. **Minimal change** — describe what the change is, no code yet.
-4. **Test check** — will `{test_cmd_short}` pass with this change? Why?
+3. **Minimal change** — describe the change precisely, no code yet.
+4. **Test check** — given the test above, will `{test_cmd_short}` pass? Walk through the assertion.
 
 Be concise and precise.
+"""
+
+TEST_SECTION_TEMPLATE = """\
+## Test files (must pass — read these first to understand expected behaviour)
+{test_files}
+
 """
 
 ACT_PROMPT = """\
@@ -128,8 +134,23 @@ at least one `@@` hunk. Nothing else.
 # ---------------------------------------------------------------------------
 
 
+def _is_test_file(f: FileContext) -> bool:
+    """Return True if this file is a test/spec file (not source to modify)."""
+    p = f.path.lower()
+    name = p.rsplit("/", 1)[-1]
+    return (
+        "/test/" in p or "/tests/" in p or "/spec/" in p or "/specs/" in p
+        or name.startswith("test_") or name.endswith("_test.py")
+        or ".test." in name or ".spec." in name
+        or name.startswith("spec_") or name.endswith("_spec.rb")
+    )
+
+
 def _rank_files(files: list[FileContext], issue_title: str, issue_body: str) -> list[FileContext]:
-    """Return files sorted by keyword relevance to the issue, most relevant first."""
+    """Return files sorted by keyword relevance to the issue, most relevant first.
+
+    Test files are excluded here — they're shown in a separate section.
+    """
     issue_text = (issue_title + " " + issue_body).lower()
 
     # Explicit file paths mentioned in the issue — strong relevance signal
@@ -143,12 +164,10 @@ def _rank_files(files: list[FileContext], issue_title: str, issue_body: str) -> 
         path_lower = f.path.lower()
         # High bonus if the file is explicitly mentioned
         path_score = 20.0 * sum(1 for mp in mentioned_paths if mp in path_lower)
-        # Test files get a small boost — the issue often relates to what they assert
-        test_bonus = 3.0 if ("/test" in path_lower or "_test." in path_lower or "test_" in path_lower.split("/")[-1]) else 0.0
         # Keyword density in file content (identifiers > 4 chars to reduce noise)
         content_lower = f.content.lower()
         keyword_hits = sum(1 for kw in keywords if len(kw) > 4 and kw in content_lower)
-        return path_score + test_bonus + keyword_hits
+        return path_score + keyword_hits
 
     return sorted(files, key=score, reverse=True)
 
@@ -294,12 +313,22 @@ class ExampleAgent(BaseAgent):
 
         log: list[str] = []
 
-        # --- Rank and truncate context files ---
-        ranked = _rank_files(problem.context_files, problem.issue_title, problem.issue_body)
-        selected = _truncate_context(ranked)
-        dropped = len(problem.context_files) - len(selected)
+        # --- Split and rank context files ---
+        test_files = [f for f in problem.context_files if _is_test_file(f)]
+        impl_files = [f for f in problem.context_files if not _is_test_file(f)]
+        ranked_impl = _rank_files(impl_files, problem.issue_title, problem.issue_body)
+        selected_impl = _truncate_context(ranked_impl)
+        dropped = len(impl_files) - len(selected_impl)
         if dropped > 0:
-            log.append(f"[context] {len(selected)}/{len(problem.context_files)} files selected (dropped {dropped} low-relevance files)")
+            log.append(f"[context] {len(selected_impl)}/{len(impl_files)} impl files selected (dropped {dropped} low-relevance)")
+        if test_files:
+            log.append(f"[context] {len(test_files)} test file(s) shown separately")
+
+        # Build test section — always shown in full (usually small)
+        test_section = (
+            TEST_SECTION_TEMPLATE.format(test_files=_format_files(test_files))
+            if test_files else ""
+        )
 
         # --- Turn 1: Observe + Plan ---
         test_cmd_str = " ".join(problem.test_cmd) if problem.test_cmd else "pytest"
@@ -311,7 +340,8 @@ class ExampleAgent(BaseAgent):
             test_cmd=test_cmd_str,
             test_cmd_short=test_cmd_short,
             tree="\n".join(problem.file_tree),
-            files=_format_files(selected),
+            test_section=test_section,
+            impl_files=_format_files(selected_impl),
         )
         history: list[dict[str, str]] = [
             {"role": "system", "content": SYSTEM_PROMPT},
