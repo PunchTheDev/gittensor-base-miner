@@ -242,6 +242,18 @@ Improvements over a naive single-shot approach:
   names alone cannot support. Prioritises changed files (marked "← changed") over unchanged
   ones; capped at ~3 KB total so it doesn't blow the verify prompt size budget. Functions
   `_extract_file_signatures()` and `_changed_paths_from_diff()` support this.
+- Verify criterion 8: structural summary symbol check. VERIFY_PROMPT now explicitly asks the
+  model to look at the "File signatures in scope" section in the compacted history and confirm
+  that any function/method required by the issue appears in the diff as a `+` line. Previously
+  the structural summary was injected into history but no criterion directed the verify model
+  to cross-reference it against the diff. Now the model actively checks: "Is `+def foo` (or
+  `+func Foo`, `+fn foo`) present?" before LGTMing — catching cases where the plan added a
+  symbol to the hunk map but the act step forgot to implement it.
+- Hunk source context extended to 10 hunks (was 6): `_hunk_source_snippets` now covers the
+  first 10 hunks across all files instead of 6. For large diffs (multi-file, many hunks) the
+  old cap left the later hunks without source verification — the verify model could only
+  plausibility-check their offsets rather than comparing against actual source lines. At ~300
+  chars per hunk snippet the increase adds ~1.3 KB to the verify prompt, well within budget.
 """
 
 from __future__ import annotations
@@ -445,6 +457,10 @@ Check it against these criteria:
 7. Look back at your step 6 hunk map from earlier in this conversation. Does this diff \
    include a change for every file path listed there? If any planned file is missing \
    from the diff, add the necessary changes now.
+8. Earlier in this conversation there is a "File signatures in scope" section listing \
+   functions and methods in each file. If the issue requires adding or modifying a \
+   specific function/method, confirm that symbol appears in your diff as a '+' line \
+   (e.g. `+def foo`, `+func Foo`, `+fn foo`). If a required symbol is absent, add it.
 
 If the diff is correct and complete, respond with exactly: LGTM
 
@@ -1852,7 +1868,7 @@ def _changed_paths_from_diff(diff: str) -> set[str]:
 def _hunk_source_snippets(
     diff: str,
     file_lookup: dict[str, str],
-    max_hunks: int = 6,
+    max_hunks: int = 10,
 ) -> str:
     """Return formatted source lines around each hunk's @@ -N offset.
 
