@@ -2533,20 +2533,26 @@ class ExampleAgent(BaseAgent):
                     history.append({"role": "assistant", "content": repaired})
                 else:
                     # Partial repair: model only fixed some files. Keep the current diff
-                    # but give targeted feedback so the next verify pass fixes all files.
+                    # but give targeted feedback naming the missing files explicitly so
+                    # the next verify pass knows exactly which files to include.
                     n_cur = _count_diff_files(diff)
                     n_rep = _count_diff_files(repaired)
+                    cur_paths = _changed_paths_from_diff(diff)
+                    rep_paths = _changed_paths_from_diff(repaired)
+                    missing_paths = sorted(cur_paths - rep_paths)
                     log.append(
                         f"[verify {attempt}] partial repair ({n_rep} < {n_cur} files) — "
-                        "feeding back multi-file requirement"
+                        f"missing: {missing_paths}"
                     )
+                    missing_list = "\n".join(f"- {p}" for p in missing_paths)
                     history.append({"role": "assistant", "content": repaired})
                     history.append({
                         "role": "user",
                         "content": (
                             f"Your corrected diff only covers {n_rep} file(s) but the original "
-                            f"diff touched {n_cur} file(s). You must include ALL {n_cur} files in "
-                            f"your response. Produce a complete unified diff covering all files."
+                            f"diff touched {n_cur} file(s). The following file(s) are missing "
+                            f"from your response:\n\n{missing_list}\n\n"
+                            f"You must include ALL {n_cur} files. Produce a complete unified diff."
                         ),
                     })
             else:
