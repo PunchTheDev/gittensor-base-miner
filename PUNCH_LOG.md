@@ -4,6 +4,31 @@ Milestone trail for the base-miner benchmark. Discord is the primary channel; th
 
 ---
 
+## 2026-06-02 — Agent: intermediate diff post-processing + history compaction (commit 936a857)
+
+### Post-process every intermediate diff
+
+Previously: `_strip_line_number_prefixes`, `_trim_trailing_prose`, and `_fix_hunk_counts` ran only once at the very end of `solve()`.
+
+Problem: intermediate diffs passed to verify/repair still had `N | ` display artifacts and wrong hunk counts. Verify saw these artifacts and could flag the diff as wrong (triggering a wasteful repair loop). The repair branch could also produce a diff with artifact-prefixed lines, and those would be fed to the next verify iteration unclean.
+
+Fix: introduced `_post_process(diff)` helper that applies all three processors in order. Called after every `_extract_diff` throughout `solve()` and `repair()`. Final pass still runs but is now a no-op in most cases (the diff is already clean).
+
+### History compaction before verify
+
+Previously: every verify/repair call sent the full conversation history including `history[1]` — the observe message containing all source files, file tree, and test file content (typically 20-30k chars, ~5-7k tokens for deepseek).
+
+Problem: the model had already used this context to produce its plan and initial diff. Re-sending the full source code on every verify call wastes token budget the model could use to reason about the diff.
+
+Fix: after the act step, `history[1]` is replaced with a compact summary (~150 chars):
+```
+[Earlier context: repo/name — issue: Issue Title — files in scope: file1.py, file2.go, ... — test: pytest tests/test_foo.py]
+```
+
+The model retains the essential metadata (what was being fixed, which files, which test) without re-processing thousands of lines of source code.
+
+---
+
 ## 2026-06-02 — Agent: non-uniform timeouts and multi-fence diff extraction (commit 3361337)
 
 ### Non-uniform timeout allocation
