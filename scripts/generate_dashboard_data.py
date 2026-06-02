@@ -99,10 +99,20 @@ def load_history():
     return []
 
 
+def load_allowed_models() -> list[str]:
+    """Load the whitelist of allowed models from allowed_models.txt."""
+    models_file = REPO_ROOT / "benchmark" / "harness" / "allowed_models.txt"
+    if not models_file.exists():
+        return []
+    lines = models_file.read_text().splitlines()
+    return [l.strip() for l in lines if l.strip() and not l.startswith("#")]
+
+
 def main(out_path: str | None = None):
     problems = load_problems()
     leaderboard = load_leaderboard()
     history = load_history()
+    allowed_models = load_allowed_models()
 
     by_repo: dict[str, int] = {}
     for p in problems:
@@ -116,6 +126,7 @@ def main(out_path: str | None = None):
         "repos": by_repo,
         "leaderboard": leaderboard,
         "history": history,
+        "allowed_models": allowed_models,
         "problems": problems,
     }
 
