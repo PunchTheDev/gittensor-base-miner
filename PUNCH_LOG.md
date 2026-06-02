@@ -1559,3 +1559,29 @@ when `show_line_numbers=True`. No-op when `show_line_numbers=False` (test files)
 - Benchmark: 430 problems, oracle 13.34, 20 repos (commit `2e82ba9`)
 - Agent: consistent line numbers in all windowing paths + all prior improvements
 - Pool: fully saturated; check ~2026-06-09 for new DAS registrations
+
+---
+
+## 2026-06-02 — Python unittest + mock assertion coverage
+
+### Summary
+Two assertion pattern improvements for `_extract_assertions`, covering 521 + 452 pool occurrences that were previously invisible to the verify step.
+
+### Fix 1: unittest.TestCase self.assert* patterns (commit `c7e6a8c`)
+Root cause: `self.assertEqual(`, `self.assertTrue(`, `self.assertRaises(` etc. all start with `self.` — not matched by the `"assert "` (space) prefix. Every Python test using a `TestCase` subclass had zero assertions captured for the verify cross-check.
+
+Added: `self.assertEqual(`, `self.assertNotEqual(`, `self.assertTrue(`, `self.assertFalse(`, `self.assertIsNone(`, `self.assertIsNotNone(`, `self.assertIn(`, `self.assertNotIn(`, `self.assertRaises(`, `with self.assertRaises(`, `self.assertAlmostEqual(`, `self.assertGreater(`, `self.assertGreaterEqual(`, `self.assertLess(`, `self.assertLessEqual(`, `pytest.raises(`, `with pytest.raises(`.
+
+521 occurrences across the pool now visible.
+
+### Fix 2: mock/spy assert_called_once_with contains-check (commit `6a66944`)
+Root cause: mock assertions appear as `variable.method.assert_called_once_with(...)` — the object name is not fixed, so prefix matching is structurally impossible.
+
+Fix: added `_ASSERT_CONTAINS` tuple with `in` check (not `startswith`): `.assert_called(`, `.assert_called_once(`, `.assert_called_once_with(`, `.assert_not_called(`, `.assert_any_call(`, `.assert_called_with(`, `.assert_has_calls(`.
+
+452 occurrences across the pool now visible.
+
+### Status
+- Benchmark: 430 problems, oracle 13.34, 20 repos (commit `6a66944`)
+- Agent: full Python test coverage for assertions (pytest, unittest.TestCase, mock/spy)
+- Pool: fully saturated; check ~2026-06-09 for new DAS registrations
