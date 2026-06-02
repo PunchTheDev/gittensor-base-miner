@@ -76,6 +76,19 @@
 
 ---
 
+## Threat 7: Behavioral cloning (output forwarding)
+
+**Attack**: Miner writes an agent that calls a prior champion's API, wraps its output, or is functionally identical despite looking structurally different. Source-level similarity checks cannot catch this if the wrapper code is sufficiently different.
+
+**Mitigations**:
+- **Output behavior fingerprinting**: Every evaluated submission generates a fingerprint — a per-problem SHA-256 of the normalized diff the agent produced. These fingerprints are stored in `results/behaviors/` and compared on every new submission.
+- **Matching threshold**: If ≥ 70% of overlapping evaluated problems produce identical diff hashes, the submission is flagged. This threshold catches near-exact forwarding while tolerating coincidental matches on simple problems.
+- **Minimum overlap requirement**: Comparisons require ≥ 5 shared problems to be meaningful. Agents evaluated in different weeks share fewer problems — the threshold still applies to the overlap window.
+
+**Residual risk**: A miner who deliberately varies their outputs problem-by-problem while using the same underlying agent could stay below the threshold. Rate limiting limits how many calibration runs they can make. Marginal-reward design means a forwarded output earns ~0 above the champion's baseline anyway.
+
+---
+
 ## Summary
 
 | Threat | Severity | Mitigation strength |
@@ -86,3 +99,4 @@
 | Sybil submissions | Low | Strong (credibility gate + similarity check) |
 | LLM variance gaming | Low | Strong (deterministic seeds + rate limiting) |
 | Issue manipulation | Low | Strong (Gittensor native + multiplier design) |
+| Behavioral cloning / output forwarding | Medium | Medium (behavior fingerprint + 70% match threshold) |

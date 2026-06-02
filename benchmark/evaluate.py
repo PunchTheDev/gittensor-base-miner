@@ -43,6 +43,18 @@ POOL_DIR = Path(__file__).parent / "problems"
 POOL_CONFIG_PATH = Path(__file__).parent / "pool_config.json"
 
 
+def _diff_hash(diff_text: str) -> str:
+    """Return a stable SHA-256 of the normalized diff.
+
+    Strips trailing whitespace from each line and sorts hunks by file path so
+    minor formatting differences don't produce different hashes for the same
+    logical change.
+    """
+    lines = [ln.rstrip() for ln in diff_text.splitlines()]
+    normalized = "\n".join(lines).strip()
+    return hashlib.sha256(normalized.encode()).hexdigest()[:16]
+
+
 def load_pool_config() -> dict:
     if POOL_CONFIG_PATH.exists():
         return json.loads(POOL_CONFIG_PATH.read_text())
@@ -236,6 +248,9 @@ def run_evaluation(
             else:
                 from benchmark.harness.runner import run_in_sandbox
                 score = run_in_sandbox(problem_dir, patch_path)
+
+            # Capture a normalized diff hash for output-level similarity checks.
+            score["diff_hash"] = _diff_hash(patch.diff)
             patch_path.unlink()
 
             score["elapsed_seconds"] = round(elapsed, 2)
@@ -274,6 +289,8 @@ def main() -> None:
     parser.add_argument("--list-shard", action="store_true",
                         help="Print the current shard IDs and exit")
     parser.add_argument("--output", help="Write JSON results to this file")
+    parser.add_argument("--save-behaviors", metavar="FILE",
+                        help="Write behavior fingerprint (per-problem diff hashes) to FILE")
     parser.add_argument("--no-sandbox", action="store_true",
                         help="Skip Docker sandbox (local dev mode)")
     parser.add_argument("--oracle", action="store_true",
@@ -311,6 +328,22 @@ def main() -> None:
     if args.output:
         Path(args.output).write_text(json.dumps(results, indent=2))
         print(f"Results written to {args.output}")
+
+    if args.save_behaviors and not args.oracle:
+        handle = Path(args.agent).parent.name if args.agent else "unknown"
+        diffs = {
+            r["problem_id"]: r.get("diff_hash", "")
+            for r in results.get("problems", [])
+            if "diff_hash" in r
+        }
+        fingerprint = {
+            "handle": handle,
+            "eval_date": date.today().isoformat(),
+            "shard": [r["problem_id"] for r in results.get("problems", [])],
+            "diffs": diffs,
+        }
+        Path(args.save_behaviors).write_text(json.dumps(fingerprint, indent=2))
+        print(f"Behavior fingerprint written to {args.save_behaviors}")
 
     sys.exit(0 if results["mean_score"] > 0 else 1)
 
