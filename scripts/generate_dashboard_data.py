@@ -19,14 +19,21 @@ ORACLE_ROW = {
 }
 
 
-def load_baselines() -> dict[str, float]:
-    """Load per-problem baseline scores from results/baselines.json."""
+def load_baselines() -> dict[str, dict]:
+    """Load per-problem baseline data from results/baselines.json."""
     baseline_file = RESULTS_DIR / "baselines.json"
     if not baseline_file.exists():
         return {}
     try:
         data = json.loads(baseline_file.read_text())
-        return {p["id"]: p["base_score"] for p in data.get("problems", [])}
+        return {
+            p["id"]: {
+                "base_score": p["base_score"],
+                "source_token_score": p.get("source_token_score"),
+                "total_token_score": p.get("total_token_score"),
+            }
+            for p in data.get("problems", [])
+        }
     except Exception:
         return {}
 
@@ -101,7 +108,9 @@ def load_problems():
                 "das_token_score": float(meta.get("das_token_score") or 0),
                 "das_structural_score": float(meta.get("das_structural_score") or 0),
                 "das_total_nodes": meta.get("das_total_nodes"),
-                "baseline_score": baselines.get(pid),
+                "baseline_score": baselines.get(pid, {}).get("base_score") if isinstance(baselines.get(pid), dict) else baselines.get(pid),
+                "src_token_score": (baselines.get(pid) or {}).get("source_token_score"),
+                "total_token_score": (baselines.get(pid) or {}).get("total_token_score"),
                 "diff_stats": stats,
                 "test_cmd": meta.get("test_cmd") or [],
                 "base_commit": meta.get("base_commit", ""),
