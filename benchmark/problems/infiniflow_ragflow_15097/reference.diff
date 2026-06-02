@@ -1,0 +1,924 @@
+diff --git a/conf/models/groq.json b/conf/models/groq.json
+new file mode 100644
+index 00000000000..827e3829efc
+--- /dev/null
++++ b/conf/models/groq.json
+@@ -0,0 +1,69 @@
++{
++  "name": "Groq",
++  "url": {
++    "default": "https://api.groq.com/openai/v1"
++  },
++  "url_suffix": {
++    "chat": "chat/completions",
++    "models": "models"
++  },
++  "class": "groq",
++  "models": [
++    {
++      "name": "llama-3.1-8b-instant",
++      "max_tokens": 131072,
++      "model_types": [
++        "chat"
++      ]
++    },
++    {
++      "name": "llama-3.3-70b-versatile",
++      "max_tokens": 131072,
++      "model_types": [
++        "chat"
++      ]
++    },
++    {
++      "name": "openai/gpt-oss-120b",
++      "max_tokens": 131072,
++      "model_types": [
++        "chat"
++      ]
++    },
++    {
++      "name": "openai/gpt-oss-20b",
++      "max_tokens": 131072,
++      "model_types": [
++        "chat"
++      ]
++    },
++    {
++      "name": "groq/compound",
++      "max_tokens": 131072,
++      "model_types": [
++        "chat"
++      ]
++    },
++    {
++      "name": "groq/compound-mini",
++      "max_tokens": 131072,
++      "model_types": [
++        "chat"
++      ]
++    },
++    {
++      "name": "meta-llama/llama-4-scout-17b-16e-instruct",
++      "max_tokens": 131072,
++      "model_types": [
++        "chat"
++      ]
++    },
++    {
++      "name": "qwen/qwen3-32b",
++      "max_tokens": 131072,
++      "model_types": [
++        "chat"
++      ]
++    }
++  ]
++}
+diff --git a/internal/entity/models/factory.go b/internal/entity/models/factory.go
+index c328da6b2a3..ea82c818860 100644
+--- a/internal/entity/models/factory.go
++++ b/internal/entity/models/factory.go
+@@ -63,6 +63,8 @@ func (f *ModelFactory) CreateModelDriver(providerName string, baseURL map[string
+ 		return NewOllamaModel(baseURL, urlSuffix), nil
+ 	case "openai":
+ 		return NewOpenAIModel(baseURL, urlSuffix), nil
++	case "groq":
++		return NewGroqModel(baseURL, urlSuffix), nil
+ 	case "azure-openai":
+ 		return NewAzureOpenAIModel(baseURL, urlSuffix), nil
+ 	case "nvidia":
+diff --git a/internal/entity/models/groq.go b/internal/entity/models/groq.go
+new file mode 100644
+index 00000000000..87072c95acc
+--- /dev/null
++++ b/internal/entity/models/groq.go
+@@ -0,0 +1,435 @@
++//
++//  Copyright 2026 The InfiniFlow Authors. All Rights Reserved.
++//
++//  Licensed under the Apache License, Version 2.0 (the "License");
++//  you may not use this file except in compliance with the License.
++//  You may obtain a copy of the License at
++//
++//      http://www.apache.org/licenses/LICENSE-2.0
++//
++//  Unless required by applicable law or agreed to in writing, software
++//  distributed under the License is distributed on an "AS IS" BASIS,
++//  WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++//  See the License for the specific language governing permissions and
++//  limitations under the License.
++//
++
++package models
++
++import (
++	"bufio"
++	"bytes"
++	"context"
++	"encoding/json"
++	"fmt"
++	"io"
++	"net/http"
++	"strings"
++	"time"
++)
++
++// GroqModel implements ModelDriver for Groq.
++//
++// Groq exposes an OpenAI-compatible chat-completions endpoint at
++// https://api.groq.com/openai/v1/chat/completions and lists models at
++// https://api.groq.com/openai/v1/models.
++type GroqModel struct {
++	BaseURL    map[string]string
++	URLSuffix  URLSuffix
++	httpClient *http.Client
++}
++
++func NewGroqModel(baseURL map[string]string, urlSuffix URLSuffix) *GroqModel {
++	defaultTransport, ok := http.DefaultTransport.(*http.Transport)
++	var transport *http.Transport
++	if ok {
++		transport = defaultTransport.Clone()
++	} else {
++		transport = &http.Transport{
++			Proxy: http.ProxyFromEnvironment,
++		}
++	}
++	transport.MaxIdleConns = 100
++	transport.MaxIdleConnsPerHost = 10
++	transport.IdleConnTimeout = 90 * time.Second
++	transport.DisableCompression = false
++	transport.ResponseHeaderTimeout = 60 * time.Second
++
++	return &GroqModel{
++		BaseURL:   baseURL,
++		URLSuffix: urlSuffix,
++		httpClient: &http.Client{
++			Transport: transport,
++		},
++	}
++}
++
++func (g *GroqModel) NewInstance(baseURL map[string]string) ModelDriver {
++	return NewGroqModel(baseURL, g.URLSuffix)
++}
++
++func (g *GroqModel) Name() string {
++	return "groq"
++}
++
++func (g *GroqModel) baseURLForRegion(region string) (string, error) {
++	base, ok := g.BaseURL[region]
++	if ok && base != "" {
++		return strings.TrimSuffix(base, "/"), nil
++	}
++	if region == "" {
++		if base, ok := g.BaseURL["default"]; ok && base != "" {
++			return strings.TrimSuffix(base, "/"), nil
++		}
++	}
++	return "", fmt.Errorf("groq: no base URL configured for region %q", region)
++}
++
++func (g *GroqModel) endpoint(apiConfig *APIConfig, suffix string) (string, error) {
++	region := "default"
++	if apiConfig != nil && apiConfig.Region != nil {
++		region = *apiConfig.Region
++	}
++
++	baseURL, err := g.baseURLForRegion(region)
++	if err != nil {
++		return "", err
++	}
++	return fmt.Sprintf("%s/%s", baseURL, strings.TrimPrefix(suffix, "/")), nil
++}
++
++func groqChatPayload(modelName string, messages []Message, stream bool, chatModelConfig *ChatConfig) map[string]interface{} {
++	apiMessages := make([]map[string]interface{}, len(messages))
++	for i, msg := range messages {
++		apiMessages[i] = map[string]interface{}{
++			"role":    msg.Role,
++			"content": msg.Content,
++		}
++	}
++
++	reqBody := map[string]interface{}{
++		"model":    modelName,
++		"messages": apiMessages,
++		"stream":   stream,
++	}
++
++	if chatModelConfig != nil {
++		if chatModelConfig.MaxTokens != nil {
++			reqBody["max_tokens"] = *chatModelConfig.MaxTokens
++		}
++		if chatModelConfig.Temperature != nil {
++			reqBody["temperature"] = *chatModelConfig.Temperature
++		}
++		if chatModelConfig.TopP != nil {
++			reqBody["top_p"] = *chatModelConfig.TopP
++		}
++		if chatModelConfig.Stop != nil {
++			reqBody["stop"] = *chatModelConfig.Stop
++		}
++	}
++
++	return reqBody
++}
++
++type groqChatMessage struct {
++	Content          string `json:"content"`
++	ReasoningContent string `json:"reasoning_content"`
++	Reasoning        string `json:"reasoning"`
++}
++
++type groqChatChoice struct {
++	Message      groqChatMessage `json:"message"`
++	Delta        groqChatMessage `json:"delta"`
++	FinishReason string          `json:"finish_reason"`
++}
++
++type groqChatResponse struct {
++	Choices      []groqChatChoice `json:"choices"`
++	Error        interface{}      `json:"error"`
++	FinishReason string           `json:"finish_reason"`
++}
++
++func (g *GroqModel) ChatWithMessages(modelName string, messages []Message, apiConfig *APIConfig, chatModelConfig *ChatConfig) (*ChatResponse, error) {
++	if apiConfig == nil || apiConfig.ApiKey == nil || *apiConfig.ApiKey == "" {
++		return nil, fmt.Errorf("api key is required")
++	}
++	if strings.TrimSpace(modelName) == "" {
++		return nil, fmt.Errorf("model name is required")
++	}
++	if len(messages) == 0 {
++		return nil, fmt.Errorf("messages is empty")
++	}
++
++	url, err := g.endpoint(apiConfig, g.URLSuffix.Chat)
++	if err != nil {
++		return nil, err
++	}
++
++	jsonData, err := json.Marshal(groqChatPayload(modelName, messages, false, chatModelConfig))
++	if err != nil {
++		return nil, fmt.Errorf("failed to marshal request: %w", err)
++	}
++
++	ctx, cancel := context.WithTimeout(context.Background(), nonStreamCallTimeout)
++	defer cancel()
++
++	req, err := http.NewRequestWithContext(ctx, http.MethodPost, url, bytes.NewBuffer(jsonData))
++	if err != nil {
++		return nil, fmt.Errorf("failed to create request: %w", err)
++	}
++	req.Header.Set("Content-Type", "application/json")
++	req.Header.Set("Authorization", fmt.Sprintf("Bearer %s", *apiConfig.ApiKey))
++
++	resp, err := g.httpClient.Do(req)
++	if err != nil {
++		return nil, fmt.Errorf("failed to send request: %w", err)
++	}
++	defer resp.Body.Close()
++
++	body, err := io.ReadAll(resp.Body)
++	if err != nil {
++		return nil, fmt.Errorf("failed to read response: %w", err)
++	}
++	if resp.StatusCode != http.StatusOK {
++		return nil, fmt.Errorf("API request failed with status %d: %s", resp.StatusCode, string(body))
++	}
++
++	var result groqChatResponse
++	if err = json.Unmarshal(body, &result); err != nil {
++		return nil, fmt.Errorf("failed to parse response: %w", err)
++	}
++	if result.Error != nil {
++		return nil, fmt.Errorf("groq: upstream error: %v", result.Error)
++	}
++	if len(result.Choices) == 0 {
++		return nil, fmt.Errorf("no choices in response")
++	}
++
++	content := result.Choices[0].Message.Content
++	reasonContent := result.Choices[0].Message.ReasoningContent
++	if reasonContent == "" {
++		reasonContent = result.Choices[0].Message.Reasoning
++	}
++
++	return &ChatResponse{
++		Answer:        &content,
++		ReasonContent: &reasonContent,
++	}, nil
++}
++
++const groqStreamTimeout = 10 * time.Minute
++
++func (g *GroqModel) ChatStreamlyWithSender(modelName string, messages []Message, apiConfig *APIConfig, chatModelConfig *ChatConfig, sender func(*string, *string) error) error {
++	if sender == nil {
++		return fmt.Errorf("sender is required")
++	}
++	if apiConfig == nil || apiConfig.ApiKey == nil || *apiConfig.ApiKey == "" {
++		return fmt.Errorf("api key is required")
++	}
++	if strings.TrimSpace(modelName) == "" {
++		return fmt.Errorf("model name is required")
++	}
++	if len(messages) == 0 {
++		return fmt.Errorf("messages is empty")
++	}
++	if chatModelConfig != nil && chatModelConfig.Stream != nil && !*chatModelConfig.Stream {
++		return fmt.Errorf("stream must be true in ChatStreamlyWithSender")
++	}
++
++	url, err := g.endpoint(apiConfig, g.URLSuffix.Chat)
++	if err != nil {
++		return err
++	}
++
++	jsonData, err := json.Marshal(groqChatPayload(modelName, messages, true, chatModelConfig))
++	if err != nil {
++		return fmt.Errorf("failed to marshal request: %w", err)
++	}
++
++	ctx, cancel := context.WithTimeout(context.Background(), groqStreamTimeout)
++	defer cancel()
++
++	req, err := http.NewRequestWithContext(ctx, http.MethodPost, url, bytes.NewBuffer(jsonData))
++	if err != nil {
++		return fmt.Errorf("failed to create request: %w", err)
++	}
++	req.Header.Set("Content-Type", "application/json")
++	req.Header.Set("Authorization", fmt.Sprintf("Bearer %s", *apiConfig.ApiKey))
++	req.Header.Set("Accept", "text/event-stream")
++
++	resp, err := g.httpClient.Do(req)
++	if err != nil {
++		return fmt.Errorf("failed to send request: %w", err)
++	}
++	defer resp.Body.Close()
++
++	if resp.StatusCode != http.StatusOK {
++		body, _ := io.ReadAll(resp.Body)
++		return fmt.Errorf("API request failed with status %d: %s", resp.StatusCode, string(body))
++	}
++
++	scanner := bufio.NewScanner(resp.Body)
++	scanner.Buffer(make([]byte, 64*1024), 1024*1024)
++	sawTerminal := false
++	for scanner.Scan() {
++		line := scanner.Text()
++		if !strings.HasPrefix(line, "data:") {
++			continue
++		}
++
++		data := strings.TrimSpace(line[5:])
++		if data == "[DONE]" {
++			sawTerminal = true
++			break
++		}
++
++		var event groqChatResponse
++		if err = json.Unmarshal([]byte(data), &event); err != nil {
++			return fmt.Errorf("groq: invalid SSE event: %w", err)
++		}
++		if event.Error != nil {
++			return fmt.Errorf("groq: upstream stream error: %v", event.Error)
++		}
++		if len(event.Choices) == 0 {
++			continue
++		}
++
++		choice := event.Choices[0]
++		reasoning := choice.Delta.ReasoningContent
++		if reasoning == "" {
++			reasoning = choice.Delta.Reasoning
++		}
++		if reasoning != "" {
++			if err := sender(nil, &reasoning); err != nil {
++				return err
++			}
++		}
++		if choice.Delta.Content != "" {
++			if err := sender(&choice.Delta.Content, nil); err != nil {
++				return err
++			}
++		}
++		if choice.FinishReason != "" || event.FinishReason != "" {
++			sawTerminal = true
++			break
++		}
++	}
++	if err := scanner.Err(); err != nil {
++		return fmt.Errorf("failed to scan response body: %w", err)
++	}
++	if !sawTerminal {
++		return fmt.Errorf("groq: stream ended before [DONE] or finish_reason")
++	}
++
++	endOfStream := "[DONE]"
++	return sender(&endOfStream, nil)
++}
++
++type groqModelInfo struct {
++	ID string `json:"id"`
++}
++
++type groqListModelsResponse struct {
++	Data  []groqModelInfo `json:"data"`
++	Error interface{}     `json:"error"`
++}
++
++func (g *GroqModel) ListModels(apiConfig *APIConfig) ([]string, error) {
++	if apiConfig == nil || apiConfig.ApiKey == nil || *apiConfig.ApiKey == "" {
++		return nil, fmt.Errorf("api key is required")
++	}
++
++	url, err := g.endpoint(apiConfig, g.URLSuffix.Models)
++	if err != nil {
++		return nil, err
++	}
++
++	ctx, cancel := context.WithTimeout(context.Background(), nonStreamCallTimeout)
++	defer cancel()
++
++	req, err := http.NewRequestWithContext(ctx, http.MethodGet, url, nil)
++	if err != nil {
++		return nil, fmt.Errorf("failed to create request: %w", err)
++	}
++	req.Header.Set("Content-Type", "application/json")
++	req.Header.Set("Authorization", fmt.Sprintf("Bearer %s", *apiConfig.ApiKey))
++
++	resp, err := g.httpClient.Do(req)
++	if err != nil {
++		return nil, fmt.Errorf("failed to send request: %w", err)
++	}
++	defer resp.Body.Close()
++
++	body, err := io.ReadAll(resp.Body)
++	if err != nil {
++		return nil, fmt.Errorf("failed to read response: %w", err)
++	}
++	if resp.StatusCode != http.StatusOK {
++		return nil, fmt.Errorf("API request failed with status %d: %s", resp.StatusCode, string(body))
++	}
++
++	var result groqListModelsResponse
++	if err = json.Unmarshal(body, &result); err != nil {
++		return nil, fmt.Errorf("failed to parse response: %w", err)
++	}
++	if result.Error != nil {
++		return nil, fmt.Errorf("groq: upstream error: %v", result.Error)
++	}
++
++	models := make([]string, 0, len(result.Data))
++	for _, model := range result.Data {
++		if model.ID != "" {
++			models = append(models, model.ID)
++		}
++	}
++	return models, nil
++}
++
++func (g *GroqModel) CheckConnection(apiConfig *APIConfig) error {
++	_, err := g.ListModels(apiConfig)
++	return err
++}
++
++func (g *GroqModel) Embed(modelName *string, texts []string, apiConfig *APIConfig, embeddingConfig *EmbeddingConfig) ([]EmbeddingData, error) {
++	return nil, fmt.Errorf("%s, no such method", g.Name())
++}
++
++func (g *GroqModel) Rerank(modelName *string, query string, documents []string, apiConfig *APIConfig, rerankConfig *RerankConfig) (*RerankResponse, error) {
++	return nil, fmt.Errorf("%s, no such method", g.Name())
++}
++
++func (g *GroqModel) Balance(apiConfig *APIConfig) (map[string]interface{}, error) {
++	return nil, fmt.Errorf("%s, no such method", g.Name())
++}
++
++func (g *GroqModel) TranscribeAudio(modelName *string, file *string, apiConfig *APIConfig, asrConfig *ASRConfig) (*ASRResponse, error) {
++	return nil, fmt.Errorf("%s, no such method", g.Name())
++}
++
++func (g *GroqModel) TranscribeAudioWithSender(modelName *string, file *string, apiConfig *APIConfig, asrConfig *ASRConfig, sender func(*string, *string) error) error {
++	return fmt.Errorf("%s, no such method", g.Name())
++}
++
++func (g *GroqModel) AudioSpeech(modelName *string, audioContent *string, apiConfig *APIConfig, ttsConfig *TTSConfig) (*TTSResponse, error) {
++	return nil, fmt.Errorf("%s, no such method", g.Name())
++}
++
++func (g *GroqModel) AudioSpeechWithSender(modelName *string, audioContent *string, apiConfig *APIConfig, ttsConfig *TTSConfig, sender func(*string, *string) error) error {
++	return fmt.Errorf("%s, no such method", g.Name())
++}
++
++func (g *GroqModel) OCRFile(modelName *string, content []byte, url *string, apiConfig *APIConfig, ocrConfig *OCRConfig) (*OCRFileResponse, error) {
++	return nil, fmt.Errorf("%s, no such method", g.Name())
++}
++
++func (g *GroqModel) ParseFile(modelName *string, content []byte, url *string, apiConfig *APIConfig, parseFileConfig *ParseFileConfig) (*ParseFileResponse, error) {
++	return nil, fmt.Errorf("%s, no such method", g.Name())
++}
++
++func (g *GroqModel) ListTasks(apiConfig *APIConfig) ([]ListTaskStatus, error) {
++	return nil, fmt.Errorf("%s, no such method", g.Name())
++}
++
++func (g *GroqModel) ShowTask(taskID string, apiConfig *APIConfig) (*TaskResponse, error) {
++	return nil, fmt.Errorf("%s, no such method", g.Name())
++}
+diff --git a/internal/entity/models/groq_test.go b/internal/entity/models/groq_test.go
+new file mode 100644
+index 00000000000..e5658bc6b6e
+--- /dev/null
++++ b/internal/entity/models/groq_test.go
+@@ -0,0 +1,389 @@
++package models
++
++import (
++	"encoding/json"
++	"io"
++	"net/http"
++	"net/http/httptest"
++	"strings"
++	"testing"
++)
++
++func newGroqServer(t *testing.T, handler func(t *testing.T, r *http.Request, body map[string]interface{}, w http.ResponseWriter)) *httptest.Server {
++	t.Helper()
++	return httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
++		if got := r.Header.Get("Authorization"); got != "Bearer test-key" {
++			t.Errorf("expected Authorization=Bearer test-key, got %q", got)
++			return
++		}
++		var body map[string]interface{}
++		if r.Method == http.MethodPost {
++			if got := r.Header.Get("Content-Type"); !strings.HasPrefix(got, "application/json") {
++				t.Errorf("expected Content-Type to start with application/json, got %q", got)
++				return
++			}
++			raw, err := io.ReadAll(r.Body)
++			if err != nil {
++				t.Errorf("read body: %v", err)
++				return
++			}
++			if err := json.Unmarshal(raw, &body); err != nil {
++				t.Errorf("unmarshal: %v\nraw=%s", err, string(raw))
++				return
++			}
++		}
++		handler(t, r, body, w)
++	}))
++}
++
++func newGroqForTest(baseURL string) *GroqModel {
++	return NewGroqModel(
++		map[string]string{"default": baseURL},
++		URLSuffix{Chat: "chat/completions", Models: "models"},
++	)
++}
++
++func TestGroqName(t *testing.T) {
++	if got := newGroqForTest("http://unused").Name(); got != "groq" {
++		t.Errorf("Name()=%q", got)
++	}
++}
++
++func TestGroqFactory(t *testing.T) {
++	driver, err := NewModelFactory().CreateModelDriver("Groq", map[string]string{"default": "http://unused"}, URLSuffix{})
++	if err != nil {
++		t.Fatalf("CreateModelDriver: %v", err)
++	}
++	if _, ok := driver.(*GroqModel); !ok {
++		t.Fatalf("driver type=%T, want *GroqModel", driver)
++	}
++}
++
++type groqStubRoundTripper struct{}
++
++func (groqStubRoundTripper) RoundTrip(*http.Request) (*http.Response, error) {
++	return nil, http.ErrUseLastResponse
++}
++
++func TestNewGroqModelHandlesCustomDefaultTransport(t *testing.T) {
++	originalTransport := http.DefaultTransport
++	http.DefaultTransport = groqStubRoundTripper{}
++	t.Cleanup(func() {
++		http.DefaultTransport = originalTransport
++	})
++
++	model := NewGroqModel(map[string]string{"default": "http://unused"}, URLSuffix{})
++	if model == nil || model.httpClient == nil || model.httpClient.Transport == nil {
++		t.Fatalf("NewGroqModel returned incomplete model: %#v", model)
++	}
++}
++
++func TestGroqChatHappyPath(t *testing.T) {
++	srv := newGroqServer(t, func(t *testing.T, r *http.Request, body map[string]interface{}, w http.ResponseWriter) {
++		if r.Method != http.MethodPost {
++			t.Errorf("method=%s", r.Method)
++		}
++		if r.URL.Path != "/chat/completions" {
++			t.Errorf("path=%s", r.URL.Path)
++		}
++		if body["model"] != "llama-3.3-70b-versatile" {
++			t.Errorf("model=%v", body["model"])
++		}
++		if body["stream"] != false {
++			t.Errorf("stream=%v want false", body["stream"])
++		}
++		if body["max_tokens"] != float64(32) {
++			t.Errorf("max_tokens=%v", body["max_tokens"])
++		}
++		if body["temperature"] != 0.3 {
++			t.Errorf("temperature=%v", body["temperature"])
++		}
++		if body["top_p"] != 0.9 {
++			t.Errorf("top_p=%v", body["top_p"])
++		}
++		stop, ok := body["stop"].([]interface{})
++		if !ok || len(stop) != 1 || stop[0] != "END" {
++			t.Errorf("stop=%v", body["stop"])
++		}
++		if _, ok := body["reasoning_effort"]; ok {
++			t.Errorf("reasoning_effort should not be sent: %v", body["reasoning_effort"])
++		}
++		_ = json.NewEncoder(w).Encode(map[string]interface{}{
++			"choices": []map[string]interface{}{{
++				"message": map[string]interface{}{
++					"content":           "pong",
++					"reasoning_content": "thinking",
++				},
++			}},
++		})
++	})
++	defer srv.Close()
++
++	apiKey := "test-key"
++	maxTokens := 32
++	temperature := 0.3
++	topP := 0.9
++	stop := []string{"END"}
++	effort := "high"
++	resp, err := newGroqForTest(srv.URL).ChatWithMessages(
++		"llama-3.3-70b-versatile",
++		[]Message{{Role: "user", Content: "ping"}},
++		&APIConfig{ApiKey: &apiKey},
++		&ChatConfig{MaxTokens: &maxTokens, Temperature: &temperature, TopP: &topP, Stop: &stop, Effort: &effort},
++	)
++	if err != nil {
++		t.Fatalf("ChatWithMessages: %v", err)
++	}
++	if resp.Answer == nil || *resp.Answer != "pong" {
++		t.Fatalf("Answer=%v, want pong", resp.Answer)
++	}
++	if resp.ReasonContent == nil || *resp.ReasonContent != "thinking" {
++		t.Fatalf("ReasonContent=%v, want thinking", resp.ReasonContent)
++	}
++}
++
++func TestGroqChatRequiresModelName(t *testing.T) {
++	apiKey := "test-key"
++	_, err := newGroqForTest("http://unused").ChatWithMessages("", []Message{{Role: "user", Content: "x"}}, &APIConfig{ApiKey: &apiKey}, nil)
++	if err == nil || !strings.Contains(err.Error(), "model name is required") {
++		t.Errorf("expected model-name error, got %v", err)
++	}
++}
++
++func TestGroqChatRequiresMessages(t *testing.T) {
++	apiKey := "test-key"
++	_, err := newGroqForTest("http://unused").ChatWithMessages("llama-3.3-70b-versatile", nil, &APIConfig{ApiKey: &apiKey}, nil)
++	if err == nil || !strings.Contains(err.Error(), "messages is empty") {
++		t.Errorf("expected messages-empty error, got %v", err)
++	}
++}
++
++func TestGroqChatRejectsHTTPError(t *testing.T) {
++	srv := newGroqServer(t, func(t *testing.T, r *http.Request, body map[string]interface{}, w http.ResponseWriter) {
++		w.WriteHeader(http.StatusUnauthorized)
++		_, _ = w.Write([]byte(`{"error":{"message":"unauthorized"}}`))
++	})
++	defer srv.Close()
++
++	apiKey := "test-key"
++	_, err := newGroqForTest(srv.URL).ChatWithMessages(
++		"llama-3.3-70b-versatile",
++		[]Message{{Role: "user", Content: "x"}},
++		&APIConfig{ApiKey: &apiKey},
++		nil,
++	)
++	if err == nil || !strings.Contains(err.Error(), "401") {
++		t.Errorf("expected 401 propagated, got %v", err)
++	}
++}
++
++func TestGroqStreamHappyPath(t *testing.T) {
++	srv := newGroqServer(t, func(t *testing.T, r *http.Request, body map[string]interface{}, w http.ResponseWriter) {
++		if r.URL.Path != "/chat/completions" {
++			t.Errorf("path=%s", r.URL.Path)
++		}
++		if body["stream"] != true {
++			t.Errorf("stream=%v want true", body["stream"])
++		}
++		if got := r.Header.Get("Accept"); got != "text/event-stream" {
++			t.Errorf("Accept=%q", got)
++		}
++		w.Header().Set("Content-Type", "text/event-stream")
++		_, _ = io.WriteString(w,
++			`data: {"choices":[{"delta":{"reasoning_content":"think ","reasoning":"fallback "}}]}`+"\n"+
++				`data: {"choices":[{"delta":{"content":"Hello"}}]}`+"\n"+
++				`data: {"choices":[{"delta":{"content":" world"},"finish_reason":"stop"}]}`+"\n",
++		)
++	})
++	defer srv.Close()
++
++	apiKey := "test-key"
++	var content []string
++	var reasoning []string
++	var sawDone bool
++	err := newGroqForTest(srv.URL).ChatStreamlyWithSender(
++		"llama-3.3-70b-versatile",
++		[]Message{{Role: "user", Content: "hi"}},
++		&APIConfig{ApiKey: &apiKey},
++		nil,
++		func(c *string, r *string) error {
++			if c != nil {
++				if *c == "[DONE]" {
++					sawDone = true
++					return nil
++				}
++				content = append(content, *c)
++			}
++			if r != nil {
++				reasoning = append(reasoning, *r)
++			}
++			return nil
++		},
++	)
++	if err != nil {
++		t.Fatalf("ChatStreamlyWithSender: %v", err)
++	}
++	if strings.Join(content, "") != "Hello world" {
++		t.Errorf("content=%q", strings.Join(content, ""))
++	}
++	if strings.Join(reasoning, "") != "think " {
++		t.Errorf("reasoning=%q", strings.Join(reasoning, ""))
++	}
++	if !sawDone {
++		t.Error("expected [DONE] sentinel")
++	}
++}
++
++func TestGroqStreamRejectsExplicitFalse(t *testing.T) {
++	apiKey := "test-key"
++	stream := false
++	err := newGroqForTest("http://unused").ChatStreamlyWithSender(
++		"llama-3.3-70b-versatile",
++		[]Message{{Role: "user", Content: "x"}},
++		&APIConfig{ApiKey: &apiKey},
++		&ChatConfig{Stream: &stream},
++		func(*string, *string) error { return nil },
++	)
++	if err == nil || !strings.Contains(err.Error(), "stream must be true") {
++		t.Errorf("expected stream-true guard, got %v", err)
++	}
++}
++
++func TestGroqStreamRequiresSender(t *testing.T) {
++	apiKey := "test-key"
++	err := newGroqForTest("http://unused").ChatStreamlyWithSender(
++		"llama-3.3-70b-versatile",
++		[]Message{{Role: "user", Content: "x"}},
++		&APIConfig{ApiKey: &apiKey},
++		nil,
++		nil,
++	)
++	if err == nil || !strings.Contains(err.Error(), "sender is required") {
++		t.Errorf("expected sender-required error, got %v", err)
++	}
++}
++
++func TestGroqStreamRejectsUnterminatedStream(t *testing.T) {
++	srv := newGroqServer(t, func(t *testing.T, r *http.Request, body map[string]interface{}, w http.ResponseWriter) {
++		w.Header().Set("Content-Type", "text/event-stream")
++		_, _ = io.WriteString(w, `data: {"choices":[{"delta":{"content":"partial"}}]}`+"\n")
++	})
++	defer srv.Close()
++
++	apiKey := "test-key"
++	err := newGroqForTest(srv.URL).ChatStreamlyWithSender(
++		"llama-3.3-70b-versatile",
++		[]Message{{Role: "user", Content: "hi"}},
++		&APIConfig{ApiKey: &apiKey},
++		nil,
++		func(*string, *string) error { return nil },
++	)
++	if err == nil || !strings.Contains(err.Error(), "stream ended before") {
++		t.Errorf("expected unterminated-stream error, got %v", err)
++	}
++}
++
++func TestGroqListModelsAndCheckConnection(t *testing.T) {
++	srv := newGroqServer(t, func(t *testing.T, r *http.Request, body map[string]interface{}, w http.ResponseWriter) {
++		if r.Method != http.MethodGet {
++			t.Errorf("method=%s", r.Method)
++		}
++		if r.URL.Path != "/models" {
++			t.Errorf("path=%s", r.URL.Path)
++		}
++		_ = json.NewEncoder(w).Encode(map[string]interface{}{
++			"data": []map[string]interface{}{
++				{"id": "llama-3.3-70b-versatile"},
++				{"id": "openai/gpt-oss-120b"},
++			},
++		})
++	})
++	defer srv.Close()
++
++	apiKey := "test-key"
++	model := newGroqForTest(srv.URL)
++	models, err := model.ListModels(&APIConfig{ApiKey: &apiKey})
++	if err != nil {
++		t.Fatalf("ListModels: %v", err)
++	}
++	if strings.Join(models, ",") != "llama-3.3-70b-versatile,openai/gpt-oss-120b" {
++		t.Errorf("models=%v", models)
++	}
++	if err := model.CheckConnection(&APIConfig{ApiKey: &apiKey}); err != nil {
++		t.Fatalf("CheckConnection: %v", err)
++	}
++}
++
++func TestGroqBaseURLTrimsTrailingSlash(t *testing.T) {
++	srv := newGroqServer(t, func(t *testing.T, r *http.Request, body map[string]interface{}, w http.ResponseWriter) {
++		if r.URL.Path != "/chat/completions" {
++			t.Errorf("path=%s", r.URL.Path)
++		}
++		_ = json.NewEncoder(w).Encode(map[string]interface{}{
++			"choices": []map[string]interface{}{{
++				"message": map[string]interface{}{"content": "ok"},
++			}},
++		})
++	})
++	defer srv.Close()
++
++	apiKey := "test-key"
++	_, err := newGroqForTest(srv.URL+"/").ChatWithMessages(
++		"llama-3.3-70b-versatile",
++		[]Message{{Role: "user", Content: "x"}},
++		&APIConfig{ApiKey: &apiKey},
++		nil,
++	)
++	if err != nil {
++		t.Fatalf("ChatWithMessages: %v", err)
++	}
++}
++
++func TestGroqUsesEmptyRegionCustomBaseURL(t *testing.T) {
++	srv := newGroqServer(t, func(t *testing.T, r *http.Request, body map[string]interface{}, w http.ResponseWriter) {
++		if r.URL.Path != "/chat/completions" {
++			t.Errorf("path=%s", r.URL.Path)
++		}
++		_ = json.NewEncoder(w).Encode(map[string]interface{}{
++			"choices": []map[string]interface{}{{
++				"message": map[string]interface{}{"content": "ok"},
++			}},
++		})
++	})
++	defer srv.Close()
++
++	apiKey := "test-key"
++	region := ""
++	model := NewGroqModel(
++		map[string]string{"": srv.URL},
++		URLSuffix{Chat: "chat/completions", Models: "models"},
++	)
++	_, err := model.ChatWithMessages(
++		"llama-3.3-70b-versatile",
++		[]Message{{Role: "user", Content: "x"}},
++		&APIConfig{ApiKey: &apiKey, Region: &region},
++		nil,
++	)
++	if err != nil {
++		t.Fatalf("ChatWithMessages: %v", err)
++	}
++}
++
++func TestGroqUnsupportedMethods(t *testing.T) {
++	m := newGroqForTest("http://unused")
++	if _, err := m.Embed(nil, nil, nil, nil); err == nil || !strings.Contains(err.Error(), "no such method") {
++		t.Errorf("Embed error=%v", err)
++	}
++	if _, err := m.Rerank(nil, "", nil, nil, nil); err == nil || !strings.Contains(err.Error(), "no such method") {
++		t.Errorf("Rerank error=%v", err)
++	}
++	if _, err := m.Balance(nil); err == nil || !strings.Contains(err.Error(), "no such method") {
++		t.Errorf("Balance error=%v", err)
++	}
++	if _, err := m.ParseFile(nil, nil, nil, nil, nil); err == nil || !strings.Contains(err.Error(), "no such method") {
++		t.Errorf("ParseFile error=%v", err)
++	}
++	if _, err := m.ListTasks(nil); err == nil || !strings.Contains(err.Error(), "no such method") {
++		t.Errorf("ListTasks error=%v", err)
++	}
++}

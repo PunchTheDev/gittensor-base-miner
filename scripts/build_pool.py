@@ -55,7 +55,8 @@ def das_get(path: str) -> dict | list:
     url = f"{DAS_API}{path}"
     req = urllib.request.Request(url, headers={
         "Accept": "application/json",
-        "User-Agent": "gittensor-base-miner/build_pool",
+        # DAS API returns 403 to non-browser user-agents; use a standard one.
+        "User-Agent": "Mozilla/5.0 (compatible; gittensor-base-miner/build_pool)",
     })
     with urllib.request.urlopen(req, timeout=30) as resp:
         return json.loads(resp.read().decode())

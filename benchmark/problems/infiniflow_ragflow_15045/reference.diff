@@ -1,0 +1,876 @@
+diff --git a/conf/models/avian.json b/conf/models/avian.json
+new file mode 100644
+index 00000000000..40c0d4f524d
+--- /dev/null
++++ b/conf/models/avian.json
+@@ -0,0 +1,55 @@
++{
++  "name": "avian",
++  "url": {
++    "default": "https://api.avian.io"
++  },
++  "url_suffix": {
++    "chat": "v1/chat/completions",
++    "models": "v1/models"
++  },
++  "class": "avian",
++  "models": [
++    {
++      "name": "deepseek/deepseek-v4-pro",
++      "max_tokens": 164000,
++      "model_types": [
++        "chat"
++      ]
++    },
++    {
++      "name": "deepseek/deepseek-v4-flash",
++      "max_tokens": 164000,
++      "model_types": [
++        "chat"
++      ]
++    },
++    {
++      "name": "deepseek/deepseek-v3.2",
++      "max_tokens": 164000,
++      "model_types": [
++        "chat"
++      ]
++    },
++    {
++      "name": "moonshotai/kimi-k2.5",
++      "max_tokens": 131000,
++      "model_types": [
++        "chat"
++      ]
++    },
++    {
++      "name": "z-ai/glm-5",
++      "max_tokens": 131000,
++      "model_types": [
++        "chat"
++      ]
++    },
++    {
++      "name": "minimax/minimax-m2.5",
++      "max_tokens": 1000000,
++      "model_types": [
++        "chat"
++      ]
++    }
++  ]
++}
+diff --git a/internal/entity/models/avian.go b/internal/entity/models/avian.go
+new file mode 100644
+index 00000000000..44e86a22b94
+--- /dev/null
++++ b/internal/entity/models/avian.go
+@@ -0,0 +1,440 @@
++//
++//  Copyright 2026 The InfiniFlow Authors. All Rights Reserved.
++//
++//  Licensed under the Apache License, Version 2.0 (the "License");
++//  you may not use this file except in compliance with the License.
++//  You may obtain a copy of the License at
++//
++//      http://www.apache.org/licenses/LICENSE-2.0
++//
++//  Unless required by applicable law or agreed to in writing, software
++//  distributed under the License is distributed on an "AS IS" BASIS,
++//  WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++//  See the License for the specific language governing permissions and
++//  limitations under the License.
++//
++
++package models
++
++import (
++	"bufio"
++	"bytes"
++	"context"
++	"encoding/json"
++	"fmt"
++	"io"
++	"net/http"
++	"strings"
++	"time"
++)
++
++// AvianModel implements ModelDriver for Avian (https://api.avian.io/docs/).
++//
++// Avian is a SaaS inference platform exposing an OpenAI-compatible REST API
++// at https://api.avian.io/v1 (chat completions at /chat/completions, list
++// models at /models). It serves a catalog of third-party chat models
++// (DeepSeek, Kimi, GLM, MiniMax, etc.) behind a single OpenAI-shaped surface.
++//
++// The shipped base URL is https://api.avian.io; the tenant may override
++// per-instance. Authentication is always required: every call sets
++// Authorization: Bearer <api_key>. Reasoning models surface their thinking
++// in either `reasoning_content` (preferred) or `reasoning`; the driver
++// extracts whichever is non-empty and routes it to ChatResponse.ReasonContent
++// (non-stream) or the sender's second argument (stream).
++type AvianModel struct {
++	BaseURL    map[string]string
++	URLSuffix  URLSuffix
++	httpClient *http.Client
++}
++
++// NewAvianModel creates a new Avian model instance.
++//
++// Same transport convention as other Go SaaS drivers in this package:
++// clone http.DefaultTransport, override the connection-pool fields,
++// no client-level Timeout so SSE streams are not capped at the client
++// layer (per-request contexts handle that).
++func NewAvianModel(baseURL map[string]string, urlSuffix URLSuffix) *AvianModel {
++	transport := http.DefaultTransport.(*http.Transport).Clone()
++	transport.MaxIdleConns = 100
++	transport.MaxIdleConnsPerHost = 10
++	transport.IdleConnTimeout = 90 * time.Second
++	transport.DisableCompression = false
++	transport.ResponseHeaderTimeout = 60 * time.Second
++
++	return &AvianModel{
++		BaseURL:   baseURL,
++		URLSuffix: urlSuffix,
++		httpClient: &http.Client{
++			Transport: transport,
++		},
++	}
++}
++
++func (a *AvianModel) NewInstance(baseURL map[string]string) ModelDriver {
++	return NewAvianModel(baseURL, a.URLSuffix)
++}
++
++func (a *AvianModel) Name() string {
++	return "avian"
++}
++
++func (a *AvianModel) baseURLForRegion(region string) (string, error) {
++	base, ok := a.BaseURL[region]
++	if !ok || base == "" {
++		return "", fmt.Errorf("avian: no base URL configured for region %q", region)
++	}
++	// Tenants may paste in a base URL that already includes the API
++	// version (".../v1" or ".../v1/"); callers append "v1/..." so we
++	// strip those plus any trailing "/" to avoid "/v1/v1/..." paths.
++	base = strings.TrimSuffix(base, "/")
++	base = strings.TrimSuffix(base, "/v1")
++	return strings.TrimSuffix(base, "/"), nil
++}
++
++func (a *AvianModel) chatPayload(modelName string, messages []Message, stream bool, chatModelConfig *ChatConfig) map[string]interface{} {
++	apiMessages := make([]map[string]interface{}, len(messages))
++	for i, msg := range messages {
++		apiMessages[i] = map[string]interface{}{
++			"role":    msg.Role,
++			"content": msg.Content,
++		}
++	}
++
++	reqBody := map[string]interface{}{
++		"model":    modelName,
++		"messages": apiMessages,
++		"stream":   stream,
++	}
++
++	if chatModelConfig != nil {
++		if chatModelConfig.MaxTokens != nil {
++			reqBody["max_tokens"] = *chatModelConfig.MaxTokens
++		}
++		if chatModelConfig.Temperature != nil {
++			reqBody["temperature"] = *chatModelConfig.Temperature
++		}
++		if chatModelConfig.TopP != nil {
++			reqBody["top_p"] = *chatModelConfig.TopP
++		}
++		if chatModelConfig.Stop != nil {
++			reqBody["stop"] = *chatModelConfig.Stop
++		}
++	}
++
++	return reqBody
++}
++
++func (a *AvianModel) chatURL(apiConfig *APIConfig) (string, error) {
++	region := "default"
++	if apiConfig != nil && apiConfig.Region != nil && *apiConfig.Region != "" {
++		region = *apiConfig.Region
++	}
++
++	baseURL, err := a.baseURLForRegion(region)
++	if err != nil {
++		return "", err
++	}
++	return fmt.Sprintf("%s/%s", baseURL, a.URLSuffix.Chat), nil
++}
++
++type avianChatMessage struct {
++	Content          string `json:"content"`
++	ReasoningContent string `json:"reasoning_content"`
++	Reasoning        string `json:"reasoning"`
++}
++
++type avianChatChoice struct {
++	Message      avianChatMessage `json:"message"`
++	Delta        avianChatMessage `json:"delta"`
++	FinishReason string           `json:"finish_reason"`
++}
++
++type avianChatResponse struct {
++	Choices      []avianChatChoice `json:"choices"`
++	Error        interface{}       `json:"error"`
++	FinishReason string            `json:"finish_reason"`
++}
++
++func (a *AvianModel) ChatWithMessages(modelName string, messages []Message, apiConfig *APIConfig, chatModelConfig *ChatConfig) (*ChatResponse, error) {
++	if apiConfig == nil || apiConfig.ApiKey == nil || *apiConfig.ApiKey == "" {
++		return nil, fmt.Errorf("api key is required")
++	}
++	if strings.TrimSpace(modelName) == "" {
++		return nil, fmt.Errorf("model name is required")
++	}
++	if len(messages) == 0 {
++		return nil, fmt.Errorf("messages is empty")
++	}
++
++	url, err := a.chatURL(apiConfig)
++	if err != nil {
++		return nil, err
++	}
++
++	jsonData, err := json.Marshal(a.chatPayload(modelName, messages, false, chatModelConfig))
++	if err != nil {
++		return nil, fmt.Errorf("failed to marshal request: %w", err)
++	}
++
++	ctx, cancel := context.WithTimeout(context.Background(), nonStreamCallTimeout)
++	defer cancel()
++
++	req, err := http.NewRequestWithContext(ctx, http.MethodPost, url, bytes.NewBuffer(jsonData))
++	if err != nil {
++		return nil, fmt.Errorf("failed to create request: %w", err)
++	}
++	req.Header.Set("Content-Type", "application/json")
++	req.Header.Set("Authorization", fmt.Sprintf("Bearer %s", *apiConfig.ApiKey))
++
++	resp, err := a.httpClient.Do(req)
++	if err != nil {
++		return nil, fmt.Errorf("failed to send request: %w", err)
++	}
++	defer resp.Body.Close()
++
++	body, err := io.ReadAll(resp.Body)
++	if err != nil {
++		return nil, fmt.Errorf("failed to read response: %w", err)
++	}
++	if resp.StatusCode != http.StatusOK {
++		return nil, fmt.Errorf("API request failed with status %d: %s", resp.StatusCode, string(body))
++	}
++
++	var result avianChatResponse
++	if err = json.Unmarshal(body, &result); err != nil {
++		return nil, fmt.Errorf("failed to parse response: %w", err)
++	}
++	if result.Error != nil {
++		return nil, fmt.Errorf("avian: upstream error: %v", result.Error)
++	}
++	if len(result.Choices) == 0 {
++		return nil, fmt.Errorf("no choices in response")
++	}
++
++	content := result.Choices[0].Message.Content
++	reasonContent := result.Choices[0].Message.ReasoningContent
++	if reasonContent == "" {
++		reasonContent = result.Choices[0].Message.Reasoning
++	}
++	return &ChatResponse{
++		Answer:        &content,
++		ReasonContent: &reasonContent,
++	}, nil
++}
++
++const avianStreamTimeout = 10 * time.Minute
++
++func (a *AvianModel) ChatStreamlyWithSender(modelName string, messages []Message, apiConfig *APIConfig, chatModelConfig *ChatConfig, sender func(*string, *string) error) error {
++	if sender == nil {
++		return fmt.Errorf("sender is required")
++	}
++	if apiConfig == nil || apiConfig.ApiKey == nil || *apiConfig.ApiKey == "" {
++		return fmt.Errorf("api key is required")
++	}
++	if strings.TrimSpace(modelName) == "" {
++		return fmt.Errorf("model name is required")
++	}
++	if len(messages) == 0 {
++		return fmt.Errorf("messages is empty")
++	}
++	if chatModelConfig != nil && chatModelConfig.Stream != nil && !*chatModelConfig.Stream {
++		return fmt.Errorf("stream must be true in ChatStreamlyWithSender")
++	}
++
++	url, err := a.chatURL(apiConfig)
++	if err != nil {
++		return err
++	}
++
++	jsonData, err := json.Marshal(a.chatPayload(modelName, messages, true, chatModelConfig))
++	if err != nil {
++		return fmt.Errorf("failed to marshal request: %w", err)
++	}
++
++	// ResponseHeaderTimeout caps the initial header wait. This context
++	// also caps the body-read phase so a stalled SSE stream cannot hold
++	// the caller's goroutine and connection indefinitely.
++	ctx, cancel := context.WithTimeout(context.Background(), avianStreamTimeout)
++	defer cancel()
++
++	req, err := http.NewRequestWithContext(ctx, http.MethodPost, url, bytes.NewBuffer(jsonData))
++	if err != nil {
++		return fmt.Errorf("failed to create request: %w", err)
++	}
++	req.Header.Set("Content-Type", "application/json")
++	req.Header.Set("Authorization", fmt.Sprintf("Bearer %s", *apiConfig.ApiKey))
++
++	resp, err := a.httpClient.Do(req)
++	if err != nil {
++		return fmt.Errorf("failed to send request: %w", err)
++	}
++	defer resp.Body.Close()
++
++	if resp.StatusCode != http.StatusOK {
++		body, _ := io.ReadAll(resp.Body)
++		return fmt.Errorf("API request failed with status %d: %s", resp.StatusCode, string(body))
++	}
++
++	scanner := bufio.NewScanner(resp.Body)
++	scanner.Buffer(make([]byte, 64*1024), 1024*1024)
++	sawTerminal := false
++	for scanner.Scan() {
++		line := scanner.Text()
++		if !strings.HasPrefix(line, "data:") {
++			continue
++		}
++
++		data := strings.TrimSpace(line[5:])
++		if data == "[DONE]" {
++			sawTerminal = true
++			break
++		}
++
++		var event avianChatResponse
++		if err = json.Unmarshal([]byte(data), &event); err != nil {
++			return fmt.Errorf("avian: invalid SSE event: %w", err)
++		}
++		if event.Error != nil {
++			return fmt.Errorf("avian: upstream stream error: %v", event.Error)
++		}
++		if len(event.Choices) == 0 {
++			continue
++		}
++
++		choice := event.Choices[0]
++		if reasoning := choice.Delta.ReasoningContent; reasoning != "" {
++			if err := sender(nil, &reasoning); err != nil {
++				return err
++			}
++		} else if reasoning := choice.Delta.Reasoning; reasoning != "" {
++			if err := sender(nil, &reasoning); err != nil {
++				return err
++			}
++		}
++		if choice.Delta.Content != "" {
++			if err := sender(&choice.Delta.Content, nil); err != nil {
++				return err
++			}
++		}
++		if choice.FinishReason != "" || event.FinishReason != "" {
++			sawTerminal = true
++			break
++		}
++	}
++	if err := scanner.Err(); err != nil {
++		return fmt.Errorf("failed to scan response body: %w", err)
++	}
++	if !sawTerminal {
++		return fmt.Errorf("avian: stream ended before [DONE] or finish_reason")
++	}
++
++	endOfStream := "[DONE]"
++	return sender(&endOfStream, nil)
++}
++
++type avianModelInfo struct {
++	ID string `json:"id"`
++}
++
++func (a *AvianModel) ListModels(apiConfig *APIConfig) ([]string, error) {
++	if apiConfig == nil || apiConfig.ApiKey == nil || *apiConfig.ApiKey == "" {
++		return nil, fmt.Errorf("api key is required")
++	}
++
++	region := "default"
++	if apiConfig.Region != nil && *apiConfig.Region != "" {
++		region = *apiConfig.Region
++	}
++
++	baseURL, err := a.baseURLForRegion(region)
++	if err != nil {
++		return nil, err
++	}
++	url := fmt.Sprintf("%s/%s", baseURL, a.URLSuffix.Models)
++
++	ctx, cancel := context.WithTimeout(context.Background(), nonStreamCallTimeout)
++	defer cancel()
++
++	req, err := http.NewRequestWithContext(ctx, http.MethodGet, url, nil)
++	if err != nil {
++		return nil, fmt.Errorf("failed to create request: %w", err)
++	}
++	req.Header.Set("Content-Type", "application/json")
++	req.Header.Set("Authorization", fmt.Sprintf("Bearer %s", *apiConfig.ApiKey))
++
++	resp, err := a.httpClient.Do(req)
++	if err != nil {
++		return nil, fmt.Errorf("failed to send request: %w", err)
++	}
++	defer resp.Body.Close()
++
++	body, err := io.ReadAll(resp.Body)
++	if err != nil {
++		return nil, fmt.Errorf("failed to read response: %w", err)
++	}
++	if resp.StatusCode != http.StatusOK {
++		return nil, fmt.Errorf("API request failed with status %d: %s", resp.StatusCode, string(body))
++	}
++
++	var result []avianModelInfo
++	if err = json.Unmarshal(body, &result); err != nil {
++		return nil, fmt.Errorf("failed to parse response: %w", err)
++	}
++
++	models := make([]string, 0, len(result))
++	for _, model := range result {
++		if model.ID != "" {
++			models = append(models, model.ID)
++		}
++	}
++	return models, nil
++}
++
++func (a *AvianModel) CheckConnection(apiConfig *APIConfig) error {
++	_, err := a.ListModels(apiConfig)
++	return err
++}
++
++func (a *AvianModel) Embed(modelName *string, texts []string, apiConfig *APIConfig, embeddingConfig *EmbeddingConfig) ([]EmbeddingData, error) {
++	return nil, fmt.Errorf("%s, no such method", a.Name())
++}
++
++func (a *AvianModel) Rerank(modelName *string, query string, documents []string, apiConfig *APIConfig, rerankConfig *RerankConfig) (*RerankResponse, error) {
++	return nil, fmt.Errorf("%s, no such method", a.Name())
++}
++
++func (a *AvianModel) Balance(apiConfig *APIConfig) (map[string]interface{}, error) {
++	return nil, fmt.Errorf("%s, no such method", a.Name())
++}
++
++func (a *AvianModel) TranscribeAudio(modelName *string, file *string, apiConfig *APIConfig, asrConfig *ASRConfig) (*ASRResponse, error) {
++	return nil, fmt.Errorf("%s, no such method", a.Name())
++}
++
++func (a *AvianModel) TranscribeAudioWithSender(modelName *string, file *string, apiConfig *APIConfig, asrConfig *ASRConfig, sender func(*string, *string) error) error {
++	return fmt.Errorf("%s, no such method", a.Name())
++}
++
++func (a *AvianModel) AudioSpeech(modelName *string, audioContent *string, apiConfig *APIConfig, ttsConfig *TTSConfig) (*TTSResponse, error) {
++	return nil, fmt.Errorf("%s, no such method", a.Name())
++}
++
++func (a *AvianModel) AudioSpeechWithSender(modelName *string, audioContent *string, apiConfig *APIConfig, ttsConfig *TTSConfig, sender func(*string, *string) error) error {
++	return fmt.Errorf("%s, no such method", a.Name())
++}
++
++func (a *AvianModel) OCRFile(modelName *string, content []byte, url *string, apiConfig *APIConfig, ocrConfig *OCRConfig) (*OCRFileResponse, error) {
++	return nil, fmt.Errorf("%s, no such method", a.Name())
++}
++
++func (a *AvianModel) ParseFile(modelName *string, content []byte, url *string, apiConfig *APIConfig, parseFileConfig *ParseFileConfig) (*ParseFileResponse, error) {
++	return nil, fmt.Errorf("%s, no such method", a.Name())
++}
++
++func (a *AvianModel) ListTasks(apiConfig *APIConfig) ([]ListTaskStatus, error) {
++	return nil, fmt.Errorf("%s, no such method", a.Name())
++}
++
++func (a *AvianModel) ShowTask(taskID string, apiConfig *APIConfig) (*TaskResponse, error) {
++	return nil, fmt.Errorf("%s, no such method", a.Name())
++}
+diff --git a/internal/entity/models/avian_test.go b/internal/entity/models/avian_test.go
+new file mode 100644
+index 00000000000..3ff25220e70
+--- /dev/null
++++ b/internal/entity/models/avian_test.go
+@@ -0,0 +1,350 @@
++//
++//  Copyright 2026 The InfiniFlow Authors. All Rights Reserved.
++//
++//  Licensed under the Apache License, Version 2.0 (the "License");
++//  you may not use this file except in compliance with the License.
++//  You may obtain a copy of the License at
++//
++//      http://www.apache.org/licenses/LICENSE-2.0
++//
++//  Unless required by applicable law or agreed to in writing, software
++//  distributed under the License is distributed on an "AS IS" BASIS,
++//  WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++//  See the License for the specific language governing permissions and
++//  limitations under the License.
++//
++
++package models
++
++import (
++	"encoding/json"
++	"io"
++	"net/http"
++	"net/http/httptest"
++	"strings"
++	"testing"
++)
++
++func newAvianServer(t *testing.T, handler func(t *testing.T, r *http.Request, body map[string]interface{}, w http.ResponseWriter)) *httptest.Server {
++	t.Helper()
++	return httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
++		if got := r.Header.Get("Authorization"); got != "Bearer test-key" {
++			t.Errorf("expected Authorization=Bearer test-key, got %q", got)
++			return
++		}
++		// The Avian client sets Content-Type: application/json on every
++		// request, including the GET to /v1/models (see avian.go ListModels),
++		// so this assertion intentionally applies even when there's no body.
++		if got := r.Header.Get("Content-Type"); !strings.HasPrefix(got, "application/json") {
++			t.Errorf("expected Content-Type to start with application/json, got %q", got)
++			return
++		}
++		var body map[string]interface{}
++		if r.Method == http.MethodPost {
++			raw, err := io.ReadAll(r.Body)
++			if err != nil {
++				t.Errorf("read body: %v", err)
++				return
++			}
++			if err := json.Unmarshal(raw, &body); err != nil {
++				t.Errorf("unmarshal: %v\nraw=%s", err, string(raw))
++				return
++			}
++		}
++		handler(t, r, body, w)
++	}))
++}
++
++func newAvianForTest(baseURL string) *AvianModel {
++	return NewAvianModel(
++		map[string]string{"default": baseURL},
++		URLSuffix{Chat: "v1/chat/completions", Models: "v1/models"},
++	)
++}
++
++func TestAvianName(t *testing.T) {
++	if got := newAvianForTest("http://unused").Name(); got != "avian" {
++		t.Errorf("Name()=%q, want avian", got)
++	}
++}
++
++func TestAvianFactory(t *testing.T) {
++	driver, err := NewModelFactory().CreateModelDriver("Avian", map[string]string{"default": "http://unused"}, URLSuffix{})
++	if err != nil {
++		t.Fatalf("CreateModelDriver: %v", err)
++	}
++	if _, ok := driver.(*AvianModel); !ok {
++		t.Fatalf("driver type=%T, want *AvianModel", driver)
++	}
++}
++
++func TestAvianChatHappyPath(t *testing.T) {
++	srv := newAvianServer(t, func(t *testing.T, r *http.Request, body map[string]interface{}, w http.ResponseWriter) {
++		if r.URL.Path != "/v1/chat/completions" {
++			t.Errorf("path=%s, want /v1/chat/completions", r.URL.Path)
++		}
++		if body["model"] != "deepseek/deepseek-v3.2" {
++			t.Errorf("model=%v", body["model"])
++		}
++		if body["stream"] != false {
++			t.Errorf("stream=%v, want false", body["stream"])
++		}
++		if body["max_tokens"] != float64(64) {
++			t.Errorf("max_tokens=%v, want 64", body["max_tokens"])
++		}
++		if body["temperature"] != 0.3 {
++			t.Errorf("temperature=%v, want 0.3", body["temperature"])
++		}
++		if body["top_p"] != 0.9 {
++			t.Errorf("top_p=%v, want 0.9", body["top_p"])
++		}
++		if stopSlice, ok := body["stop"].([]interface{}); !ok || len(stopSlice) != 1 || stopSlice[0] != "END" {
++			t.Errorf("stop=%v, want [END]", body["stop"])
++		}
++		_ = json.NewEncoder(w).Encode(map[string]interface{}{
++			"choices": []map[string]interface{}{{
++				"message": map[string]interface{}{
++					"content":           "pong",
++					"reasoning_content": "thought about it",
++				},
++			}},
++		})
++	})
++	defer srv.Close()
++
++	apiKey := "test-key"
++	mt := 64
++	temp := 0.3
++	topP := 0.9
++	stop := []string{"END"}
++	resp, err := newAvianForTest(srv.URL).ChatWithMessages(
++		"deepseek/deepseek-v3.2",
++		[]Message{{Role: "user", Content: "ping"}},
++		&APIConfig{ApiKey: &apiKey},
++		&ChatConfig{MaxTokens: &mt, Temperature: &temp, TopP: &topP, Stop: &stop},
++	)
++	if err != nil {
++		t.Fatalf("ChatWithMessages: %v", err)
++	}
++	if resp.Answer == nil || *resp.Answer != "pong" {
++		t.Errorf("Answer=%v, want pong", resp.Answer)
++	}
++	if resp.ReasonContent == nil || *resp.ReasonContent != "thought about it" {
++		t.Errorf("ReasonContent=%v, want 'thought about it'", resp.ReasonContent)
++	}
++}
++
++func TestAvianChatFallsBackToReasoningField(t *testing.T) {
++	srv := newAvianServer(t, func(t *testing.T, r *http.Request, body map[string]interface{}, w http.ResponseWriter) {
++		_ = json.NewEncoder(w).Encode(map[string]interface{}{
++			"choices": []map[string]interface{}{{
++				"message": map[string]interface{}{
++					"content":   "12",
++					"reasoning": "0.15 * 80 = 12",
++				},
++			}},
++		})
++	})
++	defer srv.Close()
++
++	apiKey := "test-key"
++	resp, err := newAvianForTest(srv.URL).ChatWithMessages(
++		"moonshotai/kimi-k2.5",
++		[]Message{{Role: "user", Content: "15% of 80?"}},
++		&APIConfig{ApiKey: &apiKey},
++		nil,
++	)
++	if err != nil {
++		t.Fatalf("ChatWithMessages: %v", err)
++	}
++	if resp.ReasonContent == nil || *resp.ReasonContent != "0.15 * 80 = 12" {
++		t.Errorf("ReasonContent=%v", resp.ReasonContent)
++	}
++}
++
++func TestAvianChatRequiresAPIKey(t *testing.T) {
++	_, err := newAvianForTest("http://unused").ChatWithMessages(
++		"deepseek/deepseek-v3.2",
++		[]Message{{Role: "user", Content: "x"}},
++		&APIConfig{},
++		nil,
++	)
++	if err == nil || !strings.Contains(err.Error(), "api key is required") {
++		t.Errorf("expected api-key-required error, got %v", err)
++	}
++}
++
++func TestAvianChatRequiresMessages(t *testing.T) {
++	apiKey := "test-key"
++	_, err := newAvianForTest("http://unused").ChatWithMessages(
++		"deepseek/deepseek-v3.2",
++		[]Message{},
++		&APIConfig{ApiKey: &apiKey},
++		nil,
++	)
++	if err == nil || !strings.Contains(err.Error(), "messages is empty") {
++		t.Errorf("expected messages-empty error, got %v", err)
++	}
++}
++
++func TestAvianChatPropagatesUpstreamErrorStatus(t *testing.T) {
++	srv := newAvianServer(t, func(t *testing.T, r *http.Request, body map[string]interface{}, w http.ResponseWriter) {
++		w.WriteHeader(http.StatusUnauthorized)
++		_, _ = io.WriteString(w, `{"error":"invalid key"}`)
++	})
++	defer srv.Close()
++
++	apiKey := "test-key"
++	_, err := newAvianForTest(srv.URL).ChatWithMessages(
++		"deepseek/deepseek-v3.2",
++		[]Message{{Role: "user", Content: "x"}},
++		&APIConfig{ApiKey: &apiKey},
++		nil,
++	)
++	if err == nil || !strings.Contains(err.Error(), "401") {
++		t.Errorf("expected 401 status error, got %v", err)
++	}
++}
++
++func TestAvianStreamHappyPath(t *testing.T) {
++	srv := newAvianServer(t, func(t *testing.T, r *http.Request, body map[string]interface{}, w http.ResponseWriter) {
++		if r.URL.Path != "/v1/chat/completions" {
++			t.Errorf("path=%s", r.URL.Path)
++		}
++		if body["stream"] != true {
++			t.Errorf("stream=%v, want true", body["stream"])
++		}
++		w.Header().Set("Content-Type", "text/event-stream")
++		_, _ = io.WriteString(w,
++			`data: {"choices":[{"delta":{"reasoning_content":"step. "}}]}`+"\n"+
++				`data: {"choices":[{"delta":{"content":"Hello"}}]}`+"\n"+
++				`data: {"choices":[{"delta":{"content":" world"},"finish_reason":"stop"}]}`+"\n"+
++				`data: [DONE]`+"\n",
++		)
++	})
++	defer srv.Close()
++
++	apiKey := "test-key"
++	var content, reasoning []string
++	var sawDone bool
++	err := newAvianForTest(srv.URL).ChatStreamlyWithSender(
++		"deepseek/deepseek-v3.2",
++		[]Message{{Role: "user", Content: "hi"}},
++		&APIConfig{ApiKey: &apiKey},
++		nil,
++		func(c *string, r *string) error {
++			if r != nil && *r != "" {
++				reasoning = append(reasoning, *r)
++			}
++			if c != nil && *c == "[DONE]" {
++				sawDone = true
++			}
++			if c != nil && *c != "" && *c != "[DONE]" {
++				content = append(content, *c)
++			}
++			return nil
++		},
++	)
++	if err != nil {
++		t.Fatalf("ChatStreamlyWithSender: %v", err)
++	}
++	if strings.Join(reasoning, "") != "step. " {
++		t.Errorf("reasoning=%q", strings.Join(reasoning, ""))
++	}
++	if strings.Join(content, "") != "Hello world" {
++		t.Errorf("content=%q", strings.Join(content, ""))
++	}
++	if !sawDone {
++		t.Error("expected [DONE] callback")
++	}
++}
++
++func TestAvianStreamRejectsFalseStreamConfig(t *testing.T) {
++	apiKey := "test-key"
++	stream := false
++	err := newAvianForTest("http://unused").ChatStreamlyWithSender(
++		"deepseek/deepseek-v3.2",
++		[]Message{{Role: "user", Content: "x"}},
++		&APIConfig{ApiKey: &apiKey},
++		&ChatConfig{Stream: &stream},
++		func(*string, *string) error { return nil },
++	)
++	if err == nil || !strings.Contains(err.Error(), "stream must be true") {
++		t.Errorf("expected stream-must-be-true error, got %v", err)
++	}
++}
++
++func TestAvianStreamRequiresSender(t *testing.T) {
++	apiKey := "test-key"
++	err := newAvianForTest("http://unused").ChatStreamlyWithSender(
++		"deepseek/deepseek-v3.2",
++		[]Message{{Role: "user", Content: "x"}},
++		&APIConfig{ApiKey: &apiKey},
++		nil,
++		nil,
++	)
++	if err == nil || !strings.Contains(err.Error(), "sender is required") {
++		t.Errorf("expected sender-required error, got %v", err)
++	}
++}
++
++func TestAvianListModelsAndCheckConnection(t *testing.T) {
++	srv := newAvianServer(t, func(t *testing.T, r *http.Request, _ map[string]interface{}, w http.ResponseWriter) {
++		if r.URL.Path != "/v1/models" {
++			t.Errorf("path=%s, want /v1/models", r.URL.Path)
++		}
++		_, _ = io.WriteString(w, `[{"id":"deepseek/deepseek-v3.2"},{"id":"moonshotai/kimi-k2.5"}]`)
++	})
++	defer srv.Close()
++
++	apiKey := "test-key"
++	cfg := &APIConfig{ApiKey: &apiKey}
++	models, err := newAvianForTest(srv.URL).ListModels(cfg)
++	if err != nil {
++		t.Fatalf("ListModels: %v", err)
++	}
++	if strings.Join(models, ",") != "deepseek/deepseek-v3.2,moonshotai/kimi-k2.5" {
++		t.Errorf("models=%v", models)
++	}
++	if err := newAvianForTest(srv.URL).CheckConnection(cfg); err != nil {
++		t.Fatalf("CheckConnection: %v", err)
++	}
++}
++
++func TestAvianMissingBaseURLFailsClearly(t *testing.T) {
++	a := NewAvianModel(map[string]string{}, URLSuffix{Chat: "v1/chat/completions"})
++	apiKey := "test-key"
++	_, err := a.ChatWithMessages(
++		"deepseek/deepseek-v3.2",
++		[]Message{{Role: "user", Content: "x"}},
++		&APIConfig{ApiKey: &apiKey},
++		nil,
++	)
++	if err == nil || !strings.Contains(err.Error(), "no base URL") {
++		t.Errorf("expected no-base-URL error, got %v", err)
++	}
++}
++
++func TestAvianUnsupportedMethodsReturnNoSuchMethod(t *testing.T) {
++	a := newAvianForTest("http://unused")
++	model := "deepseek/deepseek-v3.2"
++
++	if _, err := a.Embed(&model, []string{"x"}, &APIConfig{}, nil); err == nil || !strings.Contains(err.Error(), "no such method") {
++		t.Errorf("Embed: expected no such method, got %v", err)
++	}
++	if _, err := a.Rerank(&model, "q", []string{"d"}, &APIConfig{}, nil); err == nil || !strings.Contains(err.Error(), "no such method") {
++		t.Errorf("Rerank: expected no such method, got %v", err)
++	}
++	if _, err := a.Balance(&APIConfig{}); err == nil || !strings.Contains(err.Error(), "no such method") {
++		t.Errorf("Balance: expected no such method, got %v", err)
++	}
++	if _, err := a.TranscribeAudio(&model, nil, &APIConfig{}, nil); err == nil || !strings.Contains(err.Error(), "no such method") {
++		t.Errorf("TranscribeAudio: expected no such method, got %v", err)
++	}
++	if _, err := a.AudioSpeech(&model, nil, &APIConfig{}, nil); err == nil || !strings.Contains(err.Error(), "no such method") {
++		t.Errorf("AudioSpeech: expected no such method, got %v", err)
++	}
++	if _, err := a.OCRFile(&model, nil, nil, &APIConfig{}, nil); err == nil || !strings.Contains(err.Error(), "no such method") {
++		t.Errorf("OCRFile: expected no such method, got %v", err)
++	}
++}
+diff --git a/internal/entity/models/factory.go b/internal/entity/models/factory.go
+index f7dad653b9a..636d02dc7dc 100644
+--- a/internal/entity/models/factory.go
++++ b/internal/entity/models/factory.go
+@@ -95,6 +95,8 @@ func (f *ModelFactory) CreateModelDriver(providerName string, baseURL map[string
+ 		return NewLongCatModel(baseURL, urlSuffix), nil
+ 	case "novita":
+ 		return NewNovitaModel(baseURL, urlSuffix), nil
++	case "avian":
++		return NewAvianModel(baseURL, urlSuffix), nil
+ 	case "replicate":
+ 		return NewReplicateModel(baseURL, urlSuffix), nil
+ 	case "togetherai":
