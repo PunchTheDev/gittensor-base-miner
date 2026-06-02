@@ -4,6 +4,18 @@ Milestone trail for the base-miner benchmark. Discord is the primary channel; th
 
 ---
 
+## 2026-06-02 — Agent: exact line-range omission markers (commit a232d96)
+
+### Agent improvement
+- `_window_file()` now returns `(content, was_windowed)` and emits precise range markers:
+  `... [lines 21-260 omitted — next visible line is 261]` instead of `... [N lines omitted]`
+- `_format_files()` adds `(N lines total — relevant sections shown)` to windowed file headers
+- `ACT_PROMPT` now explicitly instructs the model to use omission-marker line numbers for accurate `@@ -N` hunk offsets
+- **Impact**: prevents "patch doesn't apply" failures caused by wrong hunk line numbers in windowed files
+- Pool dry-runs: geniepod/genie-claw (152 PRs), allways (140 PRs), jvm-live-reload (26 PRs) — all fully saturated (no test files or no linked issues)
+
+---
+
 ## 2026-06-02 — Pool 360→366 + oracle 22.79 (commit ba1f53b)
 
 ### Pool refresh (+6 new problems)
