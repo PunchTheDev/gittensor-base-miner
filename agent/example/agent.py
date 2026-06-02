@@ -108,13 +108,17 @@ Improvements over a naive single-shot approach:
   fileA+fileB diff) would silently drop fileB's changes, producing a worse patch than before.
 - Language-aware header in windowed files: `_compute_header_end()` scans the file for the
   end of its import block (Go `import (...)`, Python `from … import`, TypeScript `import`,
-  Rust `use`, Kotlin/Java `import`) and always includes that block plus a post-import buffer
-  of 8 lines. The old fixed HEADER_LINES=20 cut off mid-import-block in Go files (which
-  routinely have 25-40-line import sections), so the model never saw struct/type definitions
-  that immediately follow. Now the header extends as far as needed to cover the full import
-  section and the first top-level type declarations.
+  Rust `use`, Kotlin/Java/Scala `import`) and always includes that block plus a post-import
+  buffer of 8 lines. The old fixed HEADER_LINES=20 cut off mid-import-block in Go files
+  (which routinely have 25-40-line import sections), so the model never saw struct/type
+  definitions that immediately follow. Now the header extends as far as needed to cover the
+  full import section and the first top-level type declarations. Same fix applied to the
+  no-keyword-hit peek (was always 80 lines; now max(language_header, 80)).
 - Sibling import scan expanded from top 3 to top 5 ranked files: larger multi-file problems
   where the most relevant file is ranked 4th or 5th now benefit from sibling expansion too.
+- Scala support: LANG_NOTES["scala"] with trait/sealed/case-class reminders;
+  `_is_test_file` recognises `*Spec.scala`; `_compute_header_end` handles `.scala` imports;
+  `_resolve_test_imports` resolves Scala JVM-style imports to `.scala` source files.
 """
 
 from __future__ import annotations

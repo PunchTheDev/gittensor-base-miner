@@ -4,6 +4,42 @@ Milestone trail for the base-miner benchmark. Discord is the primary channel; th
 
 ---
 
+## 2026-06-02 — Agent: language-aware headers + Scala support (commits 6cf29f0, 9d56b86, 6f2cbfc)
+
+### Language-aware import-block detection for windowed files (commits 6cf29f0, 9d56b86)
+
+**Root cause**: `HEADER_LINES = 20` was a fixed constant applied to all files. Go files typically have a 1-line `package` declaration + 1-2 blank lines + a `import (...)` block spanning 15-30 lines, consuming all 20 header lines. The struct/type definitions that immediately follow the import block were invisible to the model, causing wrong type assumptions and missing method signatures.
+
+**Fix**: `_compute_header_end(lines, ext)` scans for the end of the language's import section:
+- Go: finds closing `)` of `import (...)` block, adds 8-line buffer → covers first struct/type defs
+- TypeScript/JS: last `import` statement + 8 lines
+- Kotlin/Java/Scala: last `import` line + 8 lines
+- Rust: last `use` statement + 8 lines
+- Python: last `import`/`from...import` + 8 lines
+- Unknown: falls back to HEADER_LINES=20
+
+Real example: `volcengine.go` (642 lines) — old header cut at line 20 (mid-import block); new header extends to line 37, showing the complete import block AND the `VolcEngine` struct definition.
+
+Same fix applied to the no-keyword-hit peek (commit 9d56b86): was always 80 lines regardless of language; now `max(language_header, 80)` so Go/TS files with > 80-line import+struct sections show the full header.
+
+**Sibling scan expanded top-3 → top-5** (commit 6cf29f0): larger multi-file problems where the most relevant file is ranked 4th or 5th now benefit from sibling import expansion too.
+
+### Scala language support (commit 6f2cbfc)
+
+seroperson/jvm-live-reload (5 problems) uses Scala test files (`*Spec.scala`) and Scala source files. Previously getting no language guidance.
+
+- `LANG_NOTES["scala"]`: trait/abstract class implementations, case class fields, sealed trait coverage, companion objects, `override def`, no `???` stubs
+- `_is_test_file`: now recognises `*Spec.scala` via `(test|spec)\.(kt|java|scala)$`
+- `_compute_header_end`: handles `.scala` in the `kt/java` branch
+- `_resolve_test_imports`: resolves Scala JVM-style imports to `.scala` files; skips `scala.`, `org.scalatest`, `cats.`, `zio.`, `akka.` stdlib imports
+
+### Status
+- Benchmark: 423 problems, oracle 23.08 (Python problems) 
+- Pool: fully saturated (no qualifying new PRs in DAS as of 2026-06-02)
+- Agent: language-aware headers, Scala support, sibling scan top-5
+
+---
+
 ## 2026-06-02 — Agent improvements + pool refresh (commits 2e8e54d–b609751)
 
 ### Agent: verify loop hardening (commits 2e8e54d, e0a8312)
