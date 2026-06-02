@@ -4,6 +4,29 @@ Milestone trail for the base-miner benchmark. Discord is the primary channel; th
 
 ---
 
+## 2026-06-02 — Structural summary in compacted history (commit b21930b)
+
+### Verify: structural context for completeness checking
+
+**Problem**: After history compaction, the verify model only saw file names ("files in scope: scoring.py, constants.py"). It had no knowledge of what functions/classes those files contain — so it couldn't check completeness ("does the diff add the required method?") or identify missing changes ("should `filter_repos` have been modified?").
+
+**Fix**: `_structural_summary()` extracts function/class/method declaration lines from all implementation files and injects them into the compacted observe message. Example:
+
+```
+[scoring.py  ← changed]
+  class ScoreCalculator:
+  def compute_score(self, pr, max_score: float = 30.0) -> float:
+  def apply_penalty(self, score: float, repo: str) -> float:
+  def filter_repos(self, repos: list[str]) -> list[str]:
+[constants.py]
+```
+
+Files that appear in the diff are marked "← changed". The verify model can now cross-reference the diff against the structural summary and answer: "Did the diff modify `filter_repos` as the issue requires?" — a completeness check that file names alone cannot support.
+
+Supported languages: Python, Go, TypeScript/JS, Rust, Kotlin/Java/Scala, Ruby. Capped at ~3 KB total to keep verify prompt size manageable.
+
+---
+
 ## 2026-06-02 — Hunk source context injected into verify (commit 13a1bde)
 
 ### Verify: real hunk-offset check via source context injection
