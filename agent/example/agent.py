@@ -254,6 +254,15 @@ Improvements over a naive single-shot approach:
   old cap left the later hunks without source verification — the verify model could only
   plausibility-check their offsets rather than comparing against actual source lines. At ~300
   chars per hunk snippet the increase adds ~1.3 KB to the verify prompt, well within budget.
+- `_fix_hunk_offsets` stripped-content fallback: `find_context_offset` previously used exact
+  string matching for context-line fingerprints. If the model wrote context lines with wrong
+  indentation (tabs vs spaces), the fingerprint wouldn't match the source, and offset correction
+  silently failed. Then `_fix_context_lines` would fix the whitespace, but the offset remained
+  wrong — `git apply` still fails with a wrong `@@ -N`. Fix: two-pass search — exact first,
+  then stripped-content fallback when exact finds zero matches. Same unambiguous-match guard
+  (exactly one match required) applies to both passes. If the exact pass was ambiguous (multiple
+  matches), the stripped fallback is skipped to avoid false positives. Empty-stripped fingerprints
+  are also rejected to prevent trivial matches on blank lines.
 """
 
 from __future__ import annotations
@@ -1594,23 +1603,48 @@ def _fix_hunk_offsets(diff: str, file_lookup: dict[str, str]) -> str:
         line (e.g. '}' or '') doesn't produce false positives.  For single-line
         context (usually a removal line used as fingerprint), still tries but
         accepts only an unambiguous match within ±10 lines.
+
+        Two-pass: tries exact content match first; falls back to stripped content
+        match (both sides stripped) when the model wrote context lines with
+        different indentation (tabs vs spaces).  Same unambiguous-match guard
+        applies to both passes.
         """
         if not ctx:
             return None
-        target = ctx[0]
         radius = _SEARCH_RADIUS if len(ctx) >= 2 else 10
         lo = max(0, stated_n - radius - 1)
         hi = min(len(file_lines), stated_n + radius)
-        matches = []
+
+        # Pass 1: exact match
+        matches: list[int] = []
         for idx in range(lo, hi):
-            if file_lines[idx] == target:
+            if file_lines[idx] == ctx[0]:
                 if all(
                     idx + j < len(file_lines) and file_lines[idx + j] == ctx[j]
                     for j in range(len(ctx))
                 ):
-                    matches.append(idx + 1)  # convert to 1-indexed
+                    matches.append(idx + 1)
         if len(matches) == 1:
             return matches[0]
+
+        # Pass 2: stripped-content fallback (handles tab/space indentation mismatches)
+        if matches:
+            return None  # exact pass was ambiguous — don't retry with weaker criterion
+        ctx_stripped = [c.strip() for c in ctx]
+        # Skip trivial fingerprints that would produce false positives when stripped
+        if not ctx_stripped[0]:
+            return None
+        matches2: list[int] = []
+        for idx in range(lo, hi):
+            if file_lines[idx].strip() == ctx_stripped[0]:
+                if all(
+                    idx + j < len(file_lines)
+                    and file_lines[idx + j].strip() == ctx_stripped[j]
+                    for j in range(len(ctx))
+                ):
+                    matches2.append(idx + 1)
+        if len(matches2) == 1:
+            return matches2[0]
         return None
 
     lines = diff.split("\n")
