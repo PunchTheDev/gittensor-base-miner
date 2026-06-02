@@ -45,6 +45,11 @@ Improvements over a naive single-shot approach:
 - `_is_test_file` detects Kotlin/Java/Scala test classes (e.g. FooTest.kt)
 - Kotlin/Java import resolution in `_resolve_test_imports`: maps `import dev.foo.Bar`
   to `Bar.kt` or `Bar.java` in the file tree
+- Sibling import expansion: after ranking, scans the top-3 implementation files for
+  local imports (``from .helpers import X``, ``from pkg.sub.helpers import X``,
+  TypeScript relative imports, same-dir Go files) and adds those sibling modules to
+  context (up to 6 KB). Prevents the agent from hallucinating helper functions that
+  already exist in the package.
 """
 
 from __future__ import annotations
@@ -465,6 +470,100 @@ def _resolve_test_imports(
     return resolved
 
 
+def _expand_sibling_imports(
+    selected: list[FileContext],
+    all_impl: list[FileContext],
+    file_tree: list[str],
+    char_budget: int = 6_000,
+) -> list[FileContext]:
+    """Add sibling modules that top-ranked files locally import from.
+
+    When a high-priority file imports from a sibling module in the same
+    package (e.g. ``from gittensor.cli.issue_commands.helpers import X`` or
+    ``from .helpers import X``), the sibling likely contains utilities the
+    agent should use rather than redefine.  Without this expansion the agent
+    has no way to discover that ``emit_error_json`` already exists in
+    ``helpers.py``, so it either hallucinates a definition or omits the import.
+
+    Adds at most ``char_budget`` additional characters of sibling content so
+    the overall context budget isn't blown.
+    """
+    all_by_path = {f.path: f for f in all_impl}
+    already = {f.path for f in selected}
+    tree_set = set(file_tree)
+    added: list[FileContext] = []
+    chars_used = 0
+
+    for f in selected[:3]:  # only follow imports from top 3 ranked files
+        ext = f.path.rsplit(".", 1)[-1].lower() if "." in f.path else ""
+        file_dir = f.path.rsplit("/", 1)[0] if "/" in f.path else ""
+        content = f.content
+
+        siblings: list[str] = []
+
+        if ext == "py":
+            # Relative: ``from .helpers import X`` → sibling in same dir
+            for m in re.finditer(r"^from\s+(\.[\w.]*)\s+import", content, re.MULTILINE):
+                raw = m.group(1).lstrip(".")
+                if raw:
+                    candidate = (file_dir + "/" if file_dir else "") + raw.replace(".", "/") + ".py"
+                    if candidate in tree_set and candidate not in already:
+                        siblings.append(candidate)
+            # Absolute within same package: ``from pkg.sub.helpers import X``
+            pkg_prefix = file_dir.replace("/", ".")
+            for m in re.finditer(r"^from\s+([\w.]+)\s+import", content, re.MULTILINE):
+                raw = m.group(1)
+                if not raw.startswith(".") and pkg_prefix and raw.startswith(pkg_prefix + "."):
+                    tail = raw[len(pkg_prefix) + 1:]
+                    candidate = file_dir + "/" + tail.replace(".", "/") + ".py"
+                    if candidate in tree_set and candidate not in already:
+                        siblings.append(candidate)
+
+        elif ext in ("ts", "tsx", "js", "jsx"):
+            # ``import { X } from './helpers'`` or ``from '../lib/utils'``
+            for m in re.finditer(r"""from\s+['"](\.[^'"]+)['"]""", content):
+                raw = m.group(1)
+                parts = (file_dir + "/" + raw).split("/")
+                norm: list[str] = []
+                for seg in parts:
+                    if seg == "..":
+                        if norm:
+                            norm.pop()
+                    elif seg and seg != ".":
+                        norm.append(seg)
+                base = "/".join(norm)
+                for suffix in (".ts", ".tsx", ".js", ".jsx"):
+                    candidate = base + suffix
+                    if candidate in tree_set and candidate not in already:
+                        siblings.append(candidate)
+                        break
+
+        elif ext == "go":
+            # Same-package Go files are in the same directory — include all .go
+            # source files in the directory that aren't test files.
+            for path in tree_set:
+                if (
+                    path.startswith(file_dir + "/")
+                    and path.endswith(".go")
+                    and not path.endswith("_test.go")
+                    and path not in already
+                ):
+                    siblings.append(path)
+
+        for sib_path in siblings:
+            sib = all_by_path.get(sib_path)
+            if sib is None:
+                continue
+            size = len(sib.path) + len(sib.content)
+            if chars_used + size > char_budget:
+                break
+            added.append(sib)
+            already.add(sib_path)
+            chars_used += size
+
+    return added
+
+
 def _index_hint(top_files: list[FileContext], file_tree: list[str]) -> str:
     """Return a prompt hint listing __init__.py / index.ts|js files in the same
     directories as the top implementation files.
@@ -807,6 +906,13 @@ class ExampleAgent(BaseAgent):
         impl_files = [f for f in problem.context_files if not _is_test_file(f)]
         ranked_impl = _rank_files(impl_files, problem.issue_title, problem.issue_body, test_files, problem.file_tree)
         selected_impl = _truncate_context(ranked_impl)
+        # Add sibling modules that top-ranked files import from (up to 6 KB extra).
+        # This ensures the agent sees helper utilities that already exist in the
+        # package (e.g. emit_error_json in helpers.py) instead of hallucinating them.
+        siblings = _expand_sibling_imports(selected_impl, impl_files, problem.file_tree or [])
+        if siblings:
+            selected_impl = selected_impl + siblings
+            log.append(f"[context] sibling-import expansion: {[s.path for s in siblings]}")
         dropped = len(impl_files) - len(selected_impl)
         if dropped > 0:
             log.append(f"[context] {len(selected_impl)}/{len(impl_files)} impl files selected (dropped {dropped} low-relevance)")
