@@ -186,6 +186,11 @@ class ExampleAgent(BaseAgent):
         if not api_key:
             raise RuntimeError("OPENROUTER_KEY environment variable not set")
 
+        if problem.allowed_models and self.model not in problem.allowed_models:
+            raise RuntimeError(
+                f"Model '{self.model}' is not in the allowed list: {problem.allowed_models}"
+            )
+
         timeout = float(problem.time_limit_seconds)
         token_budget = problem.output_token_budget
         plan_tokens = token_budget // 3
