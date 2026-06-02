@@ -91,6 +91,17 @@ Improvements over a naive single-shot approach:
 - Multi-fence diff extraction: `_extract_diff()` now collects ALL fenced diff blocks and
   joins them. When models split each changed file into its own ` ```diff ` block, the
   previous `re.search` only captured the first block and silently dropped the rest.
+- Post-process every intermediate diff: `_post_process()` (strip N| artifacts + trim
+  trailing prose + fix hunk counts) is called after every `_extract_diff` throughout the
+  solve and repair loops, not only at the end. Verify always sees clean, artifact-free
+  diffs with correct hunk counts — eliminating spurious format-repair iterations caused by
+  the model copying display prefixes into its own output and then reacting to them.
+- History compaction before verify: after the act step, `history[1]` (the observe message
+  containing all source files + file tree, typically 20-30k chars) is replaced with a
+  compact summary (~150 chars). The model has already used the full context to produce its
+  plan and diff; re-sending it on every verify/repair call wastes token budget the model
+  could use to reason about the diff. The compact version preserves essential metadata:
+  repo name, issue title, files in scope, and test command.
 """
 
 from __future__ import annotations
@@ -1159,6 +1170,20 @@ def _looks_valid(diff: str) -> bool:
     return diff.startswith("diff --git") and "@@" in diff
 
 
+def _post_process(diff: str) -> str:
+    """Strip display artifacts, trim trailing prose, fix hunk counts.
+
+    Applied after every _extract_diff call so that intermediate diffs
+    fed back into the verify/repair loop are always clean.  Verify sees
+    accurate hunk counts and no `N | ` display artifacts — reducing
+    spurious format-repair iterations and improving verify accuracy.
+    """
+    diff = _strip_line_number_prefixes(diff)
+    diff = _trim_trailing_prose(diff)
+    diff = _fix_hunk_counts(diff)
+    return diff
+
+
 def _fix_hunk_counts(diff: str) -> str:
     """Rewrite @@ -a,b +c,d @@ headers with accurate line counts.
 
@@ -1440,9 +1465,24 @@ class ExampleAgent(BaseAgent):
         # temperature=0 for diff generation: format precision matters more than creativity
         history.append({"role": "user", "content": ACT_PROMPT})
         raw_diff = _call(history, self.model, api_key, act_tokens, act_timeout, temperature=0)
-        diff = _extract_diff(raw_diff)
+        diff = _post_process(_extract_diff(raw_diff))
         log.append(f"[diff v0]\n{diff}")
         history.append({"role": "assistant", "content": raw_diff})
+
+        # --- Compact history before verify ---
+        # The observe_user message (history[1]) contains all source files and the
+        # full file tree — typically 20-30k chars.  The model has already used this
+        # context to produce its plan and diff.  Replacing it with a compact summary
+        # reduces the context sent on every verify/repair call, freeing token budget
+        # for the model to reason about the diff itself rather than re-processing
+        # source files it has already analysed.
+        compact_observe = (
+            f"[Earlier context: {problem.repo_name} — issue: {problem.issue_title} — "
+            f"files in scope: {', '.join(f.path for f in all_context[:10])}"
+            + (f" (+{len(all_context) - 10} more)" if len(all_context) > 10 else "")
+            + f" — test: {test_cmd_str}]"
+        )
+        history[1] = {"role": "user", "content": compact_observe}
 
         # --- Turn 3+: Verify + Repair ---
         for attempt in range(MAX_REPAIR_ATTEMPTS):
@@ -1453,7 +1493,7 @@ class ExampleAgent(BaseAgent):
                 repair_msg = REPAIR_FORMAT_PROMPT.format(problem=problem_desc)
                 history.append({"role": "user", "content": repair_msg})
                 raw_diff = _call(history, self.model, api_key, act_tokens, act_timeout, temperature=0)
-                diff = _extract_diff(raw_diff)
+                diff = _post_process(_extract_diff(raw_diff))
                 log.append(f"[repair {attempt} (format)]\n{diff}")
                 history.append({"role": "assistant", "content": raw_diff})
                 continue
@@ -1481,7 +1521,7 @@ class ExampleAgent(BaseAgent):
             if verdict.strip().upper().startswith("LGTM"):
                 break
 
-            repaired = _extract_diff(verdict)
+            repaired = _post_process(_extract_diff(verdict))
             if _looks_valid(repaired):
                 diff = repaired
                 log.append(f"[diff v{attempt + 1}]\n{diff}")
@@ -1490,11 +1530,9 @@ class ExampleAgent(BaseAgent):
                 # Prose critique without a new diff — accept current result
                 break
 
-        # Post-process in order: strip display artifacts, trim trailing prose,
-        # then recompute hunk counts (must come last — counts depend on final line set).
-        diff = _strip_line_number_prefixes(diff)
-        diff = _trim_trailing_prose(diff)
-        diff = _fix_hunk_counts(diff)
+        # Final post-process pass to catch any artifacts introduced after the last
+        # repair step (e.g. by the prose-critique branch above).
+        diff = _post_process(diff)
 
         reasoning = f"model={self.model}\n\n" + "\n\n".join(log)
         return Patch(diff=diff, reasoning=reasoning)
@@ -1529,7 +1567,7 @@ class ExampleAgent(BaseAgent):
             {"role": "user", "content": repair_user},
         ]
         raw_diff = _call(history, self.model, api_key, act_tokens, act_timeout, temperature=0)
-        diff = _extract_diff(raw_diff)
+        diff = _post_process(_extract_diff(raw_diff))
         log.append(f"[repair diff]\n{diff}")
 
         # One structural validation pass
@@ -1538,11 +1576,8 @@ class ExampleAgent(BaseAgent):
             history.append({"role": "assistant", "content": raw_diff})
             history.append({"role": "user", "content": REPAIR_FORMAT_PROMPT.format(problem=problem_desc)})
             raw_diff = _call(history, self.model, api_key, act_tokens, act_timeout, temperature=0)
-            diff = _extract_diff(raw_diff)
+            diff = _post_process(_extract_diff(raw_diff))
             log.append(f"[repair format fix]\n{diff}")
 
-        diff = _strip_line_number_prefixes(diff)
-        diff = _trim_trailing_prose(diff)
-        diff = _fix_hunk_counts(diff)
         reasoning = (failed_patch.reasoning or "") + "\n\n" + f"model={self.model}\n\n" + "\n\n".join(log)
         return Patch(diff=diff, reasoning=reasoning)
