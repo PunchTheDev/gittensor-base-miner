@@ -1,0 +1,403 @@
+diff --git a/doc/whatsnew/fragments/3716.bugfix b/doc/whatsnew/fragments/3716.bugfix
+new file mode 100644
+index 0000000000..d231275ed0
+--- /dev/null
++++ b/doc/whatsnew/fragments/3716.bugfix
+@@ -0,0 +1,3 @@
++``dangerous-default-value`` now detects mutable default values in ``typing.NamedTuple`` field definitions.
++
++Closes #3716
+diff --git a/pylint/checkers/base/basic_checker.py b/pylint/checkers/base/basic_checker.py
+index 57fbb42c91..1531dd5678 100644
+--- a/pylint/checkers/base/basic_checker.py
++++ b/pylint/checkers/base/basic_checker.py
+@@ -413,11 +413,21 @@ def visit_module(self, _: nodes.Module) -> None:
+         """Check module name, docstring and required arguments."""
+         self.linter.stats.node_count["module"] += 1
+ 
+-    def visit_classdef(self, _: nodes.ClassDef) -> None:
++    def visit_classdef(self, node: nodes.ClassDef) -> None:
+         """Check module name, docstring and redefinition
+         increment branch counter.
+         """
+         self.linter.stats.node_count["klass"] += 1
++        try:
++            if not any(
++                ancestor.qname() == "typing.NamedTuple" for ancestor in node.ancestors()
++            ):
++                return
++        except astroid.InferenceError:  # pragma: no cover
++            return
++        for child in node.body:
++            if isinstance(child, nodes.AnnAssign) and child.value is not None:
++                self._check_dangerous_default(child.value, child)
+ 
+     @utils.only_required_for_messages(
+         "pointless-statement",
+@@ -585,49 +595,51 @@ def visit_functiondef(self, node: nodes.FunctionDef) -> None:
+             self.linter.stats.node_count["method"] += 1
+         else:
+             self.linter.stats.node_count["function"] += 1
+-        self._check_dangerous_default(node)
++        for default in (node.args.defaults or []) + (node.args.kw_defaults or []):
++            if default:
++                self._check_dangerous_default(default, node)
+ 
+     visit_asyncfunctiondef = visit_functiondef
+ 
+-    def _check_dangerous_default(self, node: nodes.FunctionDef) -> None:
+-        """Check for dangerous default values as arguments."""
+-
+-        def is_iterable(internal_node: nodes.NodeNG) -> bool:
+-            return isinstance(internal_node, (nodes.List, nodes.Set, nodes.Dict))
+-
+-        defaults = (node.args.defaults or []) + (node.args.kw_defaults or [])
+-        for default in defaults:
+-            if not default:
+-                continue
++    def _check_dangerous_default(
++        self, default: nodes.NodeNG, msg_node: nodes.NodeNG
++    ) -> None:
++        """Emit dangerous-default-value if the inferred default is mutable."""
++        value = utils.safe_infer(default)
++        if not isinstance(value, astroid.Instance):
++            return
++        qname = value.qname()
++        if qname not in DEFAULT_ARGUMENT_SYMBOLS:
++            # The inferred type itself isn't a known mutable, but it might
++            # be a subclass of one (e.g. ``class MyDict(dict): ...``).
+             try:
+-                value = next(default.infer())
+-            except astroid.InferenceError:
+-                continue
+-
+-            if (
+-                isinstance(value, astroid.Instance)
+-                and value.qname() in DEFAULT_ARGUMENT_SYMBOLS
+-            ):
+-                if value is default:
+-                    msg = DEFAULT_ARGUMENT_SYMBOLS[value.qname()]
+-                elif isinstance(value, astroid.Instance) or is_iterable(value):
+-                    # We are here in the following situation(s):
+-                    #   * a dict/set/list/tuple call which wasn't inferred
+-                    #     to a syntax node ({}, () etc.). This can happen
+-                    #     when the arguments are invalid or unknown to
+-                    #     the inference.
+-                    #   * a variable from somewhere else, which turns out to be a list
+-                    #     or a dict.
+-                    if is_iterable(default):
+-                        msg = value.pytype()
+-                    elif isinstance(default, nodes.Call):
+-                        msg = f"{value.name}() ({value.qname()})"
+-                    else:
+-                        msg = f"{default.as_string()} ({value.qname()})"
+-                else:
+-                    # this argument is a name
+-                    msg = f"{default.as_string()} ({DEFAULT_ARGUMENT_SYMBOLS[value.qname()]})"
+-                self.add_message("dangerous-default-value", node=node, args=(msg,))
++                qname = next(
++                    (
++                        cls.qname()
++                        for cls in value._proxied.ancestors()
++                        if cls.qname() in DEFAULT_ARGUMENT_SYMBOLS
++                    ),
++                    "",
++                )
++            except astroid.InferenceError:  # pragma: no cover
++                return
++            if not qname:
++                return
++        if value is default:
++            # Literal: [], {}, {1, 2}
++            msg = DEFAULT_ARGUMENT_SYMBOLS[qname]
++        elif isinstance(default, nodes.Call):
++            msg = f"{value.name}()"
++        else:
++            # Variable name referring to a mutable from somewhere else; the
++            # name alone is uninformative, so include the qname.
++            msg = f"{default.as_string()} ({qname})"
++        self.add_message(
++            "dangerous-default-value",
++            node=msg_node,
++            args=(msg,),
++            confidence=INFERENCE,
++        )
+ 
+     @utils.only_required_for_messages("unreachable", "lost-exception")
+     def visit_return(self, node: nodes.Return) -> None:
+diff --git a/pylint/checkers/refactoring/refactoring_checker.py b/pylint/checkers/refactoring/refactoring_checker.py
+index 131c2ed489..9cd76e27af 100644
+--- a/pylint/checkers/refactoring/refactoring_checker.py
++++ b/pylint/checkers/refactoring/refactoring_checker.py
+@@ -9,9 +9,10 @@
+ import itertools
+ import tokenize
+ from collections.abc import Iterator
++from dataclasses import dataclass, field
+ from functools import cached_property, reduce
+ from re import Pattern
+-from typing import TYPE_CHECKING, Any, NamedTuple, TypeAlias, cast
++from typing import TYPE_CHECKING, Any, TypeAlias, cast
+ 
+ import astroid
+ from astroid import bases, nodes, objects
+@@ -210,14 +211,15 @@ def _is_part_of_assignment_target(node: nodes.NodeNG) -> bool:
+     return False
+ 
+ 
+-class ConsiderUsingWithStack(NamedTuple):
++@dataclass
++class ConsiderUsingWithStack:
+     """Stack for objects that may potentially trigger a R1732 message
+     if they are not used in a ``with`` block later on.
+     """
+ 
+-    module_scope: dict[str, nodes.NodeNG] = {}
+-    class_scope: dict[str, nodes.NodeNG] = {}
+-    function_scope: dict[str, nodes.NodeNG] = {}
++    module_scope: dict[str, nodes.NodeNG] = field(default_factory=dict)
++    class_scope: dict[str, nodes.NodeNG] = field(default_factory=dict)
++    function_scope: dict[str, nodes.NodeNG] = field(default_factory=dict)
+ 
+     def __iter__(self) -> Iterator[dict[str, nodes.NodeNG]]:
+         yield from (self.function_scope, self.class_scope, self.module_scope)
+diff --git a/pylint/message/_deleted_message_ids.py b/pylint/message/_deleted_message_ids.py
+index 149a800b7c..d3764ead79 100644
+--- a/pylint/message/_deleted_message_ids.py
++++ b/pylint/message/_deleted_message_ids.py
+@@ -4,6 +4,7 @@
+ 
+ from __future__ import annotations
+ 
++from collections.abc import Sequence
+ from functools import cache
+ from typing import NamedTuple
+ 
+@@ -11,7 +12,7 @@
+ class DeletedMessage(NamedTuple):
+     msgid: str
+     symbol: str
+-    old_names: list[tuple[str, str]] = []
++    old_names: Sequence[tuple[str, str]] = ()
+ 
+ 
+ DELETED_MSGID_PREFIXES: list[int] = []
+diff --git a/pylint/message/message_id_store.py b/pylint/message/message_id_store.py
+index 2e2689f6c9..f7936c3c55 100644
+--- a/pylint/message/message_id_store.py
++++ b/pylint/message/message_id_store.py
+@@ -4,6 +4,7 @@
+ 
+ from __future__ import annotations
+ 
++from collections.abc import Sequence
+ from typing import NoReturn
+ 
+ from pylint.exceptions import (
+@@ -56,7 +57,7 @@ def get_msgid(self, symbol: str) -> str:
+             raise UnknownMessageError(msg) from e
+ 
+     def register_message_definition(
+-        self, msgid: str, symbol: str, old_names: list[tuple[str, str]]
++        self, msgid: str, symbol: str, old_names: Sequence[tuple[str, str]]
+     ) -> None:
+         self.check_msgid_and_symbol(msgid, symbol)
+         self.add_msgid_and_symbol(msgid, symbol)
+diff --git a/tests/functional/a/async_functions.txt b/tests/functional/a/async_functions.txt
+index 448fb45cce..14500b1608 100644
+--- a/tests/functional/a/async_functions.txt
++++ b/tests/functional/a/async_functions.txt
+@@ -1,12 +1,12 @@
+-redefined-builtin:5:0:5:14:next:Redefining built-in 'next':UNDEFINED
+-unused-argument:8:30:8:34:some_function:Unused argument 'arg2':HIGH
+-bad-super-call:22:8:22:31:Class.some_method:Bad first argument 'OtherClass' given to super():UNDEFINED
+-line-too-long:26:0:None:None::Line too long (104/100):UNDEFINED
+-too-many-arguments:27:0:27:26:complex_function:Too many arguments (9/5):UNDEFINED
+-too-many-branches:27:0:27:26:complex_function:Too many branches (13/12):UNDEFINED
+-too-many-positional-arguments:27:0:27:26:complex_function:Too many positional arguments (9/5):HIGH
+-too-many-return-statements:27:0:27:26:complex_function:Too many return statements (10/6):UNDEFINED
+-dangerous-default-value:60:0:60:14:func:Dangerous default value [] as argument:UNDEFINED
+-duplicate-argument-name:60:18:60:19:func:Duplicate argument name 'a' in function definition:HIGH
+-disallowed-name:65:0:65:13:foo:"Disallowed name ""foo""":HIGH
+-empty-docstring:65:0:65:13:foo:Empty function docstring:HIGH
++redefined-builtin:5:0:5:14:next:Redefining built-in 'next':UNDEFINED
++unused-argument:8:30:8:34:some_function:Unused argument 'arg2':HIGH
++bad-super-call:22:8:22:31:Class.some_method:Bad first argument 'OtherClass' given to super():UNDEFINED
++line-too-long:26:0:None:None::Line too long (104/100):UNDEFINED
++too-many-arguments:27:0:27:26:complex_function:Too many arguments (9/5):UNDEFINED
++too-many-branches:27:0:27:26:complex_function:Too many branches (13/12):UNDEFINED
++too-many-positional-arguments:27:0:27:26:complex_function:Too many positional arguments (9/5):HIGH
++too-many-return-statements:27:0:27:26:complex_function:Too many return statements (10/6):UNDEFINED
++dangerous-default-value:60:0:60:14:func:Dangerous default value [] as argument:INFERENCE
++duplicate-argument-name:60:18:60:19:func:Duplicate argument name 'a' in function definition:HIGH
++disallowed-name:65:0:65:13:foo:"Disallowed name ""foo""":HIGH
++empty-docstring:65:0:65:13:foo:Empty function docstring:HIGH
+diff --git a/tests/functional/d/dangerous_default_value.txt b/tests/functional/d/dangerous_default_value.txt
+index 2376b8e296..32c7af6fb7 100644
+--- a/tests/functional/d/dangerous_default_value.txt
++++ b/tests/functional/d/dangerous_default_value.txt
+@@ -1,23 +1,23 @@
+-dangerous-default-value:6:0:6:13:function1:Dangerous default value [] as argument:UNDEFINED
+-dangerous-default-value:10:0:10:13:function2:Dangerous default value HEHE (builtins.dict) as argument:UNDEFINED
+-dangerous-default-value:18:0:18:13:function4:Dangerous default value set() (builtins.set) as argument:UNDEFINED
+-dangerous-default-value:28:0:28:13:function6:Dangerous default value GLOBAL_SET (builtins.set) as argument:UNDEFINED
+-dangerous-default-value:32:0:32:13:function7:Dangerous default value dict() (builtins.dict) as argument:UNDEFINED
+-dangerous-default-value:36:0:36:13:function8:Dangerous default value list() (builtins.list) as argument:UNDEFINED
+-dangerous-default-value:40:0:40:13:function9:Dangerous default value [] as argument:UNDEFINED
+-dangerous-default-value:44:0:44:14:function10:Dangerous default value {} as argument:UNDEFINED
+-dangerous-default-value:48:0:48:14:function11:Dangerous default value list() (builtins.list) as argument:UNDEFINED
+-dangerous-default-value:52:0:52:14:function12:Dangerous default value dict() (builtins.dict) as argument:UNDEFINED
+-dangerous-default-value:61:0:61:14:function13:Dangerous default value OINK (builtins.dict) as argument:UNDEFINED
+-dangerous-default-value:65:0:65:14:function14:Dangerous default value dict() (builtins.dict) as argument:UNDEFINED
+-dangerous-default-value:73:0:73:14:function15:Dangerous default value INVALID_DICT (builtins.dict) as argument:UNDEFINED
+-dangerous-default-value:77:0:77:14:function16:Dangerous default value set() as argument:UNDEFINED
+-dangerous-default-value:81:0:81:14:function17:Dangerous default value deque() (collections.deque) as argument:UNDEFINED
+-dangerous-default-value:85:0:85:14:function18:Dangerous default value ChainMap() (collections.ChainMap) as argument:UNDEFINED
+-dangerous-default-value:89:0:89:14:function19:Dangerous default value Counter() (collections.Counter) as argument:UNDEFINED
+-dangerous-default-value:93:0:93:14:function20:Dangerous default value OrderedDict() (collections.OrderedDict) as argument:UNDEFINED
+-dangerous-default-value:97:0:97:14:function21:Dangerous default value defaultdict() (collections.defaultdict) as argument:UNDEFINED
+-dangerous-default-value:101:0:101:14:function22:Dangerous default value UserDict() (collections.UserDict) as argument:UNDEFINED
+-dangerous-default-value:105:0:105:14:function23:Dangerous default value UserList() (collections.UserList) as argument:UNDEFINED
+-dangerous-default-value:109:0:109:14:function24:Dangerous default value [] as argument:UNDEFINED
+-dangerous-default-value:116:4:116:16:Clazz.__init__:Dangerous default value {} as argument:UNDEFINED
++dangerous-default-value:6:0:6:13:function1:Dangerous default value [] as argument:INFERENCE
++dangerous-default-value:10:0:10:13:function2:Dangerous default value HEHE (builtins.dict) as argument:INFERENCE
++dangerous-default-value:18:0:18:13:function4:Dangerous default value set() as argument:INFERENCE
++dangerous-default-value:28:0:28:13:function6:Dangerous default value GLOBAL_SET (builtins.set) as argument:INFERENCE
++dangerous-default-value:32:0:32:13:function7:Dangerous default value dict() as argument:INFERENCE
++dangerous-default-value:36:0:36:13:function8:Dangerous default value list() as argument:INFERENCE
++dangerous-default-value:40:0:40:13:function9:Dangerous default value [] as argument:INFERENCE
++dangerous-default-value:44:0:44:14:function10:Dangerous default value {} as argument:INFERENCE
++dangerous-default-value:48:0:48:14:function11:Dangerous default value list() as argument:INFERENCE
++dangerous-default-value:52:0:52:14:function12:Dangerous default value dict() as argument:INFERENCE
++dangerous-default-value:61:0:61:14:function13:Dangerous default value OINK (builtins.dict) as argument:INFERENCE
++dangerous-default-value:65:0:65:14:function14:Dangerous default value dict() as argument:INFERENCE
++dangerous-default-value:73:0:73:14:function15:Dangerous default value INVALID_DICT (builtins.dict) as argument:INFERENCE
++dangerous-default-value:77:0:77:14:function16:Dangerous default value set() as argument:INFERENCE
++dangerous-default-value:81:0:81:14:function17:Dangerous default value deque() as argument:INFERENCE
++dangerous-default-value:85:0:85:14:function18:Dangerous default value ChainMap() as argument:INFERENCE
++dangerous-default-value:89:0:89:14:function19:Dangerous default value Counter() as argument:INFERENCE
++dangerous-default-value:93:0:93:14:function20:Dangerous default value OrderedDict() as argument:INFERENCE
++dangerous-default-value:97:0:97:14:function21:Dangerous default value defaultdict() as argument:INFERENCE
++dangerous-default-value:101:0:101:14:function22:Dangerous default value UserDict() as argument:INFERENCE
++dangerous-default-value:105:0:105:14:function23:Dangerous default value UserList() as argument:INFERENCE
++dangerous-default-value:109:0:109:14:function24:Dangerous default value [] as argument:INFERENCE
++dangerous-default-value:116:4:116:16:Clazz.__init__:Dangerous default value {} as argument:INFERENCE
+diff --git a/tests/functional/d/dangerous_default_value_namedtuple.py b/tests/functional/d/dangerous_default_value_namedtuple.py
+new file mode 100644
+index 0000000000..6bdf838667
+--- /dev/null
++++ b/tests/functional/d/dangerous_default_value_namedtuple.py
+@@ -0,0 +1,74 @@
++# pylint: disable=missing-module-docstring, missing-class-docstring, missing-function-docstring, multiple-statements, use-list-literal, use-dict-literal
++import collections
++from typing import NamedTuple
++
++DANGEROUS_GLOBAL = set()
++
++
++class CustomMutableStore(dict): pass
++class CustomImmutableStore(frozenset): pass
++
++def create_my_custom_immutable_data_store() -> CustomImmutableStore:
++    return CustomImmutableStore()
++
++
++def create_my_custom_mutable_data_store() -> CustomMutableStore:
++    return CustomMutableStore()
++
++class BadListDefault(NamedTuple):
++    avgs: list[float] = []  # [dangerous-default-value]
++    stds: list[float] = []  # [dangerous-default-value]
++
++
++class BadDictDefault(NamedTuple):
++    data: dict = {}  # [dangerous-default-value]
++
++
++class BadSetDefault(NamedTuple):
++    items: set = set()  # [dangerous-default-value]
++
++
++class BadSetLiteralDefault(NamedTuple):
++    items: set = {1, 2}  # [dangerous-default-value]
++
++
++class BadListCallDefault(NamedTuple):
++    items: list = list()  # [dangerous-default-value]
++
++
++class BadDictCallDefault(NamedTuple):
++    data: dict = dict()  # [dangerous-default-value]
++
++
++class BadDequeDefault(NamedTuple):
++    items: collections.deque = collections.deque()  # [dangerous-default-value]
++
++
++class SafeNamedTuple(NamedTuple):
++    name: str = "default"
++    count: int = 0
++    flag: bool = True
++    tags: tuple = ()
++    frozen: frozenset = frozenset()
++
++
++class MixedNamedTuple(NamedTuple):
++    name: str = "ok"
++    items: list = []  # [dangerous-default-value]
++
++
++class NoDefaultNamedTuple(NamedTuple):
++    name: str
++    value: int
++
++
++class GlobalDangerousDefault(NamedTuple):
++    items: set = DANGEROUS_GLOBAL  # [dangerous-default-value]
++
++
++class BadCustomStoreDefault(NamedTuple):
++    store: CustomMutableStore = CustomMutableStore()  # [dangerous-default-value]
++
++
++class SafeCustomStoreDefault(NamedTuple):
++    store: CustomImmutableStore = CustomImmutableStore()
+diff --git a/tests/functional/d/dangerous_default_value_namedtuple.txt b/tests/functional/d/dangerous_default_value_namedtuple.txt
+new file mode 100644
+index 0000000000..519eddd524
+--- /dev/null
++++ b/tests/functional/d/dangerous_default_value_namedtuple.txt
+@@ -0,0 +1,11 @@
++dangerous-default-value:19:4:19:26:BadListDefault:Dangerous default value [] as argument:INFERENCE
++dangerous-default-value:20:4:20:26:BadListDefault:Dangerous default value [] as argument:INFERENCE
++dangerous-default-value:24:4:24:19:BadDictDefault:Dangerous default value {} as argument:INFERENCE
++dangerous-default-value:28:4:28:22:BadSetDefault:Dangerous default value set() as argument:INFERENCE
++dangerous-default-value:32:4:32:23:BadSetLiteralDefault:Dangerous default value set() as argument:INFERENCE
++dangerous-default-value:36:4:36:24:BadListCallDefault:Dangerous default value list() as argument:INFERENCE
++dangerous-default-value:40:4:40:23:BadDictCallDefault:Dangerous default value dict() as argument:INFERENCE
++dangerous-default-value:44:4:44:50:BadDequeDefault:Dangerous default value deque() as argument:INFERENCE
++dangerous-default-value:57:4:57:20:MixedNamedTuple:Dangerous default value [] as argument:INFERENCE
++dangerous-default-value:66:4:66:33:GlobalDangerousDefault:Dangerous default value DANGEROUS_GLOBAL (builtins.set) as argument:INFERENCE
++dangerous-default-value:70:4:70:52:BadCustomStoreDefault:Dangerous default value CustomMutableStore() as argument:INFERENCE
+diff --git a/tests/functional/g/generic_alias/generic_alias_side_effects.txt b/tests/functional/g/generic_alias/generic_alias_side_effects.txt
+index b22f185ea8..8f6d9e8265 100644
+--- a/tests/functional/g/generic_alias/generic_alias_side_effects.txt
++++ b/tests/functional/g/generic_alias/generic_alias_side_effects.txt
+@@ -1,8 +1,8 @@
+-dangerous-default-value:19:0:19:13:function4:Dangerous default value set() (builtins.set) as argument:UNDEFINED
+-dangerous-default-value:27:0:27:13:function7:Dangerous default value dict() (builtins.dict) as argument:UNDEFINED
+-dangerous-default-value:31:0:31:13:function8:Dangerous default value list() (builtins.list) as argument:UNDEFINED
+-dangerous-default-value:35:0:35:14:function17:Dangerous default value deque() (collections.deque) as argument:UNDEFINED
+-dangerous-default-value:39:0:39:14:function18:Dangerous default value ChainMap() (collections.ChainMap) as argument:UNDEFINED
+-dangerous-default-value:43:0:43:14:function19:Dangerous default value Counter() (collections.Counter) as argument:UNDEFINED
+-dangerous-default-value:47:0:47:14:function20:Dangerous default value OrderedDict() (collections.OrderedDict) as argument:UNDEFINED
+-dangerous-default-value:51:0:51:14:function21:Dangerous default value defaultdict() (collections.defaultdict) as argument:UNDEFINED
++dangerous-default-value:19:0:19:13:function4:Dangerous default value set() as argument:INFERENCE
++dangerous-default-value:27:0:27:13:function7:Dangerous default value dict() as argument:INFERENCE
++dangerous-default-value:31:0:31:13:function8:Dangerous default value list() as argument:INFERENCE
++dangerous-default-value:35:0:35:14:function17:Dangerous default value deque() as argument:INFERENCE
++dangerous-default-value:39:0:39:14:function18:Dangerous default value ChainMap() as argument:INFERENCE
++dangerous-default-value:43:0:43:14:function19:Dangerous default value Counter() as argument:INFERENCE
++dangerous-default-value:47:0:47:14:function20:Dangerous default value OrderedDict() as argument:INFERENCE
++dangerous-default-value:51:0:51:14:function21:Dangerous default value defaultdict() as argument:INFERENCE

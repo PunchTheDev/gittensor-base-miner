@@ -1,0 +1,174 @@
+diff --git a/doc/whatsnew/fragments/10794.false_positive b/doc/whatsnew/fragments/10794.false_positive
+new file mode 100644
+index 0000000000..9eb26b1803
+--- /dev/null
++++ b/doc/whatsnew/fragments/10794.false_positive
+@@ -0,0 +1,3 @@
++Fix a false positive ``relative-beyond-top-level`` error when linting specific files in namespace packages in parallel mode by augmenting ``sys.path`` before loading plugins and expanding files consistently for parallel workers.
++
++Closes #10794
+diff --git a/pylint/lint/parallel.py b/pylint/lint/parallel.py
+index 23a7f762e7..91e2748d01 100644
+--- a/pylint/lint/parallel.py
++++ b/pylint/lint/parallel.py
+@@ -32,6 +32,9 @@ def _worker_initialize(
+     :param linter: A linter-class (PyLinter) instance pickled with dill
+     :param extra_packages_paths: Extra entries to be added to `sys.path`
+     """
++    if extra_packages_paths:
++        _augment_sys_path(extra_packages_paths)
++
+     global _worker_linter  # pylint: disable=global-statement
+     import dill  # pylint: disable=import-outside-toplevel
+ 
+@@ -54,9 +57,6 @@ def _worker_initialize(
+     _worker_linter.load_plugin_modules(_worker_linter._dynamic_plugins, force=True)
+     _worker_linter.load_plugin_configuration()
+ 
+-    if extra_packages_paths:
+-        _augment_sys_path(extra_packages_paths)
+-
+ 
+ def _worker_check_single_file(
+     file_item: FileItem,
+diff --git a/pylint/lint/pylinter.py b/pylint/lint/pylinter.py
+index 3318fc40d4..d3399ecba4 100644
+--- a/pylint/lint/pylinter.py
++++ b/pylint/lint/pylinter.py
+@@ -719,39 +719,36 @@ def check(self, files_or_modules: Sequence[str]) -> None:
+             ).keys()
+         )
+ 
++        # 1) Gather all FileItems
++        if self.config.from_stdin:
++            fileitems = self._get_file_descr_from_stdin(files_or_modules[0])
++            data: str | None = _read_stdin()
++        else:
++            fileitems = self._iterate_file_descrs(
++                files_or_modules,
++                extra_packages_paths=extra_packages_paths,
++            )
++            data = None
++
+         # TODO: Move the parallel invocation into step 3 of the checking process
++        # 2) Lint in parallel if requested
+         if not self.config.from_stdin and self.config.jobs > 1:
+             original_sys_path = sys.path[:]
+-            check_parallel(
+-                self,
+-                self.config.jobs,
+-                self._iterate_file_descrs(files_or_modules),
+-                extra_packages_paths,
+-            )
++            check_parallel(self, self.config.jobs, fileitems, extra_packages_paths)
+             sys.path = original_sys_path
+             return
+ 
+-        progress_reporter = ProgressReporter(self.verbose)
+-
+-        # 1) Get all FileItems
+-        with augmented_sys_path(extra_packages_paths):
+-            if self.config.from_stdin:
+-                fileitems = self._get_file_descr_from_stdin(files_or_modules[0])
+-                data: str | None = _read_stdin()
+-            else:
+-                fileitems = self._iterate_file_descrs(files_or_modules)
+-                data = None
++        # 3) Sequential path: run the AST and linting pipeline.
++        reporter = ProgressReporter(self.verbose)
+ 
+-        # The contextmanager also opens all checkers and sets up the PyLinter class
++        # The context manager also opens all checkers and sets up the PyLinter class.
+         with augmented_sys_path(extra_packages_paths):
+             with self._astroid_module_checker() as check_astroid_module:
+-                # 2) Get the AST for each FileItem
+-                ast_per_fileitem = self._get_asts(fileitems, data, progress_reporter)
++                # Get the AST for each FileItem.
++                ast_per_fileitem = self._get_asts(fileitems, data, reporter)
+ 
+-                # 3) Lint each ast
+-                self._lint_files(
+-                    ast_per_fileitem, check_astroid_module, progress_reporter
+-                )
++                # Lint each AST.
++                self._lint_files(ast_per_fileitem, check_astroid_module, reporter)
+ 
+     def _get_asts(
+         self,
+@@ -925,14 +922,17 @@ def _get_file_descr_from_stdin(self, filepath: str) -> Iterator[FileItem]:
+         yield FileItem(modname, filepath, filepath)
+ 
+     def _iterate_file_descrs(
+-        self, files_or_modules: Sequence[str]
++        self, files_or_modules: Sequence[str], extra_packages_paths: Sequence[str] = ()
+     ) -> Iterator[FileItem]:
+         """Return generator yielding file descriptions (tuples of module name, file
+         path, base name).
+ 
+         The returned generator yield one item for each Python module that should be linted.
+         """
+-        for descr in self._expand_files(files_or_modules).values():
++        with augmented_sys_path(extra_packages_paths):
++            expanded_files = self._expand_files(files_or_modules)
++
++        for descr in expanded_files.values():
+             name, filepath, is_arg = descr["name"], descr["path"], descr["isarg"]
+             if descr["isignored"]:
+                 self.stats.skipped += 1
+diff --git a/tests/test_self.py b/tests/test_self.py
+index 3f82647c98..7ec4d507fc 100644
+--- a/tests/test_self.py
++++ b/tests/test_self.py
+@@ -1122,6 +1122,52 @@ def test_issue_10794_relative_beyond_top_level_parallel_specific_file(
+         with _test_cwd(path):
+             self._runtest(args, code=0)
+ 
++    @pytest.mark.needs_two_cores
++    @pytest.mark.parametrize(
++        "jobs,to_lint",
++        [
++            ["0", "a/"],
++            ["1", "a/"],
++            ["1", "a/c/d.py"],
++            ["0", "a/c/d.py"],
++        ],
++        ids=["jobs-0-dir", "jobs-1-dir", "jobs-1-file", "jobs-0-file"],
++    )
++    def test_issue_10794_relative_beyond_top_level_parallel_specific_file_subprocess(
++        self, jobs: int, to_lint: str
++    ) -> None:
++        """Regression test for https://github.com/pylint-dev/pylint/issues/10794 invoked in a subprocess."""
++        path = join(HERE, "regrtest_data", "pep420", "issue_10794")
++        pylint_call = [
++            sys.executable,
++            "-m",
++            "pylint",
++            *_add_rcfile_default_pylintrc(
++                [
++                    "--jobs",
++                    str(jobs),
++                    "--disable=all",
++                    "--enable=relative-beyond-top-level",
++                    "--source-roots",
++                    ".",
++                    to_lint,
++                    "--persistent=no",
++                ]
++            ),
++        ]
++        with _test_cwd(path):
++            process = subprocess.run(
++                pylint_call,
++                cwd=path,
++                capture_output=True,
++                encoding="utf-8",
++                check=False,
++            )
++
++        output = f"{process.stdout}\n{process.stderr}"
++        assert process.returncode == 0, output
++        assert "relative-beyond-top-level" not in output
++
+     def test_output_file_valid_path(self, tmp_path: Path) -> None:
+         path = join(HERE, "regrtest_data", "unused_variable.py")
+         output_file = tmp_path / "output.txt"

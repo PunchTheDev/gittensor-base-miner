@@ -1,0 +1,759 @@
+diff --git a/pylint/pyreverse/diadefslib.py b/pylint/pyreverse/diadefslib.py
+index dd3926a8f8..2e52439c3a 100644
+--- a/pylint/pyreverse/diadefslib.py
++++ b/pylint/pyreverse/diadefslib.py
+@@ -159,8 +159,9 @@ def get_associated(
+         """Return associated nodes of a class node."""
+         if level == 0:
+             return
+-        for association_nodes in list(klass_node.instance_attrs_type.values()) + list(
+-            klass_node.locals_type.values()
++        info = self.linker.class_info[klass_node]
++        for association_nodes in list(info.instance_attrs_type.values()) + list(
++            info.locals_type.values()
+         ):
+             for node in association_nodes:
+                 if isinstance(node, astroid.Instance):
+@@ -203,11 +204,11 @@ def visit_project(self, node: Project) -> None:
+         mode = self.config.mode
+         if len(node.modules) > 1:
+             self.pkgdiagram: PackageDiagram | None = PackageDiagram(
+-                f"packages {node.name}", mode
++                f"packages {node.name}", mode, self.linker
+             )
+         else:
+             self.pkgdiagram = None
+-        self.classdiagram = ClassDiagram(f"classes {node.name}", mode)
++        self.classdiagram = ClassDiagram(f"classes {node.name}", mode, self.linker)
+ 
+     def leave_project(self, _: Project) -> Any:
+         """Leave the pyreverse.utils.Project node.
+@@ -248,7 +249,7 @@ class ClassDiadefGenerator(DiaDefGenerator):
+ 
+     def class_diagram(self, project: Project, klass: nodes.ClassDef) -> ClassDiagram:
+         """Return a class diagram definition for the class and related classes."""
+-        self.classdiagram = ClassDiagram(klass, self.config.mode)
++        self.classdiagram = ClassDiagram(klass, self.config.mode, self.linker)
+         if len(project.modules) > 1:
+             module, klass = klass.rsplit(".", 1)
+             module = project.get_module(module)
+diff --git a/pylint/pyreverse/diagrams.py b/pylint/pyreverse/diagrams.py
+index e5589ce1ea..70ee4a5e11 100644
+--- a/pylint/pyreverse/diagrams.py
++++ b/pylint/pyreverse/diagrams.py
+@@ -7,7 +7,7 @@
+ from __future__ import annotations
+ 
+ from collections.abc import Iterable
+-from typing import Any
++from typing import TYPE_CHECKING, Any
+ 
+ import astroid
+ from astroid import nodes, objects, util
+@@ -15,6 +15,9 @@
+ from pylint.checkers.utils import decorated_with_property, in_type_checking_block
+ from pylint.pyreverse.utils import FilterMixIn, get_annotation_label
+ 
++if TYPE_CHECKING:
++    from pylint.pyreverse.inspector import Linker
++
+ 
+ class Figure:
+     """Base class for counter handling."""
+@@ -82,10 +85,11 @@ class ClassDiagram(Figure, FilterMixIn):
+ 
+     TYPE = "class"
+ 
+-    def __init__(self, title: str, mode: str) -> None:
++    def __init__(self, title: str, mode: str, linker: Linker) -> None:
+         FilterMixIn.__init__(self, mode)
+         Figure.__init__(self)
+         self.title = title
++        self.linker = linker
+         # TODO: Specify 'Any' after refactor of `DiagramEntity`
+         self.objects: list[Any] = []
+         self.relationships: dict[str, list[Relationship]] = {}
+@@ -121,6 +125,7 @@ def get_relationship(
+     def get_attrs(self, node: nodes.ClassDef) -> list[str]:
+         """Return visible attributes, possibly with class name."""
+         attrs = []
++        info = self.linker.class_info[node]
+ 
+         # Collect functions decorated with @property
+         properties = {
+@@ -131,8 +136,8 @@ def get_attrs(self, node: nodes.ClassDef) -> list[str]:
+         }
+ 
+         # Add instance attributes to properties
+-        for attr_name, attr_type in list(node.locals_type.items()) + list(
+-            node.instance_attrs_type.items()
++        for attr_name, attr_type in list(info.locals_type.items()) + list(
++            info.instance_attrs_type.items()
+         ):
+             if attr_name not in properties:
+                 properties[attr_name] = attr_type
+@@ -223,6 +228,7 @@ def extract_relationships(self) -> None:
+         """Extract relationships between nodes in the diagram."""
+         for obj in self.classes():
+             node = obj.node
++            info = self.linker.class_info[node]
+             obj.attrs = self.get_attrs(node)
+             obj.methods = self.get_methods(node)
+             obj.shape = "class"
+@@ -241,7 +247,7 @@ def extract_relationships(self) -> None:
+             # Process in priority order: Composition > Aggregation > Association
+ 
+             # 1. Composition links (highest priority)
+-            for name, values in list(node.compositions_type.items()):
++            for name, values in list(info.compositions_type.items()):
+                 if not self.show_attr(name):
+                     continue
+                 for value in values:
+@@ -251,7 +257,7 @@ def extract_relationships(self) -> None:
+                     processed_attrs.add(name)
+ 
+             # 2. Aggregation links (medium priority)
+-            for name, values in list(node.aggregations_type.items()):
++            for name, values in list(info.aggregations_type.items()):
+                 if not self.show_attr(name) or name in processed_attrs:
+                     continue
+                 for value in values:
+@@ -261,8 +267,8 @@ def extract_relationships(self) -> None:
+                     processed_attrs.add(name)
+ 
+             # 3. Association links (lowest priority)
+-            associations = node.associations_type.copy()
+-            for name, values in node.locals_type.items():
++            associations = info.associations_type.copy()
++            for name, values in info.locals_type.items():
+                 if name not in associations:
+                     associations[name] = values
+ 
+@@ -331,14 +337,15 @@ def add_from_depend(self, node: nodes.ImportFrom, from_module: str) -> None:
+         """Add dependencies created by from-imports."""
+         mod_name = node.root().name
+         package = self.module(mod_name).node
++        info = self.linker.module_info[package]
+ 
+-        if from_module in package.depends:
++        if from_module in info.depends:
+             return
+ 
+         if not in_type_checking_block(node):
+-            package.depends.append(from_module)
+-        elif from_module not in package.type_depends:
+-            package.type_depends.append(from_module)
++            info.depends.append(from_module)
++        elif from_module not in info.type_depends:
++            info.type_depends.append(from_module)
+ 
+     def extract_relationships(self) -> None:
+         """Extract relationships between nodes in the diagram."""
+@@ -352,15 +359,16 @@ def extract_relationships(self) -> None:
+                 continue
+         for package_obj in self.modules():
+             package_obj.shape = "package"
++            info = self.linker.module_info[package_obj.node]
+             # dependencies
+-            for dep_name in package_obj.node.depends:
++            for dep_name in info.depends:
+                 try:
+                     dep = self.get_module(dep_name, package_obj.node)
+                 except KeyError:
+                     continue
+                 self.add_relationship(package_obj, dep, "depends")
+ 
+-            for dep_name in package_obj.node.type_depends:
++            for dep_name in info.type_depends:
+                 try:
+                     dep = self.get_module(dep_name, package_obj.node)
+                 except KeyError:  # pragma: no cover
+diff --git a/pylint/pyreverse/inspector.py b/pylint/pyreverse/inspector.py
+index e32761e267..07386ba525 100644
+--- a/pylint/pyreverse/inspector.py
++++ b/pylint/pyreverse/inspector.py
+@@ -9,7 +9,6 @@
+ 
+ from __future__ import annotations
+ 
+-import collections
+ import os
+ import traceback
+ from abc import ABC, abstractmethod
+@@ -24,6 +23,7 @@
+ from pylint import constants
+ from pylint.checkers.utils import safe_infer
+ from pylint.pyreverse import utils
++from pylint.pyreverse.node_info import ClassInfo, FunctionInfo, InfoDict, ModuleInfo
+ 
+ _WrapperFuncT = Callable[
+     [Callable[[str], nodes.Module], str, bool], nodes.Module | None
+@@ -94,30 +94,11 @@ def __repr__(self) -> str:
+ class Linker(IdGeneratorMixIn, utils.LocalsVisitor):
+     """Walk on the project tree and resolve relationships.
+ 
+-    According to options the following attributes may be
+-    added to visited nodes:
++    Analysis data is stored in info dictionaries (class_info, module_info,
++    function_info). See node_info module for details
++    on the stored attributes.
+ 
+-    * uid,
+-      a unique identifier for the node (on astroid.Project, nodes.Module,
+-      nodes.Class and astroid.locals_type). Only if the linker
+-      has been instantiated with tag=True parameter (False by default).
+-
+-    * Function
+-      a mapping from locals names to their bounded value, which may be a
+-      constant like a string or an integer, or an astroid node
+-      (on nodes.Module, nodes.Class and nodes.Function).
+-
+-    * instance_attrs_type
+-      as locals_type but for klass member attributes (only on nodes.Class)
+-
+-    * associations_type
+-      as instance_attrs_type but for association relationships
+-
+-    * aggregations_type
+-      as instance_attrs_type but for aggregations relationships
+-
+-    * compositions_type
+-      as instance_attrs_type but for compositions relationships
++    If tag=True, unique identifiers are generated for visited nodes.
+     """
+ 
+     def __init__(self, project: Project, tag: bool = False) -> None:
+@@ -128,6 +109,14 @@ def __init__(self, project: Project, tag: bool = False) -> None:
+         # visited project
+         self.project = project
+ 
++        # Info storage (auto-creating dicts)
++        self.class_info: InfoDict[nodes.ClassDef, ClassInfo] = InfoDict(ClassInfo)
++        self.module_info: InfoDict[nodes.Module, ModuleInfo] = InfoDict(ModuleInfo)
++        self.function_info: InfoDict[nodes.FunctionDef, FunctionInfo] = InfoDict(
++            FunctionInfo
++        )
++        self._handled_assigns: set[nodes.AssignName] = set()
++
+         # Chain: Composition → Aggregation → Association
+         self.compositions_handler = CompositionsHandler()
+         aggregation_handler = AggregationsHandler()
+@@ -137,56 +126,33 @@ def __init__(self, project: Project, tag: bool = False) -> None:
+         aggregation_handler.set_next(association_handler)
+ 
+     def visit_project(self, node: Project) -> None:
+-        """Visit a pyreverse.utils.Project node.
+-
+-        * optionally tag the node with a unique id
+-        """
++        """Visit a pyreverse.utils.Project node and optionally assign a unique id."""
+         if self.tag:
+             node.uid = self.generate_id()
+         for module in node.modules:
+             self.visit(module)
+ 
+     def visit_module(self, node: nodes.Module) -> None:
+-        """Visit an nodes.Module node.
+-
+-        * set the locals_type mapping
+-        * set the depends mapping
+-        * optionally tag the node with a unique id
+-        """
+-        if hasattr(node, "locals_type"):
+-            return
+-        node.locals_type = collections.defaultdict(list)
+-        node.depends = []
+-        node.type_depends = []
++        """Visit an nodes.Module node and optionally assign a unique id."""
++        info = self.module_info[node]
+         if self.tag:
+-            node.uid = self.generate_id()
++            info.uid = self.generate_id()
+ 
+     def visit_classdef(self, node: nodes.ClassDef) -> None:
+-        """Visit an nodes.Class node.
+-
+-        * set the locals_type and instance_attrs_type mappings
+-        * optionally tag the node with a unique id
+-        """
+-        if hasattr(node, "locals_type"):
+-            return
+-        node.locals_type = collections.defaultdict(list)
++        """Visit an nodes.Class node and optionally assign a unique id."""
++        info = self.class_info[node]
+         if self.tag:
+-            node.uid = self.generate_id()
++            info.uid = self.generate_id()
+         # resolve ancestors
+         for baseobj in node.ancestors(recurs=False):
+-            specializations = getattr(baseobj, "specializations", [])
+-            specializations.append(node)
+-            baseobj.specializations = specializations
++            base_info = self.class_info[baseobj]
++            base_info.specializations.append(node)
+         # resolve instance attributes
+-        node.compositions_type = collections.defaultdict(list)
+-        node.instance_attrs_type = collections.defaultdict(list)
+-        node.aggregations_type = collections.defaultdict(list)
+-        node.associations_type = collections.defaultdict(list)
+         for assignattrs in tuple(node.instance_attrs.values()):
+             for assignattr in assignattrs:
+                 if not isinstance(assignattr, nodes.Unknown):
+-                    self.compositions_handler.handle(assignattr, node)
+-                    self.handle_assignattr_type(assignattr, node)
++                    self.compositions_handler.handle(assignattr, node, info)
++                    self.handle_assignattr_type(assignattr, info)
+ 
+         # Process class attributes
+         for local_nodes in node.locals.values():
+@@ -194,60 +160,47 @@ def visit_classdef(self, node: nodes.ClassDef) -> None:
+                 if isinstance(local_node, nodes.AssignName) and isinstance(
+                     local_node.parent, nodes.Assign
+                 ):
+-                    self.compositions_handler.handle(local_node, node)
++                    self.compositions_handler.handle(local_node, node, info)
+ 
+     def visit_functiondef(self, node: nodes.FunctionDef) -> None:
+-        """Visit an nodes.Function node.
+-
+-        * set the locals_type mapping
+-        * optionally tag the node with a unique id
+-        """
+-        if hasattr(node, "locals_type"):
+-            return
+-        node.locals_type = collections.defaultdict(list)
++        """Visit an nodes.Function node and optionally assign a unique id."""
++        info = self.function_info[node]
+         if self.tag:
+-            node.uid = self.generate_id()
++            info.uid = self.generate_id()
+ 
+     def visit_assignname(self, node: nodes.AssignName) -> None:
+-        """Visit an nodes.AssignName node.
+-
+-        handle locals_type
+-        """
+-        # avoid double parsing done by different Linkers.visit
+-        # running over the same project:
+-        if hasattr(node, "_handled"):
++        """Visit an AssignName node and update locals_type for its frame."""
++        # avoid double parsing done by different Linkers.visit running over the same project:
++        if node in self._handled_assigns:
+             return
+-        node._handled = True
++        self._handled_assigns.add(node)
++
+         if node.name in node.frame():
+             frame = node.frame()
+         else:
+             # the name has been defined as 'global' in the frame and belongs
+             # there.
+             frame = node.root()
+-        if not hasattr(frame, "locals_type"):
+-            # If the frame doesn't have a locals_type yet,
+-            # it means it wasn't yet visited. Visit it now
+-            # to add what's missing from it.
+-            if isinstance(frame, nodes.ClassDef):
+-                self.visit_classdef(frame)
+-            elif isinstance(frame, nodes.FunctionDef):
+-                self.visit_functiondef(frame)
+-            else:
+-                self.visit_module(frame)
+ 
+-        current = frame.locals_type[node.name]
+-        frame.locals_type[node.name] = list(set(current) | utils.infer_node(node))
++        # Get the info object for the frame
++        if isinstance(frame, nodes.ClassDef):
++            locals_type = self.class_info[frame].locals_type
++        elif isinstance(frame, nodes.FunctionDef):
++            locals_type = self.function_info[frame].locals_type
++        else:
++            locals_type = self.module_info[frame].locals_type
++
++        current = locals_type[node.name]
++        locals_type[node.name] = list(set(current) | utils.infer_node(node))
+ 
+     @staticmethod
+-    def handle_assignattr_type(node: nodes.AssignAttr, parent: nodes.ClassDef) -> None:
++    def handle_assignattr_type(node: nodes.AssignAttr, info: ClassInfo) -> None:
+         """Handle an astroid.assignattr node.
+ 
+         handle instance_attrs_type
+         """
+-        current = set(parent.instance_attrs_type[node.attrname])
+-        parent.instance_attrs_type[node.attrname] = list(
+-            current | utils.infer_node(node)
+-        )
++        current = set(info.instance_attrs_type[node.attrname])
++        info.instance_attrs_type[node.attrname] = list(current | utils.infer_node(node))
+ 
+     def visit_import(self, node: nodes.Import) -> None:
+         """Visit an nodes.Import node.
+@@ -302,11 +255,9 @@ def _imported_module(
+             mod_path = f"{'.'.join(context_name.split('.')[:-1])}.{mod_path}"
+         if self.compute_module(context_name, mod_path):
+             # handle dependencies
+-            if not hasattr(module, "depends"):
+-                module.depends = []
+-            mod_paths = module.depends
+-            if mod_path not in mod_paths:
+-                mod_paths.append(mod_path)
++            info = self.module_info[module]
++            if mod_path not in info.depends:
++                info.depends.append(mod_path)
+ 
+ 
+ class RelationshipHandlerInterface(ABC):
+@@ -314,13 +265,16 @@ class RelationshipHandlerInterface(ABC):
+     def set_next(
+         self, handler: RelationshipHandlerInterface
+     ) -> RelationshipHandlerInterface:
+-        pass
++        raise NotImplementedError()
+ 
+     @abstractmethod
+     def handle(
+-        self, node: nodes.AssignAttr | nodes.AssignName, parent: nodes.ClassDef
++        self,
++        node: nodes.AssignAttr | nodes.AssignName,
++        parent: nodes.ClassDef,
++        info: ClassInfo,
+     ) -> None:
+-        pass
++        raise NotImplementedError()
+ 
+ 
+ class AbstractRelationshipHandler(RelationshipHandlerInterface):
+@@ -345,21 +299,27 @@ def set_next(
+ 
+     @abstractmethod
+     def handle(
+-        self, node: nodes.AssignAttr | nodes.AssignName, parent: nodes.ClassDef
++        self,
++        node: nodes.AssignAttr | nodes.AssignName,
++        parent: nodes.ClassDef,
++        info: ClassInfo,
+     ) -> None:
+         if self._next_handler:
+-            self._next_handler.handle(node, parent)
++            self._next_handler.handle(node, parent, info)
+ 
+ 
+ class CompositionsHandler(AbstractRelationshipHandler):
+     """Handle composition relationships where parent creates child objects."""
+ 
+     def handle(
+-        self, node: nodes.AssignAttr | nodes.AssignName, parent: nodes.ClassDef
++        self,
++        node: nodes.AssignAttr | nodes.AssignName,
++        parent: nodes.ClassDef,
++        info: ClassInfo,
+     ) -> None:
+         # If the node is not part of an assignment, pass to next handler
+         if not isinstance(node.parent, (nodes.AnnAssign, nodes.Assign)):
+-            super().handle(node, parent)
++            super().handle(node, parent, info)
+             return
+ 
+         value = node.parent.value
+@@ -375,8 +335,8 @@ def handle(
+             # Resolve nodes to actual class definitions
+             resolved_types = resolve_to_class_def(element_types)
+ 
+-            current = set(parent.compositions_type[name])
+-            parent.compositions_type[name] = list(current | resolved_types)
++            current = set(info.compositions_type[name])
++            info.compositions_type[name] = list(current | resolved_types)
+             return
+ 
+         # Composition: comprehensions with object creation (self.x = [P() for ...])
+@@ -396,23 +356,26 @@ def handle(
+                 # Resolve nodes to actual class definitions
+                 resolved_types = resolve_to_class_def(element_types)
+ 
+-                current = set(parent.compositions_type[name])
+-                parent.compositions_type[name] = list(current | resolved_types)
++                current = set(info.compositions_type[name])
++                info.compositions_type[name] = list(current | resolved_types)
+                 return
+ 
+         # Not a composition, pass to next handler
+-        super().handle(node, parent)
++        super().handle(node, parent, info)
+ 
+ 
+ class AggregationsHandler(AbstractRelationshipHandler):
+     """Handle aggregation relationships where parent receives child objects."""
+ 
+     def handle(
+-        self, node: nodes.AssignAttr | nodes.AssignName, parent: nodes.ClassDef
++        self,
++        node: nodes.AssignAttr | nodes.AssignName,
++        parent: nodes.ClassDef,
++        info: ClassInfo,
+     ) -> None:
+         # If the node is not part of an assignment, pass to next handler
+         if not isinstance(node.parent, (nodes.AnnAssign, nodes.Assign)):
+-            super().handle(node, parent)
++            super().handle(node, parent, info)
+             return
+ 
+         value = node.parent.value
+@@ -428,8 +391,8 @@ def handle(
+             # Resolve nodes to actual class definitions
+             resolved_types = resolve_to_class_def(element_types)
+ 
+-            current = set(parent.aggregations_type[name])
+-            parent.aggregations_type[name] = list(current | resolved_types)
++            current = set(info.aggregations_type[name])
++            info.aggregations_type[name] = list(current | resolved_types)
+             return
+ 
+         # Aggregation: comprehensions without object creation (self.x = [existing_obj for ...])
+@@ -449,19 +412,22 @@ def handle(
+                 # Resolve nodes to actual class definitions
+                 resolved_types = resolve_to_class_def(element_types)
+ 
+-                current = set(parent.aggregations_type[name])
+-                parent.aggregations_type[name] = list(current | resolved_types)
++                current = set(info.aggregations_type[name])
++                info.aggregations_type[name] = list(current | resolved_types)
+                 return
+ 
+         # Not an aggregation, pass to next handler
+-        super().handle(node, parent)
++        super().handle(node, parent, info)
+ 
+ 
+ class AssociationsHandler(AbstractRelationshipHandler):
+     """Handle regular association relationships."""
+ 
+     def handle(
+-        self, node: nodes.AssignAttr | nodes.AssignName, parent: nodes.ClassDef
++        self,
++        node: nodes.AssignAttr | nodes.AssignName,
++        parent: nodes.ClassDef,
++        info: ClassInfo,
+     ) -> None:
+         # Extract the name to handle both AssignAttr and AssignName nodes
+         name = node.attrname if isinstance(node, nodes.AssignAttr) else node.name
+@@ -475,18 +441,18 @@ def handle(
+             # Resolve nodes to actual class definitions
+             resolved_types = resolve_to_class_def(element_types)
+ 
+-            current = set(parent.associations_type[name])
+-            parent.associations_type[name] = list(current | resolved_types)
++            current = set(info.associations_type[name])
++            info.associations_type[name] = list(current | resolved_types)
+             return
+ 
+         # Everything else is also association (fallback)
+-        current = set(parent.associations_type[name])
++        current = set(info.associations_type[name])
+         inferred_types = utils.infer_node(node)
+         element_types = extract_element_types(inferred_types)
+ 
+         # Resolve Name nodes to actual class definitions
+         resolved_types = resolve_to_class_def(element_types)
+-        parent.associations_type[name] = list(current | resolved_types)
++        info.associations_type[name] = list(current | resolved_types)
+ 
+ 
+ def resolve_to_class_def(types: set[nodes.NodeNG]) -> set[nodes.ClassDef]:
+diff --git a/pylint/pyreverse/node_info.py b/pylint/pyreverse/node_info.py
+new file mode 100644
+index 0000000000..72e38d80e5
+--- /dev/null
++++ b/pylint/pyreverse/node_info.py
+@@ -0,0 +1,102 @@
++# Licensed under the GPL: https://www.gnu.org/licenses/old-licenses/gpl-2.0.html
++# For details: https://github.com/pylint-dev/pylint/blob/main/LICENSE
++# Copyright (c) https://github.com/pylint-dev/pylint/blob/main/CONTRIBUTORS.txt
++
++"""Dataclass wrappers for storing analysis info about astroid nodes.
++
++This module provides typed dataclasses to hold the analysis metadata that was
++previously stored directly on astroid nodes. This enables proper type hints
++and avoids modifying external objects.
++"""
++
++from __future__ import annotations
++
++from collections import defaultdict
++from dataclasses import dataclass, field
++from typing import TYPE_CHECKING, Generic, TypeVar
++
++if TYPE_CHECKING:
++    from astroid import nodes
++
++
++K = TypeVar("K")
++V = TypeVar("V")
++
++
++class InfoDict(dict[K, V], Generic[K, V]):
++    """Dict that auto-creates values using a factory when accessing missing keys."""
++
++    def __init__(self, factory: type[V]) -> None:
++        super().__init__()
++        self._factory = factory
++
++    def __missing__(self, key: K) -> V:
++        self[key] = self._factory()
++        return self[key]
++
++
++@dataclass
++class ModuleInfo:
++    """Analysis info for Module nodes.
++
++    Attributes:
++        locals_type: Mapping from local names to inferred types.
++        depends: List of module dependencies.
++        type_depends: List of type-checking-only dependencies.
++        uid: Unique identifier (only set if Linker tag=True).
++    """
++
++    locals_type: defaultdict[str, list[nodes.NodeNG]] = field(
++        default_factory=lambda: defaultdict(list)
++    )
++    depends: list[str] = field(default_factory=list)
++    type_depends: list[str] = field(default_factory=list)
++    uid: int | None = None
++
++
++@dataclass
++class ClassInfo:
++    """Analysis info for ClassDef nodes.
++
++    Attributes:
++        locals_type: Mapping from local names to inferred types.
++        instance_attrs_type: Mapping from instance attribute names to types.
++        compositions_type: Attributes representing composition relationships.
++        aggregations_type: Attributes representing aggregation relationships.
++        associations_type: Attributes representing association relationships.
++        specializations: List of subclasses.
++        uid: Unique identifier (only set if Linker tag=True).
++    """
++
++    locals_type: defaultdict[str, list[nodes.NodeNG]] = field(
++        default_factory=lambda: defaultdict(list)
++    )
++    instance_attrs_type: defaultdict[str, list[nodes.NodeNG]] = field(
++        default_factory=lambda: defaultdict(list)
++    )
++    compositions_type: defaultdict[str, list[nodes.ClassDef]] = field(
++        default_factory=lambda: defaultdict(list)
++    )
++    aggregations_type: defaultdict[str, list[nodes.ClassDef]] = field(
++        default_factory=lambda: defaultdict(list)
++    )
++    associations_type: defaultdict[str, list[nodes.ClassDef]] = field(
++        default_factory=lambda: defaultdict(list)
++    )
++    specializations: list[nodes.ClassDef] = field(default_factory=list)
++    uid: int | None = None
++
++
++@dataclass
++class FunctionInfo:
++    """Analysis info for FunctionDef nodes.
++
++    Attributes:
++        locals_type: Mapping from local names to inferred types.
++        uid: Unique identifier (only set if Linker tag=True).
++    """
++
++    locals_type: defaultdict[str, list[nodes.NodeNG]] = field(
++        default_factory=lambda: defaultdict(list)
++    )
++    uid: int | None = None
+diff --git a/tests/pyreverse/test_inspector.py b/tests/pyreverse/test_inspector.py
+index b388569ac7..eb41494f65 100644
+--- a/tests/pyreverse/test_inspector.py
++++ b/tests/pyreverse/test_inspector.py
+@@ -16,8 +16,7 @@
+ import astroid
+ import pytest
+ 
+-from pylint.pyreverse import inspector
+-from pylint.pyreverse.inspector import Project
++from pylint.pyreverse.inspector import Linker, Project
+ from pylint.testutils.utils import _test_cwd
+ from pylint.typing import GetProjectCallable
+ 
+@@ -25,21 +24,24 @@
+ TESTS = HERE.parent.parent
+ 
+ 
+-@pytest.fixture
+-def project(get_project: GetProjectCallable) -> Generator[Project]:
++@pytest.fixture(params=[True, False], ids=["tag=True", "tag=False"])
++def test_context(
++    request: pytest.FixtureRequest, get_project: GetProjectCallable
++) -> Generator[tuple[Project, Linker]]:
+     with _test_cwd(TESTS):
+         project = get_project("data", "data")
+-        linker = inspector.Linker(project)
++        linker = Linker(project, tag=request.param)
+         with warnings.catch_warnings():
+             warnings.filterwarnings("ignore", category=DeprecationWarning)
+             linker.visit(project)
+-        yield project
++        yield project, linker
+ 
+ 
+-def test_locals_assignment_resolution(project: Project) -> None:
+-    klass = project.get_module("data.clientmodule_test")["Specialization"]
+-    assert hasattr(klass, "locals_type")
+-    type_dict = klass.locals_type
++def test_locals_assignment_resolution(test_context: tuple[Project, Linker]) -> None:
++    proj, linker = test_context
++    klass = proj.get_module("data.clientmodule_test")["Specialization"]
++    info = linker.class_info[klass]
++    type_dict = info.locals_type
+     assert len(type_dict) == 2
+     keys = sorted(type_dict.keys())
+     assert keys == ["TYPE", "top"]
+@@ -49,10 +51,11 @@ def test_locals_assignment_resolution(project: Project) -> None:
+     assert type_dict["top"][0].value == "class"
+ 
+ 
+-def test_instance_attrs_resolution(project: Project) -> None:
+-    klass = project.get_module("data.clientmodule_test")["Specialization"]
+-    assert hasattr(klass, "instance_attrs_type")
+-    type_dict = klass.instance_attrs_type
++def test_instance_attrs_resolution(test_context: tuple[Project, Linker]) -> None:
++    proj, linker = test_context
++    klass = proj.get_module("data.clientmodule_test")["Specialization"]
++    info = linker.class_info[klass]
++    type_dict = info.instance_attrs_type
+     assert len(type_dict) == 3
+     keys = sorted(type_dict.keys())
+     assert keys == ["_id", "relation", "relation2"]
+@@ -63,13 +66,15 @@ def test_instance_attrs_resolution(project: Project) -> None:
+     assert type_dict["_id"][0] is astroid.Uninferable
+ 
+ 
+-def test_from_directory(project: Project) -> None:
++def test_from_directory(test_context: tuple[Project, Linker]) -> None:
++    proj, _ = test_context
+     expected = os.path.join("tests", "data", "__init__.py")
+-    assert project.name == "data"
+-    assert project.path.endswith(expected)
++    assert proj.name == "data"
++    assert proj.path.endswith(expected)
+ 
+ 
+-def test_project_node(project: Project) -> None:
++def test_project_node(test_context: tuple[Project, Linker]) -> None:
++    proj, _ = test_context
+     expected = [
+         "data",
+         "data.clientmodule_test",
+@@ -77,4 +82,4 @@ def test_project_node(project: Project) -> None:
+         "data.property_pattern",
+         "data.suppliermodule_test",
+     ]
+-    assert sorted(project.keys()) == expected
++    assert sorted(proj.keys()) == expected

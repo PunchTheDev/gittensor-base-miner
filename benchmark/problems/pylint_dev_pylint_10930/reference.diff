@@ -1,0 +1,153 @@
+diff --git a/doc/whatsnew/fragments/9598.internal b/doc/whatsnew/fragments/9598.internal
+new file mode 100644
+index 0000000000..83b4190672
+--- /dev/null
++++ b/doc/whatsnew/fragments/9598.internal
+@@ -0,0 +1,6 @@
++Add ``assertDoesNotAddMessages`` to ``CheckerTestCase`` to assert that
++specific messages are not emitted, while allowing other messages to be
++present. This complements ``assertNoMessages`` which asserts that no
++messages at all are emitted.
++
++Refs #9598
+diff --git a/pylint/testutils/checker_test_case.py b/pylint/testutils/checker_test_case.py
+index 951f38c0b9..b068ec8719 100644
+--- a/pylint/testutils/checker_test_case.py
++++ b/pylint/testutils/checker_test_case.py
+@@ -37,6 +37,35 @@ def assertNoMessages(self) -> Iterator[None]:
+         with self.assertAddsMessages():
+             yield
+ 
++    @contextlib.contextmanager
++    def assertDoesNotAddMessages(self, *message_ids: str) -> Generator[None]:
++        """Assert that none of the given message IDs are emitted by the checker.
++
++        Unlike ``assertNoMessages``, other messages may still be emitted.
++        Only the specified message IDs are checked to be absent.
++        """
++        if not message_ids:
++            raise TypeError(
++                "assertDoesNotAddMessages requires at least one message ID argument"
++            )
++        exception_raised = False
++        try:
++            yield
++        except Exception:
++            exception_raised = True
++            raise
++        finally:
++            got = self.linter.release_messages()
++            if not exception_raised:
++                emitted_ids = {m.msg_id for m in got}
++                for unwanted_id in message_ids:
++                    if unwanted_id in emitted_ids:
++                        got_str = "\n".join(repr(m) for m in got)
++                        raise AssertionError(
++                            f"Message '{unwanted_id}' was not expected to be emitted"
++                            f" but it was found among the actual messages:\n\n{got_str}\n"
++                        )
++
+     @contextlib.contextmanager
+     def assertAddsMessages(
+         self, *messages: MessageTest, ignore_position: bool = False
+diff --git a/tests/testutils/test_checker_test_case.py b/tests/testutils/test_checker_test_case.py
+new file mode 100644
+index 0000000000..465bb30994
+--- /dev/null
++++ b/tests/testutils/test_checker_test_case.py
+@@ -0,0 +1,95 @@
++# Licensed under the GPL: https://www.gnu.org/licenses/old-licenses/gpl-2.0.html
++# For details: https://github.com/pylint-dev/pylint/blob/main/LICENSE
++# Copyright (c) https://github.com/pylint-dev/pylint/blob/main/CONTRIBUTORS.txt
++
++"""Tests for CheckerTestCase assertion methods."""
++
++from __future__ import annotations
++
++import pytest
++
++from pylint.checkers.base_checker import BaseChecker
++from pylint.interfaces import UNDEFINED
++from pylint.testutils import CheckerTestCase, MessageTest
++
++
++class _DummyChecker(BaseChecker):
++    """A minimal checker used only for testing the test infrastructure."""
++
++    name = "dummy-for-testcase"
++    msgs = {
++        "W9901": ("Dummy message A", "dummy-msg-a", "Dummy message A."),
++        "W9902": ("Dummy message B", "dummy-msg-b", "Dummy message B."),
++    }
++
++
++_MSG_A = MessageTest("W9901", line=1, node=None, args=None, confidence=UNDEFINED)
++
++
++class TestCheckerTestCase(CheckerTestCase):
++    CHECKER_CLASS = _DummyChecker
++
++    def test_assert_adds_messages_success(self) -> None:
++        """Scenario 1: expected raised / actual raised."""
++        with self.assertAddsMessages(_MSG_A):
++            self.linter.add_message("W9901", line=1)
++
++    def test_assert_adds_messages_failure_not_raised(self) -> None:
++        """Scenario 2: expected raised / actual not raised."""
++        with pytest.raises(AssertionError, match=r"Got:\s+No message\."):
++            with self.assertAddsMessages(_MSG_A):
++                pass  # nothing emitted
++
++    def test_assert_adds_messages_failure_wrong_message(self) -> None:
++        """Scenario 3: expected raised / actual not raised but another one raised."""
++        with pytest.raises(
++            AssertionError, match="Expected messages did not match actual"
++        ):
++            with self.assertAddsMessages(_MSG_A):
++                self.linter.add_message("W9902", line=2)
++
++    def test_assert_does_not_add_messages_failure(self) -> None:
++        """Scenario 4: expected not raised / actual raised."""
++        with pytest.raises(
++            AssertionError,
++            match="Message 'W9901' was not expected to be emitted",
++        ):
++            with self.assertDoesNotAddMessages("W9901"):
++                self.linter.add_message("W9901", line=1)
++
++    def test_assert_does_not_add_messages_success(self) -> None:
++        """Scenario 5: expected not raised / actual not raised."""
++        with self.assertDoesNotAddMessages("W9901"):
++            pass  # nothing emitted
++
++    def test_assert_does_not_add_messages_success_other_raised(self) -> None:
++        """Scenario 6: expected not raised / actual not raised but another one raised."""
++        with self.assertDoesNotAddMessages("W9901"):
++            self.linter.add_message("W9902", line=2)
++
++    def test_assert_does_not_add_messages_no_args_raises(self) -> None:
++        """Calling with no arguments must raise TypeError."""
++        with pytest.raises(TypeError, match="requires at least one"):
++            with self.assertDoesNotAddMessages():
++                pass
++
++    def test_assert_does_not_add_messages_multiple_unwanted(self) -> None:
++        """Fails when any of the several unwanted message IDs is found."""
++        with pytest.raises(
++            AssertionError,
++            match="Message 'W9902' was not expected to be emitted",
++        ):
++            with self.assertDoesNotAddMessages("W9901", "W9902"):
++                self.linter.add_message("W9902", line=2)
++
++    def test_assert_does_not_add_messages_exception_in_body_drains_messages(
++        self,
++    ) -> None:
++        """An exception in the with-block must not leak messages to later tests."""
++        with pytest.raises(RuntimeError):
++            with self.assertDoesNotAddMessages("W9901"):
++                self.linter.add_message("W9901", line=1)
++                raise RuntimeError("something went wrong")
++        # Messages must have been drained; a subsequent assertNoMessages should pass.
++        with self.assertNoMessages():
++            pass

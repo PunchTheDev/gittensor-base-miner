@@ -1,0 +1,367 @@
+diff --git a/doc/whatsnew/fragments/10589.bugfix b/doc/whatsnew/fragments/10589.bugfix
+new file mode 100644
+index 0000000000..e7644bc548
+--- /dev/null
++++ b/doc/whatsnew/fragments/10589.bugfix
+@@ -0,0 +1,3 @@
++``wrong-import-position`` now exempts ``try``, ``if``, ``with``, and ``match`` blocks from marking the import boundary. Fixed ``async def`` not being detected as an import boundary. Pragma on non-import lines now suppresses following imports until the next non-import.
++
++Closes #10589
+diff --git a/pylint/checkers/imports.py b/pylint/checkers/imports.py
+index cdda5d9665..16c4af47cd 100644
+--- a/pylint/checkers/imports.py
++++ b/pylint/checkers/imports.py
+@@ -446,7 +446,7 @@ def __init__(self, linter: PyLinter) -> None:
+         BaseChecker.__init__(self, linter)
+         self.import_graph: defaultdict[str, set[str]] = defaultdict(set)
+         self._imports_stack: list[tuple[ImportNode, str]] = []
+-        self._first_non_import_node = None
++        self._non_import_nodes: list[nodes.NodeNG] = []
+         self._module_pkg: dict[Any, Any] = (
+             {}
+         )  # mapping of modules to the pkg they belong in
+@@ -607,32 +607,21 @@ def leave_module(self, node: nodes.Module) -> None:
+             met.add(package)
+ 
+         self._imports_stack = []
+-        self._first_non_import_node = None
++        self._non_import_nodes = []
+ 
+     def compute_first_non_import_node(
+         self,
+         node: (
+-            nodes.If
+-            | nodes.Expr
++            nodes.Expr
+             | nodes.Comprehension
+             | nodes.IfExp
+             | nodes.Assign
+             | nodes.AssignAttr
+-            | nodes.Try
+         ),
+     ) -> None:
+-        # if the node does not contain an import instruction, and if it is the
+-        # first node of the module, keep a track of it (all the import positions
+-        # of the module will be compared to the position of this first
+-        # instruction)
+-        if self._first_non_import_node:
+-            return
++        # Track non-import nodes at module level
+         if not isinstance(node.parent, nodes.Module):
+             return
+-        if isinstance(node, nodes.Try) and any(
+-            node.nodes_of_class((nodes.Import, nodes.ImportFrom))
+-        ):
+-            return
+         if isinstance(node, nodes.Assign):
+             # Add compatibility for module level dunder names
+             # https://www.python.org/dev/peps/pep-0008/#module-level-dunder-names
+@@ -644,35 +633,31 @@ def compute_first_non_import_node(
+             ]
+             if all(valid_targets):
+                 return
+-        self._first_non_import_node = node
+ 
+-    visit_try = visit_assignattr = visit_assign = visit_ifexp = visit_comprehension = (
+-        visit_expr
+-    ) = visit_if = compute_first_non_import_node
++        self._non_import_nodes.append(node)
++
++    visit_assignattr = visit_assign = visit_ifexp = visit_comprehension = visit_expr = (
++        compute_first_non_import_node
++    )
+ 
+     def visit_functiondef(
+-        self, node: nodes.FunctionDef | nodes.While | nodes.For | nodes.ClassDef
++        self,
++        node: (
++            nodes.FunctionDef
++            | nodes.AsyncFunctionDef
++            | nodes.While
++            | nodes.For
++            | nodes.ClassDef
++        ),
+     ) -> None:
+-        # If it is the first non import instruction of the module, record it.
+-        if self._first_non_import_node:
+-            return
+-
+-        # Check if the node belongs to an `If` or a `Try` block. If they
+-        # contain imports, skip recording this node.
+-        if not isinstance(node.parent.scope(), nodes.Module):
++        # Track non-import nodes at module level
++        if not isinstance(node.parent, nodes.Module):
+             return
++        self._non_import_nodes.append(node)
+ 
+-        root = node
+-        while not isinstance(root.parent, nodes.Module):
+-            root = root.parent
+-
+-        if isinstance(root, (nodes.If, nodes.Try)):
+-            if any(root.nodes_of_class((nodes.Import, nodes.ImportFrom))):
+-                return
+-
+-        self._first_non_import_node = node
+-
+-    visit_classdef = visit_for = visit_while = visit_functiondef
++    visit_asyncfunctiondef = visit_classdef = visit_for = visit_while = (
++        visit_functiondef
++    )
+ 
+     def _check_misplaced_future(self, node: nodes.ImportFrom) -> None:
+         basename = node.modname
+@@ -699,19 +684,39 @@ def _check_position(self, node: ImportNode) -> None:
+ 
+         Send a message  if `node` comes before another instruction
+         """
+-        # if a first non-import instruction has already been encountered,
+-        # it means the import comes after it and therefore is not well placed
+-        if self._first_non_import_node:
+-            if self.linter.is_message_enabled(
+-                "wrong-import-position", self._first_non_import_node.fromlineno
++        # Check if import comes after a non-import statement
++        if self._non_import_nodes:
++            # Check for inline pragma on the import line
++            if not self.linter.is_message_enabled(
++                "wrong-import-position", node.fromlineno
+             ):
+-                self.add_message(
+-                    "wrong-import-position", node=node, args=node.as_string()
+-                )
+-            else:
+                 self.linter.add_ignored_message(
+                     "wrong-import-position", node.fromlineno, node
+                 )
++                return
++
++            # Check for pragma on the preceding non-import statement
++            most_recent_non_import = None
++            for non_import_node in self._non_import_nodes:
++                if non_import_node.fromlineno < node.fromlineno:
++                    most_recent_non_import = non_import_node
++                else:
++                    break
++
++            if most_recent_non_import:
++                check_line = most_recent_non_import.fromlineno
++                if not self.linter.is_message_enabled(
++                    "wrong-import-position", check_line
++                ):
++                    self.linter.add_ignored_message(
++                        "wrong-import-position", check_line, most_recent_non_import
++                    )
++                    self.linter.add_ignored_message(
++                        "wrong-import-position", node.fromlineno, node
++                    )
++                    return
++
++            self.add_message("wrong-import-position", node=node, args=node.as_string())
+ 
+     def _record_import(
+         self,
+diff --git a/tests/functional/d/disable_wrong_import_position.py b/tests/functional/d/disable_wrong_import_position.py
+index 0703325a9e..69de82aeaa 100644
+--- a/tests/functional/d/disable_wrong_import_position.py
++++ b/tests/functional/d/disable_wrong_import_position.py
+@@ -1,7 +1,11 @@
+-"""Checks that disabling 'wrong-import-position' on a statement prevents it from
+-invalidating subsequent imports."""
++"""Test wrong-import-position pragma on non-import statement."""
+ # pylint: disable=unused-import
+ 
+-CONSTANT = True  # pylint: disable=wrong-import-position
+-
++import os
+ import sys
++
++CONSTANT_A = False  # pylint: disable=wrong-import-position
++import time
++
++CONSTANT_B = True
++import logging  # [wrong-import-position]
+diff --git a/tests/functional/d/disable_wrong_import_position.txt b/tests/functional/d/disable_wrong_import_position.txt
+new file mode 100644
+index 0000000000..13f49c5b2c
+--- /dev/null
++++ b/tests/functional/d/disable_wrong_import_position.txt
+@@ -0,0 +1 @@
++wrong-import-position:11:0:11:14::"Import ""import logging"" should be placed at the top of the module":UNDEFINED
+diff --git a/tests/functional/u/used/used_before_assignment_py310.py b/tests/functional/u/used/used_before_assignment_py310.py
+index 0f6db9c1c4..feaf40dad3 100644
+--- a/tests/functional/u/used/used_before_assignment_py310.py
++++ b/tests/functional/u/used/used_before_assignment_py310.py
+@@ -1,4 +1,5 @@
+ """Tests for used-before-assignment with python 3.10's pattern matching"""
++# pylint: disable=wrong-import-position
+ 
+ match ("example", "one"):
+     case (x, y) if x == "example":
+diff --git a/tests/functional/u/used/used_before_assignment_py310.txt b/tests/functional/u/used/used_before_assignment_py310.txt
+index 5f2d3074a7..7e3e22cd6b 100644
+--- a/tests/functional/u/used/used_before_assignment_py310.txt
++++ b/tests/functional/u/used/used_before_assignment_py310.txt
+@@ -1 +1 @@
+-possibly-used-before-assignment:108:11:108:17:check_value_if_then_match_non_exhaustive:Possibly using variable 'result' before assignment:CONTROL_FLOW
++possibly-used-before-assignment:109:11:109:17:check_value_if_then_match_non_exhaustive:Possibly using variable 'result' before assignment:CONTROL_FLOW
+diff --git a/tests/functional/w/wrong_import_order.py b/tests/functional/w/wrong_import_order.py
+index b838d6e9da..98ac150999 100644
+--- a/tests/functional/w/wrong_import_order.py
++++ b/tests/functional/w/wrong_import_order.py
+@@ -1,5 +1,5 @@
+ """Checks import order rule"""
+-# pylint: disable=unused-import,ungrouped-imports,import-error,no-name-in-module,relative-beyond-top-level,multiple-imports,reimported
++# pylint: disable=unused-import,ungrouped-imports,import-error,no-name-in-module,relative-beyond-top-level,multiple-imports,reimported,wrong-import-position
+ from __future__ import absolute_import
+ try:
+     from six.moves import configparser
+diff --git a/tests/functional/w/wrong_import_position.py b/tests/functional/w/wrong_import_position.py
+index 5468706c85..e62a32dd8b 100644
+--- a/tests/functional/w/wrong_import_position.py
++++ b/tests/functional/w/wrong_import_position.py
+@@ -19,7 +19,7 @@ class OrderedDict:
+         def some_func(self):
+             pass
+ 
+-import six  # [wrong-import-position]
++import six
+ 
+ CONSTANT = True
+ 
+diff --git a/tests/functional/w/wrong_import_position.txt b/tests/functional/w/wrong_import_position.txt
+index 3de4d7c17f..ffbec9d623 100644
+--- a/tests/functional/w/wrong_import_position.txt
++++ b/tests/functional/w/wrong_import_position.txt
+@@ -1,4 +1,3 @@
+-wrong-import-position:22:0:22:10::"Import ""import six"" should be placed at the top of the module":UNDEFINED
+ wrong-import-position:26:0:26:15::"Import ""import datetime"" should be placed at the top of the module":UNDEFINED
+ wrong-import-position:32:0:32:12::"Import ""import scipy"" should be placed at the top of the module":UNDEFINED
+ wrong-import-position:33:0:33:14::"Import ""import astroid"" should be placed at the top of the module":UNDEFINED
+diff --git a/tests/functional/w/wrong_import_position14.py b/tests/functional/w/wrong_import_position14.py
+index f5c9a03e58..69d53b8bc4 100644
+--- a/tests/functional/w/wrong_import_position14.py
++++ b/tests/functional/w/wrong_import_position14.py
+@@ -2,4 +2,4 @@
+ # pylint: disable=unused-import,undefined-variable,import-error
+ if x:
+     import os
+-import y  # [wrong-import-position]
++import y
+diff --git a/tests/functional/w/wrong_import_position14.txt b/tests/functional/w/wrong_import_position14.txt
+deleted file mode 100644
+index a91a24fbcc..0000000000
+--- a/tests/functional/w/wrong_import_position14.txt
++++ /dev/null
+@@ -1 +0,0 @@
+-wrong-import-position:5:0:5:8::"Import ""import y"" should be placed at the top of the module":UNDEFINED
+diff --git a/tests/functional/w/wrong_import_position16.py b/tests/functional/w/wrong_import_position16.py
+new file mode 100644
+index 0000000000..49831da9e4
+--- /dev/null
++++ b/tests/functional/w/wrong_import_position16.py
+@@ -0,0 +1,5 @@
++"""Checks import position rule with async def"""
++# pylint: disable=unused-import,missing-function-docstring
++async def async_func():
++    pass
++import os  # [wrong-import-position]
+diff --git a/tests/functional/w/wrong_import_position16.txt b/tests/functional/w/wrong_import_position16.txt
+new file mode 100644
+index 0000000000..7ea2c2a3bf
+--- /dev/null
++++ b/tests/functional/w/wrong_import_position16.txt
+@@ -0,0 +1 @@
++wrong-import-position:5:0:5:9::"Import ""import os"" should be placed at the top of the module":UNDEFINED
+diff --git a/tests/functional/w/wrong_import_position17.py b/tests/functional/w/wrong_import_position17.py
+new file mode 100644
+index 0000000000..ac9c1a5a1e
+--- /dev/null
++++ b/tests/functional/w/wrong_import_position17.py
+@@ -0,0 +1,14 @@
++"""Checks import position rule for for/while blocks."""
++# pylint: disable=unused-import
++
++import os
++
++for _ in []:
++    pass
++
++import sys  # [wrong-import-position]
++
++while False:
++    pass
++
++import logging  # [wrong-import-position]
+diff --git a/tests/functional/w/wrong_import_position17.txt b/tests/functional/w/wrong_import_position17.txt
+new file mode 100644
+index 0000000000..255131ab0b
+--- /dev/null
++++ b/tests/functional/w/wrong_import_position17.txt
+@@ -0,0 +1,2 @@
++wrong-import-position:9:0:9:10::"Import ""import sys"" should be placed at the top of the module":UNDEFINED
++wrong-import-position:14:0:14:14::"Import ""import logging"" should be placed at the top of the module":UNDEFINED
+diff --git a/tests/functional/w/wrong_import_position18.py b/tests/functional/w/wrong_import_position18.py
+new file mode 100644
+index 0000000000..c721803b4d
+--- /dev/null
++++ b/tests/functional/w/wrong_import_position18.py
+@@ -0,0 +1,9 @@
++"""Checks import position rule for with blocks."""
++# pylint: disable=unused-import,unspecified-encoding
++
++import os
++
++with open(__file__):
++    pass
++
++import sys
+diff --git a/tests/functional/w/wrong_import_position19.py b/tests/functional/w/wrong_import_position19.py
+new file mode 100644
+index 0000000000..55d208722b
+--- /dev/null
++++ b/tests/functional/w/wrong_import_position19.py
+@@ -0,0 +1,10 @@
++"""Checks import position rule for match blocks."""
++# pylint: disable=unused-import
++
++import os
++
++match os.name:
++    case _:
++        pass
++
++import sys
+diff --git a/tests/functional/w/wrong_import_position20.py b/tests/functional/w/wrong_import_position20.py
+new file mode 100644
+index 0000000000..d8f06bd052
+--- /dev/null
++++ b/tests/functional/w/wrong_import_position20.py
+@@ -0,0 +1,20 @@
++"""Checks wrong-import-position pragma scoping on non-import statements."""
++# pylint: disable=unused-import
++
++import os
++import sys
++
++CONSTANT_A = False  # pylint: disable=wrong-import-position
++import time
++
++CONSTANT_B = True
++import logging  # [wrong-import-position]
++
++CONSTANT_C = 42
++import json  # pylint: disable=wrong-import-position
++
++CONSTANT_D = "test"  # pylint: disable=wrong-import-position
++import csv
++
++CONSTANT_E = 123
++import re  # [wrong-import-position]
+diff --git a/tests/functional/w/wrong_import_position20.txt b/tests/functional/w/wrong_import_position20.txt
+new file mode 100644
+index 0000000000..72b1f3cb50
+--- /dev/null
++++ b/tests/functional/w/wrong_import_position20.txt
+@@ -0,0 +1,2 @@
++wrong-import-position:11:0:11:14::"Import ""import logging"" should be placed at the top of the module":UNDEFINED
++wrong-import-position:20:0:20:9::"Import ""import re"" should be placed at the top of the module":UNDEFINED

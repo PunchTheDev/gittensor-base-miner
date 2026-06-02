@@ -1,0 +1,104 @@
+diff --git a/CHANGES.rst b/CHANGES.rst
+index 6c998e626..aebb38b58 100644
+--- a/CHANGES.rst
++++ b/CHANGES.rst
+@@ -20,6 +20,8 @@ Unreleased
+     async-aware filter. :issue:`1781`
+ -   ``|int`` filter handles ``OverflowError`` from scientific notation.
+     :issue:`1921`
++-   Make compiling deterministic for tuple unpacking in a ``{% set ... %}``
++    call. :issue:`2021`
+ 
+ 
+ Version 3.1.4
+diff --git a/src/jinja2/compiler.py b/src/jinja2/compiler.py
+index 91720c5f9..074e9b187 100644
+--- a/src/jinja2/compiler.py
++++ b/src/jinja2/compiler.py
+@@ -811,7 +811,7 @@ def pop_assign_tracking(self, frame: Frame) -> None:
+                 self.writeline("_block_vars.update({")
+             else:
+                 self.writeline("context.vars.update({")
+-            for idx, name in enumerate(vars):
++            for idx, name in enumerate(sorted(vars)):
+                 if idx:
+                     self.write(", ")
+                 ref = frame.symbols.ref(name)
+@@ -821,7 +821,7 @@ def pop_assign_tracking(self, frame: Frame) -> None:
+             if len(public_names) == 1:
+                 self.writeline(f"context.exported_vars.add({public_names[0]!r})")
+             else:
+-                names_str = ", ".join(map(repr, public_names))
++                names_str = ", ".join(map(repr, sorted(public_names)))
+                 self.writeline(f"context.exported_vars.update(({names_str}))")
+ 
+     # -- Statement Visitors
+diff --git a/tests/test_compile.py b/tests/test_compile.py
+index 42a773f21..42efa59c0 100644
+--- a/tests/test_compile.py
++++ b/tests/test_compile.py
+@@ -26,3 +26,64 @@ def test_import_as_with_context_deterministic(tmp_path):
+     expect = [f"'bar{i}': " for i in range(10)]
+     found = re.findall(r"'bar\d': ", content)[:10]
+     assert found == expect
++
++
++def test_top_level_set_vars_unpacking_deterministic(tmp_path):
++    src = "\n".join(f"{{% set a{i}, b{i}, c{i} = tuple_var{i} %}}" for i in range(10))
++    env = Environment(loader=DictLoader({"foo": src}))
++    env.compile_templates(tmp_path, zip=None)
++    name = os.listdir(tmp_path)[0]
++    content = (tmp_path / name).read_text("utf8")
++    expect = [
++        f"context.vars.update({{'a{i}': l_0_a{i}, 'b{i}': l_0_b{i}, 'c{i}': l_0_c{i}}})"
++        for i in range(10)
++    ]
++    found = re.findall(
++        r"context\.vars\.update\(\{'a\d': l_0_a\d, 'b\d': l_0_b\d, 'c\d': l_0_c\d\}\)",
++        content,
++    )[:10]
++    assert found == expect
++    expect = [
++        f"context.exported_vars.update(('a{i}', 'b{i}', 'c{i}'))" for i in range(10)
++    ]
++    found = re.findall(
++        r"context\.exported_vars\.update\(\('a\d', 'b\d', 'c\d'\)\)",
++        content,
++    )[:10]
++    assert found == expect
++
++
++def test_loop_set_vars_unpacking_deterministic(tmp_path):
++    src = "\n".join(f"  {{% set a{i}, b{i}, c{i} = tuple_var{i} %}}" for i in range(10))
++    src = f"{{% for i in seq %}}\n{src}\n{{% endfor %}}"
++    env = Environment(loader=DictLoader({"foo": src}))
++    env.compile_templates(tmp_path, zip=None)
++    name = os.listdir(tmp_path)[0]
++    content = (tmp_path / name).read_text("utf8")
++    expect = [
++        f"_loop_vars.update({{'a{i}': l_1_a{i}, 'b{i}': l_1_b{i}, 'c{i}': l_1_c{i}}})"
++        for i in range(10)
++    ]
++    found = re.findall(
++        r"_loop_vars\.update\(\{'a\d': l_1_a\d, 'b\d': l_1_b\d, 'c\d': l_1_c\d\}\)",
++        content,
++    )[:10]
++    assert found == expect
++
++
++def test_block_set_vars_unpacking_deterministic(tmp_path):
++    src = "\n".join(f"  {{% set a{i}, b{i}, c{i} = tuple_var{i} %}}" for i in range(10))
++    src = f"{{% block test %}}\n{src}\n{{% endblock test %}}"
++    env = Environment(loader=DictLoader({"foo": src}))
++    env.compile_templates(tmp_path, zip=None)
++    name = os.listdir(tmp_path)[0]
++    content = (tmp_path / name).read_text("utf8")
++    expect = [
++        f"_block_vars.update({{'a{i}': l_0_a{i}, 'b{i}': l_0_b{i}, 'c{i}': l_0_c{i}}})"
++        for i in range(10)
++    ]
++    found = re.findall(
++        r"_block_vars\.update\(\{'a\d': l_0_a\d, 'b\d': l_0_b\d, 'c\d': l_0_c\d\}\)",
++        content,
++    )[:10]
++    assert found == expect
