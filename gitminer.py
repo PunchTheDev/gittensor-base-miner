@@ -11,6 +11,7 @@ Subcommands:
     cache       Pre-warm the local repo cache (speeds up --no-sandbox evals)
     hash        Compute the commit-reveal SHA-256 hash for a patch file
     shard       Print the current week's 30-problem shard IDs
+    info        Show full details for a single problem (issue, test cmd, context files, scores)
     submit      Validate an agent, generate its commit-reveal hash, and print (or open) a PR
     serve-api   Start the REST API server (default port 8083)
     mine        Run your agent continuously; auto-submit when it beats the champion
@@ -31,6 +32,7 @@ Usage:
     python gitminer.py cache
     python gitminer.py hash my_patch.diff
     python gitminer.py shard
+    python gitminer.py info 0463
     python gitminer.py submit agent/submissions/myhandle/agent.py
     python gitminer.py submit agent/submissions/myhandle/agent.py --model claude-3-5-haiku-20241022 --open-pr
     python gitminer.py serve-api
@@ -463,6 +465,109 @@ def cmd_leaderboard(args: argparse.Namespace) -> None:
     if oracle and oracle.get("score") is not None:
         print(f"Oracle (reference diffs): {oracle['score']:.2f} / 30.00")
     print(f"Dashboard: https://punchthedev.github.io/gittensor-miner-dashboard/")
+    print()
+
+
+def cmd_info(args: argparse.Namespace) -> None:
+    """Show full details for a single problem: issue, test cmd, context files, scores."""
+    problem_dir = REPO_ROOT / "benchmark" / "problems" / args.id
+    meta_path = problem_dir / "meta.json"
+    if not meta_path.exists():
+        print(f"Problem {args.id!r} not found in benchmark/problems/")
+        sys.exit(1)
+
+    meta = json.loads(meta_path.read_text())
+
+    # Baselines
+    baseline_score: float | None = None
+    bl_path = REPO_ROOT / "results" / "baselines.json"
+    if bl_path.exists():
+        bl = json.loads(bl_path.read_text())
+        for entry in bl.get("problems", []):
+            if entry.get("id") == args.id:
+                baseline_score = entry.get("base_score")
+                break
+
+    # Context files
+    ctx_dir = problem_dir / "context"
+    ctx_files: list[str] = []
+    test_files: set[str] = set()
+    if ctx_dir.exists():
+        _TEST_PATS = ("test_", "_test.", ".test.", ".spec.", "/tests/", "/test/", "/spec/")
+        for f in sorted(ctx_dir.rglob("*")):
+            if f.is_file():
+                rel = str(f.relative_to(ctx_dir))
+                ctx_files.append(rel)
+                if any(p in rel.replace("\\", "/") for p in _TEST_PATS):
+                    test_files.add(rel)
+
+    # Reference diff size
+    ref_diff = problem_dir / "reference.diff"
+    diff_lines = ref_diff.read_text().splitlines() if ref_diff.exists() else []
+    add_lines = sum(1 for l in diff_lines if l.startswith("+") and not l.startswith("+++"))
+    rem_lines = sum(1 for l in diff_lines if l.startswith("-") and not l.startswith("---"))
+
+    RESET, BOLD, DIM, GREEN, YELLOW, CYAN, RED = (
+        "\033[0m", "\033[1m", "\033[2m", "\033[32m", "\033[33m", "\033[36m", "\033[31m",
+    )
+    sep = DIM + "─" * 70 + RESET
+
+    print(f"\n{BOLD}{meta.get('issue_title', 'Untitled')}{RESET}")
+    print(f"{DIM}{meta.get('repo_name','')}  ·  Issue #{meta.get('issue_number','?')}  ·  PR #{meta.get('pr_number','?')}{RESET}")
+    merged = (meta.get("merged_at") or "")[:10]
+    if merged:
+        print(f"{DIM}Merged {merged}{RESET}")
+
+    print(f"\n{sep}")
+
+    # Issue body
+    body = (meta.get("issue_body") or "").strip()
+    if body:
+        print(f"\n{BOLD}Issue{RESET}")
+        # Wrap to ~72 chars
+        for line in body[:1200].splitlines():
+            print(f"  {line}")
+        if len(body) > 1200:
+            print(f"  {DIM}… (truncated){RESET}")
+
+    # Test command
+    test_cmd = meta.get("test_cmd") or []
+    print(f"\n{BOLD}Test command{RESET}")
+    print(f"  {GREEN}{' '.join(test_cmd)}{RESET}")
+
+    # Scores
+    print(f"\n{BOLD}Scores{RESET}")
+    if baseline_score is not None:
+        diff_str = ""
+        if baseline_score >= 25:
+            diff_str = f"  {GREEN}easy{RESET}"
+        elif baseline_score >= 18:
+            diff_str = f"  {YELLOW}medium{RESET}"
+        else:
+            diff_str = f"  {RED}hard{RESET}"
+        print(f"  Baseline: {CYAN}{baseline_score:.2f}{RESET}/30{diff_str}")
+    das = meta.get("das_score")
+    if das is not None:
+        try:
+            print(f"  DAS match: {float(das):.4f}")
+        except (TypeError, ValueError):
+            pass
+    print(f"  Reference diff: {GREEN}+{add_lines}{RESET}/{RED}-{rem_lines}{RESET} lines")
+
+    # Context files
+    print(f"\n{BOLD}Context files ({len(ctx_files)}){RESET}")
+    for f in ctx_files:
+        marker = f"  {GREEN}🧪{RESET}" if f in test_files else "  📄"
+        print(f"{marker}  {CYAN}{f}{RESET}")
+    src_count = len(ctx_files) - len(test_files)
+    print(f"  {DIM}{src_count} source · {len(test_files)} test{RESET}")
+
+    # Quick commands
+    print(f"\n{sep}")
+    print(f"\n{BOLD}Quick commands{RESET}")
+    print(f"  {DIM}Run oracle (no agent):  {RESET}python gitminer.py run --problem {args.id} --show-ref")
+    print(f"  {DIM}Run your agent:         {RESET}python gitminer.py run --problem {args.id} --agent <path/agent.py> --score --no-sandbox")
+    print(f"  {DIM}View on GitHub:         {RESET}https://github.com/{meta.get('repo_name','')}/pull/{meta.get('pr_number','?')}")
     print()
 
 
@@ -969,6 +1074,11 @@ def main() -> None:
     # shard
     p_shard = sub.add_parser("shard", help="Print current week's 30-problem shard")
     p_shard.set_defaults(func=cmd_shard)
+
+    # info
+    p_info = sub.add_parser("info", help="Show full details for a single problem")
+    p_info.add_argument("id", metavar="ID", help="Problem ID (e.g. 0463)")
+    p_info.set_defaults(func=cmd_info)
 
     # parity
     p_parity = sub.add_parser(

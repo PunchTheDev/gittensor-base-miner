@@ -31,6 +31,29 @@ def load_baselines() -> dict[str, float]:
         return {}
 
 
+TEST_PATH_PATTERNS = (
+    "test_", "_test.", ".test.", ".spec.", "/tests/", "/test/", "/spec/",
+    "__tests__", "tests/", "test/",
+)
+
+
+def context_files_for(problem_dir: pathlib.Path) -> tuple[list[str], list[str]]:
+    """Return (all_files, test_files) as sorted relative path lists."""
+    ctx = problem_dir / "context"
+    if not ctx.exists():
+        return [], []
+    all_files = sorted(
+        str(f.relative_to(ctx))
+        for f in ctx.rglob("*")
+        if f.is_file()
+    )
+    test_files = [
+        p for p in all_files
+        if any(pat in p.replace("\\", "/") for pat in TEST_PATH_PATTERNS)
+    ]
+    return all_files, test_files
+
+
 def load_problems():
     baselines = load_baselines()
     problems = []
@@ -49,6 +72,7 @@ def load_problems():
         issue = meta.get("issue_number")
         issue_body = meta.get("issue_body") or ""
         pid = meta.get("id")
+        ctx_files, test_files = context_files_for(p)
         problems.append(
             {
                 "id": pid,
@@ -68,6 +92,8 @@ def load_problems():
                 "base_commit": meta.get("base_commit", ""),
                 "pr_url": f"https://github.com/{repo}/pull/{pr}",
                 "issue_url": f"https://github.com/{repo}/issues/{issue}" if issue else None,
+                "context_files": ctx_files,
+                "test_files": test_files,
             }
         )
     return problems
