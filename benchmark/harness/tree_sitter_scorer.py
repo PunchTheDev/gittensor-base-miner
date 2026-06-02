@@ -297,14 +297,23 @@ def score_file_pairs(pairs: list[FilePair]) -> Optional[tuple[float, float]]:
         file_is_test = is_test_file(pair.path, pair.new_content, ext)
         file_weight = _TEST_FILE_WEIGHT if file_is_test else 1.0
 
-        # Non-code extensions: line-count scoring (simplified)
+        # Non-code extensions: line-count scoring on changed lines (matches DAS file.changes)
         if ext in _NON_CODE_EXTS:
             lang_w = weights.lang_weight(ext)
-            change_lines = 0
-            if pair.old_content:
-                change_lines += len(pair.old_content.splitlines())
-            if pair.new_content:
-                change_lines += len(pair.new_content.splitlines())
+            # Count changed lines (additions + deletions) — matches `file.changes` from GitHub API.
+            if pair.old_content is None:
+                change_lines = len((pair.new_content or "").splitlines())
+            elif pair.new_content is None:
+                change_lines = len(pair.old_content.splitlines())
+            else:
+                import difflib
+                old_lines = pair.old_content.splitlines()
+                new_lines = pair.new_content.splitlines()
+                change_lines = sum(
+                    (j2 - j1) + (i2 - i1)
+                    for op, i1, i2, j1, j2 in difflib.SequenceMatcher(None, old_lines, new_lines).get_opcodes()
+                    if op != "equal"
+                )
             line_score = lang_w * min(change_lines, _MAX_LINES_NON_CODE) * file_weight
             total_score += line_score
             if not file_is_test:
