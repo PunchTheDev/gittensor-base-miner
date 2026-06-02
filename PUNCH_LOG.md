@@ -4,6 +4,33 @@ Milestone trail for the base-miner benchmark. Discord is the primary channel; th
 
 ---
 
+## 2026-06-02 — Oracle mean update + hunk map in plan step (commits ba036fb, 31dcf29, 38d1809)
+
+### Oracle mean update: 23.08 → 23.36 (commit ba036fb)
+
+Scored all 423 problems (was 400). The 23 new ragflow Go/TS problems added last step were missing from baselines.json. Running `scripts/baseline_scores.py` across all 423 produced:
+- Mean: 23.36 (was 23.08 for 400 problems)
+- Median: 26.74
+- New Go/TS problems score high (many ~30.00 — large driver implementations)
+
+Updated oracle mean in: leaderboard.json, record_result.py, gitminer.py, benchmark/evaluate.py, docs/rewards.md, docs/api.md, README.md.
+
+Dashboard regenerated: 423 problems, oracle 23.36 (benchmark commit 31dcf29, dashboard commit 94113f3).
+
+### Agent: hunk map in plan step (commit 38d1809)
+
+**Root cause of line-offset errors**: the model re-derives `@@ -N` start lines during the ACT step, under time pressure and without having explicitly committed to specific line numbers. This produces hunk offset errors (wrong start line in `@@ -a,c +b,d @@`) that cause `git apply` to reject a structurally-valid diff.
+
+Our `_fix_hunk_counts` post-processor fixes the *counts* (b/d fields) but cannot fix the *start offset* (a/c fields) without running `git apply`.
+
+**Fix**: added Step 6 "Hunk map" to the OBSERVE_PROMPT. Before writing the diff, the model explicitly states each planned change with its file path and `N |` start line from the windowed source display. ACT_PROMPT now tells the model to use the hunk map from step 6 for its `@@ -N` offsets directly. This pre-computation moves the hard reasoning to the plan step (18s budget, no format pressure) rather than the act step (48s budget, but generating a full multi-file diff simultaneously).
+
+### Status
+- Benchmark: 423 problems, oracle 23.36, 20 repos (commit 38d1809)
+- Pool: fully saturated (check 2026-06-09 for new DAS registrations)
+
+---
+
 ## 2026-06-02 — Agent: language-aware headers + Scala support (commits 6cf29f0, 9d56b86, 6f2cbfc)
 
 ### Language-aware import-block detection for windowed files (commits 6cf29f0, 9d56b86)
