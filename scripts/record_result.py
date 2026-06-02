@@ -121,6 +121,19 @@ def main():
         leaderboard.insert(0, ORACLE_ROW)
 
     today = date.today().isoformat()
+
+    # Per-problem breakdown for dashboard drill-down (problem_id, score, passed, category)
+    raw_problems = results.get("problems", [])
+    breakdown = [
+        {
+            "problem_id": p.get("problem_id", ""),
+            "score": round(float(p.get("final_score", 0.0)), 4),
+            "passed": bool(p.get("tests_passed", False)),
+            "category": p.get("category", ""),
+        }
+        for p in raw_problems
+    ]
+
     entry = {
         "rank": 1,  # placeholder — update_leaderboard will re-rank
         "agent": args.handle,
@@ -129,6 +142,7 @@ def main():
         "model": args.model,
         "date": today,
         "note": args.note,
+        "breakdown": breakdown,
     }
 
     prev_sota = current_sota(leaderboard)
