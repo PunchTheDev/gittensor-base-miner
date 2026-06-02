@@ -216,6 +216,12 @@ Improvements over a naive single-shot approach:
   short "produce the corrected diff now" message (~80 chars). The model already has its analysis
   in context; asking it to output the diff is more directed and saves significant token budget
   on every prose-critique retry path.
+- Verify body snippet: head + tail for long issues. The full observe context is compacted
+  after the act step, leaving the verify prompt as the model's only view of the issue body.
+  Previously `body[:3000]` could miss requirements near the end of a long issue (31% of
+  pool problems exceed 3000 chars; max 16200). Now shows `body[:2500] + "[...]" + body[-500:]`
+  for bodies > 3000 chars — preserving both the opening requirements and the trailing edge-case
+  details/gotchas. Total length stays ~3000 chars.
 """
 
 from __future__ import annotations
@@ -2129,7 +2135,15 @@ class ExampleAgent(BaseAgent):
             else:
                 # First verify call, or previous call produced a corrected diff:
                 # inject extracted assertions so the model can cross-check each one.
-                body_snippet = (problem.issue_body or "")[:3000]
+                # For long issue bodies, show first 2500 chars + last 500 chars so
+                # requirements stated near the end (edge cases, gotchas) are visible.
+                # The model's full observe turn is compacted after the act step, so
+                # the verify prompt is the only place the model sees issue body text.
+                body_raw = problem.issue_body or ""
+                if len(body_raw) > 3000:
+                    body_snippet = body_raw[:2500] + "\n[...]\n" + body_raw[-500:]
+                else:
+                    body_snippet = body_raw
                 assertions_text = _extract_assertions(test_files)
                 assertions_section = (
                     ASSERTIONS_SECTION_TEMPLATE.format(assertions=assertions_text)
