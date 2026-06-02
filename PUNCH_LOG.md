@@ -114,3 +114,17 @@ Local harness over-estimates DAS reference scores by median 3.4×. Root cause: t
 - **`gitminer cache`** (commit 7da8450): pre-warms the cache across all 325 problems' repos with progress output.
 - **`gitminer problems`** (commit dd41305): list/filter/sort all 325 problems by language, difficulty, repo, or text search. Reads baselines.json for difficulty tier.
 - **Better eval summary** (commit b796e28): shows pass rate, language breakdown (Python/JS/Rust/Java pass counts), and failed problem list with test failure hint.
+
+---
+
+## 2026-06-02 — Eval CI enrichment + oracle score sync
+
+- **Richer eval PR comment** (commit 85da967 → e798f43): CI comment now shows per-problem language (py/js/rs/java), difficulty (easy/medium/hard), baseline ceiling score, and a "vs Baseline" delta column. Summary line shows "N/M beat baseline" and oracle score for direct comparison.
+- **Oracle score synced to 22.77** (commit e798f43, c98d80d): leaderboard.json, record_result.py, and generate_dashboard_data.py now all use 22.77 (actual mean of 324 reference diffs). Was 21.60 in leaderboard/record, 22.79 in dashboard generator — all consistent now.
+- **Fixed generate_dashboard_data.py arg parsing** (commit 652c46c): CLI `--output path` silently wrote to a file named `--output`. Fixed to use argparse positional arg.
+- Dashboard data.json regenerated (dashboard commit 9da35e9).
+
+### Waiting on operator
+
+1. Verify `OPENROUTER_KEY` in GitHub Actions Environment is the correct production key.
+2. Gittensor registration — team handles approval; hyperparameters.json is ready.
