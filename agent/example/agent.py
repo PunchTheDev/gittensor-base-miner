@@ -7,6 +7,8 @@ Miners compete to outperform this baseline.
 Improvements over a naive single-shot approach:
 - Context files ranked by keyword relevance to the issue — most relevant first,
   over-long context truncated rather than blindly dumped into the prompt
+- Large files windowed to relevant sections only (±40 lines around keyword hits)
+  so more files fit in the context budget without blowing the token limit
 - Explicit file-and-line hypothesis required in the planning turn so the act
   turn has a precise target
 - Structural diff validation beyond the basic `@@` presence check — catches
@@ -193,11 +195,63 @@ def _truncate_context(files: list[FileContext]) -> list[FileContext]:
     return selected
 
 
-def _format_files(files: list[FileContext]) -> str:
+def _window_file(content: str, keywords: set[str], context_lines: int = 40) -> str:
+    """Return only the sections of a file that contain issue-relevant keywords.
+
+    For files over 300 lines, finds all lines containing keyword hits and
+    emits a ±context_lines window around each hit cluster. Unshown regions
+    are replaced with an omission marker. Full content is returned for small files.
+    """
+    lines = content.splitlines(keepends=True)
+    if len(lines) <= 300:
+        return content
+
+    # Mark which lines contain a keyword hit
+    hit = [False] * len(lines)
+    for i, line in enumerate(lines):
+        l = line.lower()
+        if any(kw in l for kw in keywords if len(kw) > 3):
+            hit[i] = True
+
+    if not any(hit):
+        # No hits — return first N lines as a peek
+        peek = min(80, len(lines))
+        suffix = f"\n... [{len(lines) - peek} more lines omitted — no keyword hits]"
+        return "".join(lines[:peek]) + suffix
+
+    # Expand each hit into a window and merge overlapping windows
+    windows: list[tuple[int, int]] = []
+    i = 0
+    while i < len(lines):
+        if hit[i]:
+            start = max(0, i - context_lines)
+            end = min(len(lines), i + context_lines + 1)
+            if windows and start <= windows[-1][1]:
+                windows[-1] = (windows[-1][0], end)
+            else:
+                windows.append((start, end))
+        i += 1
+
+    parts = []
+    prev_end = 0
+    for start, end in windows:
+        if start > prev_end:
+            omitted = start - prev_end
+            parts.append(f"... [{omitted} lines omitted]\n")
+        parts.append("".join(lines[start:end]))
+        prev_end = end
+    if prev_end < len(lines):
+        parts.append(f"... [{len(lines) - prev_end} lines omitted]\n")
+
+    return "".join(parts)
+
+
+def _format_files(files: list[FileContext], keywords: set[str] | None = None) -> str:
     parts = []
     for f in files:
         lang = f.language or ""
-        parts.append(f"### {f.path}\n```{lang}\n{f.content}\n```")
+        content = _window_file(f.content, keywords or set()) if keywords else f.content
+        parts.append(f"### {f.path}\n```{lang}\n{content}\n```")
     return "\n\n".join(parts)
 
 
@@ -329,6 +383,10 @@ class ExampleAgent(BaseAgent):
         if test_files:
             log.append(f"[context] {len(test_files)} test file(s) shown separately")
 
+        # Build keyword set for windowing large files
+        raw_tokens = re.findall(r"\b([a-z_][a-z0-9_]{3,}|[A-Z][A-Za-z0-9]{3,})\b", problem.issue_title + " " + problem.issue_body)
+        keywords = {t.lower() for t in raw_tokens}
+
         # Build test section — always shown in full (usually small)
         test_section = (
             TEST_SECTION_TEMPLATE.format(test_files=_format_files(test_files))
@@ -346,7 +404,7 @@ class ExampleAgent(BaseAgent):
             test_cmd_short=test_cmd_short,
             tree="\n".join(problem.file_tree),
             test_section=test_section,
-            impl_files=_format_files(selected_impl),
+            impl_files=_format_files(selected_impl, keywords),
         )
         history: list[dict[str, str]] = [
             {"role": "system", "content": SYSTEM_PROMPT},
