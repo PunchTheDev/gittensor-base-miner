@@ -134,6 +134,11 @@ def cmd_eval(args: argparse.Namespace) -> None:
         if len(failed) + len(errored) > 15:
             print(f"    ... and {len(failed) + len(errored) - 15} more (see --output for full details)")
 
+    if args.no_sandbox:
+        print(f"\n  Note: --no-sandbox scores use a local heuristic that typically")
+        print(f"  runs 3–5× above Docker CI scores. Use these for relative comparison")
+        print(f"  only — the authoritative score comes from CI (git push + open PR).")
+
     print(f"{'─'*54}")
 
     if args.output:
