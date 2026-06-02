@@ -1816,3 +1816,25 @@ prestigious external GitHub repos via GitHub API (no DAS dependency).
 - Benchmark: **578 problems**, oracle **10.12** (tree-sitter calibrated), commit `bd41391`
 - Pool: DAS repos saturated; external expansion now at 7 repos
 - Next pool check: ~2026-06-09 for new DAS registrations; consider celery, aiohttp if they have isolated tests
+
+---
+
+## 2026-06-02 — Pool expansion +62, oracle recalibrated to 9.70
+
+**Target repos** (all self-contained Python test suites, no external service deps):
+- `pallets/jinja` (11k stars): +13 problems — Jinja2 templating engine
+- `python-attrs/attrs` (5k stars): +19 problems — pure Python data classes
+- `pylint-dev/pylint` (5k stars): +30 problems — Python code linter (maxed at 30 cap)
+
+Repos dry-run but rejected: `encode/httpcore` (only 1 qualifying)
+
+**Oracle recalibration across all 640 problems**:
+- Full baseline recomputation: `scripts/baseline_scores.py` across all 640 problems
+- Mean drops 10.12 → 9.70 (new repos are surgical bug fixes → lower AST token counts)
+- leaderboard.json updated, dashboard_data.json regenerated and pushed
+
+### Status
+- Benchmark: **640 problems** (+62), oracle **9.70**, commit `ff139cb`
+- External repos now: pytest, click, werkzeug, starlette, pydantic, marshmallow, fastapi, jinja, attrs, pylint
+- Pool: DAS repos saturated; external now at 10 repos
+- Next pool check: ~2026-06-09 for new DAS registrations
