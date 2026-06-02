@@ -1,0 +1,236 @@
+diff --git a/client/src/components/combat/DamageAssignmentModal.tsx b/client/src/components/combat/DamageAssignmentModal.tsx
+index a921af87b0..f5c72bd813 100644
+--- a/client/src/components/combat/DamageAssignmentModal.tsx
++++ b/client/src/components/combat/DamageAssignmentModal.tsx
+@@ -26,8 +26,12 @@ export function DamageAssignmentModal({ data }: { data: AssignCombatDamage["data
+   const blockerTotal = amounts.reduce((acc, n) => acc + n, 0);
+   const total = blockerTotal + trampleDamage + controllerDamage;
+   const remaining = data.total_damage - total;
+-  // CR 702.19b: Trample requires lethal to every blocker.
++  // CR 702.19b: Lethal-to-all-blockers is a precondition only for assigning
++  // excess to the defending player/planeswalker, not an unconditional constraint.
++  // When trampleDamage and controllerDamage are both 0 the player is freely
++  // dividing all damage among blockers, so any split is legal.
+   const trampleLethalMet = data.trample == null ||
++    (trampleDamage === 0 && controllerDamage === 0) ||
+     data.blockers.every((b, i) => amounts[i] >= b.lethal_minimum);
+   // CR 702.19c: Must assign at least PW loyalty before controller spillover.
+   const loyaltyMet = !isOverPw || controllerDamage === 0 ||
+diff --git a/client/src/components/combat/__tests__/DamageAssignmentModal.test.tsx b/client/src/components/combat/__tests__/DamageAssignmentModal.test.tsx
+new file mode 100644
+index 0000000000..d6ed9428a8
+--- /dev/null
++++ b/client/src/components/combat/__tests__/DamageAssignmentModal.test.tsx
+@@ -0,0 +1,118 @@
++import { cleanup, fireEvent, render, screen } from "@testing-library/react";
++import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
++
++import type { GameObject, GameState } from "../../../adapter/types.ts";
++import { dispatchAction } from "../../../game/dispatch.ts";
++import { useGameStore } from "../../../stores/gameStore.ts";
++import { DamageAssignmentModal } from "../DamageAssignmentModal.tsx";
++
++vi.mock("../../../game/dispatch.ts", () => ({
++  dispatchAction: vi.fn(),
++}));
++
++function creature(id: number, name: string, power: number, toughness: number): GameObject {
++  return {
++    id,
++    card_id: id,
++    owner: id === 10 ? 0 : 1,
++    controller: id === 10 ? 0 : 1,
++    zone: "Battlefield",
++    tapped: false,
++    face_down: false,
++    flipped: false,
++    transformed: false,
++    damage_marked: 0,
++    dealt_deathtouch_damage: false,
++    attached_to: null,
++    attachments: [],
++    counters: {},
++    name,
++    power,
++    toughness,
++    loyalty: null,
++    card_types: { supertypes: [], core_types: ["Creature"], subtypes: [] },
++    mana_cost: { type: "Cost", shards: [], generic: 0 },
++    keywords: [],
++    abilities: [],
++    trigger_definitions: [],
++    replacement_definitions: [],
++    static_definitions: [],
++    color: [],
++    base_power: power,
++    base_toughness: toughness,
++    base_keywords: [],
++    base_color: [],
++    timestamp: 1,
++    entered_battlefield_turn: 1,
++  };
++}
++
++function setCombatObjects() {
++  useGameStore.setState({
++    gameState: {
++      objects: {
++        10: creature(10, "Rampager", 4, 4),
++        20: creature(20, "Guard A", 3, 3),
++        21: creature(21, "Guard B", 3, 3),
++      },
++    } as unknown as GameState,
++  });
++}
++
++describe("DamageAssignmentModal", () => {
++  beforeEach(() => {
++    vi.mocked(dispatchAction).mockReset();
++    vi.mocked(dispatchAction).mockResolvedValue(undefined);
++    setCombatObjects();
++  });
++
++  afterEach(() => {
++    cleanup();
++    useGameStore.setState({ gameState: null });
++  });
++
++  it("allows a trampler with insufficient damage for all blockers to assign no excess", () => {
++    render(
++      <DamageAssignmentModal
++        data={{
++          player: 0,
++          attacker_id: 10,
++          total_damage: 4,
++          blockers: [
++            { blocker_id: 20, lethal_minimum: 3 },
++            { blocker_id: 21, lethal_minimum: 3 },
++          ],
++          trample: "Standard",
++          defending_player: 1,
++          attack_target: { type: "Player", data: 1 },
++        }}
++      />,
++    );
++
++    const assignButton = screen.getByRole("button", { name: "Assign Damage" });
++    const incrementButtons = screen.getAllByRole("button", { name: "+" });
++
++    expect(assignButton).toBeDisabled();
++
++    fireEvent.click(incrementButtons[0]);
++    fireEvent.click(incrementButtons[0]);
++    fireEvent.click(incrementButtons[1]);
++    fireEvent.click(incrementButtons[1]);
++
++    expect(assignButton).toBeEnabled();
++
++    fireEvent.click(assignButton);
++
++    expect(dispatchAction).toHaveBeenCalledWith({
++      type: "AssignCombatDamage",
++      data: {
++        assignments: [
++          [20, 2],
++          [21, 2],
++        ],
++        trample_damage: 0,
++        controller_damage: 0,
++      },
++    });
++  });
++});
+diff --git a/crates/engine/src/game/combat_damage.rs b/crates/engine/src/game/combat_damage.rs
+index 0f3c597875..fa75e70ae6 100644
+--- a/crates/engine/src/game/combat_damage.rs
++++ b/crates/engine/src/game/combat_damage.rs
+@@ -3030,6 +3030,61 @@ mod tests {
+         assert_eq!(state.players[1].life, 17);
+     }
+ 
++    #[test]
++    fn trample_multi_blocker_power_below_combined_lethal_no_excess_is_legal() {
++        // CR 702.19b + CR 510.1c: a 4/4 trample attacker blocked by two 3/3s has
++        // combined lethal 6 > power 4, so the controller cannot assign lethal to
++        // both AND send excess to the player.  The controller MUST be allowed to
++        // freely distribute all 4 damage among the two blockers with trample_damage=0.
++        // (The frontend #1491 bug: trampleLethalMet unconditionally required lethal
++        // to every blocker, deadlocking combat here.)
++        let mut state = setup();
++        let attacker = create_creature(&mut state, PlayerId(0), "Rampager", 4, 4);
++        state
++            .objects
++            .get_mut(&attacker)
++            .unwrap()
++            .keywords
++            .push(Keyword::Trample);
++        let blocker_a = create_creature(&mut state, PlayerId(1), "Guard A", 3, 3);
++        let blocker_b = create_creature(&mut state, PlayerId(1), "Guard B", 3, 3);
++        setup_combat(
++            &mut state,
++            vec![attacker],
++            vec![(attacker, vec![blocker_a, blocker_b])],
++        );
++
++        let mut events = Vec::new();
++        let waiting =
++            resolve_combat_damage(&mut state, &mut events).expect("2 blockers must always prompt");
++        state.waiting_for = waiting;
++
++        // Assign 2 to each blocker, 0 trample through; this must succeed even though
++        // neither blocker gets lethal (CR 702.19b: lethal gating only applies when
++        // excess is being sent to the player/PW).
++        crate::game::engine::apply_as_current(
++            &mut state,
++            crate::types::actions::GameAction::AssignCombatDamage {
++                mode: CombatDamageAssignmentMode::Normal,
++                assignments: vec![(blocker_a, 2), (blocker_b, 2)],
++                trample_damage: 0,
++                controller_damage: 0,
++            },
++        )
++        .expect("distributing all damage among blockers with trample_damage=0 is legal");
++
++        // Neither blocker takes lethal; both survive. Defending player untouched.
++        assert!(
++            state.battlefield.contains(&blocker_a),
++            "blocker_a took 2 < lethal (3) and must survive"
++        );
++        assert!(
++            state.battlefield.contains(&blocker_b),
++            "blocker_b took 2 < lethal (3) and must survive"
++        );
++        assert_eq!(state.players[1].life, 20, "no trample damage to player");
++    }
++
+     #[test]
+     fn single_blocker_trample_outcome_b_keep_on_blocker() {
+         // Outcome B (the user's case): controller keeps ALL 5 on the blocker and
+diff --git a/crates/engine/src/types/game_state.rs b/crates/engine/src/types/game_state.rs
+index 7b1bc713cf..36c18038ba 100644
+--- a/crates/engine/src/types/game_state.rs
++++ b/crates/engine/src/types/game_state.rs
+@@ -2906,7 +2906,7 @@ pub enum WaitingFor {
+         current_slot: usize,
+     },
+     /// CR 510.1c: Attacker with multiple blockers — controller divides damage as they choose.
+-    /// CR 702.19b/c: Trample requires lethal to each blocker before excess to defending player.
++    /// CR 702.19b/c: Trample requires lethal to each blocker before assigning excess.
+     AssignCombatDamage {
+         player: PlayerId,
+         attacker_id: ObjectId,
+@@ -3037,12 +3037,12 @@ pub enum CombatDamageAssignmentMode {
+ }
+ 
+ /// CR 510.1c: A blocker with its lethal damage threshold for UI display.
+-/// `lethal_minimum` is only enforced as a hard constraint for trample (CR 702.19b).
++/// `lethal_minimum` is only enforced as a hard constraint before trample excess (CR 702.19b).
+ #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+ pub struct DamageSlot {
+     pub blocker_id: ObjectId,
+     /// Lethal damage threshold. CR 702.2c: With deathtouch, lethal = 1.
+-    /// Informational for non-trample; enforced for trample (CR 702.19b).
++    /// Informational for non-trample; enforced before trample excess (CR 702.19b).
+     pub lethal_minimum: u32,
+ }
+ 

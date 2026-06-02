@@ -1,0 +1,258 @@
+diff --git a/client/src/viewmodel/__tests__/cardActionChoice.test.ts b/client/src/viewmodel/__tests__/cardActionChoice.test.ts
+index b9958cb156..3b9d2c63ea 100644
+--- a/client/src/viewmodel/__tests__/cardActionChoice.test.ts
++++ b/client/src/viewmodel/__tests__/cardActionChoice.test.ts
+@@ -289,6 +289,24 @@ describe("abilityChoiceLabel", () => {
+     ).toBe("Tap for {1}");
+   });
+ 
++  it("labels TapLandForMana as Tap for Mana", () => {
++    const object = makeGameObject({
++      name: "Emergence Zone",
++      card_types: {
++        supertypes: [],
++        core_types: ["Land"],
++        subtypes: [],
++      },
++    });
++
++    expect(
++      abilityChoiceLabel(
++        { type: "TapLandForMana", data: { object_id: 1 } },
++        object,
++      ).label,
++    ).toBe("Tap for Mana");
++  });
++
+   it("labels the spell face cast action with the front-face name", () => {
+     const object = makeGameObject();
+ 
+diff --git a/crates/engine/src/ai_support/mod.rs b/crates/engine/src/ai_support/mod.rs
+index 1a34288d43..6ed8c43390 100644
+--- a/crates/engine/src/ai_support/mod.rs
++++ b/crates/engine/src/ai_support/mod.rs
+@@ -843,7 +843,9 @@ mod tests {
+         candidate_actions, cheap_reject_candidate, legal_actions, legal_actions_for_viewer,
+         legal_actions_full, validated_candidate_actions,
+     };
++    use crate::game::engine::apply_as_current;
+     use crate::game::zones::create_object;
++    use crate::parser::oracle::parse_oracle_text;
+     use crate::types::ability::{
+         AbilityCost, AbilityDefinition, AbilityKind, ControllerRef, Effect, ManaContribution,
+         ManaProduction, QuantityExpr, ResolvedAbility, SearchSelectionConstraint, TargetFilter,
+@@ -855,7 +857,7 @@ mod tests {
+         CastingVariant, GameState, PendingCast, StackEntry, StackEntryKind, WaitingFor,
+     };
+     use crate::types::identifiers::{CardId, ObjectId};
+-    use crate::types::mana::{ManaColor, ManaCost};
++    use crate::types::mana::{ManaColor, ManaCost, ManaType, ManaUnit};
+     use crate::types::player::PlayerId;
+     use crate::types::zones::Zone;
+ 
+@@ -2128,4 +2130,92 @@ mod tests {
+             "colored shards remain untouched by Affinity"
+         );
+     }
++
++    /// Issue #1542: Emergence Zone must expose TapLandForMana alongside its
++    /// sacrifice-for-flash activated ability.
++    #[test]
++    fn emergence_zone_exposes_tap_for_mana() {
++        let mut state = setup_priority();
++        state.players[0].mana_pool.add(ManaUnit {
++            color: ManaType::Colorless,
++            source_id: ObjectId(0),
++            snow: false,
++            source_could_produce_two_or_more_colors: false,
++            restrictions: Vec::new(),
++            grants: vec![],
++            expiry: None,
++        });
++        state.players[0].mana_pool.add(ManaUnit {
++            color: ManaType::Colorless,
++            source_id: ObjectId(0),
++            snow: false,
++            source_could_produce_two_or_more_colors: false,
++            restrictions: Vec::new(),
++            grants: vec![],
++            expiry: None,
++        });
++        let land_id = create_object(
++            &mut state,
++            CardId(1542),
++            PlayerId(0),
++            "Emergence Zone".to_string(),
++            Zone::Battlefield,
++        );
++        {
++            let obj = state.objects.get_mut(&land_id).unwrap();
++            obj.card_types.core_types.push(CoreType::Land);
++            let parsed = parse_oracle_text(
++                "{T}: Add {C}.\n\
++                 {1}, {T}, Sacrifice this land: You may cast spells this turn as though they had flash.",
++                "Emergence Zone",
++                &[],
++                &[String::from("Land")],
++                &[],
++            );
++            Arc::make_mut(&mut obj.abilities).extend(parsed.abilities);
++        }
++
++        let (_, _, grouped) = legal_actions_full(&state);
++        let land_actions = grouped
++            .get(&land_id)
++            .expect("Emergence Zone should expose legal actions");
++        assert!(
++            land_actions.iter().any(|action| matches!(
++                action,
++                GameAction::TapLandForMana { object_id } if *object_id == land_id
++            )),
++            "expected TapLandForMana in grouped actions, got {land_actions:?}"
++        );
++        assert!(
++            land_actions.iter().any(|action| matches!(
++                action,
++                GameAction::ActivateAbility {
++                    source_id,
++                    ability_index: 1,
++                } if *source_id == land_id
++            )),
++            "flash sacrifice ability must be activatable when {{1}} is payable"
++        );
++
++        let flash_effect = &state.objects[&land_id].abilities[1].effect;
++        assert!(
++            matches!(*flash_effect.clone(), Effect::GenericEffect { .. }),
++            "flash ability must parse as GenericEffect, not CastFromZone — got {flash_effect:?}"
++        );
++        assert_eq!(state.objects[&land_id].abilities.len(), 2);
++
++        apply_as_current(
++            &mut state,
++            GameAction::TapLandForMana { object_id: land_id },
++        )
++        .expect("TapLandForMana must succeed when flash ability is also legal");
++        assert!(
++            state.objects[&land_id].tapped,
++            "Emergence Zone should be tapped after TapLandForMana"
++        );
++        assert!(
++            state.players[0].mana_pool.total() >= 1,
++            "mana should be added to pool"
++        );
++    }
+ }
+diff --git a/crates/engine/src/parser/oracle_effect/mod.rs b/crates/engine/src/parser/oracle_effect/mod.rs
+index f5897d5f2f..fcf2724e5d 100644
+--- a/crates/engine/src/parser/oracle_effect/mod.rs
++++ b/crates/engine/src/parser/oracle_effect/mod.rs
+@@ -10367,27 +10367,52 @@ fn has_from_among_cards_exiled_with_self(rest: &str) -> bool {
+ }
+ 
+ /// CR 601.3b + CR 702.8a: "you may cast [type] spells as though they had flash"
+-/// — a duration-scoped flash-timing grant (Teferi, Time Raveler +1 class),
+-/// not a `CastFromZone` card-selection permission. Must dispatch before
+-/// `try_parse_cast_effect`, which misclassifies the spell-type filter as an
+-/// activation-time target and blocks loyalty activation (issue #878).
++/// — a duration-scoped flash-timing grant (Teferi, Time Raveler +1 class;
++/// Emergence Zone sacrifice ability), not a `CastFromZone` card-selection
++/// permission. Must dispatch before `try_parse_cast_effect`, which
++/// misclassifies the spell-type filter as an activation-time target and blocks
++/// loyalty activation (issue #878).
+ fn try_parse_cast_as_though_flash_permission(tp: TextPair<'_>) -> Option<ParsedEffectClause> {
+-    let (type_text_orig, _) = nom_on_lower(tp.original, tp.lower, |i| {
++    let ((type_text_orig, flash_duration), _) = nom_on_lower(tp.original, tp.lower, |i| {
+         let (i, _) = opt(tag::<_, _, OracleError<'_>>("you may ")).parse(i)?;
+         let (i, _) = tag("cast ").parse(i)?;
+-        let (i, type_part) = take_until(" spells as though they had flash").parse(i)?;
+-        let (i, _) = tag(" spells as though they had flash").parse(i)?;
++        let (i, (type_part, duration)) = alt((
++            map(tag("spells this turn as though they had flash"), |_| {
++                ("", Duration::UntilEndOfTurn)
++            }),
++            map(
++                terminated(
++                    take_until(" spells this turn as though they had flash"),
++                    tag(" spells this turn as though they had flash"),
++                ),
++                |type_part: &str| (type_part.trim(), Duration::UntilEndOfTurn),
++            ),
++            map(tag("spells as though they had flash"), |_| {
++                (
++                    "",
++                    Duration::UntilNextTurnOf {
++                        player: PlayerScope::Controller,
++                    },
++                )
++            }),
++            map(
++                terminated(
++                    take_until(" spells as though they had flash"),
++                    tag(" spells as though they had flash"),
++                ),
++                |type_part: &str| {
++                    (
++                        type_part.trim(),
++                        Duration::UntilNextTurnOf {
++                            player: PlayerScope::Controller,
++                        },
++                    )
++                },
++            ),
++        ))
++        .parse(i)?;
+         let (i, _) = eof.parse(i)?;
+-        Ok((i, type_part.trim().to_string()))
+-    })
+-    .or_else(|| {
+-        nom_on_lower(tp.original, tp.lower, |i| {
+-            let (i, _) = opt(tag("you may ")).parse(i)?;
+-            let (i, _) = tag("cast ").parse(i)?;
+-            let (i, _) = tag("spells as though they had flash").parse(i)?;
+-            let (i, _) = eof.parse(i)?;
+-            Ok((i, String::new()))
+-        })
++        Ok((i, (type_part.to_string(), duration)))
+     })?;
+ 
+     let mut spell_filter = if type_text_orig.is_empty() {
+@@ -10423,9 +10448,7 @@ fn try_parse_cast_as_though_flash_permission(tp: TextPair<'_>) -> Option<ParsedE
+                 definition: Box::new(granted_static),
+             },
+         ])],
+-        duration: Some(Duration::UntilNextTurnOf {
+-            player: PlayerScope::Controller,
+-        }),
++        duration: Some(flash_duration),
+         target: Some(TargetFilter::Controller),
+     }))
+ }
+@@ -34520,6 +34543,27 @@ mod tests {
+         );
+     }
+ 
++    #[test]
++    fn parse_cast_spells_this_turn_as_though_flash() {
++        // Emergence Zone (issue #1542): "this turn" is part of the permission
++        // phrase, not a separate duration prefix — must not fall through to
++        // `CastFromZone`. Covers both bare "spells" and type-filtered spells.
++        for text in [
++            "You may cast spells this turn as though they had flash.",
++            "You may cast creature spells this turn as though they had flash.",
++        ] {
++            let def = parse_effect_chain(text, AbilityKind::Activated);
++            let Effect::GenericEffect {
++                duration, target, ..
++            } = *def.effect
++            else {
++                panic!("expected GenericEffect flash grant, got {:?}", def.effect);
++            };
++            assert_eq!(duration, Some(Duration::UntilEndOfTurn));
++            assert_eq!(target, Some(TargetFilter::Controller));
++        }
++    }
++
+     #[test]
+     fn parse_next_spell_has_cascade() {
+         // Dark Apostle pattern

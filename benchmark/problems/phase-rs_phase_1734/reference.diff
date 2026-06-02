@@ -1,0 +1,688 @@
+diff --git a/client/src/adapter/types.ts b/client/src/adapter/types.ts
+index e6d00a7ce6..aa934d6338 100644
+--- a/client/src/adapter/types.ts
++++ b/client/src/adapter/types.ts
+@@ -1173,6 +1173,7 @@ export type WaitingFor =
+   | { type: "DiscardChoice"; data: { player: PlayerId; count: number; cards: ObjectId[]; source_id: ObjectId; effect_kind: string; up_to?: boolean; unless_filter?: TargetFilter } }
+   | { type: "ManifestDreadChoice"; data: { player: PlayerId; cards: ObjectId[] } }
+   | { type: "LearnChoice"; data: { player: PlayerId; hand_cards: ObjectId[] } }
++  | { type: "ClashChooseOpponent"; data: { player: PlayerId; candidates: PlayerId[]; ability: unknown } }
+   | { type: "ClashCardPlacement"; data: { player: PlayerId; card: ObjectId; remaining: [PlayerId, ObjectId][] } }
+   | { type: "VoteChoice"; data: {
+       player: PlayerId;
+@@ -1462,6 +1463,7 @@ export type GameAction =
+   | { type: "DiscoverChoice"; data: { choice: CastChoice } }
+   | { type: "CascadeChoice"; data: { choice: CastChoice } }
+   | { type: "ChooseTopOrBottom"; data: { top: boolean } }
++  | { type: "ChooseClashOpponent"; data: { opponent: PlayerId } }
+   | { type: "SetAutoPass"; data: { mode: { type: "UntilStackEmpty" } | { type: "UntilEndOfTurn" } } }
+   | { type: "CancelAutoPass" }
+   | { type: "SetPhaseStops"; data: { stops: Phase[] } }
+diff --git a/client/src/components/modal/ClashOpponentModal.tsx b/client/src/components/modal/ClashOpponentModal.tsx
+new file mode 100644
+index 0000000000..07c17090ad
+--- /dev/null
++++ b/client/src/components/modal/ClashOpponentModal.tsx
+@@ -0,0 +1,68 @@
++import { useTranslation } from "react-i18next";
++
++import type { GameAction, PlayerId, WaitingFor } from "../../adapter/types.ts";
++import { useGameDispatch } from "../../hooks/useGameDispatch.ts";
++import { useCanActForWaitingState } from "../../hooks/usePlayerId.ts";
++import { useGameStore } from "../../stores/gameStore.ts";
++import { getOpponentDisplayName } from "../../stores/multiplayerStore.ts";
++import { ChoiceModal } from "./ChoiceModal.tsx";
++
++type ClashOpponentWaitingFor = Extract<WaitingFor, { type: "ClashChooseOpponent" }>;
++
++interface ClashOpponentModalContentProps {
++  waitingFor: ClashOpponentWaitingFor;
++  seatOrder?: PlayerId[];
++  dispatch: (action: GameAction) => void | Promise<void>;
++}
++
++/**
++ * CR 701.30b: "Clash with an opponent" requires the controller to choose the
++ * opponent before both players reveal their top card.
++ */
++export function ClashOpponentModalContent({
++  waitingFor,
++  seatOrder,
++  dispatch,
++}: ClashOpponentModalContentProps) {
++  const { t } = useTranslation("game");
++  const candidates = [...waitingFor.data.candidates].sort((a, b) => {
++    const aIdx = seatOrder?.indexOf(a) ?? a;
++    const bIdx = seatOrder?.indexOf(b) ?? b;
++    return aIdx - bIdx;
++  });
++
++  return (
++    <ChoiceModal
++      title={t("clashOpponent.title")}
++      subtitle={t("clashOpponent.subtitle")}
++      options={candidates.map((opponent) => ({
++        id: String(opponent),
++        label: getOpponentDisplayName(opponent),
++      }))}
++      onChoose={(id) => {
++        dispatch({
++          type: "ChooseClashOpponent",
++          data: { opponent: Number(id) },
++        });
++      }}
++    />
++  );
++}
++
++export function ClashOpponentModal() {
++  const canActForWaitingState = useCanActForWaitingState();
++  const dispatch = useGameDispatch();
++  const waitingFor = useGameStore((s) => s.waitingFor);
++  const seatOrder = useGameStore((s) => s.gameState?.seat_order);
++
++  if (waitingFor?.type !== "ClashChooseOpponent") return null;
++  if (!canActForWaitingState) return null;
++
++  return (
++    <ClashOpponentModalContent
++      waitingFor={waitingFor}
++      seatOrder={seatOrder}
++      dispatch={dispatch}
++    />
++  );
++}
+diff --git a/client/src/components/modal/__tests__/ClashOpponentModal.test.tsx b/client/src/components/modal/__tests__/ClashOpponentModal.test.tsx
+new file mode 100644
+index 0000000000..f97651f188
+--- /dev/null
++++ b/client/src/components/modal/__tests__/ClashOpponentModal.test.tsx
+@@ -0,0 +1,61 @@
++import { cleanup, fireEvent, render, screen } from "@testing-library/react";
++import { afterEach, describe, expect, it, vi } from "vitest";
++
++import type { GameAction, WaitingFor } from "../../../adapter/types.ts";
++import { isWaitingForHandled } from "../../../game/waitingForRegistry.ts";
++import { useMultiplayerStore } from "../../../stores/multiplayerStore.ts";
++import { ClashOpponentModalContent } from "../ClashOpponentModal.tsx";
++
++type ClashOpponentWaitingFor = Extract<WaitingFor, { type: "ClashChooseOpponent" }>;
++
++function clashOpponentWaitingFor(): ClashOpponentWaitingFor {
++  return {
++    type: "ClashChooseOpponent",
++    data: {
++      player: 0,
++      candidates: [2, 1],
++      ability: {},
++    },
++  };
++}
++
++function renderModal(waitingFor: ClashOpponentWaitingFor) {
++  const dispatch = vi.fn<(action: GameAction) => void>();
++  render(
++    <ClashOpponentModalContent
++      waitingFor={waitingFor}
++      seatOrder={[0, 1, 2]}
++      dispatch={dispatch}
++    />,
++  );
++  return dispatch;
++}
++
++afterEach(() => {
++  cleanup();
++  useMultiplayerStore.setState({ playerNames: new Map() });
++});
++
++describe("ClashOpponentModalContent", () => {
++  it("registers the waiting state as handled", () => {
++    expect(isWaitingForHandled(clashOpponentWaitingFor())).toBe(true);
++  });
++
++  it("dispatches the selected clash opponent", () => {
++    useMultiplayerStore.setState({
++      playerNames: new Map([
++        [1, "Alice"],
++        [2, "Bob"],
++      ]),
++    });
++    const dispatch = renderModal(clashOpponentWaitingFor());
++
++    expect(screen.getByRole("heading", { name: "Choose Clash Opponent" })).toBeInTheDocument();
++    fireEvent.click(screen.getByRole("button", { name: "Bob" }));
++
++    expect(dispatch).toHaveBeenCalledWith({
++      type: "ChooseClashOpponent",
++      data: { opponent: 2 },
++    });
++  });
++});
+diff --git a/client/src/game/waitingForRegistry.ts b/client/src/game/waitingForRegistry.ts
+index f8d5428283..38d6ba24af 100644
+--- a/client/src/game/waitingForRegistry.ts
++++ b/client/src/game/waitingForRegistry.ts
+@@ -95,6 +95,7 @@ export const HANDLED_WAITING_FOR_TYPES: ReadonlySet<WaitingFor["type"]> =
+     "DrawnThisTurnTopdeckChoice",
+     "LearnChoice",
+     "ManifestDreadChoice",
++    "ClashChooseOpponent",
+     "ClashCardPlacement",
+     "TopOrBottomChoice",
+     "ProliferateChoice",
+diff --git a/client/src/i18n/locales/de/game.json b/client/src/i18n/locales/de/game.json
+index 06a33c7dd8..7d08723318 100644
+--- a/client/src/i18n/locales/de/game.json
++++ b/client/src/i18n/locales/de/game.json
+@@ -1156,6 +1156,10 @@
+     "battleFallback": "Schlacht",
+     "subtitle": "{{name}} benötigt einen neuen Beschützer. Wähle, welcher Gegner sie verteidigt."
+   },
++  "clashOpponent": {
++    "title": "Kampf-Gegner wählen",
++    "subtitle": "Wähle, welcher Gegner mit dir kämpft."
++  },
+   "cardDataMissing": {
+     "title": "Kartendaten fehlen",
+     "body": "<code>card-data.json</code> wurde nicht gefunden. Das Spiel benötigt Kartendefinitionen, um mit echten Karten zu spielen.",
+diff --git a/client/src/i18n/locales/en/game.json b/client/src/i18n/locales/en/game.json
+index e306b3b44b..855309bb50 100644
+--- a/client/src/i18n/locales/en/game.json
++++ b/client/src/i18n/locales/en/game.json
+@@ -1156,6 +1156,10 @@
+     "battleFallback": "Battle",
+     "subtitle": "{{name}} needs a new protector. Choose which opponent will defend it."
+   },
++  "clashOpponent": {
++    "title": "Choose Clash Opponent",
++    "subtitle": "Choose which opponent will clash with you."
++  },
+   "cardDataMissing": {
+     "title": "Card Data Missing",
+     "body": "<code>card-data.json</code> was not found. The game needs card definitions to play with real cards.",
+diff --git a/client/src/i18n/locales/es/game.json b/client/src/i18n/locales/es/game.json
+index 1a3cf1ff8c..d592e68a73 100644
+--- a/client/src/i18n/locales/es/game.json
++++ b/client/src/i18n/locales/es/game.json
+@@ -1156,6 +1156,10 @@
+     "battleFallback": "Batalla",
+     "subtitle": "{{name}} necesita un nuevo protector. Elige qué oponente la defenderá."
+   },
++  "clashOpponent": {
++    "title": "Elegir oponente para chocar",
++    "subtitle": "Elige qué oponente chocará contigo."
++  },
+   "cardDataMissing": {
+     "title": "Faltan los datos de cartas",
+     "body": "No se encontró <code>card-data.json</code>. La partida necesita las definiciones de cartas para jugar con cartas reales.",
+diff --git a/client/src/i18n/locales/fr/game.json b/client/src/i18n/locales/fr/game.json
+index ef3999c0b1..c30ee648ac 100644
+--- a/client/src/i18n/locales/fr/game.json
++++ b/client/src/i18n/locales/fr/game.json
+@@ -1156,6 +1156,10 @@
+     "battleFallback": "Bataille",
+     "subtitle": "{{name}} a besoin d'un nouveau protecteur. Choisissez quel adversaire la défendra."
+   },
++  "clashOpponent": {
++    "title": "Choisir l'adversaire pour la confrontation",
++    "subtitle": "Choisissez quel adversaire fera la confrontation avec vous."
++  },
+   "cardDataMissing": {
+     "title": "Données de cartes manquantes",
+     "body": "<code>card-data.json</code> est introuvable. Le jeu a besoin des définitions de cartes pour jouer avec de vraies cartes.",
+diff --git a/client/src/i18n/locales/it/game.json b/client/src/i18n/locales/it/game.json
+index f52b36067f..3f0fc6bf2d 100644
+--- a/client/src/i18n/locales/it/game.json
++++ b/client/src/i18n/locales/it/game.json
+@@ -1156,6 +1156,10 @@
+     "battleFallback": "Battaglia",
+     "subtitle": "{{name}} necessita di un nuovo protettore. Scegli quale avversario la difenderà."
+   },
++  "clashOpponent": {
++    "title": "Scegli l'avversario per lo scontro",
++    "subtitle": "Scegli quale avversario si scontrerà con te."
++  },
+   "cardDataMissing": {
+     "title": "Dati delle carte mancanti",
+     "body": "<code>card-data.json</code> non è stato trovato. La partita ha bisogno delle definizioni delle carte per giocare con carte reali.",
+diff --git a/client/src/i18n/locales/pl/game.json b/client/src/i18n/locales/pl/game.json
+index 88695e00f9..e98005836d 100644
+--- a/client/src/i18n/locales/pl/game.json
++++ b/client/src/i18n/locales/pl/game.json
+@@ -1156,6 +1156,10 @@
+     "battleFallback": "Bitwa",
+     "subtitle": "{{name}} potrzebuje nowego obrońcy. Wybierz, który przeciwnik będzie jej bronił."
+   },
++  "clashOpponent": {
++    "title": "Wybierz przeciwnika do starcia",
++    "subtitle": "Wybierz, który przeciwnik stoczy z tobą starcie."
++  },
+   "cardDataMissing": {
+     "title": "Brak danych kart",
+     "body": "Nie znaleziono <code>card-data.json</code>. Gra potrzebuje definicji kart, aby grać prawdziwymi kartami.",
+diff --git a/client/src/i18n/locales/pt/game.json b/client/src/i18n/locales/pt/game.json
+index 4a0622331b..8310329072 100644
+--- a/client/src/i18n/locales/pt/game.json
++++ b/client/src/i18n/locales/pt/game.json
+@@ -1156,6 +1156,10 @@
+     "battleFallback": "Batalha",
+     "subtitle": "{{name}} precisa de um novo protetor. Escolha qual oponente a defenderá."
+   },
++  "clashOpponent": {
++    "title": "Escolher oponente para confronto",
++    "subtitle": "Escolha qual oponente fará confronto com você."
++  },
+   "cardDataMissing": {
+     "title": "Dados das Cartas Ausentes",
+     "body": "<code>card-data.json</code> não foi encontrado. O jogo precisa das definições das cartas para jogar com cartas reais.",
+diff --git a/client/src/pages/GamePage.tsx b/client/src/pages/GamePage.tsx
+index 4869576d8b..1547a1cfe5 100644
+--- a/client/src/pages/GamePage.tsx
++++ b/client/src/pages/GamePage.tsx
+@@ -63,6 +63,7 @@ import { ModeChoiceModal } from "../components/modal/ModeChoiceModal.tsx";
+ import { ReplacementModal } from "../components/modal/ReplacementModal.tsx";
+ import { TriggerOrderModal } from "../components/modal/TriggerOrderModal.tsx";
+ import { BattleProtectorModal } from "../components/modal/BattleProtectorModal.tsx";
++import { ClashOpponentModal } from "../components/modal/ClashOpponentModal.tsx";
+ import { TributeModal } from "../components/modal/TributeModal.tsx";
+ import { CombatTaxModal } from "../components/modal/CombatTaxModal.tsx";
+ import { TopOrBottomChoiceModalContent } from "../components/modal/TopOrBottomChoiceModal.tsx";
+@@ -1357,6 +1358,7 @@ function GamePageContent({
+         {waitingFor?.type === "OrderTriggers" &&
+           canActForWaitingState && <TriggerOrderModal />}
+         <BattleProtectorModal />
++        <ClashOpponentModal />
+         <TributeModal />
+         <CombatTaxModal />
+         <AlternativeCostModal />
+diff --git a/crates/engine/src/ai_support/candidates.rs b/crates/engine/src/ai_support/candidates.rs
+index 66f173bd1f..f0b1ad28c6 100644
+--- a/crates/engine/src/ai_support/candidates.rs
++++ b/crates/engine/src/ai_support/candidates.rs
+@@ -533,6 +533,21 @@ pub fn candidate_actions_exact(state: &GameState) -> Vec<CandidateAction> {
+                 Some(*player),
+             ),
+         ],
++        // CR 701.30b: One candidate per choosable opponent.
++        WaitingFor::ClashChooseOpponent {
++            player, candidates, ..
++        } => candidates
++            .iter()
++            .map(|opponent| {
++                candidate(
++                    GameAction::ChooseClashOpponent {
++                        opponent: *opponent,
++                    },
++                    TacticalClass::Selection,
++                    Some(*player),
++                )
++            })
++            .collect(),
+         WaitingFor::BetweenGamesChoosePlayDraw { player, .. } => vec![
+             candidate(
+                 GameAction::ChoosePlayDraw { play_first: true },
+@@ -2106,6 +2121,7 @@ pub fn candidate_actions_broad(state: &GameState) -> Vec<CandidateAction> {
+         | WaitingFor::RepeatDecision { .. }
+         | WaitingFor::LearnChoice { .. }
+         | WaitingFor::TopOrBottomChoice { .. }
++        | WaitingFor::ClashChooseOpponent { .. }
+         | WaitingFor::ClashCardPlacement { .. }
+         | WaitingFor::BetweenGamesChoosePlayDraw { .. }
+         | WaitingFor::OrderTriggers { .. }
+diff --git a/crates/engine/src/ai_support/mod.rs b/crates/engine/src/ai_support/mod.rs
+index 14c69567cf..47586cedb1 100644
+--- a/crates/engine/src/ai_support/mod.rs
++++ b/crates/engine/src/ai_support/mod.rs
+@@ -270,6 +270,7 @@ fn cheap_reject_candidate(state: &GameState, action: &GameAction) -> bool {
+         | (WaitingFor::MulliganDecision { .. }, GameAction::MulliganDecision { .. })
+         | (WaitingFor::BetweenGamesChoosePlayDraw { .. }, GameAction::ChoosePlayDraw { .. })
+         | (WaitingFor::TopOrBottomChoice { .. }, GameAction::ChooseTopOrBottom { .. })
++        | (WaitingFor::ClashChooseOpponent { .. }, GameAction::ChooseClashOpponent { .. })
+         | (WaitingFor::ClashCardPlacement { .. }, GameAction::ChooseTopOrBottom { .. })
+         | (WaitingFor::OptionalCostChoice { .. }, GameAction::DecideOptionalCost { .. })
+         | (WaitingFor::DefilerPayment { .. }, GameAction::DecideOptionalCost { .. })
+diff --git a/crates/engine/src/game/effects/clash.rs b/crates/engine/src/game/effects/clash.rs
+index e41c2397e6..d6d90cae69 100644
+--- a/crates/engine/src/game/effects/clash.rs
++++ b/crates/engine/src/game/effects/clash.rs
+@@ -6,6 +6,12 @@ use crate::types::player::PlayerId;
+ 
+ /// CR 701.30: Clash with an opponent.
+ ///
++/// CR 701.30b: "Clash with an opponent" means "Choose an opponent. You and that
++/// opponent each clash." The choice of opponent belongs to the clashing player
++/// and is made as the ability resolves. With two or more opponents the engine
++/// pauses on `WaitingFor::ClashChooseOpponent` for that choice; with a single
++/// opponent there is nothing to choose, so the clash proceeds immediately.
++///
+ /// CR 701.30a: Each player reveals the top card of their library.
+ /// CR 701.30c: Revealed simultaneously; choices in APNAP order.
+ /// CR 701.30d: Higher mana value wins.
+@@ -20,13 +26,49 @@ pub fn resolve(
+ ) -> Result<(), EffectError> {
+     let controller = ability.controller;
+ 
+-    // CR 701.30b: Choose an opponent. For 2-player, it's the other player.
+-    let opponent = state
++    // CR 701.30b: The clashing player chooses which opponent to clash with.
++    let candidates: Vec<PlayerId> = state
+         .players
+         .iter()
+-        .find(|p| p.id != controller && !p.is_eliminated)
++        .filter(|p| p.id != controller && !p.is_eliminated)
+         .map(|p| p.id)
+-        .unwrap_or(PlayerId(1));
++        .collect();
++
++    // CR 701.30b: With no opponents there is no legal clash opponent. The
++    // effect does nothing; any result-gated rider remains unperformed.
++    if candidates.is_empty() {
++        return Ok(());
++    }
++
++    // CR 701.30b: With two or more opponents the choice is a genuine decision
++    // made by the controller — pause for it. The chosen opponent (validated
++    // against `candidates`) is fed back through `perform_clash`.
++    if candidates.len() >= 2 {
++        state.waiting_for = WaitingFor::ClashChooseOpponent {
++            player: controller,
++            candidates,
++            ability: Box::new(ability.clone()),
++        };
++        return Ok(());
++    }
++
++    // CR 701.30b: One opponent — no decision to make. The single opponent is
++    // used directly so two-player games never see an extra prompt.
++    let opponent = candidates[0];
++    perform_clash(state, ability, opponent, events)
++}
++
++/// CR 701.30a-d: Carry out a clash against an already-chosen `opponent`: reveal
++/// both top cards, decide the result by mana value, and queue the APNAP
++/// top/bottom placement. Shared by the immediate (≤1 opponent) path and the
++/// resumed `WaitingFor::ClashChooseOpponent` path so both behave identically.
++pub fn perform_clash(
++    state: &mut GameState,
++    ability: &ResolvedAbility,
++    opponent: PlayerId,
++    events: &mut Vec<GameEvent>,
++) -> Result<(), EffectError> {
++    let controller = ability.controller;
+ 
+     // CR 701.30a: Reveal top card of each player's library.
+     let controller_top = top_card_of_library(state, controller);
+@@ -96,7 +138,6 @@ pub fn resolve(
+                 card: c_card,
+                 remaining: vec![(opponent, o_card)],
+             };
+-            stash_sub(state);
+         }
+         (Some(c_card), None) => {
+             state.waiting_for = WaitingFor::ClashCardPlacement {
+@@ -104,7 +145,6 @@ pub fn resolve(
+                 card: c_card,
+                 remaining: vec![],
+             };
+-            stash_sub(state);
+         }
+         (None, Some(o_card)) => {
+             state.waiting_for = WaitingFor::ClashCardPlacement {
+@@ -112,16 +152,22 @@ pub fn resolve(
+                 card: o_card,
+                 remaining: vec![],
+             };
+-            stash_sub(state);
+         }
+         (None, None) => {
+-            // Both libraries empty — no cards to place. The sub_ability chain
+-            // (including IfYouDo gating) continues naturally via resolve_ability_chain.
+-            // Context is correct: both MVs are None → Tied → optional_effect_performed
+-            // stays false (the default), matching the natural ability.context propagation.
++            // Both libraries empty — no cards to place. No ClashCardPlacement is
++            // queued; the stashed sub_ability is drained by the caller (the
++            // result is Tied → optional_effect_performed stays false, so any
++            // "if you win the clash" rider correctly does nothing).
+         }
+     }
+ 
++    // CR 701.30 + CR 609.3: Stash the result-aware sub_ability uniformly. With
++    // cards placed, the ClashCardPlacement handler drains it after the APNAP
++    // placement; with both libraries empty, the caller drains it directly. The
++    // early-exit in resolve_ability_chain detects this pending_continuation and
++    // skips redundant sub_ability processing on the immediate path.
++    stash_sub(state);
++
+     Ok(())
+ }
+ 
+diff --git a/crates/engine/src/game/effects/mod.rs b/crates/engine/src/game/effects/mod.rs
+index 857788098f..7704b86bf2 100644
+--- a/crates/engine/src/game/effects/mod.rs
++++ b/crates/engine/src/game/effects/mod.rs
+@@ -11238,6 +11238,84 @@ mod tests {
+         assert!(evaluate_condition(&cond, &state, &ability));
+     }
+ 
++    /// CR 701.30b: "Clash with an opponent" lets the clashing player CHOOSE the
++    /// opponent. With two or more opponents the engine must pause on
++    /// `ClashChooseOpponent` (offering every opponent) instead of silently
++    /// clashing with the first opponent in seat order.
++    #[test]
++    fn clash_with_multiple_opponents_prompts_for_opponent_choice() {
++        let mut state = GameState::new(FormatConfig::standard(), 3, 42);
++        let ability = ResolvedAbility::new(Effect::Clash, vec![], ObjectId(1), PlayerId(0));
++
++        let mut events = Vec::new();
++        clash::resolve(&mut state, &ability, &mut events).expect("clash resolves");
++
++        match &state.waiting_for {
++            WaitingFor::ClashChooseOpponent {
++                player, candidates, ..
++            } => {
++                assert_eq!(*player, PlayerId(0));
++                assert!(
++                    candidates.contains(&PlayerId(1)) && candidates.contains(&PlayerId(2)),
++                    "both opponents must be offered, got {candidates:?}"
++                );
++            }
++            other => panic!("expected ClashChooseOpponent, got {other:?}"),
++        }
++
++        // CR 701.30b: the controller's chosen opponent — not the first in seat
++        // order — is the one that clashes.
++        let mut clash_events = Vec::new();
++        clash::perform_clash(&mut state, &ability, PlayerId(2), &mut clash_events)
++            .expect("clash performs against the chosen opponent");
++        assert!(
++            clash_events.iter().any(|e| matches!(
++                e,
++                GameEvent::Clash {
++                    opponent: PlayerId(2),
++                    ..
++                }
++            )),
++            "clash must be against the chosen opponent PlayerId(2)"
++        );
++    }
++
++    /// CR 701.30b: With a single opponent there is no decision to make, so a
++    /// two-player clash proceeds without a `ClashChooseOpponent` prompt.
++    #[test]
++    fn clash_with_single_opponent_needs_no_choice() {
++        let mut state = GameState::new_two_player(42);
++        let ability = ResolvedAbility::new(Effect::Clash, vec![], ObjectId(1), PlayerId(0));
++
++        let mut events = Vec::new();
++        clash::resolve(&mut state, &ability, &mut events).expect("clash resolves");
++        assert!(
++            !matches!(state.waiting_for, WaitingFor::ClashChooseOpponent { .. }),
++            "two-player clash must not prompt for an opponent choice"
++        );
++    }
++
++    /// CR 701.30b: If no opponent exists, there is no legal player to choose
++    /// for "clash with an opponent"; the effect is a no-op rather than
++    /// manufacturing `PlayerId(1)`.
++    #[test]
++    fn clash_with_no_opponents_does_not_default_to_invalid_player() {
++        let mut state = GameState::new(FormatConfig::standard(), 1, 42);
++        let ability = ResolvedAbility::new(Effect::Clash, vec![], ObjectId(1), PlayerId(0));
++
++        let mut events = Vec::new();
++        clash::resolve(&mut state, &ability, &mut events).expect("clash no-op succeeds");
++
++        assert!(
++            !matches!(state.waiting_for, WaitingFor::ClashChooseOpponent { .. }),
++            "no-op clash must not prompt when there are no candidates"
++        );
++        assert!(
++            !events.iter().any(|e| matches!(e, GameEvent::Clash { .. })),
++            "no-op clash must not emit a Clash event with a fabricated opponent"
++        );
++    }
++
+     /// CR 702.33f: variant gating reads `kickers_paid` membership. Mirrors
+     /// Ana Battlemage's per-kicker triggers.
+     #[test]
+diff --git a/crates/engine/src/game/engine_resolution_choices.rs b/crates/engine/src/game/engine_resolution_choices.rs
+index 59e390f77b..00aaf1f047 100644
+--- a/crates/engine/src/game/engine_resolution_choices.rs
++++ b/crates/engine/src/game/engine_resolution_choices.rs
+@@ -77,6 +77,7 @@ pub(super) fn handles(waiting_for: &WaitingFor) -> bool {
+             | WaitingFor::LearnChoice { .. }
+             | WaitingFor::TopOrBottomChoice { .. }
+             | WaitingFor::PopulateChoice { .. }
++            | WaitingFor::ClashChooseOpponent { .. }
+             | WaitingFor::ClashCardPlacement { .. }
+             | WaitingFor::VoteChoice { .. }
+             | WaitingFor::SeparatePilesPartition { .. }
+@@ -646,6 +647,33 @@ pub(super) fn handle_resolution_choice(
+             let _ = effects::populate::create_token_copy(state, token_id, &dummy_ability, events);
+             ResolutionChoiceOutcome::WaitingFor(finish_with_continuation(state, player, events))
+         }
++        (
++            WaitingFor::ClashChooseOpponent {
++                player,
++                candidates,
++                ability,
++            },
++            GameAction::ChooseClashOpponent { opponent },
++        ) => {
++            // CR 701.30b: The chosen opponent must be one of the offered
++            // candidates (a non-eliminated opponent of the clashing player).
++            if !candidates.contains(&opponent) {
++                return Err(EngineError::InvalidAction(format!(
++                    "Chosen clash opponent {opponent:?} is not a legal opponent"
++                )));
++            }
++            effects::clash::perform_clash(state, &ability, opponent, events)
++                .map_err(|e| EngineError::InvalidAction(format!("{e:?}")))?;
++            // CR 701.30a: With at least one revealed card, `perform_clash` queued
++            // the APNAP placement (which drains the clash's sub_ability). With
++            // both libraries empty, no placement was queued, so drain the stashed
++            // sub_ability here and hand priority back to the clashing player.
++            if !matches!(state.waiting_for, WaitingFor::ClashCardPlacement { .. }) {
++                set_priority(state, player);
++                effects::drain_pending_continuation(state, events);
++            }
++            ResolutionChoiceOutcome::WaitingFor(state.waiting_for.clone())
++        }
+         (
+             WaitingFor::ClashCardPlacement {
+                 player,
+diff --git a/crates/engine/src/game/scenario.rs b/crates/engine/src/game/scenario.rs
+index 68f7c017d6..fcbfab90ca 100644
+--- a/crates/engine/src/game/scenario.rs
++++ b/crates/engine/src/game/scenario.rs
+@@ -1374,6 +1374,7 @@ impl GameRunner {
+             WaitingFor::ChooseDungeon { .. } => "ChooseDungeon",
+             WaitingFor::ChooseDungeonRoom { .. } => "ChooseDungeonRoom",
+             WaitingFor::PopulateChoice { .. } => "PopulateChoice",
++            WaitingFor::ClashChooseOpponent { .. } => "ClashChooseOpponent",
+             WaitingFor::ClashCardPlacement { .. } => "ClashCardPlacement",
+             WaitingFor::VoteChoice { .. } => "VoteChoice",
+             WaitingFor::CategoryChoice { .. } => "CategoryChoice",
+diff --git a/crates/engine/src/types/actions.rs b/crates/engine/src/types/actions.rs
+index 05846de626..26b964a4bf 100644
+--- a/crates/engine/src/types/actions.rs
++++ b/crates/engine/src/types/actions.rs
+@@ -153,6 +153,12 @@ pub enum GameAction {
+     ChooseExert {
+         exert: bool,
+     },
++    /// CR 701.30b: The clashing player's choice of which opponent to clash with,
++    /// answering a pending `WaitingFor::ClashChooseOpponent`. `opponent` must be
++    /// one of that prompt's `candidates`.
++    ChooseClashOpponent {
++        opponent: PlayerId,
++    },
+     /// CR 103.5 + 103.5b: A player's decision at a `WaitingFor::MulliganDecision`
+     /// prompt. See [`MulliganChoice`] for the three branches.
+     MulliganDecision {
+@@ -1153,6 +1159,7 @@ impl GameAction {
+             | GameAction::DiscoverChoice { .. }
+             | GameAction::CascadeChoice { .. }
+             | GameAction::ChooseTopOrBottom { .. }
++            | GameAction::ChooseClashOpponent { .. }
+             | GameAction::ChooseBattleProtector { .. }
+             | GameAction::SetAutoPass { .. }
+             | GameAction::CancelAutoPass
+diff --git a/crates/engine/src/types/game_state.rs b/crates/engine/src/types/game_state.rs
+index 2840095f48..1d57f2a2e8 100644
+--- a/crates/engine/src/types/game_state.rs
++++ b/crates/engine/src/types/game_state.rs
+@@ -2667,6 +2667,16 @@ pub enum WaitingFor {
+         source_id: ObjectId,
+         valid_tokens: Vec<ObjectId>,
+     },
++    /// CR 701.30b: "Clash with an opponent" lets the clashing player choose
++    /// which opponent to clash with. Only entered when two or more opponents
++    /// are available (with one opponent there is no decision). `candidates`
++    /// is the set of legal opponents; `ability` is the resolving clash ability,
++    /// carried so the clash can be performed against the chosen opponent.
++    ClashChooseOpponent {
++        player: PlayerId,
++        candidates: Vec<PlayerId>,
++        ability: Box<crate::types::ability::ResolvedAbility>,
++    },
+     /// CR 701.30c: After a clash, each player puts their revealed card on top or
+     /// bottom of their library. Choices are made in APNAP order. `remaining` holds
+     /// the next player/card pairs still awaiting a choice.
+@@ -3164,6 +3174,7 @@ impl WaitingFor {
+             | WaitingFor::RepeatDecision { player, .. }
+             | WaitingFor::TopOrBottomChoice { player, .. }
+             | WaitingFor::PopulateChoice { player, .. }
++            | WaitingFor::ClashChooseOpponent { player, .. }
+             | WaitingFor::ClashCardPlacement { player, .. }
+             | WaitingFor::CompanionReveal { player, .. }
+             | WaitingFor::ChooseLegend { player, .. }
+diff --git a/crates/phase-ai/src/decision_kind.rs b/crates/phase-ai/src/decision_kind.rs
+index ad6e080462..549e3d3590 100644
+--- a/crates/phase-ai/src/decision_kind.rs
++++ b/crates/phase-ai/src/decision_kind.rs
+@@ -121,6 +121,7 @@ pub fn classify(waiting_for: &WaitingFor, action: &GameAction) -> DecisionKind {
+         | WaitingFor::RepeatDecision { .. }
+         | WaitingFor::TopOrBottomChoice { .. }
+         | WaitingFor::PopulateChoice { .. }
++        | WaitingFor::ClashChooseOpponent { .. }
+         | WaitingFor::ClashCardPlacement { .. }
+         | WaitingFor::VoteChoice { .. }
+         | WaitingFor::SeparatePilesPartition { .. }
+diff --git a/crates/phase-ai/src/search.rs b/crates/phase-ai/src/search.rs
+index 5305f8af67..787fa82871 100644
+--- a/crates/phase-ai/src/search.rs
++++ b/crates/phase-ai/src/search.rs
+@@ -542,6 +542,11 @@ fn fallback_action(state: &GameState) -> Option<GameAction> {
+             Some(GameAction::ChooseTopOrBottom { top: true })
+         }
+ 
++        // CR 701.30b: clash opponent choice — fall back to the first candidate.
++        WaitingFor::ClashChooseOpponent { candidates, .. } => candidates
++            .first()
++            .map(|&opponent| GameAction::ChooseClashOpponent { opponent }),
++
+         // Adventure/MDFC/alt-cost choice: default to the "normal" face/cost.
+         WaitingFor::CastOffer {
+             kind: CastOfferKind::Adventure { .. },
