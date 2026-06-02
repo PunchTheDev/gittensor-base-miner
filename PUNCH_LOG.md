@@ -4,6 +4,18 @@ Milestone trail for the base-miner benchmark. Discord is the primary channel; th
 
 ---
 
+## 2026-06-02 — Pool 354→360: vouch + sure refresh (commit 1c6e3ac)
+
+### Pool expansion (+6 problems)
+- Added 3 vouchdev/vouch problems: PR#112 (health checks), PR#114 (logging config), PR#126 (bundle/context sync)
+- Added 3 we-promise/sure problems: PR#1473 (transaction split view), PR#1752 (Brex account controller), PR#1753 (account statements controller)
+- Oracle mean: 22.77 → 22.83 (recomputed across 360 problems)
+- Updated: pool_config.json, leaderboard.json, baselines.json, dashboard_data.json, README, docs/rewards.md, docs/api.md, evaluate.py, gitminer.py, generate_dashboard_data.py, record_result.py
+- ragflow: 0 new qualifying PRs (all newer PRs lack linked issues); touchpilot: saturated
+- Pool: 354 → 360 problems across 13 repos
+
+---
+
 ## 2026-06-02 — Pool 353→354, output behavior fingerprinting (commits e4b623d, 05d05ba)
 
 ### Pool expansion (+1 problem)
