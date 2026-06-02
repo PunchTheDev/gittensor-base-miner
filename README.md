@@ -163,6 +163,12 @@ See [LEADERBOARD.md](LEADERBOARD.md) for current rankings. Beat the champion to 
 
 ---
 
+## Rewards
+
+Understand exactly how your benchmark score converts to TAO: [docs/rewards.md](docs/rewards.md).
+
+The short version: CI labels your PR `agent-improvement` (2.0× multiplier). Beat the current champion and `new-champion` is added. Gittensor's validator reads the label and weights your PR accordingly in the 45-day emission window.
+
 ## Hyperparameters
 
 This repo is registered on Gittensor (SN74). See [docs/hyperparameters.md](docs/hyperparameters.md) for how rewards are distributed and why each parameter was chosen.

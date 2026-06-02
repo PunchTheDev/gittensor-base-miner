@@ -8,6 +8,7 @@ on:
 permissions:
   contents: read
   pull-requests: write
+  issues: write
 
 jobs:
   detect:
@@ -252,6 +253,89 @@ jobs:
                 repo: context.repo.repo,
                 issue_number: context.issue.number,
                 body,
+              });
+            }
+
+      - name: Apply Gittensor labels and champion badge
+        if: always()
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const fs = require('fs');
+            const handle = '${{ needs.detect.outputs.handle }}';
+
+            // Parse eval results
+            let mean = null;
+            let oracleMean = null;
+            try {
+              const data = JSON.parse(fs.readFileSync('results.json', 'utf8'));
+              mean = data.mean_score ?? null;
+            } catch (e) {}
+            try {
+              const lb = JSON.parse(fs.readFileSync('results/leaderboard.json', 'utf8'));
+              // Highest score among real ranked entries
+              const real = lb.filter(r => r.rank !== null && r.score !== null);
+              oracleMean = lb.find(r => r.rank === null)?.score ?? 22.83;
+              // Current SOTA (best non-oracle)
+              const sota = real.length > 0 ? Math.max(...real.map(r => r.score)) : 0;
+              context.sota = sota;
+            } catch (e) { oracleMean = 22.83; context.sota = 0; }
+
+            if (mean === null) return; // eval failed, skip labeling
+
+            // Ensure required labels exist in the repo
+            const labelsToEnsure = [
+              { name: 'agent-improvement', color: '2ea44f', description: 'Improves the base miner agent (2.0× emission multiplier)' },
+              { name: 'new-champion', color: 'f9c513', description: 'Beats the current SOTA score — new leaderboard leader' },
+            ];
+            const { data: existingLabels } = await github.rest.issues.listLabelsForRepo({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              per_page: 100,
+            });
+            const existingNames = new Set(existingLabels.map(l => l.name));
+            for (const label of labelsToEnsure) {
+              if (!existingNames.has(label.name)) {
+                try {
+                  await github.rest.issues.createLabel({
+                    owner: context.repo.owner,
+                    repo: context.repo.repo,
+                    name: label.name,
+                    color: label.color,
+                    description: label.description,
+                  });
+                } catch (e) { /* label may have been created concurrently */ }
+              }
+            }
+
+            // Always apply agent-improvement label for any scored submission
+            const labelsToAdd = ['agent-improvement'];
+
+            // Apply new-champion if they beat current SOTA
+            const sota = context.sota ?? 0;
+            const isNewChampion = mean > sota && mean > 0;
+            if (isNewChampion) {
+              labelsToAdd.push('new-champion');
+            }
+
+            await github.rest.issues.addLabels({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              issue_number: context.issue.number,
+              labels: labelsToAdd,
+            });
+
+            // If new champion, post a celebration comment
+            if (isNewChampion) {
+              const oracleNote = oracleMean !== null
+                ? ` (oracle upper bound: **${oracleMean.toFixed(2)}**)` : '';
+              await github.rest.issues.createComment({
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                issue_number: context.issue.number,
+                body: `### New SOTA: ${mean.toFixed(4)} / 30\n\n` +
+                  `**${handle}** is the new benchmark champion, beating the previous record of **${sota.toFixed(4)}**${oracleNote}.\n\n` +
+                  `When this PR is merged, run \`python scripts/record_result.py\` to update the leaderboard and dashboard.`,
               });
             }
 
