@@ -642,3 +642,35 @@ Pending: Gittensor registration (operator action).
 - API: http://localhost:8083 (serving)
 - Pool: 342 problems, oracle 22.83
 - Pending: Gittensor registration, nginx hookup
+
+## 2026-06-02 — Agent: new impl file detection + is_test_file fixes
+
+### Benchmark (commit f1adaa3)
+
+**New implementation file detection** (33% of pool problems affected)
+
+Found that 132/400 problems (33%) add new source code implementation files via the PR that don't exist at base_commit. Previously the agent had no way to know these needed to be created — it would see the file content in context but not in the file tree, and produce a diff that modifies a non-existent file. `git apply` would fail silently.
+
+Fix:
+- `_new_impl_files()`: detects source code files (`.py`, `.go`, `.ts`, `.tsx`, `.js`, `.jsx`, `.kt`, `.java`, `.rb`, `.rs`) in context that are absent from the file tree
+- `NEW_IMPL_FILES_TEMPLATE`: new prompt section listing the paths — agent is instructed to create them as new files (`--- /dev/null` format), implemented fully
+- `ACT_PROMPT`: explicit reminder about new impl file creation format
+- Distinct from test files: agent implements content (doesn't copy verbatim); template lists paths, not diffs
+
+**`_is_test_file` bug fixes** (fixes misclassification of 60+ files)
+
+Previous detection missed:
+- Go test files: `nvidia_rerank_test.go` (has `_test.go` suffix, not `_test.py`)
+- Paths starting with `tests/` (only detected `/tests/` mid-path, not at root)
+- `conftest.py` (pytest fixture file, not an implementation file)
+
+Fixes added: `name.endswith("_test.go")`, `p.startswith("tests/")`, `name == "conftest.py"`, `p.startswith("test/")`, `p.startswith("spec/")`
+
+**`_new_test_diff` no-newline bug fix**
+
+`splitlines()` strips newlines, so `lines[-1].endswith("\n")` was always False — every new test file diff was incorrectly getting the `"\ No newline at end of file"` marker. Fixed to check `f.content.endswith("\n")` on the original content.
+
+### Status
+- Benchmark: 400 problems, oracle 23.08 (unchanged)
+- Agent improvements: new impl file detection, is_test_file fixes, no-newline fix
+- Pending: Gittensor registration, nginx hookup
