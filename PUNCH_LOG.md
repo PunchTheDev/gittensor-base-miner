@@ -178,3 +178,23 @@ Local harness over-estimates DAS reference scores by median 3.4×. Root cause: t
 
 1. Verify `OPENROUTER_KEY` in GitHub Actions Environment is the correct production key.
 2. Gittensor registration — team handles approval; hyperparameters.json is ready.
+
+---
+
+## 2026-06-02 — gitminer run: single-problem dev loop
+
+Added `gitminer run` command (commit dddee08) — the missing inner development loop tool.
+
+**Why:** Miners had no fast way to inspect what their agent actually produces for a specific problem. The only option was `eval --problems ID`, which runs the full pipeline but shows only a score, not the patch. Dev iteration was slow.
+
+**What ships:**
+- `gitminer run --problem ID [--agent PATH]` — runs agent on one problem, prints the generated diff with ANSI color
+- `--show-ref` — prints the reference diff below for side-by-side comparison
+- `--score [--no-sandbox]` — scores the patch inline, shows baseline delta
+- `--output FILE` — saves the patch to disk for `validate` or manual inspection
+- `--verbose` — prints the agent's internal reasoning log
+- `_print_diff()` helper with color output (red/green/cyan, no-op when not a TTY)
+
+**README + CONTRIBUTING.md** updated with examples.
+
+Pending: OPENROUTER_KEY verification, Gittensor registration.
