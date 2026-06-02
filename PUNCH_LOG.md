@@ -1396,3 +1396,39 @@ Fix: `_fix_new_starts()` as stage 7 of `_post_process` — runs after `_fix_hunk
 - Scoring: tree-sitter AST scorer active for local eval; matches DAS validator
 - Pool: all repos saturated — next check 2026-06-09
 - Pending: Gittensor registration, nginx hookup
+
+---
+
+## 2026-06-02 — Docker CI tree-sitter scorer (commit 95b51b5)
+
+**The last remaining scoring gap is closed**: Docker CI now uses the same tree-sitter AST scorer as local eval.
+
+### What changed
+
+**`benchmark/harness/runner.py`**
+- Phase 1 (`setup_and_test.sh`) now runs `capture_files.py` twice:
+  - Before `git apply`: writes old file contents to `/staging/file_pairs.json`
+  - After `git apply`: fills in new file contents
+  - File content capped at 1 MB per file (same limit as DAS)
+  - `python3-minimal` added to `apt-get` install for Node/Rust base images (which lack Python)
+- Phase 2 (`score_result.py`) now:
+  - Reads `file_pairs.json` + loads `ts_scorer.py` from staging via `importlib`
+  - Uses tree-sitter AST scorer when available (tree-sitter pre-installed in custom image)
+  - Falls back to heuristic token count when tree-sitter is absent (SCORE_IMAGE unavailable)
+- `SCORE_IMAGE` changed from `python:3.12-slim` → `ghcr.io/punchthedev/gitminer-scorer:latest`
+- `_resolve_score_image()` attempts to pull SCORE_IMAGE once per process; caches result; falls back on failure
+
+**`docker/scorer.Dockerfile`** (new)
+- `python:3.12-slim` + `pip install tree-sitter==0.24.0 tree-sitter-language-pack==0.7.2`
+- Same versions pinned as gittensor's pyproject.toml
+
+**`.github/workflows/build-scorer.yml`** (new)
+- Triggers on push to main (paths: `docker/scorer.Dockerfile`)
+- Builds and pushes `ghcr.io/punchthedev/gitminer-scorer:latest` to GHCR
+- Docker layer cache via GitHub Actions cache
+
+### Status
+- Benchmark: 430 problems, oracle **13.34** (tree-sitter), 20 repos
+- Scoring: tree-sitter AST scorer active for **both** local eval and Docker CI
+- Pool: all repos saturated — next check 2026-06-09
+- Pending: Gittensor registration, nginx hookup
