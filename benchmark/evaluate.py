@@ -137,10 +137,11 @@ def load_problem(problem_dir: Path):
 
 
 def run_evaluation(
-    agent_path: str,
+    agent_path: str | None = None,
     problem_ids: list[str] | None = None,
     use_sandbox: bool = True,
     use_all: bool = False,
+    use_oracle: bool = False,
 ) -> dict:
     config = load_pool_config()
     all_problem_dirs = sorted(POOL_DIR.glob("*/meta.json"))
@@ -156,6 +157,61 @@ def run_evaluation(
         selected = all_problem_dirs
     else:
         selected = select_shard(all_problem_dirs, config)
+
+    # Oracle mode: score reference diffs directly — no agent call needed.
+    # Used for pipeline calibration; expected mean is ~22.77 (the stored oracle baseline).
+    if use_oracle:
+        print("Oracle mode: scoring reference diffs to verify pipeline calibration.")
+        print(f"Expected mean: ~22.77 / 30.00 (stored oracle baseline)\n")
+        results = []
+        for problem_dir in selected:
+            ref_diff = problem_dir / "reference.diff"
+            meta = json.loads((problem_dir / "meta.json").read_text())
+            pid = meta["id"]
+            print(f"  [{pid}] {meta['issue_title'][:60]}...")
+            if not ref_diff.exists():
+                results.append({
+                    "problem_id": pid,
+                    "error": "reference.diff missing",
+                    "final_score": 0.0,
+                    "elapsed_seconds": 0.0,
+                })
+                print(f"       SKIP  (no reference.diff)")
+                continue
+            try:
+                if not use_sandbox:
+                    from benchmark.harness.score import score_patch
+                    score = score_patch(problem_dir, ref_diff)
+                else:
+                    from benchmark.harness.runner import run_in_sandbox
+                    score = run_in_sandbox(problem_dir, ref_diff)
+                results.append(score)
+                status = "PASS" if score.get("tests_passed") else "FAIL"
+                print(f"       {status}  final_score={score['final_score']}")
+            except Exception as e:
+                results.append({
+                    "problem_id": pid,
+                    "error": str(e),
+                    "final_score": 0.0,
+                    "elapsed_seconds": 0.0,
+                })
+                print(f"       ERROR: {e}")
+
+        total = sum(r["final_score"] for r in results)
+        mean = total / len(results) if results else 0.0
+        return {
+            "mean_score": round(mean, 4),
+            "problems_evaluated": len(results),
+            "pool_size": len(all_problem_dirs),
+            "shard_size": len(selected),
+            "rotation_policy": config.get("rotation_policy", "weekly"),
+            "oracle_mode": True,
+            "problems": results,
+        }
+
+    if not agent_path:
+        print("Error: --agent is required unless using --oracle", file=sys.stderr)
+        sys.exit(1)
 
     agent = load_agent(agent_path)
 
@@ -220,6 +276,8 @@ def main() -> None:
     parser.add_argument("--output", help="Write JSON results to this file")
     parser.add_argument("--no-sandbox", action="store_true",
                         help="Skip Docker sandbox (local dev mode)")
+    parser.add_argument("--oracle", action="store_true",
+                        help="Score reference diffs (calibration check, no agent needed)")
     args = parser.parse_args()
 
     if args.list_shard:
@@ -232,17 +290,19 @@ def main() -> None:
             print(f"  {d.name:30s}  {meta['repo_name']}  #{meta['pr_number']}")
         return
 
-    if not args.agent:
-        parser.error("--agent is required unless using --list-shard")
+    if not args.oracle and not args.agent:
+        parser.error("--agent is required unless using --oracle or --list-shard")
 
     problem_ids = args.problems.split(",") if args.problems else None
 
-    print(f"Evaluating: {args.agent}")
+    label = "oracle (reference diffs)" if args.oracle else args.agent
+    print(f"Evaluating: {label}")
     results = run_evaluation(
-        args.agent,
+        agent_path=args.agent,
         problem_ids=problem_ids,
         use_sandbox=not args.no_sandbox,
         use_all=args.all,
+        use_oracle=args.oracle,
     )
 
     pool_info = f"{results['shard_size']}/{results['pool_size']} problems"

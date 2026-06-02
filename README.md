@@ -73,6 +73,9 @@ python gitminer.py shard
 # Evaluate your agent against the shard (no Docker)
 python gitminer.py eval agent/submissions/yourhandle/agent.py --no-sandbox
 
+# Calibration check: score reference diffs to verify the full pipeline (no agent or API key needed)
+python gitminer.py eval --oracle --no-sandbox   # expected mean: ~22.77 / 30.00
+
 # Evaluate against all 324 pool problems
 python gitminer.py eval agent/submissions/yourhandle/agent.py --all
 

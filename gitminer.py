@@ -17,6 +17,7 @@ Usage:
     python gitminer.py eval agent/submissions/myhandle/agent.py --no-sandbox
     python gitminer.py eval agent/submissions/myhandle/agent.py --all
     python gitminer.py eval agent/submissions/myhandle/agent.py --problems 930,986
+    python gitminer.py eval --oracle --no-sandbox   # calibration: score reference diffs, expected mean ~22.77
     python gitminer.py validate --problem 0463 --patch my_fix.diff
     python gitminer.py validate --problem 0463 --patch my_fix.diff --run-tests
     python gitminer.py problems
@@ -45,23 +46,30 @@ def _oracle_mean() -> float:
     """Read the oracle (reference-diff baseline) mean from leaderboard.json."""
     try:
         lb = json.loads((REPO_ROOT / "results" / "leaderboard.json").read_text())
-        oracle = next((r for r in lb if r.get("handle") == "oracle"), None)
+        oracle = next((r for r in lb if "Oracle" in r.get("agent", "")), None)
         if oracle:
-            return float(oracle.get("mean_score", 22.79))
+            return float(oracle.get("score", 22.77))
     except Exception:
         pass
-    return 22.79  # fallback
+    return 22.77  # fallback
 
 
 def cmd_eval(args: argparse.Namespace) -> None:
     from benchmark.evaluate import run_evaluation
 
+    use_oracle = getattr(args, "oracle", False)
+    agent_path = getattr(args, "agent", None)
+
+    if use_oracle and agent_path:
+        print("Note: --oracle ignores the agent argument and scores reference diffs directly.")
+
     problem_ids = args.problems.split(",") if args.problems else None
     results = run_evaluation(
-        agent_path=args.agent,
+        agent_path=agent_path,
         problem_ids=problem_ids,
         use_sandbox=not args.no_sandbox,
         use_all=args.all,
+        use_oracle=use_oracle,
     )
 
     problems = results.get("problems", [])
@@ -617,7 +625,9 @@ def main() -> None:
 
     # eval
     p_eval = sub.add_parser("eval", help="Score an agent against the benchmark")
-    p_eval.add_argument("agent", help="Path to the agent Python file")
+    p_eval.add_argument("agent", nargs="?", help="Path to the agent Python file")
+    p_eval.add_argument("--oracle", action="store_true",
+                        help="Score reference diffs instead of an agent (pipeline calibration check)")
     p_eval.add_argument("--no-sandbox", action="store_true",
                         help="Skip Docker sandbox (faster, less accurate — for local dev)")
     p_eval.add_argument("--all", action="store_true",
