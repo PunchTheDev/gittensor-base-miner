@@ -21,7 +21,7 @@ Usage:
     python gitminer.py eval agent/submissions/myhandle/agent.py --no-sandbox
     python gitminer.py eval agent/submissions/myhandle/agent.py --all
     python gitminer.py eval agent/submissions/myhandle/agent.py --problems 930,986
-    python gitminer.py eval --oracle --no-sandbox   # calibration: score reference diffs, expected mean ~22.83
+    python gitminer.py eval --oracle --no-sandbox   # calibration: score reference diffs, expected mean ~22.85
     python gitminer.py run --problem 0463
     python gitminer.py run --problem 0463 --agent agent/submissions/myhandle/agent.py
     python gitminer.py run --problem 0463 --show-ref --score --no-sandbox
@@ -60,10 +60,10 @@ def _oracle_mean() -> float:
         lb = json.loads((REPO_ROOT / "results" / "leaderboard.json").read_text())
         oracle = next((r for r in lb if "Oracle" in r.get("agent", "")), None)
         if oracle:
-            return float(oracle.get("score", 22.83))
+            return float(oracle.get("score", 22.85))
     except Exception:
         pass
-    return 22.83  # fallback
+    return 22.85  # fallback
 
 
 def cmd_eval(args: argparse.Namespace) -> None:
@@ -815,6 +815,12 @@ def cmd_run(args: argparse.Namespace) -> None:
 
     # Score
     if args.score and diff:
+        use_color = sys.stdout.isatty()
+        GREEN = "\033[32m" if use_color else ""
+        RED   = "\033[31m" if use_color else ""
+        CYAN  = "\033[36m" if use_color else ""
+        RESET = "\033[0m"  if use_color else ""
+
         with tempfile.NamedTemporaryFile(suffix=".diff", mode="w", delete=False) as tmp:
             tmp.write(diff)
             tmp_path = Path(tmp.name)
@@ -828,9 +834,32 @@ def cmd_run(args: argparse.Namespace) -> None:
 
             tests_ok = result.get("tests_passed", False)
             score = result.get("final_score", 0.0)
-            status = "PASS" if tests_ok else "FAIL"
+            status = f"{GREEN}PASS{RESET}" if tests_ok else f"{RED}FAIL{RESET}"
+            src_tok = result.get("source_token_score", 0.0)
+            base_score = result.get("base_score", score)
+            skipped = result.get("tests_skipped_locally", False)
+
             print("─" * 72)
-            print(f"Score    : {score:.2f} / 30.00  ({status})")
+            if not tests_ok:
+                print(f"Tests    : {status}")
+                test_out = result.get("test_output", "")
+                if test_out:
+                    # Show last 20 lines of test output
+                    lines = test_out.strip().splitlines()
+                    shown = lines[-20:]
+                    if len(lines) > 20:
+                        print(f"  [{len(lines) - 20} lines omitted]")
+                    for line in shown:
+                        print(f"  {line}")
+                print(f"Score    : {RED}0.00{RESET} / 30.00  (tests must pass)")
+            else:
+                print(f"Tests    : {status}{'  (skipped locally — CI runs full suite)' if skipped else ''}")
+                # Score breakdown
+                src_bar_filled = int(round(src_tok / 25 * 20))
+                src_bar = "█" * src_bar_filled + "░" * (20 - src_bar_filled)
+                print(f"Src tok  : {GREEN}{src_tok:5.2f}{RESET} / 25.00  [{src_bar}]")
+                bonus = score - base_score if score > base_score else 0.0
+                print(f"Score    : {GREEN}{score:.2f}{RESET} / 30.00")
 
             baselines_path = REPO_ROOT / "results" / "baselines.json"
             if baselines_path.exists():
@@ -842,9 +871,18 @@ def cmd_run(args: argparse.Namespace) -> None:
                 if ref_score is not None:
                     delta = score - ref_score
                     sign = "+" if delta >= 0 else ""
-                    print(f"Baseline : {ref_score:.2f}  (delta {sign}{delta:.2f})")
+                    color = GREEN if delta >= 0 else RED
+                    print(f"Oracle   : {ref_score:.2f}  (delta {color}{sign}{delta:.2f}{RESET})")
+
+            oracle_mean = _oracle_mean()
+            delta_vs_oracle = score - oracle_mean
+            sign = "+" if delta_vs_oracle >= 0 else ""
+            color = GREEN if delta_vs_oracle >= 0 else CYAN
+            print(f"Avg oracle: {oracle_mean:.2f}  (vs mean: {color}{sign}{delta_vs_oracle:.2f}{RESET})")
+
             if args.no_sandbox:
-                print("Note: --no-sandbox scores run ~2× above Docker CI.")
+                print(f"\n{CYAN}Note:{RESET} --no-sandbox scores ~2× above Docker CI.  "
+                      "Use CI score as the authoritative benchmark.")
         finally:
             tmp_path.unlink(missing_ok=True)
     elif args.score:
