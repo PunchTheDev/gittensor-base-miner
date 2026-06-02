@@ -357,6 +357,7 @@ def cmd_submit(args: argparse.Namespace) -> None:
 def cmd_problems(args: argparse.Namespace) -> None:
     """List benchmark problems with filtering and sorting."""
     import json as _json
+    from benchmark.evaluate import REPO_CATEGORY
 
     pool_dir = REPO_ROOT / "benchmark" / "problems"
     baselines_path = REPO_ROOT / "results" / "baselines.json"
@@ -368,37 +369,36 @@ def cmd_problems(args: argparse.Namespace) -> None:
             if pid_key:
                 baseline_lookup[pid_key] = entry.get("base_score", 0.0)
 
-    _LANG = {"npm": "js", "cargo": "rs", "./gradlew": "java", "go": "go"}
+    def _difficulty(score: float | None) -> str:
+        # Mirrors generate_dashboard_data.py: easy≥15, medium 5–15, hard<5
+        if score is None:
+            return "?"
+        if score >= 15:
+            return "easy"
+        if score >= 5:
+            return "medium"
+        return "hard"
 
     rows = []
     for meta_path in sorted(pool_dir.glob("*/meta.json")):
         meta = _json.loads(meta_path.read_text())
         pid = meta.get("id", "")
-        runner = meta.get("test_cmd", ["python"])[0]
-        lang = _LANG.get(runner, "py")
+        repo = meta.get("repo_name", "")
+        cat = REPO_CATEGORY.get(repo.lower(), "python")
         baseline = baseline_lookup.get(pid)
-
-        difficulty = "?"
-        if baseline is not None:
-            if baseline >= 25:
-                difficulty = "easy"
-            elif baseline >= 18:
-                difficulty = "medium"
-            else:
-                difficulty = "hard"
 
         rows.append({
             "id": pid,
-            "repo": meta.get("repo_name", ""),
-            "lang": lang,
-            "difficulty": difficulty,
+            "repo": repo,
+            "cat": cat,
+            "difficulty": _difficulty(baseline),
             "baseline": baseline,
             "title": meta.get("issue_title", "")[:60],
         })
 
     # Filter
-    if args.lang:
-        rows = [r for r in rows if r["lang"] == args.lang]
+    if args.cat:
+        rows = [r for r in rows if r["cat"] == args.cat]
     if args.difficulty:
         rows = [r for r in rows if r["difficulty"] == args.difficulty]
     if args.repo:
@@ -408,7 +408,6 @@ def cmd_problems(args: argparse.Namespace) -> None:
         rows = [r for r in rows if q in r["title"].lower() or q in r["id"].lower()]
 
     # Sort
-    reverse = args.sort in ("baseline",)
     if args.sort == "baseline":
         rows.sort(key=lambda r: (r["baseline"] or 0), reverse=True)
     elif args.sort == "difficulty":
@@ -419,11 +418,11 @@ def cmd_problems(args: argparse.Namespace) -> None:
 
     # Display
     limit = args.limit or len(rows)
-    print(f"\n{'ID':<42} {'Repo':<30} {'Lang':<6} {'Diff':<8} {'Baseline':>9}")
-    print("─" * 100)
+    print(f"\n{'ID':<42} {'Repo':<32} {'Cat':<12} {'Diff':<8} {'Baseline':>9}")
+    print("─" * 107)
     for r in rows[:limit]:
         b = f"{r['baseline']:.2f}" if r["baseline"] is not None else "n/a"
-        print(f"{r['id']:<42} {r['repo']:<30} {r['lang']:<6} {r['difficulty']:<8} {b:>9}  {r['title']}")
+        print(f"{r['id']:<42} {r['repo']:<32} {r['cat']:<12} {r['difficulty']:<8} {b:>9}  {r['title']}")
 
     print(f"\n{len(rows[:limit])} of {len(rows)} problems shown.")
 
@@ -1175,7 +1174,8 @@ def main() -> None:
 
     # problems
     p_problems = sub.add_parser("problems", help="List benchmark problems with optional filters")
-    p_problems.add_argument("--lang", choices=["py", "js", "rs", "java", "go"], help="Filter by language")
+    p_problems.add_argument("--cat", choices=["python", "typescript", "rust", "jvm", "ruby"],
+                            help="Filter by language category")
     p_problems.add_argument("--difficulty", choices=["easy", "medium", "hard"], help="Filter by difficulty")
     p_problems.add_argument("--repo", metavar="PATTERN", help="Filter by repo name substring")
     p_problems.add_argument("--search", metavar="TEXT", help="Search title or problem ID")
