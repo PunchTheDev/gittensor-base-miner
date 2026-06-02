@@ -40,6 +40,11 @@ class Problem:
     # Full file tree at base_commit (paths only)
     file_tree: list[str] = field(default_factory=list)
 
+    # Test command used to score the patch — agents can use this to understand
+    # which test files their fix must satisfy (e.g. ["python", "-m", "pytest",
+    # "--tb=short", "-q", "tests/validator/test_repo_scan.py"])
+    test_cmd: list[str] = field(default_factory=list)
+
     # Hard constraints enforced by the harness
     allowed_models: list[str] = field(default_factory=list)
     time_limit_seconds: int = 120

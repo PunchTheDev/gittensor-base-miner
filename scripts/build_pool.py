@@ -108,11 +108,45 @@ def get_file_tree(repo: str, commit: str) -> list[str]:
         return []
 
 
-def select_context_files(repo: str, base_commit: str, diff: str, max_files: int = 15) -> list[dict]:
+def extract_added_file(diff: str, path: str) -> str | None:
+    """
+    Extract the full content of a newly-added file from a unified diff.
+    Used as a fallback when the file doesn't exist at base_commit.
+    """
+    pattern = re.compile(
+        r"diff --git a/" + re.escape(path) + r" b/" + re.escape(path) +
+        r".*?(?=\ndiff --git |\Z)",
+        re.DOTALL,
+    )
+    match = pattern.search(diff)
+    if not match or "--- /dev/null" not in match.group(0):
+        return None
+
+    lines = []
+    in_hunk = False
+    for line in match.group(0).splitlines():
+        if line.startswith("@@"):
+            in_hunk = True
+            continue
+        if not in_hunk:
+            continue
+        if line.startswith("+") and not line.startswith("+++"):
+            lines.append(line[1:])
+        elif line.startswith("\\"):
+            pass
+        elif not line.startswith("-"):
+            lines.append(line)
+    return "\n".join(lines) if lines else None
+
+
+def select_context_files(
+    repo: str, base_commit: str, diff: str, test_cmd: list[str] | None = None, max_files: int = 15
+) -> list[dict]:
     changed_paths = re.findall(r"^diff --git a/(.+) b/", diff, re.MULTILINE)
     context_files = []
     fetched: set[str] = set()
 
+    # Include source files changed in the diff.
     for path in changed_paths[:max_files]:
         if path in fetched:
             continue
@@ -122,7 +156,28 @@ def select_context_files(repo: str, base_commit: str, diff: str, max_files: int 
             context_files.append({"path": path, "content": content})
             fetched.add(path)
         except Exception:
-            pass
+            # File may be newly added in this PR; extract from diff as fallback.
+            content = extract_added_file(diff, path)
+            if content is not None:
+                context_files.append({"path": path, "content": content})
+            fetched.add(path)
+
+    # Include test files referenced in test_cmd so agents know what they must satisfy.
+    # Only applicable for Python pytest commands where test files are explicit arguments.
+    if test_cmd and test_cmd[0] == "python" and len(test_cmd) > 4:
+        test_paths = [arg for arg in test_cmd[4:] if arg.endswith(".py") and not arg.startswith("-")]
+        for path in test_paths[:3]:
+            if path in fetched:
+                continue
+            try:
+                data = gh_api(f"repos/{repo}/contents/{path}?ref={base_commit}")
+                content = base64.b64decode(data["content"]).decode("utf-8", errors="replace")
+                context_files.append({"path": path, "content": content})
+            except Exception:
+                content = extract_added_file(diff, path)
+                if content is not None:
+                    context_files.append({"path": path, "content": content})
+            fetched.add(path)
 
     return context_files
 
@@ -229,8 +284,8 @@ def curate_pr(
 
     base_commit = pr_data["base"]["sha"]
     file_tree = get_file_tree(repo, base_commit)
-    context_files = select_context_files(repo, base_commit, diff)
     test_cmd = infer_test_cmd(repo, diff)
+    context_files = select_context_files(repo, base_commit, diff, test_cmd=test_cmd)
 
     problem_out.mkdir(parents=True, exist_ok=True)
     context_out = problem_out / "context"

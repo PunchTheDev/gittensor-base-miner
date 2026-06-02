@@ -49,6 +49,12 @@ OBSERVE_PROMPT = """\
 
 ## Repository: {repo}
 
+## Test command
+```
+{test_cmd}
+```
+The scoring harness will run this command on your patched repo. Your fix must make it pass.
+
 ## File tree
 ```
 {tree}
@@ -64,6 +70,7 @@ Analyse the issue carefully. Answer these questions in order:
 1. What is the root cause?
 2. Which files and lines need to change?
 3. What is the minimal correct change — no refactors, no style fixes?
+4. Will the test command above pass with this change?
 
 Be concise and precise. Do not write any code yet.
 """
@@ -214,10 +221,12 @@ class ExampleAgent(BaseAgent):
         log: list[str] = []
 
         # --- Turn 1: Observe + Plan ---
+        test_cmd_str = " ".join(problem.test_cmd) if problem.test_cmd else "pytest"
         observe_user = OBSERVE_PROMPT.format(
             title=problem.issue_title,
             body=problem.issue_body,
             repo=problem.repo_name,
+            test_cmd=test_cmd_str,
             tree="\n".join(problem.file_tree),
             files=_format_files(problem.context_files),
         )

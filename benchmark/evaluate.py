@@ -129,6 +129,7 @@ def load_problem(problem_dir: Path):
         base_commit=meta["base_commit"],
         context_files=context_files,
         file_tree=meta.get("file_tree", []),
+        test_cmd=meta.get("test_cmd", []),
         allowed_models=allowed_models,
         time_limit_seconds=meta.get("time_limit_seconds", 120),
         output_token_budget=meta.get("output_token_budget", 50_000),
