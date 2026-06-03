@@ -101,6 +101,18 @@ def _baseline_map() -> dict[str, float]:
     return {p["id"]: p["base_score"] for p in data.get("problems", [])}
 
 
+def _oracle_weighted_score() -> float:
+    """Returns the difficulty-weighted oracle mean (the metric miners compete on)."""
+    if not BASELINES.exists():
+        return 0.0
+    try:
+        data = json.loads(BASELINES.read_text())
+        ws = data.get("weighted_mean_score")
+        return float(ws) if ws is not None else float(data.get("mean_score", 0))
+    except Exception:
+        return 0.0
+
+
 def _shard_ids(all_ids: list[str], config: dict) -> list[str]:
     shard_size = config.get("shard_size", 30)
     policy = config.get("rotation_policy", "weekly")
@@ -130,9 +142,24 @@ def _shard_ids(all_ids: list[str], config: dict) -> list[str]:
 
 
 def _difficulty(base_score: float) -> str:
+    """Legacy score-based tier — not used internally, kept for external callers."""
     if base_score >= 15:
         return "easy"
     if base_score >= 5:
+        return "medium"
+    return "hard"
+
+
+def _difficulty_by_lines(problem_dir: Path) -> str:
+    """Difficulty based on reference diff added-line count — mirrors evaluate.py."""
+    ref = problem_dir / "reference.diff"
+    if not ref.exists():
+        return "medium"
+    added = sum(1 for line in ref.read_text(errors="replace").splitlines()
+                if line.startswith("+") and not line.startswith("+++"))
+    if added < 30:
+        return "easy"
+    if added < 150:
         return "medium"
     return "hard"
 
@@ -154,7 +181,7 @@ def _problem_summary(meta: dict, baselines: dict[str, float]) -> dict:
         "issue_title": meta.get("issue_title", ""),
         "merged_at": meta.get("merged_at", ""),
         "category": cat,
-        "difficulty": _difficulty(score),
+        "difficulty": _difficulty_by_lines(POOL_DIR / pid),
         "baseline_score": round(score, 2),
         "test_cmd": meta.get("test_cmd", []),
     }
@@ -245,7 +272,7 @@ class Handler(BaseHTTPRequestHandler):
                 continue
             cat = _category(meta)
             by_category[cat] = by_category.get(cat, 0) + 1
-            diff = _difficulty(baselines.get(pid, 0.0))
+            diff = _difficulty_by_lines(POOL_DIR / pid)
             by_difficulty[diff] = by_difficulty.get(diff, 0) + 1
             repos.add(meta.get("repo_name", ""))
 
@@ -253,7 +280,7 @@ class Handler(BaseHTTPRequestHandler):
             "pool_size": len(all_ids),
             "shard_size": len(shard),
             "repos": len(repos),
-            "oracle_score": round(sum(scores) / len(scores), 2) if scores else 0,
+            "oracle_score": _oracle_weighted_score(),
             "by_category": by_category,
             "by_difficulty": by_difficulty,
             "rotation_policy": config.get("rotation_policy", "weekly"),
@@ -383,7 +410,7 @@ class Handler(BaseHTTPRequestHandler):
                 champion_score = top["score"]
                 champion_agent = top.get("agent")
 
-        oracle_score = round(sum(baselines.values()) / len(baselines), 2) if baselines else 0
+        oracle_score = _oracle_weighted_score()
 
         return {
             "name": "Gittensor Base Miner Benchmark",
@@ -421,7 +448,8 @@ class Handler(BaseHTTPRequestHandler):
                 "note": (
                     "Structural AST tokens (functions, classes, branches) count. "
                     "Comments and whitespace score 0. "
-                    "Beat the champion's mean score across 30 problems to win."
+                    "oracle_score is the difficulty-weighted mean (hard×2/medium×1.5/easy×1). "
+                    "Beat the champion weighted mean across 30 problems to win."
                 ),
             },
             "constraints": {

@@ -31,6 +31,7 @@ RESULTS_DIR = REPO_ROOT / "results"
 
 sys.path.insert(0, str(REPO_ROOT))
 from benchmark.harness.score import score_diff_quality
+from benchmark.evaluate import problem_difficulty
 
 
 def score_reference(problem_dir: Path) -> dict | None:
@@ -88,9 +89,19 @@ def main() -> None:
     median_scores = sorted(scores)
     median_score = round(median_scores[len(median_scores) // 2], 2)
 
+    # Weighted mean mirrors evaluate.py: hard×2, medium×1.5, easy×1
+    w_total = w_count = 0.0
+    for b in baselines:
+        prob_dir = PROBLEMS_DIR / b["id"]
+        _, w = problem_difficulty(prob_dir) if prob_dir.exists() else ("medium", 1.5)
+        w_total += b["base_score"] * w
+        w_count += w
+    weighted_mean_score = round(w_total / w_count, 2) if w_count else mean_score
+
     out = {
         "count": len(baselines),
         "mean_score": mean_score,
+        "weighted_mean_score": weighted_mean_score,
         "median_score": median_score,
         "max_score": round(max(scores), 2),
         "min_score": round(min(scores), 2),
@@ -103,8 +114,8 @@ def main() -> None:
     dest.write_text(json.dumps(out, indent=2))
 
     print(f"\nScored {len(baselines)} problems (skipped {skipped})")
-    print(f"Mean: {mean_score:.2f} | Median: {median_score:.2f} | "
-          f"Max: {out['max_score']:.2f} | Min: {out['min_score']:.2f}")
+    print(f"Mean: {mean_score:.2f} | Weighted mean: {weighted_mean_score:.2f} | "
+          f"Median: {median_score:.2f} | Max: {out['max_score']:.2f} | Min: {out['min_score']:.2f}")
     print(f"Written to {dest}")
 
 

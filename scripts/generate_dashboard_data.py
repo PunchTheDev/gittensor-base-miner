@@ -64,25 +64,28 @@ RESULTS_DIR = REPO_ROOT / "results"
 
 def _load_oracle_row() -> dict:
     baseline_file = RESULTS_DIR / "baselines.json"
-    score = None
+    mean_score = weighted_score = None
     count = None
     if baseline_file.exists():
         try:
             data = json.loads(baseline_file.read_text())
-            score = round(data["mean_score"], 2)
+            mean_score = round(data["mean_score"], 2)
+            weighted_score = round(data.get("weighted_mean_score") or mean_score, 2)
             count = data["count"]
         except Exception:
             pass
-    if score is None:
-        score = 9.04  # fallback
+    if mean_score is None:
+        mean_score = 11.83
+        weighted_score = 12.77
         count = 430
     return {
         "rank": None,
         "agent": "Oracle (accepted solution)",
-        "score": score,
+        "score": mean_score,
+        "weighted_score": weighted_score,
         "model": "—",
         "date": "—",
-        "note": f"Mean tree-sitter score across {count} accepted solutions (Gittensor DAS only)",
+        "note": f"Weighted mean {weighted_score} (arithmetic {mean_score}) across {count} accepted solutions (Gittensor DAS only)",
     }
 
 
@@ -233,11 +236,16 @@ def load_allowed_models() -> list[str]:
 
 
 def oracle_score_from_leaderboard(leaderboard: list) -> float:
-    """Read oracle score from the leaderboard entry rather than hardcoding."""
+    """Read oracle weighted mean from the leaderboard entry (the metric miners compete on)."""
     for row in leaderboard:
-        if row.get("agent") == "Oracle (accepted solution)" and row.get("score") is not None:
-            return float(row["score"])
-    return ORACLE_ROW["score"]
+        if row.get("agent") == "Oracle (accepted solution)":
+            # Prefer weighted_score; fall back to score for backward compat
+            ws = row.get("weighted_score")
+            if ws is not None:
+                return float(ws)
+            if row.get("score") is not None:
+                return float(row["score"])
+    return ORACLE_ROW.get("weighted_score") or ORACLE_ROW["score"]
 
 
 def main(out_path: str | None = None):

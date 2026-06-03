@@ -18,23 +18,28 @@ from datetime import date
 REPO_ROOT = pathlib.Path(__file__).parent.parent
 RESULTS_DIR = REPO_ROOT / "results"
 
-def _oracle_score_from_baselines() -> float:
-    """Read oracle mean from baselines.json (authoritative); fall back to 11.83."""
+def _oracle_score_from_baselines() -> tuple[float, float]:
+    """Read oracle scores from baselines.json. Returns (mean, weighted_mean)."""
     baseline_file = RESULTS_DIR / "baselines.json"
     try:
         data = json.loads(baseline_file.read_text())
-        return round(float(data["mean_score"]), 2)
+        mean = round(float(data["mean_score"]), 2)
+        weighted = round(float(data.get("weighted_mean_score") or mean), 2)
+        return mean, weighted
     except Exception:
-        return 11.83
+        return 11.83, 12.77
 
+
+_oracle_mean, _oracle_weighted = _oracle_score_from_baselines()
 
 ORACLE_ROW = {
     "rank": None,
     "agent": "Oracle (accepted solution)",
-    "score": _oracle_score_from_baselines(),
+    "score": _oracle_mean,
+    "weighted_score": _oracle_weighted,
     "model": "—",
     "date": "—",
-    "note": "Mean tree-sitter score across accepted solutions (Gittensor DAS network only)",
+    "note": "Weighted mean tree-sitter score across accepted solutions (Gittensor DAS network only)",
 }
 
 
