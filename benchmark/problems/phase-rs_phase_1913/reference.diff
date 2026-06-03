@@ -1,0 +1,2131 @@
+diff --git a/crates/engine-wasm/src/lib.rs b/crates/engine-wasm/src/lib.rs
+index 86de0a4afe..e420066e00 100644
+--- a/crates/engine-wasm/src/lib.rs
++++ b/crates/engine-wasm/src/lib.rs
+@@ -396,7 +396,7 @@ pub fn classify_deck_js(names_js: JsValue) -> Result<JsValue, JsValue> {
+             main_deck: names,
+             sideboard: Vec::new(),
+             commander: Vec::new(),
+-            bracket_tier: Default::default(),
++            ..Default::default()
+         };
+         let payload = resolve_player_deck_list(db, &list);
+         let profile = DeckProfile::analyze(&payload.main_deck);
+@@ -1407,6 +1407,7 @@ pub fn apply_seat_mutation(state_json: &str, mutation_json: &str) -> Result<JsVa
+                 main_deck: deck_data.main_deck,
+                 sideboard: deck_data.sideboard,
+                 commander: deck_data.commander,
++                attraction_deck: deck_data.attraction_deck,
+                 bracket_tier: deck_data.bracket_tier,
+             })
+         }
+@@ -1477,7 +1478,7 @@ mod bracket_estimate_tests {
+             commander: vec!["Atraxa, Praetors' Voice".into()],
+             main_deck: vec!["Smothering Tithe".into(), "Forest".into()],
+             sideboard: vec![],
+-            bracket_tier: Default::default(),
++            ..Default::default()
+         };
+         let result = estimate_bracket_inner(&deck);
+         let est = result.expect("estimate present");
+@@ -1494,7 +1495,7 @@ mod bracket_estimate_tests {
+             commander: vec!["Cmdr".into()],
+             main_deck: vec!["Forest".into()],
+             sideboard: vec![],
+-            bracket_tier: Default::default(),
++            ..Default::default()
+         };
+         assert!(estimate_bracket_inner(&deck).is_none());
+     }
+diff --git a/crates/engine/src/database/card_db.rs b/crates/engine/src/database/card_db.rs
+index 2325007e9e..2c069e2f34 100644
+--- a/crates/engine/src/database/card_db.rs
++++ b/crates/engine/src/database/card_db.rs
+@@ -520,6 +520,7 @@ mod tests {
+             deck_copy_limit: None,
+             metadata: Default::default(),
+             rarities: Default::default(),
++            attraction_lights: vec![],
+         }
+     }
+ 
+diff --git a/crates/engine/src/database/synthesis.rs b/crates/engine/src/database/synthesis.rs
+index f8b0ddb0b0..fbe4af874d 100644
+--- a/crates/engine/src/database/synthesis.rs
++++ b/crates/engine/src/database/synthesis.rs
+@@ -5284,6 +5284,7 @@ fn build_oracle_face_inner(
+         deck_copy_limit: None,
+         metadata: Default::default(),
+         rarities: Default::default(),
++        attraction_lights: vec![],
+     };
+ 
+     face.brawl_commander = compute_brawl_commander(mtgjson, &face);
+diff --git a/crates/engine/src/game/attractions.rs b/crates/engine/src/game/attractions.rs
+new file mode 100644
+index 0000000000..c6877bd503
+--- /dev/null
++++ b/crates/engine/src/game/attractions.rs
+@@ -0,0 +1,152 @@
++//! CR 717 + CR 701.51 + CR 701.52: Unfinity Attraction deck, open, and visit.
++//!
++//! Attractions live in a supplementary deck (command zone) tracked per player via
++//! `Player::attraction_deck`. Opening moves the top card to the battlefield; rolling
++//! to visit is a turn-based action at the beginning of the active player's precombat
++//! main phase when they control an Attraction.
++
++use crate::types::ability::{EffectKind, ResolvedAbility};
++use crate::types::events::GameEvent;
++use crate::types::game_state::GameState;
++use crate::types::identifiers::ObjectId;
++use crate::types::player::PlayerId;
++use crate::types::zones::Zone;
++
++use super::effects::roll_die;
++use super::game_object::GameObject;
++use super::zones;
++use crate::types::ability::EffectError;
++
++/// CR 717.1: Default lit numbers when card data omits variant lights (1 and 6 are always lit).
++pub fn default_attraction_lights() -> Vec<u8> {
++    vec![1, 6]
++}
++
++pub fn is_attraction_card(obj: &GameObject) -> bool {
++    obj.in_attraction_deck
++        || !obj.attraction_lights.is_empty()
++        || obj
++            .card_types
++            .subtypes
++            .iter()
++            .any(|s| s.eq_ignore_ascii_case("Attraction"))
++}
++
++pub fn is_attraction_permanent(obj: &GameObject) -> bool {
++    obj.zone == Zone::Battlefield && is_attraction_card(obj)
++}
++
++/// CR 701.51b: Put the top card of the controller's Attraction deck onto the battlefield.
++pub fn open_attractions(
++    state: &mut GameState,
++    player: PlayerId,
++    count: u32,
++    events: &mut Vec<GameEvent>,
++) -> Result<(), EffectError> {
++    for _ in 0..count {
++        let Some(object_id) = state
++            .players
++            .iter_mut()
++            .find(|p| p.id == player)
++            .and_then(|p| p.attraction_deck.pop_front())
++        else {
++            // CR 609.3: If the player has fewer Attractions than requested, open
++            // as many as possible and ignore the impossible remainder.
++            break;
++        };
++        zones::move_to_zone(state, object_id, Zone::Battlefield, events);
++        if let Some(obj) = state.objects.get_mut(&object_id) {
++            obj.in_attraction_deck = false;
++        }
++        events.push(GameEvent::AttractionOpened {
++            player_id: player,
++            object_id,
++        });
++    }
++    Ok(())
++}
++
++/// CR 701.52a: Roll a d6 and visit each controlled Attraction whose lights include the result.
++pub fn roll_to_visit_attractions(
++    state: &mut GameState,
++    player: PlayerId,
++    events: &mut Vec<GameEvent>,
++) {
++    if !controls_attraction(state, player) {
++        return;
++    }
++    let roll = roll_die::roll_die(state, player, 6, events);
++    events.push(GameEvent::AttractionsRolledToVisit {
++        player_id: player,
++        roll,
++    });
++    let visited = visited_attraction_ids(state, player, roll);
++    for attraction_id in visited {
++        events.push(GameEvent::AttractionVisited {
++            player_id: player,
++            roll,
++            attraction_id,
++        });
++    }
++    super::triggers::process_triggers(state, events);
++}
++
++/// CR 703.4g + CR 717.4: Turn-based action at the beginning of the precombat main phase.
++pub fn perform_roll_to_visit_turn_based_action(state: &mut GameState, events: &mut Vec<GameEvent>) {
++    let player = state.active_player;
++    roll_to_visit_attractions(state, player, events);
++}
++
++fn controls_attraction(state: &GameState, player: PlayerId) -> bool {
++    state.battlefield.iter().any(|id| {
++        state
++            .objects
++            .get(id)
++            .is_some_and(|o| o.controller == player && is_attraction_permanent(o))
++    })
++}
++
++fn visited_attraction_ids(state: &GameState, player: PlayerId, roll: u8) -> Vec<ObjectId> {
++    state
++        .battlefield
++        .iter()
++        .filter_map(|id| {
++            let obj = state.objects.get(id)?;
++            if obj.controller != player || !is_attraction_permanent(obj) {
++                return None;
++            }
++            if obj.attraction_lights.contains(&roll) {
++                Some(*id)
++            } else {
++                None
++            }
++        })
++        .collect()
++}
++
++pub fn resolve_open(
++    state: &mut GameState,
++    ability: &ResolvedAbility,
++    count: u32,
++    events: &mut Vec<GameEvent>,
++) -> Result<(), EffectError> {
++    open_attractions(state, ability.controller, count, events)?;
++    events.push(GameEvent::EffectResolved {
++        kind: EffectKind::OpenAttractions,
++        source_id: ability.source_id,
++    });
++    Ok(())
++}
++
++pub fn resolve_roll_to_visit(
++    state: &mut GameState,
++    ability: &ResolvedAbility,
++    events: &mut Vec<GameEvent>,
++) -> Result<(), EffectError> {
++    roll_to_visit_attractions(state, ability.controller, events);
++    events.push(GameEvent::EffectResolved {
++        kind: EffectKind::RollToVisitAttractions,
++        source_id: ability.source_id,
++    });
++    Ok(())
++}
+diff --git a/crates/engine/src/game/bracket_estimate.rs b/crates/engine/src/game/bracket_estimate.rs
+index 0a3d8f30ff..a4e8d549f0 100644
+--- a/crates/engine/src/game/bracket_estimate.rs
++++ b/crates/engine/src/game/bracket_estimate.rs
+@@ -308,7 +308,7 @@ mod tests {
+             commander: commander.into_iter().map(String::from).collect(),
+             main_deck: main.into_iter().map(String::from).collect(),
+             sideboard: Vec::new(),
+-            bracket_tier: Default::default(),
++            ..Default::default()
+         }
+     }
+ 
+diff --git a/crates/engine/src/game/commander.rs b/crates/engine/src/game/commander.rs
+index defde629db..ecb7fef85f 100644
+--- a/crates/engine/src/game/commander.rs
++++ b/crates/engine/src/game/commander.rs
+@@ -1412,6 +1412,7 @@ mod tests {
+             deck_copy_limit: None,
+             metadata: Default::default(),
+             rarities: Default::default(),
++            attraction_lights: vec![],
+         };
+ 
+         let obj_id = create_commander_from_card_face(&mut state, &face, PlayerId(0));
+diff --git a/crates/engine/src/game/coverage.rs b/crates/engine/src/game/coverage.rs
+index d78fc65b06..48309617ff 100644
+--- a/crates/engine/src/game/coverage.rs
++++ b/crates/engine/src/game/coverage.rs
+@@ -2391,6 +2391,8 @@ fn effect_details(effect: &Effect) -> Vec<(String, String)> {
+         | Effect::VentureIntoDungeon
+         | Effect::VentureInto { .. }
+         | Effect::TakeTheInitiative
++        | Effect::OpenAttractions { .. }
++        | Effect::RollToVisitAttractions
+         | Effect::ProcessRadCounters
+         | Effect::Clash
+         | Effect::Vote { .. }
+@@ -8400,6 +8402,7 @@ mod tests {
+             deck_copy_limit: None,
+             metadata: Default::default(),
+             rarities: Default::default(),
++            attraction_lights: vec![],
+         }
+     }
+ 
+diff --git a/crates/engine/src/game/deck_loading.rs b/crates/engine/src/game/deck_loading.rs
+index 2e8ab79501..28bf55198e 100644
+--- a/crates/engine/src/game/deck_loading.rs
++++ b/crates/engine/src/game/deck_loading.rs
+@@ -27,6 +27,9 @@ pub struct PlayerDeckPayload {
+     pub sideboard: Vec<DeckEntry>,
+     #[serde(default)]
+     pub commander: Vec<DeckEntry>,
++    /// CR 717.2: Optional supplementary Attraction deck (typically 10 cards).
++    #[serde(default)]
++    pub attraction_deck: Vec<DeckEntry>,
+     /// The declared bracket tier for this player's deck. Defaults to `Core`
+     /// so that existing serialized payloads and test fixtures that omit the
+     /// field continue to deserialize correctly.
+@@ -57,6 +60,8 @@ pub struct PlayerDeckList {
+     pub sideboard: Vec<String>,
+     #[serde(default)]
+     pub commander: Vec<String>,
++    #[serde(default)]
++    pub attraction_deck: Vec<String>,
+     /// Declared bracket tier for this player's deck. Defaults to `Core` for
+     /// backward-compatible deserialization (payloads that predate this field
+     /// omit it, which `#[serde(default)]` handles transparently).
+@@ -111,6 +116,7 @@ pub fn resolve_player_deck_list(db: &CardDatabase, list: &PlayerDeckList) -> Pla
+         main_deck: resolve_names(db, &list.main_deck),
+         sideboard: resolve_names(db, &list.sideboard),
+         commander: resolve_names(db, &list.commander),
++        attraction_deck: resolve_names(db, &list.attraction_deck),
+         bracket_tier: list.bracket_tier,
+     }
+ }
+@@ -128,12 +134,14 @@ pub fn resolve_deck_list(db: &CardDatabase, list: &DeckList) -> DeckPayload {
+             main_deck: resolve_names(db, &list.player.main_deck),
+             sideboard: resolve_names(db, &list.player.sideboard),
+             commander: resolve_names(db, &list.player.commander),
++            attraction_deck: resolve_names(db, &list.player.attraction_deck),
+             bracket_tier: list.player.bracket_tier,
+         },
+         opponent: PlayerDeckPayload {
+             main_deck: resolve_names(db, &list.opponent.main_deck),
+             sideboard: resolve_names(db, &list.opponent.sideboard),
+             commander: resolve_names(db, &list.opponent.commander),
++            attraction_deck: resolve_names(db, &list.opponent.attraction_deck),
+             bracket_tier: list.opponent.bracket_tier,
+         },
+         ai_decks: list
+@@ -143,6 +151,7 @@ pub fn resolve_deck_list(db: &CardDatabase, list: &DeckList) -> DeckPayload {
+                 main_deck: resolve_names(db, &deck.main_deck),
+                 sideboard: resolve_names(db, &deck.sideboard),
+                 commander: resolve_names(db, &deck.commander),
++                attraction_deck: resolve_names(db, &deck.attraction_deck),
+                 bracket_tier: deck.bracket_tier,
+             })
+             .collect(),
+@@ -183,6 +192,36 @@ pub fn create_commander_from_card_face(
+     obj_id
+ }
+ 
++/// CR 717.2: Create an Attraction in the supplementary deck (command zone).
++pub fn create_attraction_deck_card(
++    state: &mut GameState,
++    card_face: &CardFace,
++    owner: PlayerId,
++) -> crate::types::identifiers::ObjectId {
++    let card_id = CardId(state.next_object_id);
++    let obj_id = create_object(state, card_id, owner, card_face.name.clone(), Zone::Command);
++    let obj = state.objects.get_mut(&obj_id).expect("just created");
++    apply_card_face_to_object(obj, card_face);
++    obj.in_attraction_deck = true;
++    state.command_zone.retain(|id| *id != obj_id);
++    state
++        .players
++        .iter_mut()
++        .find(|p| p.id == owner)
++        .expect("owner exists")
++        .attraction_deck
++        .push_back(obj_id);
++    obj_id
++}
++
++fn load_player_attraction_deck(state: &mut GameState, entries: &[DeckEntry], owner: PlayerId) {
++    for entry in entries {
++        for _ in 0..entry.count {
++            create_attraction_deck_card(state, &entry.card, owner);
++        }
++    }
++}
++
+ /// Load deck data into a GameState, creating GameObjects in each player's library and shuffling.
+ pub fn load_deck_into_state(state: &mut GameState, payload: &DeckPayload) {
+     state.deck_pools.clear();
+@@ -305,6 +344,12 @@ pub fn load_deck_into_state(state: &mut GameState, payload: &DeckPayload) {
+         }
+     }
+ 
++    load_player_attraction_deck(state, &payload.player.attraction_deck, PlayerId(0));
++    load_player_attraction_deck(state, &payload.opponent.attraction_deck, PlayerId(1));
++    for (i, ai_deck) in payload.ai_decks.iter().enumerate() {
++        load_player_attraction_deck(state, &ai_deck.attraction_deck, PlayerId((2 + i) as u8));
++    }
++
+     // Collect all creature subtypes for Changeling CDA expansion.
+     // CR 205.2b + CR 205.3m + CR 308.1: creature subtypes are shared by Creature
+     // and Kindred (legacy Tribal) faces. Subtype categories are disjoint, so a
+@@ -347,10 +392,11 @@ pub fn load_deck_into_state(state: &mut GameState, payload: &DeckPayload) {
+     sorted.sort();
+     state.all_creature_types = sorted;
+ 
+-    // Shuffle each player's library
++    // Shuffle each player's library and Attraction deck (CR 103.3a / CR 717.2).
+     let GameState { players, rng, .. } = state;
+     for player in players.iter_mut() {
+         crate::util::im_ext::shuffle_vector(&mut player.library, rng);
++        crate::util::im_ext::shuffle_vector(&mut player.attraction_deck, rng);
+     }
+ }
+ 
+@@ -472,6 +518,7 @@ mod tests {
+             deck_copy_limit: None,
+             metadata: Default::default(),
+             rarities: Default::default(),
++            attraction_lights: vec![],
+         }
+     }
+ 
+@@ -522,6 +569,7 @@ mod tests {
+             deck_copy_limit: None,
+             metadata: Default::default(),
+             rarities: Default::default(),
++            attraction_lights: vec![],
+         }
+     }
+ 
+@@ -644,7 +692,7 @@ mod tests {
+                     count: 3,
+                 }],
+                 commander: vec![],
+-                bracket_tier: Default::default(),
++                ..Default::default()
+             },
+             opponent: PlayerDeckPayload {
+                 main_deck: vec![DeckEntry {
+@@ -656,7 +704,7 @@ mod tests {
+                     count: 2,
+                 }],
+                 commander: vec![],
+-                bracket_tier: Default::default(),
++                ..Default::default()
+             },
+             ai_decks: vec![],
+             ai_difficulties: vec![],
+@@ -935,13 +983,13 @@ mod tests {
+                 commander: vec![String::from(
+                     "Brigid, Clachan's Heart // Brigid, Doun's Mind",
+                 )],
+-                bracket_tier: Default::default(),
++                ..Default::default()
+             },
+             opponent: PlayerDeckList {
+                 main_deck: vec![],
+                 sideboard: vec![],
+                 commander: vec![],
+-                bracket_tier: Default::default(),
++                ..Default::default()
+             },
+             ..Default::default()
+         };
+diff --git a/crates/engine/src/game/effects/attractions.rs b/crates/engine/src/game/effects/attractions.rs
+new file mode 100644
+index 0000000000..f81a429553
+--- /dev/null
++++ b/crates/engine/src/game/effects/attractions.rs
+@@ -0,0 +1,21 @@
++use crate::types::ability::{Effect, EffectError, ResolvedAbility};
++use crate::types::events::GameEvent;
++use crate::types::game_state::GameState;
++
++use super::super::attractions;
++
++pub fn resolve(
++    state: &mut GameState,
++    ability: &ResolvedAbility,
++    events: &mut Vec<GameEvent>,
++) -> Result<(), EffectError> {
++    match &ability.effect {
++        Effect::OpenAttractions { count } => {
++            attractions::resolve_open(state, ability, *count, events)
++        }
++        Effect::RollToVisitAttractions => {
++            attractions::resolve_roll_to_visit(state, ability, events)
++        }
++        _ => Err(EffectError::MissingParam("attraction effect".to_string())),
++    }
++}
+diff --git a/crates/engine/src/game/effects/mod.rs b/crates/engine/src/game/effects/mod.rs
+index fe7e9d5267..0aeb58079b 100644
+--- a/crates/engine/src/game/effects/mod.rs
++++ b/crates/engine/src/game/effects/mod.rs
+@@ -26,6 +26,7 @@ pub mod additional_phase;
+ pub mod amass;
+ pub mod animate;
+ pub mod attach;
++pub mod attractions;
+ pub mod awaken;
+ pub mod become_copy;
+ pub mod become_monarch;
+@@ -1849,6 +1850,9 @@ pub fn resolve_effect(
+             venture::resolve_venture_into(state, ability, *dungeon, events)
+         }
+         Effect::TakeTheInitiative => venture::resolve_take_initiative(state, ability, events),
++        Effect::OpenAttractions { .. } | Effect::RollToVisitAttractions => {
++            attractions::resolve(state, ability, events)
++        }
+         Effect::ProcessRadCounters => rad_counters::resolve(state, ability, events),
+         Effect::Conjure { .. } => conjure::resolve(state, ability, events),
+         Effect::ChooseOneOf { .. } => choose_one_of::resolve(state, ability, events),
+diff --git a/crates/engine/src/game/effects/roll_die.rs b/crates/engine/src/game/effects/roll_die.rs
+index 725e6a1a1b..74b5fa69be 100644
+--- a/crates/engine/src/game/effects/roll_die.rs
++++ b/crates/engine/src/game/effects/roll_die.rs
+@@ -7,6 +7,24 @@ use crate::types::game_state::GameState;
+ 
+ use super::resolve_ability_chain;
+ 
++/// CR 706.2: Roll a die using the game's seeded RNG and emit the authoritative
++/// die-roll event consumed by die-roll triggers and "the result" effects.
++pub(crate) fn roll_die(
++    state: &mut GameState,
++    player_id: crate::types::player::PlayerId,
++    sides: u8,
++    events: &mut Vec<GameEvent>,
++) -> u8 {
++    let result = state.rng.random_range(1..=sides);
++    events.push(GameEvent::DieRolled {
++        player_id,
++        sides,
++        result,
++    });
++    state.die_result_this_resolution = Some(result);
++    result
++}
++
+ /// CR 706: Roll a die and execute the matching result branch.
+ ///
+ /// CR 706.2: The natural roll is taken from a uniform 1..=sides distribution
+@@ -30,7 +48,7 @@ pub fn resolve(
+ 
+     // CR 706.2: Roll the die using the game's seeded RNG. This is the
+     // "natural result" before any modifiers.
+-    let natural = state.rng.random_range(1..=sides);
++    let natural = roll_die(state, ability.controller, sides, events);
+ 
+     // CR 706.2: Apply the (optional) modifier to produce the actual result.
+     // The result is clamped to a u8-representable non-negative integer so a
+@@ -54,11 +72,11 @@ pub fn resolve(
+         natural
+     };
+ 
+-    events.push(GameEvent::DieRolled {
+-        player_id: ability.controller,
+-        sides,
+-        result: actual,
+-    });
++    if actual != natural {
++        if let Some(GameEvent::DieRolled { result, .. }) = events.last_mut() {
++            *result = actual;
++        }
++    }
+ 
+     // CR 706.2: The stored value is the actual die-roll result.
+     // CR 706.4: Record the actual result so an inline "equal to the
+diff --git a/crates/engine/src/game/game_object.rs b/crates/engine/src/game/game_object.rs
+index 53bdccbeaa..08a5e77066 100644
+--- a/crates/engine/src/game/game_object.rs
++++ b/crates/engine/src/game/game_object.rs
+@@ -321,6 +321,13 @@ pub struct GameObject {
+     #[serde(default, skip_serializing_if = "Option::is_none")]
+     pub token_rules_text: Option<String>,
+     pub card_types: CardType,
++    /// CR 717.1: Which d6 results visit this Attraction (from card variant data).
++    #[serde(default, skip_serializing_if = "Vec::is_empty")]
++    pub attraction_lights: Vec<u8>,
++    /// CR 717.2: Object is in the supplementary Attraction deck (command zone),
++    /// tracked via `Player::attraction_deck` rather than `command_zone`.
++    #[serde(default)]
++    pub in_attraction_deck: bool,
+     pub mana_cost: ManaCost,
+     pub keywords: Vec<Keyword>,
+     /// Live abilities after layer evaluation. Wrapped in `Arc<Vec<_>>` so
+@@ -842,6 +849,8 @@ impl GameObject {
+             defense: None,
+             token_rules_text: None,
+             card_types: CardType::default(),
++            attraction_lights: Vec::new(),
++            in_attraction_deck: false,
+             mana_cost: ManaCost::default(),
+             keywords: Vec::new(),
+             abilities: Arc::new(Vec::new()),
+diff --git a/crates/engine/src/game/log.rs b/crates/engine/src/game/log.rs
+index d47208563f..ed48e6e0ac 100644
+--- a/crates/engine/src/game/log.rs
++++ b/crates/engine/src/game/log.rs
+@@ -195,6 +195,9 @@ fn categorize(event: &GameEvent) -> LogCategory {
+         | GameEvent::RoomDoorUnlocked { .. }
+         | GameEvent::DungeonCompleted { .. }
+         | GameEvent::InitiativeTaken { .. }
++        | GameEvent::AttractionOpened { .. }
++        | GameEvent::AttractionsRolledToVisit { .. }
++        | GameEvent::AttractionVisited { .. }
+         | GameEvent::Clash { .. }
+         | GameEvent::VoteCast { .. }
+         | GameEvent::VoteResolved { .. }
+@@ -968,6 +971,29 @@ fn format_segments(event: &GameEvent, state: &GameState) -> Vec<LogSegment> {
+         GameEvent::RoomDoorUnlocked { .. } => vec![text("Room door unlocked")],
+         GameEvent::DungeonCompleted { .. } => vec![text("Dungeon completed")],
+         GameEvent::InitiativeTaken { .. } => vec![text("Initiative taken")],
++        GameEvent::AttractionOpened { object_id, .. } => {
++            vec![text("Opened Attraction "), card_seg(state, *object_id)]
++        }
++        GameEvent::AttractionsRolledToVisit { roll, .. } => {
++            vec![
++                text("Rolled "),
++                text(&roll.to_string()),
++                text(" to visit Attractions"),
++            ]
++        }
++        GameEvent::AttractionVisited {
++            attraction_id,
++            roll,
++            ..
++        } => {
++            vec![
++                text("Visited Attraction "),
++                card_seg(state, *attraction_id),
++                text(" (rolled "),
++                text(&roll.to_string()),
++                text(")"),
++            ]
++        }
+         GameEvent::Clash { .. } => vec![text("Clash")],
+         GameEvent::VoteCast { voter, choice, .. } => {
+             vec![player_seg(state, *voter), text(" voted "), text(choice)]
+diff --git a/crates/engine/src/game/match_flow.rs b/crates/engine/src/game/match_flow.rs
+index 1770dbbcbf..46c2be775b 100644
+--- a/crates/engine/src/game/match_flow.rs
++++ b/crates/engine/src/game/match_flow.rs
+@@ -100,6 +100,7 @@ fn deck_payload_from_current_pools(state: &GameState) -> Result<DeckPayload, Str
+             main_deck: (*p.current_main).clone(),
+             sideboard: (*p.current_sideboard).clone(),
+             commander: (*p.current_commander).clone(),
++            attraction_deck: Vec::new(),
+             bracket_tier: p.bracket_tier,
+         })
+         .collect();
+@@ -109,12 +110,14 @@ fn deck_payload_from_current_pools(state: &GameState) -> Result<DeckPayload, Str
+             main_deck: (*p0.current_main).clone(),
+             sideboard: (*p0.current_sideboard).clone(),
+             commander: (*p0.current_commander).clone(),
++            attraction_deck: Vec::new(),
+             bracket_tier: p0.bracket_tier,
+         },
+         opponent: PlayerDeckPayload {
+             main_deck: (*p1.current_main).clone(),
+             sideboard: (*p1.current_sideboard).clone(),
+             commander: (*p1.current_commander).clone(),
++            attraction_deck: Vec::new(),
+             bracket_tier: p1.bracket_tier,
+         },
+         ai_decks,
+@@ -332,6 +335,7 @@ mod tests {
+             deck_copy_limit: None,
+             metadata: Default::default(),
+             rarities: Default::default(),
++            attraction_lights: vec![],
+         }
+     }
+ 
+diff --git a/crates/engine/src/game/mod.rs b/crates/engine/src/game/mod.rs
+index 25c7ffadd5..70eaedd90f 100644
+--- a/crates/engine/src/game/mod.rs
++++ b/crates/engine/src/game/mod.rs
+@@ -1,5 +1,6 @@
+ pub mod ability_utils;
+ pub mod arithmetic;
++pub mod attractions;
+ pub mod bending;
+ pub mod bracket_estimate;
+ pub mod casting;
+diff --git a/crates/engine/src/game/printed_cards.rs b/crates/engine/src/game/printed_cards.rs
+index d195bf1983..f78e1abedc 100644
+--- a/crates/engine/src/game/printed_cards.rs
++++ b/crates/engine/src/game/printed_cards.rs
+@@ -168,6 +168,18 @@ pub fn apply_card_face_to_object(obj: &mut GameObject, card_face: &CardFace) {
+     if card_face.card_type.subtypes.iter().any(|s| s == "Room") {
+         obj.room_unlocks.get_or_insert_with(Default::default);
+     }
++    if card_face
++        .card_type
++        .subtypes
++        .iter()
++        .any(|s| s.eq_ignore_ascii_case("Attraction"))
++    {
++        obj.attraction_lights = if card_face.attraction_lights.is_empty() {
++            super::attractions::default_attraction_lights()
++        } else {
++            card_face.attraction_lights.clone()
++        };
++    }
+ }
+ 
+ pub fn apply_card_face_to_back_face(back_face: &mut BackFaceData, card_face: &CardFace) {
+@@ -749,6 +761,8 @@ fn walk_effect(effect: &Effect, out: &mut Vec<String>) {
+         | Effect::VentureIntoDungeon
+         | Effect::VentureInto { .. }
+         | Effect::TakeTheInitiative
++        | Effect::OpenAttractions { .. }
++        | Effect::RollToVisitAttractions
+         | Effect::ProcessRadCounters
+         | Effect::GrantCastingPermission { .. }
+         | Effect::ChooseFromZone { .. }
+@@ -1219,6 +1233,7 @@ mod tests {
+             deck_copy_limit: None,
+             metadata: Default::default(),
+             rarities: Default::default(),
++            attraction_lights: vec![],
+         }
+     }
+ 
+diff --git a/crates/engine/src/game/public_state.rs b/crates/engine/src/game/public_state.rs
+index a7f91fd827..0bfeb19661 100644
+--- a/crates/engine/src/game/public_state.rs
++++ b/crates/engine/src/game/public_state.rs
+@@ -275,6 +275,9 @@ pub fn mark_public_state_from_events(state: &mut GameState, events: &[GameEvent]
+             GameEvent::MonarchChanged { player_id }
+             | GameEvent::CityBlessingGained { player_id }
+             | GameEvent::InitiativeTaken { player_id }
++            | GameEvent::AttractionOpened { player_id, .. }
++            | GameEvent::AttractionsRolledToVisit { player_id, .. }
++            | GameEvent::AttractionVisited { player_id, .. }
+             | GameEvent::RingTemptsYou { player_id } => {
+                 mark_public_state_player_dirty(state, *player_id);
+             }
+diff --git a/crates/engine/src/game/trigger_index.rs b/crates/engine/src/game/trigger_index.rs
+index 79a5fa0726..874c08ae3c 100644
+--- a/crates/engine/src/game/trigger_index.rs
++++ b/crates/engine/src/game/trigger_index.rs
+@@ -276,6 +276,9 @@ pub(crate) fn keys_from_trigger_def(def: &TriggerDefinition) -> (Keys, bool) {
+             push(TriggerEventKey::MonarchOrInitiative);
+         }
+ 
++        // CR 701.52a + CR 702.159a: Visit abilities on Attractions.
++        TriggerMode::VisitAttraction => push(TriggerEventKey::VisitAttraction),
++
+         // --- Game state ---
+         TriggerMode::LosesGame => push(TriggerEventKey::PlayerLost),
+ 
+@@ -352,7 +355,6 @@ pub(crate) fn keys_from_trigger_def(def: &TriggerDefinition) -> (Keys, bool) {
+         | TriggerMode::Stationed
+         | TriggerMode::Trains
+         | TriggerMode::UnlockDoor
+-        | TriggerMode::VisitAttraction
+         | TriggerMode::BecomesCrewed
+         | TriggerMode::BecomesPlotted
+         | TriggerMode::BecomesSaddled
+@@ -571,6 +573,8 @@ fn keys_from_event(event: &GameEvent, state: &GameState) -> Keys {
+         }
+         GameEvent::RoomDoorUnlocked { .. } | GameEvent::BecomesPlotted { .. } => {}
+         GameEvent::InitiativeTaken { .. } => push(TriggerEventKey::MonarchOrInitiative),
++        GameEvent::AttractionOpened { .. } | GameEvent::AttractionsRolledToVisit { .. } => {}
++        GameEvent::AttractionVisited { .. } => push(TriggerEventKey::VisitAttraction),
+         GameEvent::Firebend { .. }
+         | GameEvent::Airbend { .. }
+         | GameEvent::Earthbend { .. }
+@@ -727,6 +731,8 @@ fn keys_from_effect_kind(kind: EffectKind, push: &mut impl FnMut(TriggerEventKey
+         | EffectKind::VentureIntoDungeon
+         | EffectKind::VentureInto
+         | EffectKind::TakeTheInitiative
++        | EffectKind::OpenAttractions
++        | EffectKind::RollToVisitAttractions
+         | EffectKind::ProcessRadCounters
+         | EffectKind::GrantCastingPermission
+         | EffectKind::ChooseFromZone
+diff --git a/crates/engine/src/game/trigger_matchers.rs b/crates/engine/src/game/trigger_matchers.rs
+index 6042b6b389..3d6a8f83e1 100644
+--- a/crates/engine/src/game/trigger_matchers.rs
++++ b/crates/engine/src/game/trigger_matchers.rs
+@@ -170,7 +170,7 @@ pub fn trigger_matcher(mode: TriggerMode) -> Option<TriggerMatcher> {
+         | TriggerMode::SetInMotion
+         | TriggerMode::Specializes
+         | TriggerMode::Trains
+-        | TriggerMode::VisitAttraction => match_unimplemented,
++        | TriggerMode::VisitAttraction => match_visit_attraction,
+         // CR 603.8: State triggers are not event-based — they are checked separately
+         // in the priority pipeline, not through the event-matching trigger system.
+         TriggerMode::StateCondition => return None,
+@@ -345,6 +345,9 @@ pub fn build_trigger_registry() -> HashMap<TriggerMode, TriggerMatcher> {
+     // CR 701.54: Ring tempts you trigger
+     r.insert(TriggerMode::RingTemptsYou, match_ring_tempts_you);
+ 
++    // CR 701.52a + CR 702.159a: Attraction visit triggers
++    r.insert(TriggerMode::VisitAttraction, match_visit_attraction);
++
+     // CR 309 / CR 701.49: Dungeon triggers
+     r.insert(TriggerMode::DungeonCompleted, match_dungeon_completed);
+     r.insert(TriggerMode::RoomEntered, match_room_entered);
+@@ -425,7 +428,7 @@ pub fn build_trigger_registry() -> HashMap<TriggerMode, TriggerMatcher> {
+         TriggerMode::Specializes,
+         // TriggerMode::Stationed — moved to real matcher below
+         TriggerMode::Trains,
+-        TriggerMode::VisitAttraction,
++        // TriggerMode::VisitAttraction — moved to real matcher above
+         // TriggerMode::BecomesCrewed — moved to real matcher below
+         // TriggerMode::BecomesPlotted — moved to real matcher above
+         // TriggerMode::BecomesSaddled — moved to real matcher below
+@@ -803,6 +806,9 @@ fn count_matching_trigger_event_subjects(
+         | GameEvent::BecomesPlotted { .. }
+         | GameEvent::DungeonCompleted { .. }
+         | GameEvent::InitiativeTaken { .. }
++        | GameEvent::AttractionOpened { .. }
++        | GameEvent::AttractionsRolledToVisit { .. }
++        | GameEvent::AttractionVisited { .. }
+         | GameEvent::Firebend { .. }
+         | GameEvent::Airbend { .. }
+         | GameEvent::Earthbend { .. }
+@@ -2923,6 +2929,25 @@ pub(super) fn match_vote_resolved(
+     matches!(event, GameEvent::VoteResolved { .. })
+ }
+ 
++/// CR 701.52a + CR 702.159a: Visit ability on an Attraction permanent.
++pub(super) fn match_visit_attraction(
++    event: &GameEvent,
++    trigger: &TriggerDefinition,
++    source_id: ObjectId,
++    state: &GameState,
++) -> bool {
++    if let GameEvent::AttractionVisited {
++        player_id,
++        attraction_id,
++        ..
++    } = event
++    {
++        *attraction_id == source_id && valid_player_matches(trigger, state, *player_id, source_id)
++    } else {
++        false
++    }
++}
++
+ /// CR 309.7: Match dungeon completion events.
+ pub(super) fn match_dungeon_completed(
+     event: &GameEvent,
+diff --git a/crates/engine/src/game/triggers.rs b/crates/engine/src/game/triggers.rs
+index 209146e822..4b7ae4df72 100644
+--- a/crates/engine/src/game/triggers.rs
++++ b/crates/engine/src/game/triggers.rs
+@@ -3726,6 +3726,12 @@ pub(crate) fn check_trigger_condition(
+             .and_then(|id| state.objects.get(&id))
+             .and_then(|obj| obj.class_level)
+             .is_some_and(|current| current >= *level),
++        TriggerCondition::AttractionVisitRoll { min, max } => trigger_event
++            .and_then(|e| match e {
++                GameEvent::AttractionVisited { roll, .. } => Some(*roll),
++                _ => None,
++            })
++            .is_some_and(|roll| roll >= *min && roll <= *max),
+         // CR 601.2: "if you cast it" — true when the entering/affected object was
+         // cast as a spell (regardless of origin zone). For ETB-based triggers like
+         // Light-Paws, Emperor's Voice ("Whenever an Aura you control enters, if you
+diff --git a/crates/engine/src/game/turns.rs b/crates/engine/src/game/turns.rs
+index 5db349526c..bd59cd245c 100644
+--- a/crates/engine/src/game/turns.rs
++++ b/crates/engine/src/game/turns.rs
+@@ -1449,6 +1449,7 @@ pub fn auto_advance(state: &mut GameState, events: &mut Vec<GameEvent>) -> Waiti
+                 // to each Saga the active player controls (turn-based action).
+                 if state.phase == Phase::PreCombatMain {
+                     add_lore_counters_to_sagas(state, events);
++                    super::attractions::perform_roll_to_visit_turn_based_action(state, events);
+                     // CR 702.xxx: Paradigm (Strixhaven) — turn-based action at
+                     // the start of the active player's first precombat main
+                     // phase: offer to cast a copy of each exiled paradigm
+diff --git a/crates/engine/src/game/zones.rs b/crates/engine/src/game/zones.rs
+index 7796449294..f643587207 100644
+--- a/crates/engine/src/game/zones.rs
++++ b/crates/engine/src/game/zones.rs
+@@ -275,7 +275,7 @@ pub fn create_object(
+ pub fn move_to_zone(
+     state: &mut GameState,
+     object_id: ObjectId,
+-    to: Zone,
++    mut to: Zone,
+     events: &mut Vec<GameEvent>,
+ ) {
+     // CR 903.9a: A fresh zone change resets the "declined zone return" flag
+@@ -316,6 +316,13 @@ pub fn move_to_zone(
+     let obj = state.objects.get(&object_id).expect("object exists");
+     let from = obj.zone;
+     let owner = obj.owner;
++    let redirect_attraction_to_command = super::attractions::is_attraction_card(obj)
++        && !matches!(to, Zone::Battlefield | Zone::Exile | Zone::Command);
++    if redirect_attraction_to_command {
++        // CR 717.6: Astrotorium-backed cards that would move to any zone other
++        // than battlefield, exile, or command move to command instead.
++        to = Zone::Command;
++    }
+     let unattached_from = if from == Zone::Battlefield {
+         obj.attached_to
+             .map(super::effects::attach::target_ref_from_attach_target)
+@@ -335,6 +342,15 @@ pub fn move_to_zone(
+     apply_zone_exit_cleanup(state, object_id, from, to);
+ 
+     remove_from_zone(state, object_id, from, owner);
++    if redirect_attraction_to_command {
++        // CR 717.6a: Cards redirected this way are kept in the command-zone
++        // junkyard pile, separate from the Attraction deck.
++        state
++            .objects
++            .get_mut(&object_id)
++            .expect("object exists")
++            .in_attraction_deck = false;
++    }
+     add_to_zone(state, object_id, to, owner);
+ 
+     // CR 603.6c: Drop the leaving permanent from the TriggerIndex. The
+@@ -681,7 +697,23 @@ pub fn remove_from_zone(state: &mut GameState, object_id: ObjectId, zone: Zone,
+             state.stack_paid_facts.remove(&object_id);
+         }
+         Zone::Exile => state.exile.retain(|id| *id != object_id),
+-        Zone::Command => state.command_zone.retain(|id| *id != object_id),
++        Zone::Command => {
++            if state
++                .objects
++                .get(&object_id)
++                .is_some_and(|obj| obj.in_attraction_deck)
++            {
++                state
++                    .players
++                    .iter_mut()
++                    .find(|p| p.id == owner)
++                    .expect("owner exists")
++                    .attraction_deck
++                    .retain(|id| *id != object_id);
++            } else {
++                state.command_zone.retain(|id| *id != object_id);
++            }
++        }
+     }
+ }
+ 
+@@ -705,7 +737,23 @@ pub fn add_to_zone(state: &mut GameState, object_id: ObjectId, zone: Zone, owner
+         Zone::Battlefield => state.battlefield.push_back(object_id),
+         Zone::Stack => {} // Stack entries are managed separately via StackEntry
+         Zone::Exile => state.exile.push_back(object_id),
+-        Zone::Command => state.command_zone.push_back(object_id),
++        Zone::Command => {
++            if state
++                .objects
++                .get(&object_id)
++                .is_some_and(|obj| obj.in_attraction_deck)
++            {
++                state
++                    .players
++                    .iter_mut()
++                    .find(|p| p.id == owner)
++                    .expect("owner exists")
++                    .attraction_deck
++                    .push_back(object_id);
++            } else {
++                state.command_zone.push_back(object_id);
++            }
++        }
+     }
+ }
+ 
+diff --git a/crates/engine/src/parser/mod.rs b/crates/engine/src/parser/mod.rs
+index 5081a0cfc8..95126ade94 100644
+--- a/crates/engine/src/parser/mod.rs
++++ b/crates/engine/src/parser/mod.rs
+@@ -1,5 +1,6 @@
+ pub(crate) mod clause_shell;
+ pub mod oracle;
++pub(crate) mod oracle_attraction;
+ pub mod oracle_casting;
+ pub(crate) mod oracle_class;
+ pub(crate) mod oracle_classifier;
+diff --git a/crates/engine/src/parser/oracle.rs b/crates/engine/src/parser/oracle.rs
+index 963781f226..4147cccede 100644
+--- a/crates/engine/src/parser/oracle.rs
++++ b/crates/engine/src/parser/oracle.rs
+@@ -29,6 +29,7 @@ use super::oracle_nom::condition::parse_inner_condition;
+ use super::oracle_nom::primitives::parse_number as nom_parse_number;
+ use super::oracle_nom::primitives::scan_contains;
+ 
++use super::oracle_attraction::parse_attraction_visit_triggers;
+ use super::oracle_casting::{
+     parse_additional_cost_line, parse_casting_restriction_line, parse_spell_casting_option_line,
+ };
+@@ -1609,8 +1610,8 @@ pub(crate) fn parse_oracle_ir(
+     let oracle_text_owned = normalize_card_name_refs(oracle_text, card_name);
+     let lines: Vec<&str> = oracle_text_owned.split('\n').collect();
+ 
+-    // CR 714: Pre-parse Saga chapter lines into triggers + ETB replacement.
+-    let saga_consumed = if subtypes.iter().any(|s| s == "Saga") {
++    // CR 714 / CR 717: Pre-parse Saga chapters and Attraction visit lines.
++    let mut preparsed_consumed = if subtypes.iter().any(|s| s == "Saga") {
+         let (chapter_triggers, etb_replacement, consumed) = parse_saga_chapters(&lines, card_name);
+         result.triggers.extend(chapter_triggers);
+         result.replacements.push(etb_replacement);
+@@ -1618,6 +1619,14 @@ pub(crate) fn parse_oracle_ir(
+     } else {
+         std::collections::HashSet::new()
+     };
++    if subtypes
++        .iter()
++        .any(|s| s.eq_ignore_ascii_case("Attraction"))
++    {
++        let (visit_triggers, consumed) = parse_attraction_visit_triggers(&lines, card_name);
++        result.triggers.extend(visit_triggers);
++        preparsed_consumed.extend(consumed);
++    }
+ 
+     // CR 716: Pre-parse Class level sections into level-gated abilities.
+     if subtypes.iter().any(|s| s == "Class") {
+@@ -1759,8 +1768,8 @@ pub(crate) fn parse_oracle_ir(
+             i += 1;
+             continue;
+         }
+-        // CR 714: Skip lines already consumed by the saga pre-parser.
+-        if saga_consumed.contains(&i) {
++        // CR 714 / CR 717: Skip lines consumed by saga/attraction pre-parsers.
++        if preparsed_consumed.contains(&i) {
+             i += 1;
+             continue;
+         }
+@@ -2844,7 +2853,7 @@ pub(crate) fn parse_oracle_ir(
+             let mut next_i = i + 1;
+             while next_i < lines.len() {
+                 if level_consumed.contains(&next_i)
+-                    || saga_consumed.contains(&next_i)
++                    || preparsed_consumed.contains(&next_i)
+                     || spacecraft_consumed.contains(&next_i)
+                     || parse_oracle_block(&lines, next_i).is_some()
+                 {
+diff --git a/crates/engine/src/parser/oracle_attraction.rs b/crates/engine/src/parser/oracle_attraction.rs
+new file mode 100644
+index 0000000000..edc2ee94db
+--- /dev/null
++++ b/crates/engine/src/parser/oracle_attraction.rs
+@@ -0,0 +1,210 @@
++//! CR 717.5 + CR 702.159a: Attraction visit abilities and numbered visit lines.
++
++use nom::branch::alt;
++use nom::bytes::complete::{tag, take_while1};
++use nom::character::complete::multispace0;
++use nom::combinator::{map, opt, value};
++use nom::sequence::preceded;
++use nom::Parser;
++
++use crate::parser::oracle_nom::bridge::{nom_parse_lower, split_once_on_lower};
++use crate::types::ability::{AbilityKind, TriggerCondition, TriggerDefinition};
++use crate::types::triggers::TriggerMode;
++
++use super::oracle_effect::parse_effect_chain;
++use super::oracle_util::strip_reminder_text;
++
++const NUMBERED_VISIT_PIPE: &str = " | ";
++
++/// Parse `"Visit — …"` or `"N—M | …"` / `"N | …"` attraction visit lines.
++pub(crate) fn parse_visit_trigger(line: &str, card_name: &str) -> Option<TriggerDefinition> {
++    let stripped = strip_reminder_text(line);
++    let lower = stripped.to_ascii_lowercase();
++
++    if let Some((min, max, effect_text)) = parse_numbered_visit_line(&lower, &stripped) {
++        let mut trigger = TriggerDefinition::new(TriggerMode::VisitAttraction)
++            .valid_card(crate::types::ability::TargetFilter::SelfRef)
++            .execute(parse_effect_chain(&effect_text, AbilityKind::Spell));
++        if min != 1 || max != 6 {
++            trigger.condition = Some(TriggerCondition::AttractionVisitRoll { min, max });
++        }
++        return Some(trigger);
++    }
++
++    let effect = strip_visit_effect_text(&stripped)?;
++    let _ = card_name;
++    Some(
++        TriggerDefinition::new(TriggerMode::VisitAttraction)
++            .valid_card(crate::types::ability::TargetFilter::SelfRef)
++            .execute(parse_effect_chain(effect, AbilityKind::Spell)),
++    )
++}
++
++/// Returns line indices consumed by visit triggers (for oracle.rs dispatcher).
++pub(crate) fn parse_attraction_visit_triggers(
++    lines: &[&str],
++    card_name: &str,
++) -> (Vec<TriggerDefinition>, std::collections::HashSet<usize>) {
++    let mut triggers = Vec::new();
++    let mut consumed = std::collections::HashSet::new();
++    for (idx, line) in lines.iter().enumerate() {
++        let trimmed = line.trim();
++        if trimmed.is_empty() {
++            continue;
++        }
++        let lower = trimmed.to_ascii_lowercase();
++        if is_attraction_visit_line(&lower) {
++            if let Some(trigger) = parse_visit_trigger(trimmed, card_name) {
++                triggers.push(trigger);
++                consumed.insert(idx);
++            }
++        }
++    }
++    (triggers, consumed)
++}
++
++fn is_attraction_visit_line(lower: &str) -> bool {
++    parse_visit_line_header(lower).is_ok() || parse_numbered_visit_line(lower, lower).is_some()
++}
++
++fn parse_visit_line_header(input: &str) -> nom::IResult<&str, ()> {
++    preceded(
++        tag("visit"),
++        alt((
++            value((), multispace0),
++            value((), tag("—")),
++            value((), tag("-")),
++        )),
++    )
++    .parse(input)
++}
++
++fn strip_visit_effect_text(line: &str) -> Option<&str> {
++    let lower = line.to_ascii_lowercase();
++    let (effect_start, effect_end) = nom_parse_lower(&lower, |input| {
++        let (rest, _) = tag("visit").parse(input)?;
++        let (rest, _) = multispace0.parse(rest)?;
++        let (rest, _) = opt((alt((tag("—"), tag("-"), tag(":"))), multispace0)).parse(rest)?;
++        let effect_body = rest.trim();
++        if effect_body.is_empty() {
++            return Err(nom::Err::Error(nom::error::Error::new(
++                input,
++                nom::error::ErrorKind::Fail,
++            )));
++        }
++        let body_start = input.len() - rest.len() + (rest.len() - rest.trim_start().len());
++        Ok(("", (body_start, body_start + effect_body.len())))
++    })?;
++    Some(line[effect_start..effect_end].trim())
++}
++
++fn parse_attraction_die_face(input: &str) -> nom::IResult<&str, u8> {
++    let (rest, digits) = take_while1(|c: char| c.is_ascii_digit()).parse(input)?;
++    let n = digits
++        .parse::<u8>()
++        .map_err(|_| nom::Err::Error(nom::error::Error::new(input, nom::error::ErrorKind::Fail)))?;
++    if (1..=6).contains(&n) {
++        Ok((rest, n))
++    } else {
++        Err(nom::Err::Error(nom::error::Error::new(
++            input,
++            nom::error::ErrorKind::Fail,
++        )))
++    }
++}
++
++fn parse_roll_range_prefix(input: &str) -> nom::IResult<&str, (u8, u8)> {
++    let (input, _) = multispace0.parse(input)?;
++    alt((
++        map(
++            (
++                parse_attraction_die_face,
++                alt((tag("\u{2014}"), tag("-"))),
++                parse_attraction_die_face,
++            ),
++            |(min, _, max)| (min, max),
++        ),
++        map(parse_attraction_die_face, |n| (n, n)),
++    ))
++    .parse(input)
++}
++
++fn parse_numbered_visit_line(lower: &str, original: &str) -> Option<(u8, u8, String)> {
++    let (prefix_lower, effect_original) =
++        split_once_on_lower(original, lower, NUMBERED_VISIT_PIPE)?;
++    let (min, max) = nom_parse_lower(prefix_lower, parse_roll_range_prefix)?;
++    let effect = effect_original.trim();
++    if effect.is_empty() || min > max {
++        return None;
++    }
++    Some((min, max, effect.to_string()))
++}
++
++#[cfg(test)]
++mod tests {
++    use super::*;
++    use crate::parser::oracle::parse_oracle_text;
++    use crate::types::ability::Effect;
++    use crate::types::triggers::TriggerMode;
++
++    #[test]
++    fn parse_oracle_text_open_an_attraction() {
++        let parsed = parse_oracle_text("Open an Attraction.", "Opener", &[], &[], &[]);
++        assert!(
++            parsed.abilities.iter().any(|a| {
++                matches!(
++                    *a.effect,
++                    crate::types::ability::Effect::OpenAttractions { count: 1 }
++                )
++            }),
++            "abilities: {:?}",
++            parsed
++                .abilities
++                .iter()
++                .map(|a| &a.effect)
++                .collect::<Vec<_>>()
++        );
++    }
++
++    #[test]
++    fn parse_oracle_text_includes_visit_trigger_for_attraction_subtype() {
++        let parsed = parse_oracle_text(
++            "Visit — Draw a card.",
++            "Test Attraction",
++            &[],
++            &[],
++            &["Attraction".to_string()],
++        );
++        assert!(
++            parsed
++                .triggers
++                .iter()
++                .any(|t| t.mode == TriggerMode::VisitAttraction),
++            "triggers: {:?}",
++            parsed.triggers
++        );
++    }
++
++    #[test]
++    fn visit_dash_parses_draw() {
++        let trigger = parse_visit_trigger("Visit — Draw a card.", "Test Attraction").unwrap();
++        assert_eq!(trigger.mode, TriggerMode::VisitAttraction);
++        let execute = trigger.execute.as_ref().expect("visit execute effect");
++        assert!(
++            matches!(*execute.effect, Effect::Draw { .. }),
++            "expected Draw, got {:?}",
++            execute.effect
++        );
++    }
++
++    #[test]
++    fn numbered_line_parses_range_condition() {
++        let trigger =
++            parse_visit_trigger("2—5 | Create a Treasure token.", "Test Attraction").unwrap();
++        assert_eq!(trigger.mode, TriggerMode::VisitAttraction);
++        assert!(matches!(
++            trigger.condition,
++            Some(TriggerCondition::AttractionVisitRoll { min: 2, max: 5 })
++        ));
++    }
++}
+diff --git a/crates/engine/src/parser/oracle_classifier.rs b/crates/engine/src/parser/oracle_classifier.rs
+index bdef01939c..97d69dcfe1 100644
+--- a/crates/engine/src/parser/oracle_classifier.rs
++++ b/crates/engine/src/parser/oracle_classifier.rs
+@@ -523,6 +523,9 @@ const EFFECT_IMPERATIVE_PREFIXES: &[&str] = &[
+     "attach ",
+     "counter ",
+     "create ",
++    "open ",
++    "opens ",
++    "roll to visit ",
+     "deal ",
+     "destroy ",
+     "detain ",
+diff --git a/crates/engine/src/parser/oracle_effect/imperative.rs b/crates/engine/src/parser/oracle_effect/imperative.rs
+index 93d06335af..b924b4f19c 100644
+--- a/crates/engine/src/parser/oracle_effect/imperative.rs
++++ b/crates/engine/src/parser/oracle_effect/imperative.rs
+@@ -1,6 +1,7 @@
+ use crate::parser::oracle_nom::error::{OracleError, OracleResult};
+ use nom::branch::alt;
+ use nom::bytes::complete::{tag, take_until};
++use nom::character::complete::space1;
+ use nom::combinator::{all_consuming, eof, map, not, opt, rest, value};
+ use nom::error::ParseError;
+ use nom::sequence::{preceded, terminated};
+@@ -17,7 +18,7 @@ use super::{
+ };
+ use crate::parser::oracle_ir::ast::*;
+ use crate::parser::oracle_ir::diagnostic::OracleDiagnostic;
+-use crate::parser::oracle_nom::bridge::nom_on_lower;
++use crate::parser::oracle_nom::bridge::{nom_on_lower, nom_parse_lower};
+ use crate::parser::oracle_nom::primitives as nom_primitives;
+ use crate::parser::oracle_static::{
+     parse_continuous_modifications, parse_quoted_ability_modifications,
+@@ -5443,10 +5444,29 @@ pub(super) fn parse_imperative_family_ast(
+             .ok()
+             .map(|(_, ast)| ast)
+         }
+-        // CR 706 + CR 706.2: "roll a d20" with an optional "and add/subtract X"
+-        // modifier suffix attached as a typed `DieRollModifier`.
+-        "roll" | "rolls" => try_parse_roll_die_with_modifier(lower)
+-            .map(|(sides, modifier)| ImperativeFamilyAst::RollDie { sides, modifier }),
++        // CR 701.52: "roll to visit your Attractions" (not a generic d20/d6 roll).
++        "roll" | "rolls" => {
++            if nom_parse_lower(lower, |input| {
++                value(
++                    ImperativeFamilyAst::RollToVisitAttractions,
++                    (
++                        alt((tag("roll"), tag("rolls"))),
++                        tag(" to visit your attractions"),
++                        eof,
++                    ),
++                )
++                .parse(input)
++            })
++            .is_some()
++            {
++                Some(ImperativeFamilyAst::RollToVisitAttractions)
++            } else {
++                try_parse_roll_die_with_modifier(lower)
++                    .map(|(sides, modifier)| ImperativeFamilyAst::RollDie { sides, modifier })
++            }
++        }
++        // CR 701.51b: "open an Attraction" / "open two Attractions"
++        "open" | "opens" => parse_open_attraction_imperative(lower),
+         // CR 725.1: "become the monarch"
+         "become" | "becomes" => {
+             if lower == "become the monarch" || lower == "becomes the monarch" {
+@@ -6101,6 +6121,42 @@ fn try_parse_roll_die_sides_with_rest(lower: &str) -> Option<(u8, &str)> {
+     Some((sides, after_word))
+ }
+ 
++/// CR 701.51b: "open N attraction(s)" after the open/opens prefix.
++fn parse_open_attractions_count_imperative(input: &str) -> OracleResult<'_, ImperativeFamilyAst> {
++    let (rest, count) = nom_primitives::parse_number(input)?;
++    let (rest, _) = space1(rest)?;
++    let (rest, _) = alt((tag("attractions"), tag("attraction"))).parse(rest)?;
++    Ok((rest, ImperativeFamilyAst::OpenAttractions { count }))
++}
++
++/// CR 701.51b: "open an Attraction" / "open two Attractions".
++fn parse_open_attraction_imperative(lower: &str) -> Option<ImperativeFamilyAst> {
++    nom_parse_lower(lower, |input| {
++        map(
++            (
++                alt((tag("open "), tag("opens "))),
++                alt((
++                    value(
++                        ImperativeFamilyAst::OpenAttractions { count: 1 },
++                        tag("an attraction"),
++                    ),
++                    value(
++                        ImperativeFamilyAst::OpenAttractions { count: 1 },
++                        tag("a attraction"),
++                    ),
++                    parse_open_attractions_count_imperative,
++                )),
++                opt(nom::bytes::complete::take_while(|c: char| {
++                    c == '.' || c == ','
++                })),
++                eof,
++            ),
++            |(_, ast, _, _)| ast,
++        )
++        .parse(input)
++    })
++}
++
+ /// CR 706 + CR 706.2: Try to parse a full `"roll a d{N}"` clause, including
+ /// an optional trailing `" and (add|subtract) {quantity}"` modifier that the
+ /// resolver applies to the natural roll before result-table lookup.
+@@ -6447,6 +6503,8 @@ fn lower_imperative_family_effect(ast: ImperativeFamilyAst) -> Effect {
+             dungeon: crate::game::dungeon::DungeonId::Undercity,
+         },
+         ImperativeFamilyAst::TakeTheInitiative => Effect::TakeTheInitiative,
++        ImperativeFamilyAst::OpenAttractions { count } => Effect::OpenAttractions { count },
++        ImperativeFamilyAst::RollToVisitAttractions => Effect::RollToVisitAttractions,
+         ImperativeFamilyAst::Proliferate => Effect::Proliferate,
+         // CR 701.56a: Time travel.
+         ImperativeFamilyAst::TimeTravel => Effect::TimeTravel,
+diff --git a/crates/engine/src/parser/oracle_effect/sequence.rs b/crates/engine/src/parser/oracle_effect/sequence.rs
+index 633ed453c7..ab92d58ef8 100644
+--- a/crates/engine/src/parser/oracle_effect/sequence.rs
++++ b/crates/engine/src/parser/oracle_effect/sequence.rs
+@@ -2917,6 +2917,8 @@ pub(super) fn clause_is_dig_lookback_transparent(effect: &Effect) -> bool {
+         | Effect::VentureIntoDungeon
+         | Effect::VentureInto { .. }
+         | Effect::TakeTheInitiative
++        | Effect::OpenAttractions { .. }
++        | Effect::RollToVisitAttractions
+         | Effect::ProcessRadCounters
+         | Effect::GrantCastingPermission { .. }
+         | Effect::ChooseFromZone { .. }
+diff --git a/crates/engine/src/parser/oracle_ir/ast.rs b/crates/engine/src/parser/oracle_ir/ast.rs
+index 8463be8ef1..b2265f27e2 100644
+--- a/crates/engine/src/parser/oracle_ir/ast.rs
++++ b/crates/engine/src/parser/oracle_ir/ast.rs
+@@ -406,6 +406,12 @@ pub(crate) enum ImperativeFamilyAst {
+     VentureIntoUndercity,
+     /// CR 725: "take the initiative"
+     TakeTheInitiative,
++    /// CR 701.51b: "open N Attractions"
++    OpenAttractions {
++        count: u32,
++    },
++    /// CR 701.52: "roll to visit your Attractions"
++    RollToVisitAttractions,
+     Proliferate,
+     /// CR 701.56a: Time travel — add or remove time counters.
+     TimeTravel,
+diff --git a/crates/engine/src/starter_decks.rs b/crates/engine/src/starter_decks.rs
+index d81a91b6f4..fa9ea379ca 100644
+--- a/crates/engine/src/starter_decks.rs
++++ b/crates/engine/src/starter_decks.rs
+@@ -5,13 +5,16 @@ use crate::game::bracket_estimate::CommanderBracketTier;
+ /// A deck specified as card name strings — the wire format used by clients
+ /// and the starter deck module. Distinct from `PlayerDeckPayload` which
+ /// contains fully-parsed `CardFace` data resolved against the card database.
+-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
++#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq)]
+ pub struct DeckData {
+     pub main_deck: Vec<String>,
+     #[serde(default)]
+     pub sideboard: Vec<String>,
+     #[serde(default)]
+     pub commander: Vec<String>,
++    /// CR 717.2: Supplementary Attraction deck (Unfinity) as card names.
++    #[serde(default)]
++    pub attraction_deck: Vec<String>,
+     /// Declared bracket tier for this deck. Defaults to `Core` when omitted,
+     /// preserving backward compatibility with older wire payloads.
+     #[serde(default)]
+@@ -132,9 +135,7 @@ fn starter_to_deck_data(deck: &StarterDeck) -> DeckData {
+         .collect();
+     DeckData {
+         main_deck,
+-        sideboard: Vec::new(),
+-        commander: Vec::new(),
+-        bracket_tier: CommanderBracketTier::default(),
++        ..Default::default()
+     }
+ }
+ 
+diff --git a/crates/engine/src/types/ability.rs b/crates/engine/src/types/ability.rs
+index cc68717752..f4af90bf7e 100644
+--- a/crates/engine/src/types/ability.rs
++++ b/crates/engine/src/types/ability.rs
+@@ -6547,6 +6547,13 @@ pub enum Effect {
+     /// CR 726.1 + CR 726.2: Take the initiative. Grants the initiative
+     /// designation and triggers venture into Undercity.
+     TakeTheInitiative,
++    /// CR 701.51b: Open N Attractions by putting cards from the top of your
++    /// Attraction deck onto the battlefield.
++    OpenAttractions {
++        count: u32,
++    },
++    /// CR 701.52: Roll to visit your Attractions.
++    RollToVisitAttractions,
+     /// CR 728.1: Process rad counters — mill cards equal to rad counter count,
+     /// lose 1 life and remove one rad counter per nonland card milled.
+     ProcessRadCounters,
+@@ -7873,6 +7880,8 @@ impl Effect {
+             | Effect::VentureIntoDungeon
+             | Effect::VentureInto { .. }
+             | Effect::TakeTheInitiative
++            | Effect::OpenAttractions { .. }
++            | Effect::RollToVisitAttractions
+             | Effect::ProcessRadCounters
+             | Effect::Incubate { .. }
+             | Effect::Amass { .. }
+@@ -8038,6 +8047,8 @@ pub fn effect_variant_name(effect: &Effect) -> &str {
+         Effect::VentureIntoDungeon => "VentureIntoDungeon",
+         Effect::VentureInto { .. } => "VentureInto",
+         Effect::TakeTheInitiative => "TakeTheInitiative",
++        Effect::OpenAttractions { .. } => "OpenAttractions",
++        Effect::RollToVisitAttractions => "RollToVisitAttractions",
+         Effect::ProcessRadCounters => "ProcessRadCounters",
+         Effect::GrantCastingPermission { .. } => "GrantCastingPermission",
+         Effect::ChooseFromZone { .. } => "ChooseFromZone",
+@@ -8218,6 +8229,8 @@ pub enum EffectKind {
+     VentureIntoDungeon,
+     VentureInto,
+     TakeTheInitiative,
++    OpenAttractions,
++    RollToVisitAttractions,
+     ProcessRadCounters,
+     GrantCastingPermission,
+     ChooseFromZone,
+@@ -8404,6 +8417,8 @@ impl From<&Effect> for EffectKind {
+             Effect::VentureIntoDungeon => EffectKind::VentureIntoDungeon,
+             Effect::VentureInto { .. } => EffectKind::VentureInto,
+             Effect::TakeTheInitiative => EffectKind::TakeTheInitiative,
++            Effect::OpenAttractions { .. } => EffectKind::OpenAttractions,
++            Effect::RollToVisitAttractions => EffectKind::RollToVisitAttractions,
+             Effect::ProcessRadCounters => EffectKind::ProcessRadCounters,
+             Effect::GrantCastingPermission { .. } => EffectKind::GrantCastingPermission,
+             Effect::ChooseFromZone { .. } => EffectKind::ChooseFromZone,
+@@ -9875,6 +9890,9 @@ pub enum TriggerCondition {
+     /// CR 716.2a: True when the source Class enchantment is at or above the given level.
+     /// Used to gate continuous triggers that only become active at higher class levels.
+     ClassLevelGE { level: u8 },
++    /// CR 701.52a + CR 702.159a: Visit ability on a numbered attraction line —
++    /// the roll from `AttractionVisited` must fall within the printed range.
++    AttractionVisitRoll { min: u8, max: u8 },
+ 
+     /// CR 601.2 + CR 603.4: reads the ENTERING object's `cast_from_zone`, never the source.
+     WasCast {
+diff --git a/crates/engine/src/types/card.rs b/crates/engine/src/types/card.rs
+index f4b75f44a3..379664d59e 100644
+--- a/crates/engine/src/types/card.rs
++++ b/crates/engine/src/types/card.rs
+@@ -175,6 +175,9 @@ pub struct CardFace {
+     /// singleton) limit applies.
+     #[serde(default, skip_serializing_if = "Option::is_none")]
+     pub deck_copy_limit: Option<DeckCopyLimit>,
++    /// CR 717.1: Lit-up roll numbers for Attraction card variants (d6 values 1–6).
++    #[serde(default, skip_serializing_if = "Vec::is_empty")]
++    pub attraction_lights: Vec<u8>,
+     /// Parser diagnostic warnings — silent fallbacks, ignored remainders, bare filters.
+     /// Populated at build time by the Oracle parser warning accumulator.
+     #[serde(default, skip_serializing_if = "Vec::is_empty")]
+diff --git a/crates/engine/src/types/events.rs b/crates/engine/src/types/events.rs
+index a74dd5fa9b..09576a324d 100644
+--- a/crates/engine/src/types/events.rs
++++ b/crates/engine/src/types/events.rs
+@@ -568,6 +568,22 @@ pub enum GameEvent {
+     InitiativeTaken {
+         player_id: PlayerId,
+     },
++    /// CR 701.51c: An Attraction was opened onto the battlefield.
++    AttractionOpened {
++        player_id: PlayerId,
++        object_id: ObjectId,
++    },
++    /// CR 701.52: The active player rolled to visit their Attractions.
++    AttractionsRolledToVisit {
++        player_id: PlayerId,
++        roll: u8,
++    },
++    /// CR 701.52a + CR 702.159a: A specific Attraction was visited this roll.
++    AttractionVisited {
++        player_id: PlayerId,
++        roll: u8,
++        attraction_id: ObjectId,
++    },
+     /// Avatar crossover: A firebending ability resolved and produced mana.
+     Firebend {
+         source_id: ObjectId,
+diff --git a/crates/engine/src/types/player.rs b/crates/engine/src/types/player.rs
+index 190f5b4423..b87c5df7db 100644
+--- a/crates/engine/src/types/player.rs
++++ b/crates/engine/src/types/player.rs
+@@ -96,6 +96,9 @@ pub struct Player {
+     pub library: im::Vector<ObjectId>,
+     pub hand: im::Vector<ObjectId>,
+     pub graveyard: im::Vector<ObjectId>,
++    /// CR 717.2: Supplementary Attraction deck (command zone), top at front.
++    #[serde(default)]
++    pub attraction_deck: im::Vector<ObjectId>,
+ 
+     // Tracking
+     pub has_drawn_this_turn: bool,
+@@ -191,6 +194,7 @@ impl Default for Player {
+             library: im::Vector::new(),
+             hand: im::Vector::new(),
+             graveyard: im::Vector::new(),
++            attraction_deck: im::Vector::new(),
+             has_drawn_this_turn: false,
+             lands_played_this_turn: 0,
+             poison_counters: 0,
+diff --git a/crates/engine/src/types/triggers.rs b/crates/engine/src/types/triggers.rs
+index ceaf05f4b4..79f9c032fa 100644
+--- a/crates/engine/src/types/triggers.rs
++++ b/crates/engine/src/types/triggers.rs
+@@ -112,6 +112,8 @@ pub enum TriggerEventKey {
+     DieOrCoin,
+     /// CR 725 (Monarch) + CR 726 (Initiative): Designation changed hands.
+     MonarchOrInitiative,
++    /// CR 701.52a + CR 702.159a: An Attraction was visited after rolling to visit.
++    VisitAttraction,
+     /// CR 104.3: A player lost the game.
+     PlayerLost,
+     /// CR 701.30: A clash occurred.
+diff --git a/crates/engine/tests/integration/rules.rs b/crates/engine/tests/integration/rules.rs
+index 6087341c5c..5c92e52867 100644
+--- a/crates/engine/tests/integration/rules.rs
++++ b/crates/engine/tests/integration/rules.rs
+@@ -96,7 +96,7 @@ pub fn run_combat(
+ }
+ 
+ // Mechanic test modules (stubs -- populated in Plans 02 and 03)
+-#[path = "rules/battle.rs"]
++mod attractions;
+ mod battle;
+ #[path = "rules/casting.rs"]
+ mod casting;
+diff --git a/crates/engine/tests/integration/rules/attractions.rs b/crates/engine/tests/integration/rules/attractions.rs
+new file mode 100644
+index 0000000000..1338da5ef5
+--- /dev/null
++++ b/crates/engine/tests/integration/rules/attractions.rs
+@@ -0,0 +1,235 @@
++//! Integration tests for Unfinity Attractions (CR 717, CR 701.51, CR 701.52).
++
++#![allow(unused_imports)]
++
++use engine::game::attractions::{open_attractions, roll_to_visit_attractions};
++use engine::game::deck_loading::create_attraction_deck_card;
++use engine::game::scenario::{GameRunner, GameScenario, P0};
++use engine::game::stack;
++use engine::game::zones;
++use engine::parser::oracle::parse_oracle_text;
++use engine::types::ability::Effect;
++use engine::types::card::CardFace;
++use engine::types::card_type::{CardType, CoreType};
++use engine::types::events::GameEvent;
++use engine::types::identifiers::CardId;
++use engine::types::mana::ManaCost;
++use engine::types::phase::Phase;
++use engine::types::triggers::TriggerMode;
++use engine::types::zones::Zone;
++fn test_attraction_face(name: &str, oracle: &str, lights: Vec<u8>) -> CardFace {
++    let parsed = parse_oracle_text(oracle, name, &[], &[], &["Attraction".to_string()]);
++    CardFace {
++        name: name.to_string(),
++        mana_cost: ManaCost::default(),
++        card_type: CardType {
++            core_types: vec![CoreType::Artifact],
++            subtypes: vec!["Attraction".to_string()],
++            supertypes: vec![],
++        },
++        power: None,
++        toughness: None,
++        loyalty: None,
++        defense: None,
++        oracle_text: Some(oracle.to_string()),
++        non_ability_text: None,
++        flavor_name: None,
++        keywords: vec![],
++        abilities: parsed.abilities,
++        triggers: parsed.triggers,
++        static_abilities: vec![],
++        replacements: vec![],
++        cleave_variant: None,
++        color_override: None,
++        color_identity: vec![],
++        scryfall_oracle_id: None,
++        modal: None,
++        additional_cost: None,
++        casting_restrictions: vec![],
++        casting_options: vec![],
++        solve_condition: None,
++        strive_cost: None,
++        brawl_commander: false,
++        is_commander: false,
++        deck_copy_limit: None,
++        parse_warnings: vec![],
++        metadata: Default::default(),
++        rarities: Default::default(),
++        attraction_lights: lights,
++    }
++}
++
++#[test]
++fn open_attraction_moves_top_deck_card_to_battlefield() {
++    let mut scenario = GameScenario::new();
++    scenario.at_phase(Phase::PreCombatMain);
++    let mut runner = scenario.build();
++
++    let face = test_attraction_face("Test Ride", "Visit — Draw a card.", vec![1, 2, 3, 4, 5, 6]);
++    create_attraction_deck_card(runner.state_mut(), &face, P0);
++    assert_eq!(runner.state().players[0].attraction_deck.len(), 1);
++
++    let mut events = Vec::new();
++    open_attractions(runner.state_mut(), P0, 1, &mut events).unwrap();
++
++    assert!(runner.state().players[0].attraction_deck.is_empty());
++    assert_eq!(runner.state().battlefield.len(), 1);
++    let id = runner.state().battlefield[0];
++    assert_eq!(runner.state().objects[&id].zone, Zone::Battlefield);
++    assert!(events
++        .iter()
++        .any(|e| matches!(e, GameEvent::AttractionOpened { .. })));
++}
++
++#[test]
++fn open_attractions_does_as_much_as_possible_when_deck_is_short() {
++    let mut scenario = GameScenario::new();
++    scenario.at_phase(Phase::PreCombatMain);
++    let mut runner = scenario.build();
++
++    let face = test_attraction_face("Test Ride", "Visit — Draw a card.", vec![1, 2, 3, 4, 5, 6]);
++    create_attraction_deck_card(runner.state_mut(), &face, P0);
++
++    let mut events = Vec::new();
++    open_attractions(runner.state_mut(), P0, 2, &mut events).unwrap();
++
++    assert!(runner.state().players[0].attraction_deck.is_empty());
++    assert_eq!(runner.state().battlefield.len(), 1);
++    assert_eq!(
++        events
++            .iter()
++            .filter(|e| matches!(e, GameEvent::AttractionOpened { .. }))
++            .count(),
++        1
++    );
++}
++
++#[test]
++fn attraction_leaving_for_graveyard_redirects_to_command_junkyard() {
++    let mut scenario = GameScenario::new();
++    scenario.at_phase(Phase::PreCombatMain);
++    let mut runner = scenario.build();
++
++    let face = test_attraction_face("Test Ride", "Visit — Draw a card.", vec![1, 2, 3, 4, 5, 6]);
++    let attraction_id = create_attraction_deck_card(runner.state_mut(), &face, P0);
++    open_attractions(runner.state_mut(), P0, 1, &mut Vec::new()).unwrap();
++
++    let mut events = Vec::new();
++    zones::move_to_zone(
++        runner.state_mut(),
++        attraction_id,
++        Zone::Graveyard,
++        &mut events,
++    );
++
++    assert_eq!(runner.state().objects[&attraction_id].zone, Zone::Command);
++    assert!(!runner.state().objects[&attraction_id].in_attraction_deck);
++    assert!(runner.state().command_zone.contains(&attraction_id));
++    assert!(!runner.state().players[0].graveyard.contains(&attraction_id));
++    assert!(!runner.state().players[0]
++        .attraction_deck
++        .contains(&attraction_id));
++}
++
++#[test]
++fn roll_to_visit_fires_visit_trigger_when_roll_matches_lights() {
++    let mut scenario = GameScenario::new();
++    scenario.at_phase(Phase::PreCombatMain);
++    let mut runner = scenario.build();
++
++    for i in 0..10 {
++        zones::create_object(
++            runner.state_mut(),
++            CardId(5000 + i),
++            P0,
++            format!("Library {i}"),
++            Zone::Library,
++        );
++    }
++
++    let face = test_attraction_face(
++        "Prize Booth",
++        "Visit — Draw a card.",
++        vec![1, 2, 3, 4, 5, 6],
++    );
++    let attraction_id = create_attraction_deck_card(runner.state_mut(), &face, P0);
++    open_attractions(runner.state_mut(), P0, 1, &mut Vec::new()).unwrap();
++    assert_eq!(runner.state().battlefield[0], attraction_id);
++
++    let hand_before = runner.state().players[0].hand.len();
++    let mut events = Vec::new();
++    roll_to_visit_attractions(runner.state_mut(), P0, &mut events);
++    let roll = events
++        .iter()
++        .find_map(|e| {
++            if let GameEvent::AttractionsRolledToVisit { roll, .. } = e {
++                Some(*roll)
++            } else {
++                None
++            }
++        })
++        .expect("roll-to-visit event");
++
++    assert!(events.iter().any(|e| matches!(
++        e,
++        GameEvent::DieRolled {
++            player_id: P0,
++            sides: 6,
++            result,
++        } if *result == roll
++    )));
++
++    assert!(
++        !runner.state().stack.is_empty(),
++        "Visit trigger should be on the stack after rolling to visit"
++    );
++    let mut resolve_events = Vec::new();
++    stack::resolve_top(runner.state_mut(), &mut resolve_events);
++
++    assert!(events.iter().any(|e| matches!(
++        e,
++        GameEvent::AttractionVisited {
++            attraction_id: id,
++            ..
++        } if *id == attraction_id
++    )));
++    assert!(
++        runner.state().players[0].hand.len() > hand_before,
++        "Visit — Draw a card should have resolved"
++    );
++}
++
++#[test]
++fn parser_open_an_attraction_effect() {
++    let parsed = parse_oracle_text("Open an Attraction.", "Opener", &[], &[], &[]);
++    assert!(
++        parsed
++            .abilities
++            .iter()
++            .any(|a| matches!(*a.effect, Effect::OpenAttractions { count: 1 })),
++        "expected OpenAttractions {{ count: 1 }} effect, got {:?}",
++        parsed
++            .abilities
++            .iter()
++            .map(|a| &a.effect)
++            .collect::<Vec<_>>()
++    );
++}
++
++#[test]
++fn parser_visit_line_becomes_visit_trigger() {
++    let parsed = parse_oracle_text(
++        "Visit — Create a 1/1 red Balloon creature token with flying.",
++        "Balloon Stand",
++        &[],
++        &[],
++        &["Attraction".to_string()],
++    );
++    assert!(
++        parsed
++            .triggers
++            .iter()
++            .any(|t| t.mode == TriggerMode::VisitAttraction),
++        "expected VisitAttraction trigger"
++    );
++}
+diff --git a/crates/lobby-broker/src/broker.rs b/crates/lobby-broker/src/broker.rs
+index f5e14bf05a..6222035a49 100644
+--- a/crates/lobby-broker/src/broker.rs
++++ b/crates/lobby-broker/src/broker.rs
+@@ -793,9 +793,7 @@ mod tests {
+     fn test_deck() -> engine::starter_decks::DeckData {
+         engine::starter_decks::DeckData {
+             main_deck: vec![],
+-            sideboard: vec![],
+-            commander: vec![],
+-            bracket_tier: Default::default(),
++            ..Default::default()
+         }
+     }
+ 
+diff --git a/crates/phase-ai/src/bin/ai_commander.rs b/crates/phase-ai/src/bin/ai_commander.rs
+index 73f8d1c05a..73d6114664 100644
+--- a/crates/phase-ai/src/bin/ai_commander.rs
++++ b/crates/phase-ai/src/bin/ai_commander.rs
+@@ -136,7 +136,7 @@ fn main() {
+             main_deck: main,
+             sideboard: vec![],
+             commander: cmd_names,
+-            bracket_tier: Default::default(),
++            ..Default::default()
+         });
+     }
+ 
+diff --git a/crates/phase-ai/src/bin/ai_tune.rs b/crates/phase-ai/src/bin/ai_tune.rs
+index adb28d6e87..0af2f4df37 100644
+--- a/crates/phase-ai/src/bin/ai_tune.rs
++++ b/crates/phase-ai/src/bin/ai_tune.rs
+@@ -405,7 +405,7 @@ fn build_matchups() -> Vec<Matchup> {
+         .concat(),
+         sideboard: vec![],
+         commander: vec![],
+-        bracket_tier: Default::default(),
++        ..Default::default()
+     };
+ 
+     let green_midrange = PlayerDeckList {
+@@ -425,7 +425,7 @@ fn build_matchups() -> Vec<Matchup> {
+         .concat(),
+         sideboard: vec![],
+         commander: vec![],
+-        bracket_tier: Default::default(),
++        ..Default::default()
+     };
+ 
+     let white_weenie = PlayerDeckList {
+@@ -445,7 +445,7 @@ fn build_matchups() -> Vec<Matchup> {
+         .concat(),
+         sideboard: vec![],
+         commander: vec![],
+-        bracket_tier: Default::default(),
++        ..Default::default()
+     };
+ 
+     let blue_control = PlayerDeckList {
+@@ -464,7 +464,7 @@ fn build_matchups() -> Vec<Matchup> {
+         .concat(),
+         sideboard: vec![],
+         commander: vec![],
+-        bracket_tier: Default::default(),
++        ..Default::default()
+     };
+ 
+     vec![
+diff --git a/crates/phase-ai/src/duel_suite/run.rs b/crates/phase-ai/src/duel_suite/run.rs
+index 0df5c60055..72c6c50e19 100644
+--- a/crates/phase-ai/src/duel_suite/run.rs
++++ b/crates/phase-ai/src/duel_suite/run.rs
+@@ -251,13 +251,13 @@ fn build_payload(db: &CardDatabase, spec: &MatchupSpec) -> Result<DeckPayload, S
+             main_deck: p0,
+             sideboard: Vec::new(),
+             commander: Vec::new(),
+-            bracket_tier: Default::default(),
++            ..Default::default()
+         },
+         opponent: PlayerDeckList {
+             main_deck: p1,
+             sideboard: Vec::new(),
+             commander: Vec::new(),
+-            bracket_tier: Default::default(),
++            ..Default::default()
+         },
+         ..Default::default()
+     };
+diff --git a/crates/phase-ai/src/policies/redundancy_avoidance.rs b/crates/phase-ai/src/policies/redundancy_avoidance.rs
+index 5d4549c425..fb28a7df90 100644
+--- a/crates/phase-ai/src/policies/redundancy_avoidance.rs
++++ b/crates/phase-ai/src/policies/redundancy_avoidance.rs
+@@ -500,6 +500,9 @@ fn redundancy_delta(
+         // between a player's life and the source's stat — no static redundancy
+         // signal (it never "does nothing" the way a duplicate keyword grant does).
+         | Effect::ExchangeLifeWithStat { .. }
++        // CR 701.51 + CR 701.52: Attraction open/visit — deck state dependent.
++        | Effect::OpenAttractions { .. }
++        | Effect::RollToVisitAttractions
+         | Effect::ProcessRadCounters => None,
+     }
+ }
+diff --git a/crates/phase-ai/tests/whitemane_lion_bounded.rs b/crates/phase-ai/tests/whitemane_lion_bounded.rs
+index a40bcf0bd5..cb663806fc 100644
+--- a/crates/phase-ai/tests/whitemane_lion_bounded.rs
++++ b/crates/phase-ai/tests/whitemane_lion_bounded.rs
+@@ -86,13 +86,13 @@ fn whitemane_lion_self_bounce_does_not_infinite_loop() {
+             main_deck: deck_whitemane_lion_stack(),
+             sideboard: Vec::new(),
+             commander: Vec::new(),
+-            bracket_tier: Default::default(),
++            ..Default::default()
+         },
+         opponent: PlayerDeckList {
+             main_deck: deck_whitemane_lion_stack(),
+             sideboard: Vec::new(),
+             commander: Vec::new(),
+-            bracket_tier: Default::default(),
++            ..Default::default()
+         },
+         ai_decks: Vec::new(),
+         ai_difficulties: Vec::new(),
+diff --git a/crates/phase-server/src/main.rs b/crates/phase-server/src/main.rs
+index b6d10a1a01..bfd21003f2 100644
+--- a/crates/phase-server/src/main.rs
++++ b/crates/phase-server/src/main.rs
+@@ -2064,6 +2064,7 @@ impl DeckResolver for ServerDeckResolver<'_> {
+             main_deck: deck.main_deck,
+             sideboard: deck.sideboard,
+             commander: deck.commander,
++            attraction_deck: deck.attraction_deck,
+             bracket_tier: deck.bracket_tier,
+         })
+     }
+@@ -4886,9 +4887,7 @@ mod mode_gate_tests {
+     fn deck() -> DeckData {
+         DeckData {
+             main_deck: vec!["Forest".into()],
+-            sideboard: vec![],
+-            commander: vec![],
+-            bracket_tier: Default::default(),
++            ..Default::default()
+         }
+     }
+ 
+@@ -5056,9 +5055,7 @@ mod handshake_tests {
+     fn empty_deck() -> DeckData {
+         DeckData {
+             main_deck: vec!["Forest".into()],
+-            sideboard: vec![],
+-            commander: vec![],
+-            bracket_tier: Default::default(),
++            ..Default::default()
+         }
+     }
+ 
+diff --git a/crates/seat-reducer/src/tests.rs b/crates/seat-reducer/src/tests.rs
+index 4fa31ae378..9f423c220a 100644
+--- a/crates/seat-reducer/src/tests.rs
++++ b/crates/seat-reducer/src/tests.rs
+@@ -11,7 +11,7 @@ impl DeckResolver for NoOpResolver {
+             main_deck: vec![],
+             sideboard: vec![],
+             commander: vec![],
+-            bracket_tier: Default::default(),
++            ..Default::default()
+         })
+     }
+ }
+diff --git a/crates/server-core/src/deck_resolve.rs b/crates/server-core/src/deck_resolve.rs
+index 861c89e952..054d0a49dd 100644
+--- a/crates/server-core/src/deck_resolve.rs
++++ b/crates/server-core/src/deck_resolve.rs
+@@ -55,6 +55,9 @@ pub fn resolve_deck(db: &CardDatabase, deck: &DeckData) -> Result<PlayerDeckPayl
+     missing.append(&mut sideboard_missing);
+     let (commander, mut commander_missing) = resolve_entries(db, &deck.commander, "commander");
+     missing.append(&mut commander_missing);
++    let (attraction_deck, mut attraction_missing) =
++        resolve_entries(db, &deck.attraction_deck, "attraction_deck");
++    missing.append(&mut attraction_missing);
+ 
+     if !missing.is_empty() {
+         missing.sort();
+@@ -69,6 +72,7 @@ pub fn resolve_deck(db: &CardDatabase, deck: &DeckData) -> Result<PlayerDeckPayl
+         main_deck,
+         sideboard,
+         commander,
++        attraction_deck,
+         bracket_tier: deck.bracket_tier,
+     })
+ }
+@@ -86,7 +90,7 @@ mod tests {
+             main_deck: v(main),
+             sideboard: v(sideboard),
+             commander: v(commander),
+-            bracket_tier: Default::default(),
++            ..Default::default()
+         }
+     }
+ 
+diff --git a/crates/server-core/src/filter.rs b/crates/server-core/src/filter.rs
+index 64a1cdf34b..c390ab8822 100644
+--- a/crates/server-core/src/filter.rs
++++ b/crates/server-core/src/filter.rs
+@@ -206,6 +206,7 @@ mod tests {
+                 deck_copy_limit: None,
+                 metadata: Default::default(),
+                 rarities: Default::default(),
++                attraction_lights: vec![],
+             },
+             count: 4,
+         };
+diff --git a/crates/server-core/src/legacy_deck_guard.rs b/crates/server-core/src/legacy_deck_guard.rs
+index 916e59e705..fa0ac32d9f 100644
+--- a/crates/server-core/src/legacy_deck_guard.rs
++++ b/crates/server-core/src/legacy_deck_guard.rs
+@@ -25,7 +25,7 @@ mod tests {
+             main_deck: v(main),
+             sideboard: v(sideboard),
+             commander: v(commander),
+-            bracket_tier: Default::default(),
++            ..Default::default()
+         }
+     }
+ 
+diff --git a/crates/server-core/src/legacy_join_guard.rs b/crates/server-core/src/legacy_join_guard.rs
+index d0a328a9f9..1ddcf2b894 100644
+--- a/crates/server-core/src/legacy_join_guard.rs
++++ b/crates/server-core/src/legacy_join_guard.rs
+@@ -24,9 +24,7 @@ mod tests {
+     fn deck(main: &[&str]) -> DeckData {
+         DeckData {
+             main_deck: main.iter().map(|s| s.to_string()).collect(),
+-            sideboard: vec![],
+-            commander: vec![],
+-            bracket_tier: Default::default(),
++            ..Default::default()
+         }
+     }
+ 
+diff --git a/crates/server-core/src/protocol.rs b/crates/server-core/src/protocol.rs
+index 60c3541d72..b5f6ed7532 100644
+--- a/crates/server-core/src/protocol.rs
++++ b/crates/server-core/src/protocol.rs
+@@ -478,7 +478,7 @@ mod tests {
+                 main_deck: vec!["Lightning Bolt".to_string(); 4],
+                 sideboard: Vec::new(),
+                 commander: Vec::new(),
+-                bracket_tier: Default::default(),
++                ..Default::default()
+             },
+         };
+         let json = serde_json::to_string(&msg).unwrap();
+@@ -499,7 +499,7 @@ mod tests {
+                 main_deck: vec!["Forest".to_string()],
+                 sideboard: Vec::new(),
+                 commander: Vec::new(),
+-                bracket_tier: Default::default(),
++                ..Default::default()
+             },
+         };
+         let json = serde_json::to_string(&msg).unwrap();
+@@ -600,7 +600,7 @@ mod tests {
+                 main_deck: vec!["Forest".to_string()],
+                 sideboard: Vec::new(),
+                 commander: Vec::new(),
+-                bracket_tier: Default::default(),
++                ..Default::default()
+             },
+             display_name: "Alice".to_string(),
+             public: true,
+@@ -671,7 +671,7 @@ mod tests {
+                 main_deck: vec!["Forest".to_string()],
+                 sideboard: Vec::new(),
+                 commander: Vec::new(),
+-                bracket_tier: Default::default(),
++                ..Default::default()
+             },
+             display_name: "Bob".to_string(),
+             password: None,
+@@ -1054,7 +1054,7 @@ mod tests {
+                 main_deck: vec!["Forest".to_string()],
+                 sideboard: Vec::new(),
+                 commander: Vec::new(),
+-                bracket_tier: Default::default(),
++                ..Default::default()
+             },
+             display_name: "Host".to_string(),
+             public: false,
+@@ -1096,9 +1096,7 @@ mod tests {
+                     difficulty: AiDifficulty::Medium,
+                     deck: DeckChoice::DeckList(Box::new(DeckData {
+                         main_deck: vec!["Forest".to_string(); 60],
+-                        sideboard: Vec::new(),
+-                        commander: Vec::new(),
+-                        bracket_tier: Default::default(),
++                        ..Default::default()
+                     })),
+                 },
+             },
+@@ -1364,7 +1362,7 @@ mod tests {
+                 main_deck: vec!["Forest".to_string()],
+                 sideboard: Vec::new(),
+                 commander: Vec::new(),
+-                bracket_tier: Default::default(),
++                ..Default::default()
+             },
+             display_name: "Alice".to_string(),
+             public: true,
+diff --git a/crates/server-core/src/session.rs b/crates/server-core/src/session.rs
+index 0e1808e3ec..a2d2dd58e0 100644
+--- a/crates/server-core/src/session.rs
++++ b/crates/server-core/src/session.rs
+@@ -374,6 +374,7 @@ impl GameSession {
+                 main_deck: deck.main_deck.clone(),
+                 sideboard: deck.sideboard.clone(),
+                 commander: deck.commander.clone(),
++                attraction_deck: deck.attraction_deck.clone(),
+                 bracket_tier: deck.bracket_tier,
+             };
+             // The resolver (`ServerDeckResolver::resolve` in phase-server)
+@@ -1306,6 +1307,7 @@ mod tests {
+                     deck_copy_limit: None,
+                     metadata: Default::default(),
+                     rarities: Default::default(),
++                    attraction_lights: vec![],
+                 },
+                 count: 10,
+             }],
