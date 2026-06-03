@@ -1,0 +1,632 @@
+diff --git a/apps/gittensory-ui/public/openapi.json b/apps/gittensory-ui/public/openapi.json
+index d0dd7a8..38be3f7 100644
+--- a/apps/gittensory-ui/public/openapi.json
++++ b/apps/gittensory-ui/public/openapi.json
+@@ -8349,6 +8349,9 @@
+           "publicSafeSummary": {
+             "type": "string"
+           },
++          "explanationCard": {
++            "$ref": "#/components/schemas/AgentActionExplanationCard"
++          },
+           "approvalRequired": {
+             "type": "boolean"
+           },
+@@ -8380,11 +8383,98 @@
+           "why",
+           "blockedBy",
+           "publicSafeSummary",
++          "explanationCard",
+           "approvalRequired",
+           "safetyClass",
+           "payload"
+         ]
+       },
++      "AgentActionExplanationCard": {
++        "type": "object",
++        "properties": {
++          "summary": {
++            "type": "string"
++          },
++          "whyNow": {
++            "type": "string"
++          },
++          "scoreabilityBlocker": {
++            "type": "string"
++          },
++          "risk": {
++            "type": "string"
++          },
++          "maintainerFriction": {
++            "type": "string"
++          },
++          "expectedImpact": {
++            "type": "string"
++          },
++          "blockerGroups": {
++            "type": "array",
++            "items": {
++              "type": "object",
++              "properties": {
++                "category": {
++                  "type": "string",
++                  "enum": [
++                    "branch",
++                    "account",
++                    "queue",
++                    "scoreability",
++                    "risk",
++                    "maintainer",
++                    "unknown"
++                  ]
++                },
++                "items": {
++                  "type": "array",
++                  "items": {
++                    "type": "string"
++                  }
++                }
++              },
++              "required": [
++                "category",
++                "items"
++              ]
++            }
++          },
++          "rerunWhen": {
++            "type": "string"
++          },
++          "publicSafe": {
++            "type": "object",
++            "properties": {
++              "summary": {
++                "type": "string"
++              },
++              "whyNow": {
++                "type": "string"
++              },
++              "rerunWhen": {
++                "type": "string"
++              }
++            },
++            "required": [
++              "summary",
++              "whyNow",
++              "rerunWhen"
++            ]
++          }
++        },
++        "required": [
++          "summary",
++          "whyNow",
++          "scoreabilityBlocker",
++          "risk",
++          "maintainerFriction",
++          "expectedImpact",
++          "blockerGroups",
++          "rerunWhen",
++          "publicSafe"
++        ]
++      },
+       "AgentContextSnapshot": {
+         "type": "object",
+         "properties": {
+diff --git a/packages/gittensory-mcp/bin/gittensory-mcp.js b/packages/gittensory-mcp/bin/gittensory-mcp.js
+index ade603f..c72aaac 100755
+--- a/packages/gittensory-mcp/bin/gittensory-mcp.js
++++ b/packages/gittensory-mcp/bin/gittensory-mcp.js
+@@ -648,7 +648,13 @@ function outputAgentPayload(payload, options, summary) {
+     const label = action.actionType ?? action.actionKind ?? action.recommendation ?? "action";
+     const detail = action.recommendation ?? action.actionKind ?? action.summary ?? label;
+     process.stdout.write(`- ${label}: ${detail}\n`);
+-    if (action.rerunWhen) process.stdout.write(`  rerun: ${action.rerunWhen}\n`);
++    if (action.explanationCard) {
++      process.stdout.write(`  why now: ${action.explanationCard.whyNow}\n`);
++      process.stdout.write(`  impact: ${action.explanationCard.expectedImpact}\n`);
++      process.stdout.write(`  rerun: ${action.explanationCard.rerunWhen}\n`);
++    } else if (action.rerunWhen) {
++      process.stdout.write(`  rerun: ${action.rerunWhen}\n`);
++    }
+   }
+ }
+ 
+diff --git a/src/openapi/schemas.ts b/src/openapi/schemas.ts
+index 7fc1039..ba6a736 100644
+--- a/src/openapi/schemas.ts
++++ b/src/openapi/schemas.ts
+@@ -1957,6 +1957,29 @@ export const RegistryChangeReportSchema = z
+   })
+   .openapi("RegistryChangeReport");
+ 
++export const AgentActionExplanationCardSchema = z
++  .object({
++    summary: z.string(),
++    whyNow: z.string(),
++    scoreabilityBlocker: z.string(),
++    risk: z.string(),
++    maintainerFriction: z.string(),
++    expectedImpact: z.string(),
++    blockerGroups: z.array(
++      z.object({
++        category: z.enum(["branch", "account", "queue", "scoreability", "risk", "maintainer", "unknown"]),
++        items: z.array(z.string()),
++      }),
++    ),
++    rerunWhen: z.string(),
++    publicSafe: z.object({
++      summary: z.string(),
++      whyNow: z.string(),
++      rerunWhen: z.string(),
++    }),
++  })
++  .openapi("AgentActionExplanationCard");
++
+ export const AgentActionSchema = z
+   .object({
+     id: z.string(),
+@@ -1983,6 +2006,7 @@ export const AgentActionSchema = z
+     blockedBy: z.array(z.string()),
+     rerunWhen: z.string().nullable().optional(),
+     publicSafeSummary: z.string(),
++    explanationCard: AgentActionExplanationCardSchema,
+     approvalRequired: z.boolean(),
+     safetyClass: z.enum(["private", "public_safe", "approval_required"]),
+     payload: z.record(z.string(), z.unknown()),
+diff --git a/src/services/agent-action-explanation-card.ts b/src/services/agent-action-explanation-card.ts
+new file mode 100644
+index 0000000..93f5a49
+--- /dev/null
++++ b/src/services/agent-action-explanation-card.ts
+@@ -0,0 +1,129 @@
++import type { AgentActionBlockerCategory, AgentActionExplanationCard, AgentActionRecord } from "../types";
++
++type AgentActionExplanationInput = Pick<
++  AgentActionRecord,
++  "actionType" | "status" | "why" | "scoreabilityImpact" | "riskImpact" | "maintainerImpact" | "blockedBy" | "rerunWhen" | "publicSafeSummary" | "safetyClass"
++>;
++
++const BLOCKER_CATEGORY_ORDER: AgentActionBlockerCategory[] = ["branch", "account", "queue", "scoreability", "risk", "maintainer", "unknown"];
++const PUBLIC_FORBIDDEN_PATTERN =
++  /\b(wallets?|hotkeys?|coldkeys?|seed phrases?|mnemonics?|raw[-_\s]?trust scores?|trust scores?|private reviewability|reviewability internals?|private scoreability|scoreability|public score estimates?|estimated scores?|score estimates?|score previews?|reward estimates?|payouts?|farming|reward optimization|private rankings?)\b/gi;
++const TOKEN_OR_PATH_PATTERN = /\bgithub_pat_[A-Za-z0-9_]+|\bgh[pousr]_[A-Za-z0-9_]+|\/Users\/\S+|\/home\/\S+|\/tmp\/\S+|[A-Z]:\\Users\\\S+/gi;
++
++export function withAgentActionExplanationCard(action: AgentActionRecord): AgentActionRecord {
++  return { ...action, explanationCard: buildAgentActionExplanationCard(action) };
++}
++
++export function buildAgentActionExplanationCard(action: AgentActionExplanationInput): AgentActionExplanationCard {
++  const whyNow = compactText(whyNowForAction(action));
++  const rerunWhen = compactText(action.rerunWhen ?? "Rerun when the referenced repo, branch, queue, or validation signal changes.");
++  return {
++    summary: compactText(summaryForAction(action)),
++    whyNow,
++    scoreabilityBlocker: compactText(scoreabilityBlockerForAction(action)),
++    risk: compactText(action.riskImpact ?? riskForAction(action)),
++    maintainerFriction: compactText(action.maintainerImpact ?? maintainerFrictionForAction(action)),
++    expectedImpact: compactText(expectedImpactForAction(action)),
++    blockerGroups: groupBlockers(action.blockedBy),
++    rerunWhen,
++    publicSafe: {
++      summary: sanitizePublicCardText(action.publicSafeSummary || summaryForAction(action)),
++      whyNow: sanitizePublicCardText(publicWhyNowForAction(action, whyNow)),
++      rerunWhen: sanitizePublicCardText(rerunWhen),
++    },
++  };
++}
++
++function summaryForAction(action: AgentActionExplanationInput): string {
++  if (action.actionType === "cleanup_existing_prs") return "Cleanup first: reduce existing PR pressure before starting new work.";
++  if (action.actionType === "monitor_existing_pr") return "Wait on existing work: land, update, or close the current PR before adding more.";
++  if (action.actionType === "preflight_branch") return "Preflight the branch: fix branch-level readiness before posting maintainer-facing context.";
++  if (action.actionType === "explain_score_blockers") return "Resolve blockers: separate private scoreability context from public PR copy.";
++  if (action.actionType === "prepare_pr_packet") return "Prepare public-safe PR text: turn private analysis into maintainer-friendly evidence.";
++  if (action.actionType === "explain_repo_fit") return action.status === "watch" ? "Watch this repo: current signals argue against acting now." : "Explain repo fit: verify this lane before choosing work.";
++  if (action.status === "watch") return "Avoid for now: wait for better repo, queue, or account signals.";
++  return "Pursue now: this action is the current ranked next step.";
++}
++
++function whyNowForAction(action: AgentActionExplanationInput): string {
++  if (action.actionType === "cleanup_existing_prs") return "Open PR pressure is the most actionable signal before new submissions.";
++  if (action.actionType === "monitor_existing_pr") return "Existing work can affect scoreability and maintainer load before another action is useful.";
++  if (action.actionType === "preflight_branch") return "Branch findings are directly actionable and should be fixed before public PR copy.";
++  if (action.actionType === "explain_score_blockers") return "Blockers are gating the next useful step, so they should be handled before new work.";
++  if (action.actionType === "prepare_pr_packet") return "A concise packet keeps public context focused on linked work, validation, and next steps.";
++  if (action.status === "watch") return "The safer action is to wait until the blockers or queue signals improve.";
++  return action.why.find((line) => line.trim().length > 0) ?? "Current deterministic planning signals rank this action ahead of other available next steps.";
++}
++
++function publicWhyNowForAction(action: AgentActionExplanationInput, whyNow: string): string {
++  if (action.safetyClass === "public_safe") return whyNow;
++  return action.publicSafeSummary || "Use the private card for planning and keep public output focused on review hygiene.";
++}
++
++function scoreabilityBlockerForAction(action: AgentActionExplanationInput): string {
++  if (action.scoreabilityImpact) return action.scoreabilityImpact;
++  const blockers = action.blockedBy.filter((blocker) => categorizeBlocker(blocker) === "scoreability");
++  if (blockers.length > 0) return `Scoreability blockers: ${blockers.join(", ")}.`;
++  if (action.status === "blocked") return "Blocked action; inspect the grouped blockers before proceeding.";
++  return "No hard scoreability blocker is visible in current signals.";
++}
++
++function riskForAction(action: AgentActionExplanationInput): string {
++  if (action.status === "watch") return "Acting now may add review load or collide with stronger repo signals.";
++  if (action.actionType === "cleanup_existing_prs") return "Leaving existing PRs unresolved can increase stale or duplicate review pressure.";
++  if (action.actionType === "prepare_pr_packet") return "Public copy should avoid private planning, scoring, or identity context.";
++  return "No major action-specific risk is visible in the current card.";
++}
++
++function maintainerFrictionForAction(action: AgentActionExplanationInput): string {
++  if (action.actionType === "cleanup_existing_prs") return "Cleanup reduces queue noise before asking maintainers to review new work.";
++  if (action.actionType === "preflight_branch" || action.actionType === "prepare_pr_packet") return "Focused branch evidence makes review faster and less ambiguous.";
++  if (action.status === "watch") return "Waiting avoids adding low-confidence work to the maintainer queue.";
++  return "Narrow, validated work is easier for maintainers to review.";
++}
++
++function expectedImpactForAction(action: AgentActionExplanationInput): string {
++  if (action.actionType === "cleanup_existing_prs") return "Lower active review pressure and make future work easier to score and review.";
++  if (action.actionType === "monitor_existing_pr") return "Convert current open work into a clearer merged, closed, or updated state.";
++  if (action.actionType === "preflight_branch") return "Move branch metadata toward a ready public-safe PR packet.";
++  if (action.actionType === "explain_score_blockers") return "Turn blocker details into a concrete cleanup or wait condition.";
++  if (action.actionType === "prepare_pr_packet") return "Produce maintainer-facing copy that excludes private planning context.";
++  if (action.status === "watch") return "Avoid low-confidence effort until rerun conditions improve.";
++  return "Advance toward one narrow, validated contribution path.";
++}
++
++function groupBlockers(blockers: string[]): AgentActionExplanationCard["blockerGroups"] {
++  const grouped = new Map<AgentActionBlockerCategory, string[]>();
++  for (const blocker of blockers.map((value) => compactText(value)).filter(Boolean)) {
++    const category = categorizeBlocker(blocker);
++    grouped.set(category, [...(grouped.get(category) ?? []), blocker]);
++  }
++  return BLOCKER_CATEGORY_ORDER.flatMap((category) => {
++    const items = [...new Set(grouped.get(category) ?? [])].slice(0, 6);
++    return items.length > 0 ? [{ category, items }] : [];
++  });
++}
++
++function categorizeBlocker(blocker: string): AgentActionBlockerCategory {
++  const value = blocker.toLowerCase();
++  if (/branch|preflight|linked|issue|validation|test|draft|diff|file|metadata|eligib/.test(value)) return "branch";
++  if (/account|credibility|contributor|official|miner|profile|role|author/.test(value)) return "account";
++  if (/queue|open[_\s-]?pr|review|duplicate|collision|stale|approved|pending|merge|close/.test(value)) return "queue";
++  if (/score|scoreability|inactive[_\s-]?allocation|allocation|gate|blocker/.test(value)) return "scoreability";
++  if (/risk|reward|payout|farming|uncertain/.test(value)) return "risk";
++  if (/maintainer|friction|intake|label|policy/.test(value)) return "maintainer";
++  return "unknown";
++}
++
++function sanitizePublicCardText(value: string): string {
++  return compactText(value)
++    .replace(TOKEN_OR_PATH_PATTERN, "<redacted>")
++    .replace(PUBLIC_FORBIDDEN_PATTERN, "private context")
++    .replace(/private context(?:[,\s]+private context)+/gi, "private context")
++    .replace(/\s+([,.])/g, "$1")
++    .trim();
++}
++
++function compactText(value: string): string {
++  return value.replace(/\s+/g, " ").trim().slice(0, 300);
++}
+diff --git a/src/services/agent-orchestrator.ts b/src/services/agent-orchestrator.ts
+index 4731eae..8ca66dc 100644
+--- a/src/services/agent-orchestrator.ts
++++ b/src/services/agent-orchestrator.ts
+@@ -29,6 +29,7 @@ import { buildContributorFit, buildContributorOutcomeHistory, buildContributorPr
+ import { buildContributorOpenPrMonitor, type ContributorOpenPrMonitor } from "../signals/contributor-open-pr-monitor";
+ import { buildLocalBranchAnalysis, findCurrentBranchPullRequest, type LocalBranchAnalysis, type LocalBranchAnalysisInput } from "../signals/local-branch";
+ import { loadRepoFocusManifest } from "../signals/focus-manifest-loader";
++import { withAgentActionExplanationCard } from "./agent-action-explanation-card";
+ import type {
+   AgentActionRecord,
+   AgentActionStatus,
+@@ -125,7 +126,7 @@ export async function getAgentRunBundle(env: Env, runId: string): Promise<AgentR
+   const [actions, contextSnapshots] = await Promise.all([listAgentActions(env, runId), listAgentContextSnapshots(env, runId)]);
+   return {
+     run,
+-    actions,
++    actions: actions.map(withAgentActionExplanationCard),
+     contextSnapshots,
+     summary: summarizeRun(run, actions),
+   };
+@@ -596,7 +597,7 @@ function actionRecord(args: {
+   evidence?: RecommendationEvidence | undefined;
+ }): AgentActionRecord {
+   const evidence = args.evidence ?? defaultRecommendationEvidence(args.actionType);
+-  return {
++  const action: AgentActionRecord = {
+     id: `${args.run.id}:${String(args.index).padStart(2, "0")}:${args.actionType}`,
+     runId: args.run.id,
+     actionType: args.actionType,
+@@ -620,6 +621,7 @@ function actionRecord(args: {
+     },
+     createdAt: nowIso(),
+   };
++  return withAgentActionExplanationCard(action);
+ }
+ 
+ function decisionPackEvidence(pack: ContributorDecisionPack, decision: RepoDecision, sourceSummary: string): RecommendationEvidence {
+diff --git a/src/types.ts b/src/types.ts
+index eb3e3f3..cd643da 100644
+--- a/src/types.ts
++++ b/src/types.ts
+@@ -615,6 +615,26 @@ export type AgentActionType =
+   | "explain_repo_fit";
+ export type AgentActionStatus = "recommended" | "ready" | "blocked" | "watch" | "needs_input";
+ export type AgentSafetyClass = "private" | "public_safe" | "approval_required";
++export type AgentActionBlockerCategory = "branch" | "account" | "queue" | "scoreability" | "risk" | "maintainer" | "unknown";
++
++export type AgentActionExplanationCard = {
++  summary: string;
++  whyNow: string;
++  scoreabilityBlocker: string;
++  risk: string;
++  maintainerFriction: string;
++  expectedImpact: string;
++  blockerGroups: Array<{
++    category: AgentActionBlockerCategory;
++    items: string[];
++  }>;
++  rerunWhen: string;
++  publicSafe: {
++    summary: string;
++    whyNow: string;
++    rerunWhen: string;
++  };
++};
+ 
+ export type AgentRunRecord = {
+   id: string;
+@@ -646,6 +666,7 @@ export type AgentActionRecord = {
+   blockedBy: string[];
+   rerunWhen?: string | null | undefined;
+   publicSafeSummary: string;
++  explanationCard?: AgentActionExplanationCard | undefined;
+   approvalRequired: boolean;
+   safetyClass: AgentSafetyClass;
+   payload: Record<string, JsonValue>;
+diff --git a/test/integration/api.test.ts b/test/integration/api.test.ts
+index a0668b5..89f9122 100644
+--- a/test/integration/api.test.ts
++++ b/test/integration/api.test.ts
+@@ -648,7 +648,7 @@ describe("api routes", () => {
+     expect(agentPlan.status).toBe(200);
+     const agentPlanPayload = (await agentPlan.json()) as {
+       run: { id: string; status: string; mode: string; surface: string; payload: Record<string, unknown> };
+-      actions: Array<{ actionType: string; publicSafeSummary: string; payload: Record<string, unknown> }>;
++      actions: Array<{ actionType: string; publicSafeSummary: string; explanationCard?: { whyNow: string; rerunWhen: string; publicSafe: Record<string, string> }; payload: Record<string, unknown> }>;
+       contextSnapshots: Array<{ payload: Record<string, unknown> }>;
+     };
+     expect(agentPlanPayload.run).toMatchObject({ status: "completed", mode: "copilot", surface: "api" });
+@@ -661,6 +661,12 @@ describe("api routes", () => {
+     });
+     expect(agentPlanPayload.actions.length).toBeGreaterThan(0);
+     expect(agentPlanPayload.actions[0]?.publicSafeSummary).not.toMatch(/wallet|hotkey|reward estimate|payout|farming|raw trust score/i);
++    expect(agentPlanPayload.actions[0]?.explanationCard).toMatchObject({
++      whyNow: expect.any(String),
++      rerunWhen: expect.any(String),
++      publicSafe: expect.any(Object),
++    });
++    expect(JSON.stringify(agentPlanPayload.actions[0]?.explanationCard?.publicSafe)).not.toMatch(/wallet|hotkey|reward estimate|payout|farming|raw trust score|private reviewability|public score estimate|scoreability/i);
+     expect(agentPlanPayload.actions[0]?.payload).toHaveProperty("decision");
+     expect(agentPlanPayload.actions[0]?.payload.recommendationEvidence).toMatchObject({
+       confidence: expect.stringMatching(/^(high|medium|low)$/),
+diff --git a/test/unit/agent-orchestrator.test.ts b/test/unit/agent-orchestrator.test.ts
+index 06fadfc..63bfbf9 100644
+--- a/test/unit/agent-orchestrator.test.ts
++++ b/test/unit/agent-orchestrator.test.ts
+@@ -11,6 +11,7 @@ import {
+   startAgentRun,
+   type AgentRunBundle,
+ } from "../../src/services/agent-orchestrator";
++import { buildAgentActionExplanationCard } from "../../src/services/agent-action-explanation-card";
+ import { CONTRIBUTOR_DECISION_PACK_SIGNAL, type ContributorDecisionPack } from "../../src/services/decision-pack";
+ import { buildPublicAgentCommandComment, parseGittensoryMentionCommand } from "../../src/github/commands";
+ import { normalizeRegistryPayload } from "../../src/registry/normalize";
+@@ -120,6 +121,15 @@ describe("agent orchestrator", () => {
+       approvalRequired: true,
+       safetyClass: "private",
+     });
++    expect(bundle.actions.every((action) => Boolean(action.explanationCard))).toBe(true);
++    expect(bundle.actions[0]?.explanationCard).toMatchObject({
++      summary: expect.stringMatching(/Cleanup first/),
++      scoreabilityBlocker: expect.stringContaining("open_pr_pressure"),
++      expectedImpact: expect.stringMatching(/review pressure/i),
++      rerunWhen: expect.stringContaining("Rerun"),
++      blockerGroups: expect.arrayContaining([expect.objectContaining({ category: "queue", items: expect.arrayContaining(["open_pr_pressure"]) })]),
++    });
++    expect(JSON.stringify(bundle.actions[0]?.explanationCard?.publicSafe)).not.toMatch(/wallet|hotkey|reward estimate|payout|farming|raw trust score|private reviewability|public score estimate|scoreability/i);
+     expect(bundle.actions[0]?.payload.recommendationEvidence).toMatchObject({
+       confidence: "low",
+       sourceSummary: "Ranked next-action recommendation from the contributor decision pack.",
+@@ -305,6 +315,12 @@ describe("agent orchestrator", () => {
+       blockedBy: ["closed_pr_credibility", "low_credibility"],
+     });
+     expect(bundle.actions[0]?.rerunWhen).toContain("Rerun after");
++    expect(bundle.actions[0]?.explanationCard).toMatchObject({
++      summary: expect.stringMatching(/Resolve blockers/),
++      blockerGroups: expect.arrayContaining([
++        expect.objectContaining({ category: "account", items: expect.arrayContaining(["closed_pr_credibility", "low_credibility"]) }),
++      ]),
++    });
+   });
+ 
+   it("covers pure action mapping, summaries, and public sanitization branches", () => {
+@@ -362,6 +378,19 @@ describe("agent orchestrator", () => {
+     const readyAction = __agentOrchestratorInternals.actionFromDecisionAction(run, action("open_new_direct_pr", "owner/ready", "pursue", 80), readyDecision, 2);
+     const emptyNextAction = __agentOrchestratorInternals.actionFromDecisionAction(run, { ...action("open_new_direct_pr", "owner/ready", "pursue", 80), nextActions: [] }, readyDecision, 4);
+     const repoFit = __agentOrchestratorInternals.actionFromRepoDecision(run, { ...readyDecision, nextActions: [] }, 3);
++    const groupedBlockerAction = __agentOrchestratorInternals.actionRecord({
++      run,
++      actionType: "preflight_branch",
++      index: 5,
++      targetRepoFullName: "owner/ready",
++      status: "blocked",
++      recommendation: "Fix branch and account blockers before opening a PR.",
++      why: ["branch and account blockers are present"],
++      blockedBy: ["branch_eligibility_missing", "account credibility below floor", "open_pr_pressure"],
++      rerunWhen: "Rerun after branch metadata and account queue state change.",
++      publicSafeSummary: "Run branch preflight after resolving public readiness blockers.",
++      payload: {},
++    });
+     const outcomeRepoFit = __agentOrchestratorInternals.actionFromRepoDecision(run, { ...readyDecision, outcome: { repoFullName: "owner/ready" } as any }, 5);
+     const defaultEvidenceAction = __agentOrchestratorInternals.actionRecord({
+       run,
+@@ -410,6 +439,18 @@ describe("agent orchestrator", () => {
+     );
+ 
+     expect([watchAction.status, blockedAction.status, readyAction.status]).toEqual(["watch", "blocked", "recommended"]);
++    expect(watchAction.explanationCard?.summary).toMatch(/Avoid for now|Watch/);
++    expect(watchAction.explanationCard?.whyNow).toMatch(/wait/i);
++    expect(blockedAction.explanationCard?.scoreabilityBlocker).toContain("inactive_or_unknown_lane");
++    expect(readyAction.explanationCard?.summary).toMatch(/Pursue now/);
++    expect(JSON.stringify(readyAction.explanationCard?.publicSafe)).not.toMatch(/reward|wallet|hotkey|raw trust|payout|farming|private reviewability|public score estimate|scoreability/i);
++    expect(groupedBlockerAction.explanationCard?.blockerGroups).toEqual(
++      expect.arrayContaining([
++        expect.objectContaining({ category: "branch", items: expect.arrayContaining(["branch_eligibility_missing"]) }),
++        expect.objectContaining({ category: "account", items: expect.arrayContaining(["account credibility below floor"]) }),
++        expect.objectContaining({ category: "queue", items: expect.arrayContaining(["open_pr_pressure"]) }),
++      ]),
++    );
+     expect(emptyNextAction.publicSafeSummary).toMatch(/Use Gittensory preflight/);
+     expect(repoFit.recommendation).toMatch(/repo fit/);
+     expect(noDecisionActions[0]).toMatchObject({ actionType: "explain_repo_fit", status: "recommended" });
+@@ -611,6 +652,78 @@ describe("agent orchestrator", () => {
+     expect(staleSnapshot.payload.openPrMonitor).toEqual(approvedPack.openPrMonitor);
+   });
+ 
++  it("builds deterministic explanation-card fallbacks and public-safe text", () => {
++    const recommended = buildAgentActionExplanationCard({
++      actionType: "choose_next_work",
++      status: "recommended",
++      why: [],
++      blockedBy: ["reward risk is uncertain", "maintainer policy unclear", "unclassified wait condition"],
++      publicSafeSummary: "Wallet hotkey raw trust score /home/alice/private reward estimate.",
++      safetyClass: "private",
++    });
++    const blocked = buildAgentActionExplanationCard({
++      actionType: "choose_next_work",
++      status: "blocked",
++      why: ["A blocker is still present."],
++      blockedBy: ["unclassified wait condition"],
++      publicSafeSummary: "Use public review hygiene only.",
++      safetyClass: "private",
++    });
++    const privateFallback = buildAgentActionExplanationCard({
++      actionType: "choose_next_work",
++      status: "recommended",
++      why: [],
++      blockedBy: [],
++      publicSafeSummary: "",
++      safetyClass: "private",
++    });
++    const watch = buildAgentActionExplanationCard({
++      actionType: "choose_next_work",
++      status: "watch",
++      why: ["Existing signals say wait."],
++      blockedBy: [],
++      publicSafeSummary: "",
++      safetyClass: "public_safe",
++    });
++    const cleanup = buildAgentActionExplanationCard({
++      actionType: "cleanup_existing_prs",
++      status: "recommended",
++      why: ["Close stale PRs before opening another one."],
++      blockedBy: ["scoreability gate failed"],
++      publicSafeSummary: "Cleanup existing PRs before asking for another review.",
++      safetyClass: "public_safe",
++    });
++
++    expect(recommended.summary).toMatch(/Pursue now/);
++    expect(recommended.whyNow).toMatch(/deterministic planning signals/);
++    expect(recommended.scoreabilityBlocker).toMatch(/No hard scoreability/);
++    expect(recommended.risk).toMatch(/No major action-specific risk/);
++    expect(recommended.maintainerFriction).toMatch(/Narrow, validated work/);
++    expect(recommended.expectedImpact).toMatch(/Advance toward/);
++    expect(recommended.rerunWhen).toMatch(/referenced repo/);
++    expect(recommended.blockerGroups).toEqual(
++      expect.arrayContaining([
++        expect.objectContaining({ category: "risk", items: ["reward risk is uncertain"] }),
++        expect.objectContaining({ category: "maintainer", items: ["maintainer policy unclear"] }),
++        expect.objectContaining({ category: "unknown", items: ["unclassified wait condition"] }),
++      ]),
++    );
++    expect(JSON.stringify(recommended.publicSafe)).not.toMatch(/wallet|hotkey|raw trust|reward estimate|\/home\/alice|scoreability/i);
++    expect(recommended.publicSafe.whyNow).toMatch(/private context/);
++    expect(privateFallback.publicSafe.whyNow).toMatch(/private card/);
++    expect(blocked.scoreabilityBlocker).toMatch(/Blocked action/);
++    expect(watch.risk).toMatch(/review load/);
++    expect(watch.maintainerFriction).toMatch(/Waiting avoids/);
++    expect(watch.expectedImpact).toMatch(/low-confidence/);
++    expect(watch.publicSafe.whyNow).toBe(watch.whyNow);
++    expect(cleanup.summary).toMatch(/Cleanup first/);
++    expect(cleanup.whyNow).toMatch(/Open PR pressure/);
++    expect(cleanup.scoreabilityBlocker).toMatch(/scoreability gate failed/);
++    expect(cleanup.risk).toMatch(/increase stale or duplicate review pressure/);
++    expect(cleanup.maintainerFriction).toMatch(/reduces queue noise/);
++    expect(cleanup.expectedImpact).toMatch(/Lower active review pressure/);
++  });
++
+   it("covers local action ready and blocker-free branches from prepared metadata", () => {
+     const run = __agentOrchestratorInternals.buildRunRecord({
+       objective: "local ready branch",
+diff --git a/test/unit/mcp-cli.test.ts b/test/unit/mcp-cli.test.ts
+index 2e10100..6479751 100644
+--- a/test/unit/mcp-cli.test.ts
++++ b/test/unit/mcp-cli.test.ts
+@@ -600,6 +600,12 @@ describe("gittensory-mcp CLI", () => {
+     expect(plan.run).toMatchObject({ id: "run-1", status: "completed" });
+     expect(plan.actions[0]).toMatchObject({ actionType: "choose_next_work" });
+ 
++    const planText = await runAsync(["agent", "plan", "--login", "JSONbored", "--repo", "JSONbored/gittensory"], env);
++    expect(planText).toContain("why now:");
++    expect(planText).toContain("impact:");
++    expect(planText).toContain("rerun:");
++    expect(planText).not.toMatch(/wallet|hotkey|raw trust|payout|farming|private reviewability|public score estimate/i);
++
+     const statusPayload = JSON.parse(await runAsync(["agent", "status", "run-1", "--json"], env)) as { run: { id: string } };
+     expect(statusPayload.run.id).toBe("run-1");
+ 
+@@ -1045,6 +1051,7 @@ async function startFixtureServer(
+       return;
+     }
+     if (request.url === "/v1/agent/plan-next-work" && request.method === "POST") {
++      await readJsonRequest(request);
+       response.end(JSON.stringify(agentFixture()));
+       return;
+     }
+@@ -1169,7 +1176,23 @@ function agentFixture() {
+         recommendation: "Pick narrow work and run branch preflight.",
+         why: ["Fixture"],
+         blockedBy: [],
++        rerunWhen: "Rerun before opening a PR or when repo queue signals change.",
+         publicSafeSummary: "Fixture public summary.",
++        explanationCard: {
++          summary: "Pursue now: this action is the current ranked next step.",
++          whyNow: "Current deterministic planning signals rank this action ahead of other available next steps.",
++          scoreabilityBlocker: "No hard scoreability blocker is visible in current signals.",
++          risk: "No major action-specific risk is visible in the current card.",
++          maintainerFriction: "Narrow, validated work is easier for maintainers to review.",
++          expectedImpact: "Advance toward one narrow, validated contribution path.",
++          blockerGroups: [],
++          rerunWhen: "Rerun before opening a PR or when repo queue signals change.",
++          publicSafe: {
++            summary: "Fixture public summary.",
++            whyNow: "Fixture public summary.",
++            rerunWhen: "Rerun before opening a PR or when repo queue signals change.",
++          },
++        },
+         approvalRequired: true,
+         safetyClass: "private",
+         payload: {},
+diff --git a/test/unit/openapi.test.ts b/test/unit/openapi.test.ts
+index 04babc6..03181ee 100644
+--- a/test/unit/openapi.test.ts
++++ b/test/unit/openapi.test.ts
+@@ -103,6 +103,7 @@ describe("OpenAPI contract", () => {
+     expect(spec.components?.schemas?.UpstreamRulesetSnapshot).toBeDefined();
+     expect(spec.components?.schemas?.UpstreamDriftReport).toBeDefined();
+     expect(JSON.stringify(spec.components?.schemas?.ScorePreviewResult)).toContain("scenarioPreviews");
++    expect(JSON.stringify(spec.components?.schemas?.AgentAction)).toContain("explanationCard");
+     expect(JSON.stringify(spec.components?.schemas?.RepoIntelligence)).toContain("burdenForecastFreshness");
+     expect(JSON.stringify(spec.components?.schemas?.CommandPreviewResponse)).toContain("missing_permission");
+     expect(JSON.stringify(spec.components?.schemas?.ContributorOutcomeHistory)).toContain("reconciliation");

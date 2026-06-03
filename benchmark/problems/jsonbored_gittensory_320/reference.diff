@@ -1,0 +1,227 @@
+diff --git a/apps/gittensory-ui/public/openapi.json b/apps/gittensory-ui/public/openapi.json
+index 88cca140..f12c7f25 100644
+--- a/apps/gittensory-ui/public/openapi.json
++++ b/apps/gittensory-ui/public/openapi.json
+@@ -9003,6 +9003,33 @@
+               ]
+             }
+           },
++          "source": {
++            "type": "object",
++            "properties": {
++              "repo": {
++                "type": "string",
++                "nullable": true
++              },
++              "ref": {
++                "type": "string",
++                "nullable": true
++              },
++              "commitSha": {
++                "type": "string",
++                "nullable": true
++              }
++            },
++            "required": [
++              "repo",
++              "ref"
++            ]
++          },
++          "recommendedFollowUp": {
++            "type": "array",
++            "items": {
++              "type": "string"
++            }
++          },
+           "previousRulesetId": {
+             "type": "string",
+             "nullable": true
+diff --git a/src/openapi/schemas.ts b/src/openapi/schemas.ts
+index f75195a9..65a159ed 100644
+--- a/src/openapi/schemas.ts
++++ b/src/openapi/schemas.ts
+@@ -816,6 +816,14 @@ export const UpstreamDriftReportSchema = z
+     status: z.enum(["open", "acknowledged", "resolved", "ignored"]),
+     summary: z.string(),
+     affectedAreas: z.array(z.enum(["registry", "scoring_model", "issue_discovery", "mirror_linkage", "language_weights", "source"])),
++    source: z
++      .object({
++        repo: z.string().nullable(),
++        ref: z.string().nullable(),
++        commitSha: z.string().nullable().optional(),
++      })
++      .optional(),
++    recommendedFollowUp: z.array(z.string()).optional(),
+     previousRulesetId: z.string().nullable().optional(),
+     currentRulesetId: z.string().nullable().optional(),
+     issueNumber: z.number().nullable().optional(),
+diff --git a/src/upstream/ruleset.ts b/src/upstream/ruleset.ts
+index 6839bc03..e54ba806 100644
+--- a/src/upstream/ruleset.ts
++++ b/src/upstream/ruleset.ts
+@@ -198,6 +198,12 @@ export async function refreshUpstreamDrift(env: Env): Promise<{ sources: Upstrea
+   const ruleset = await buildUpstreamRulesetSnapshot(env, sources);
+   const drift = await buildUpstreamDriftReport(ruleset, (await listLatestUpstreamRulesetSnapshots(env, 2))[1] ?? null);
+   if (drift) await upsertUpstreamDriftReport(env, drift);
++  await recordAuditEvent(env, {
++    eventType: "upstream.drift_detected",
++    outcome: drift ? "completed" : "success",
++    detail: drift?.severity ?? "none",
++    metadata: { currentRulesetId: ruleset.id, previousRulesetId: drift?.previousRulesetId ?? null, fingerprint: drift?.fingerprint ?? null },
++  });
+   return { sources, ruleset, drift };
+ }
+ 
+@@ -334,6 +340,12 @@ export async function buildUpstreamDriftReport(current: UpstreamRulesetSnapshotR
+   const affectedAreas = [...affected].sort();
+   const fingerprint = await sha256Hex(stableStringify({ current: current.semanticHash, previous: previous.semanticHash, affectedAreas }));
+   const now = nowIso();
++  const source = {
++    repo: current.sourceRepo,
++    ref: current.sourceRef,
++    commitSha: current.commitSha ?? null,
++  };
++  const recommendedFollowUp = upstreamRecommendedFollowUpForAreas(affectedAreas);
+   return {
+     id: crypto.randomUUID(),
+     fingerprint,
+@@ -347,6 +359,8 @@ export async function buildUpstreamDriftReport(current: UpstreamRulesetSnapshotR
+       changes,
+       repoChanges,
+       registryHyperparameterDrift,
++      source,
++      recommendedFollowUp,
+       current: publicRuleset(current),
+       previous: publicRuleset(previous),
+     },
+@@ -882,6 +896,8 @@ function publicRuleset(snapshot: UpstreamRulesetSnapshotRecord): Record<string,
+ }
+ 
+ function publicDriftReport(report: UpstreamDriftReportRecord): Record<string, JsonValue> {
++  const source = recordPayload(report.payload.source);
++  const recommendedFollowUp = arrayPayload(report.payload.recommendedFollowUp).filter((entry): entry is string => typeof entry === "string");
+   return {
+     id: report.id,
+     fingerprint: report.fingerprint,
+@@ -889,6 +905,12 @@ function publicDriftReport(report: UpstreamDriftReportRecord): Record<string, Js
+     status: report.status,
+     summary: report.summary,
+     affectedAreas: report.affectedAreas,
++    source: {
++      repo: stringPayload(source.repo) ?? null,
++      ref: stringPayload(source.ref) ?? null,
++      commitSha: stringPayload(source.commitSha),
++    },
++    recommendedFollowUp,
+     previousRulesetId: report.previousRulesetId ?? null,
+     currentRulesetId: report.currentRulesetId ?? null,
+     issueNumber: report.issueNumber ?? null,
+@@ -1043,6 +1065,31 @@ function upstreamSourcePathsForArea(area: UpstreamDriftArea): string[] {
+   }
+ }
+ 
++function upstreamRecommendedFollowUpForAreas(areas: UpstreamDriftArea[]): string[] {
++  const modules = new Set<string>();
++  for (const area of areas.length > 0 ? areas : (["source"] as UpstreamDriftArea[])) {
++    for (const module of upstreamModulesForArea(area)) modules.add(module);
++  }
++  return [...modules].sort();
++}
++
++function upstreamModulesForArea(area: UpstreamDriftArea): string[] {
++  switch (area) {
++    case "registry":
++      return ["src/registry/normalize.ts", "src/registry/sync.ts", "test/unit/upstream-ruleset.test.ts"];
++    case "scoring_model":
++      return ["src/scoring/model.ts", "src/upstream/ruleset.ts", "test/unit/upstream-ruleset.test.ts"];
++    case "issue_discovery":
++      return ["src/upstream/ruleset.ts", "src/signals/registration-readiness.ts"];
++    case "mirror_linkage":
++      return ["src/upstream/ruleset.ts", "src/scoring/model.ts"];
++    case "language_weights":
++      return ["src/upstream/ruleset.ts", "src/scoring/model.ts"];
++    case "source":
++      return ["src/upstream/ruleset.ts", "test/contract/upstream-contract.test.ts"];
++  }
++}
++
+ function githubHeaders(token: string | undefined, accept: string): Record<string, string> {
+   return {
+     accept,
+diff --git a/test/unit/upstream-ruleset.test.ts b/test/unit/upstream-ruleset.test.ts
+index ae015ee9..f9c1103b 100644
+--- a/test/unit/upstream-ruleset.test.ts
++++ b/test/unit/upstream-ruleset.test.ts
+@@ -1,4 +1,5 @@
+ import { afterEach, describe, expect, it, vi } from "vitest";
++import * as repositories from "../../src/db/repositories";
+ import {
+   persistUpstreamRulesetSnapshot,
+   listLatestUpstreamSourceSnapshotsByKey,
+@@ -847,6 +848,66 @@ describe("upstream ruleset drift tracking", () => {
+       reports: expect.arrayContaining([expect.objectContaining({ currentRulesetId: null, previousRulesetId: null, issueNumber: null, issueUrl: null })]),
+     });
+   });
++
++  it("includes upstream source metadata and recommended follow-up modules in drift reports", async () => {
++    const previous = ruleset("ruleset-old", "old-hash", "current_density_model", 1, 0.01, "2026-05-30T00:00:00.000Z");
++    const current = ruleset("ruleset-new", "new-hash", "pending_saturation_model", 2, 0.02, "2026-05-30T00:05:00.000Z");
++    const report = await buildUpstreamDriftReport(current, previous);
++
++    expect(report).toMatchObject({
++      payload: {
++        source: { repo: "entrius/gittensor", ref: "test", commitSha: "ruleset-new-commit" },
++        recommendedFollowUp: expect.arrayContaining(["src/scoring/model.ts", "src/upstream/ruleset.ts", "src/registry/normalize.ts"]),
++      },
++    });
++
++    const env = createTestEnv();
++    await persistUpstreamRulesetSnapshot(env, previous);
++    await persistUpstreamRulesetSnapshot(env, current);
++    await upsertUpstreamDriftReport(env, report!);
++
++    const status = await loadUpstreamStatus(env);
++    const publicReport = status.reports.find((entry) => entry.fingerprint === report!.fingerprint);
++    expect(publicReport).toMatchObject({
++      source: { repo: "entrius/gittensor", ref: "test", commitSha: "ruleset-new-commit" },
++      recommendedFollowUp: expect.arrayContaining(["src/upstream/ruleset.ts"]),
++    });
++    expect(JSON.stringify(publicReport)).not.toMatch(/wallet|hotkey|raw trust score|payout|reward estimate|farming|private reviewability|public score estimate/i);
++  });
++
++  it("computes a deterministic drift fingerprint for a known ruleset pair", async () => {
++    const previous = ruleset("fingerprint-previous", "semantic-previous", "pending_saturation_model", 1, 0.01, "2026-05-30T00:00:00.000Z");
++    const current = withPayload(previous, "fingerprint-current", {
++      scoring: { activeModel: "pending_saturation_model", constants: { SRC_TOK_SATURATION_SCALE: 99 }, semanticFlags: {} },
++    });
++
++    const report = await buildUpstreamDriftReport(current, previous);
++    expect(report?.fingerprint).toBe("362f9fd9666e8e8629b28cf8214b05dafb7bef7d5d72c75b80162e019052a42f");
++  });
++
++  it("records secret-safe upstream drift audit metadata without raw source payloads", async () => {
++    vi.useFakeTimers({ toFake: ["Date"] });
++    vi.setSystemTime(new Date("2026-05-30T00:00:00.000Z"));
++    const env = createTestEnv({ GITHUB_PUBLIC_TOKEN: "token" });
++    const auditEvents: Array<Record<string, unknown>> = [];
++    vi.spyOn(repositories, "recordAuditEvent").mockImplementation(async (_env, event) => {
++      auditEvents.push({ eventType: event.eventType, detail: event.detail, metadata: event.metadata ?? {} });
++    });
++    vi.stubGlobal("fetch", upstreamFetch(fixtures("58", 0.01)));
++    await refreshUpstreamDrift(env);
++
++    vi.setSystemTime(new Date("2026-05-30T00:10:00.000Z"));
++    vi.stubGlobal("fetch", upstreamFetch(fixtures("99", 0.02)));
++    await refreshUpstreamDrift(env);
++
++    const serialized = JSON.stringify(auditEvents);
++    expect(auditEvents.map((event) => event.eventType)).toEqual(
++      expect.arrayContaining(["upstream.sources_refreshed", "upstream.ruleset_built", "upstream.drift_detected"]),
++    );
++    expect(auditEvents.filter((event) => event.eventType === "upstream.drift_detected")).toHaveLength(2);
++    expect(serialized).not.toMatch(/SRC_TOK_SATURATION_SCALE|master_repositories\.json|wallet|hotkey|raw trust score|payout|reward estimate|farming|private reviewability|public score estimate/i);
++    expect(serialized).not.toContain("OSS_EMISSION_SHARE");
++  });
+ });
+ 
+ function fixtures(scale: string, emissionShare: number): Record<string, string> {
