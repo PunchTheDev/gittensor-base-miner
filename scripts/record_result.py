@@ -55,9 +55,13 @@ def load_json(path: pathlib.Path, default):
 
 
 def current_sota(leaderboard: list[dict]) -> float:
-    """Best score among real (ranked) entries."""
-    real = [r["score"] for r in leaderboard if r.get("rank") and r.get("score") is not None]
-    return max(real) if real else 0.0
+    """Best weighted score among real (ranked) entries (primary ranking metric)."""
+    real = [
+        r.get("weighted_score") or r.get("score")
+        for r in leaderboard
+        if r.get("rank") and r.get("score") is not None
+    ]
+    return max((s for s in real if s is not None), default=0.0)
 
 
 def marginal_gain(score: float, sota: float) -> float:
@@ -155,8 +159,8 @@ def main():
     }
 
     prev_sota = current_sota(leaderboard)
-    gain = marginal_gain(float(mean_score), prev_sota)
-    weight = contribution_weight(float(mean_score), prev_sota)
+    gain = marginal_gain(float(weighted_mean), prev_sota)
+    weight = contribution_weight(float(weighted_mean), prev_sota)
 
     entry["sota_at_submission"] = round(prev_sota, 4)
     entry["marginal_gain"] = round(gain, 4)
@@ -166,7 +170,7 @@ def main():
     new_sota = current_sota(leaderboard)
 
     lb_file.write_text(json.dumps(leaderboard, indent=2))
-    print(f"Leaderboard updated: {args.handle} scored {mean_score:.4f}")
+    print(f"Leaderboard updated: {args.handle} scored weighted={weighted_mean:.4f} / arithmetic={mean_score:.4f}")
     print(f"  SOTA at submission: {prev_sota:.4f}  |  marginal gain: {gain:.4f}  |  weight: {weight:.4f}")
 
     # Append to history if this beats or ties SOTA
