@@ -2834,3 +2834,28 @@ Both updated to current values (675 problems, 14.94/13.62).
 - 🚨 Per-miner OpenRouter key
 - Commit-reveal (private eval server)
 
+
+---
+
+## Step 169 — 2026-06-03
+
+### Audit: Zero-score problem retrospective + is_substantive() fix
+
+**PR #25** — Remove 4 zero-score problems; gate ingestion on baseScore > 0.5
+
+Root cause: `is_substantive()` only checked `tokenScore > 0` and `totalNodesScored > 0`. All 4 had DAS `baseScore = 0.0` but non-zero token/structural activity. A miner who solves the underlying issue perfectly still gets base_score = 0 (unsolvable benchmarks).
+
+Problems removed (675 → 671):
+- geniepod_genie-claw_76: ref diff only touches shell scripts + test (no Rust source)
+- geniepod_genie-claw_98: ref diff only touches HTML template + test
+- jsonbored_gittensory_228: TypeScript code reorder, AST diff ≈ 0
+- encode_starlette_2711: single-line Python whitespace change, AST delta = 0
+
+Fix: `is_substantive()` now requires `baseScore > 0.5`. Pool_config.json documents `min_reference_score: 0.5` in selection_criteria. Oracle: **14.94 → 15.0** weighted, **13.62 → 13.71** arithmetic.
+
+Dashboard updated: punchthedev.github.io/gittensor-miner-dashboard/ now shows 671 problems, oracle 15.0. API verified: pool_size=671, oracle_score=15.0.
+
+### Critical gaps (unchanged, still need operator input)
+- 🚨 Daytona integration — model enforcement + static agent detection
+- 🚨 Per-miner OpenRouter key
+- Commit-reveal (private eval server)
