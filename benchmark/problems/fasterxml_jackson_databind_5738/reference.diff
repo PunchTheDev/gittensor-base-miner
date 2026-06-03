@@ -1,0 +1,222 @@
+diff --git a/release-notes/VERSION b/release-notes/VERSION
+index 6833a63f36..7c794cf0ab 100644
+--- a/release-notes/VERSION
++++ b/release-notes/VERSION
+@@ -26,6 +26,10 @@ Versions: 3.x (for earlier see VERSION-2.x)
+   `BeanDescription.getIgnoredPropertyNames()`
+  (requested by Oliver D)
+  (fix by @cowtowncoder, w/ Claude code)
++#5615: JsonMapper seems to be not thread-safe when using the polymorphic
++  `JsonTypeInfo.As.PROPERTY` definition (and `@JsonIgnoreProperties`)
++ (reported by @xC0DEBA5E)
++ (fix by @cowtowncoder, w/ Claude code)
+ #5734: `DeserializationFeature.FAIL_ON_NULL_FOR_PRIMITIVES` treats
+   absent field same as explicit `null`
+  (reported by Martin U)
+diff --git a/src/main/java/tools/jackson/databind/ser/BeanPropertyWriter.java b/src/main/java/tools/jackson/databind/ser/BeanPropertyWriter.java
+index cac45e7400..52c44769a4 100644
+--- a/src/main/java/tools/jackson/databind/ser/BeanPropertyWriter.java
++++ b/src/main/java/tools/jackson/databind/ser/BeanPropertyWriter.java
+@@ -243,6 +243,17 @@ public BeanPropertyWriter(BeanPropertyDefinition propDef,
+         _typeSerializer = typeSer;
+         _cfgSerializationType = serType;
+ 
++        // [databind#5615]: Set _nonTrivialBaseType here in constructor (rather than
++        // in BeanSerializerBase.resolve()) to avoid race condition where another thread
++        // may use this property writer before resolve() has been called.
++        if (ser == null) {
++            JavaType baseType = (serType != null) ? serType : declaredType;
++            if (baseType != null && !baseType.isFinal()
++                    && (baseType.isContainerType() || baseType.hasGenericTypes())) {
++                _nonTrivialBaseType = baseType;
++            }
++        }
++
+         _suppressNulls = suppressNulls;
+         _suppressableValue = suppressableValue;
+ 
+@@ -405,7 +416,10 @@ public BeanPropertyWriter unwrappingWriter(NameTransformer unwrapper) {
+      * Method called to define type to consider as "non-trivial" basetype,
+      * needed for dynamic serialization resolution for complex (usually
+      * container) types
++     *
++     * @deprecated Since 3.2, should no longer be needed
+      */
++    @Deprecated // @since 3.2
+     public void setNonTrivialBaseType(JavaType t) {
+         _nonTrivialBaseType = t;
+     }
+diff --git a/src/main/java/tools/jackson/databind/ser/bean/BeanSerializerBase.java b/src/main/java/tools/jackson/databind/ser/bean/BeanSerializerBase.java
+index 305aae5cce..853ed91b37 100644
+--- a/src/main/java/tools/jackson/databind/ser/bean/BeanSerializerBase.java
++++ b/src/main/java/tools/jackson/databind/ser/bean/BeanSerializerBase.java
+@@ -301,10 +301,9 @@ public void resolve(SerializationContext ctxt)
+                 // if not, we don't really know the actual type until we get the instance.
+                 if (type == null) {
+                     type = prop.getType();
++                    // [databind#5615]: _nonTrivialBaseType now set in BeanPropertyWriter
++                    // constructor to avoid race condition
+                     if (!type.isFinal()) {
+-                        if (type.isContainerType() || type.containedTypeCount() > 0) {
+-                            prop.setNonTrivialBaseType(type);
+-                        }
+                         continue;
+                     }
+                 }
+diff --git a/src/test/java/tools/jackson/databind/misc/ThreadSafetyWithPolymorphicSer5615Test.java b/src/test/java/tools/jackson/databind/misc/ThreadSafetyWithPolymorphicSer5615Test.java
+new file mode 100644
+index 0000000000..90c4f25203
+--- /dev/null
++++ b/src/test/java/tools/jackson/databind/misc/ThreadSafetyWithPolymorphicSer5615Test.java
+@@ -0,0 +1,151 @@
++package tools.jackson.databind.misc;
++
++import java.util.List;
++import java.util.concurrent.CopyOnWriteArrayList;
++import java.util.concurrent.CyclicBarrier;
++import java.util.stream.Collectors;
++
++import com.fasterxml.jackson.annotation.JsonIgnoreProperties;
++import com.fasterxml.jackson.annotation.JsonProperty;
++import com.fasterxml.jackson.annotation.JsonSubTypes;
++import com.fasterxml.jackson.annotation.JsonTypeInfo;
++
++import org.junit.jupiter.api.RepeatedTest;
++
++import tools.jackson.databind.json.JsonMapper;
++import tools.jackson.databind.testutil.DatabindTestUtil;
++
++import static org.junit.jupiter.api.Assertions.assertTrue;
++
++/**
++ * Test for [databind#5615]: Race condition with {@code @JsonIgnoreProperties}
++ * and {@code @JsonTypeInfo(include = As.PROPERTY)} on serialization side
++ */
++public class ThreadSafetyWithPolymorphicSer5615Test
++    extends DatabindTestUtil
++{
++    @JsonIgnoreProperties(value = {"typ"}, allowSetters = true)
++    @JsonTypeInfo(use = JsonTypeInfo.Id.NAME, include = JsonTypeInfo.As.PROPERTY, property = "typ", visible = true)
++    @JsonSubTypes({
++            @JsonSubTypes.Type(value = LivingRoom.class, name = "Living"),
++            @JsonSubTypes.Type(value = SleepingRoom.class, name = "Sleeping")
++    })
++    interface Room {
++        @JsonProperty("typ")
++        RoomType getTyp();
++    }
++
++    record LivingRoom(@JsonProperty("typ") RoomType typ,
++            @JsonProperty("animals") List<Cat> animals)
++        implements Room
++    {
++        @Override
++        public RoomType getTyp() { return typ; }
++    }
++
++    record SleepingRoom(@JsonProperty("typ") RoomType typ,
++            @JsonProperty("animals") List<Dog> animals)
++        implements Room
++    {
++        @Override
++        public RoomType getTyp() { return typ; }
++    }
++
++    enum RoomType { Living, Sleeping }
++
++    @JsonIgnoreProperties(value = {"typ"}, allowSetters = true)
++    @JsonTypeInfo(use = JsonTypeInfo.Id.NAME, include = JsonTypeInfo.As.PROPERTY, property = "typ", visible = true)
++    @JsonSubTypes({
++            @JsonSubTypes.Type(value = Cat.class, name = "Cat"),
++            @JsonSubTypes.Type(value = Dog.class, name = "Dog")
++    })
++    interface Animal {
++        @JsonProperty("typ")
++        AnimalType getTyp();
++    }
++
++    record Cat(@JsonProperty("typ") AnimalType typ) implements Animal {
++        @Override
++        public AnimalType getTyp() { return typ; }
++    }
++
++    record Dog(@JsonProperty("typ") AnimalType typ) implements Animal {
++        @Override
++        public AnimalType getTyp() { return typ; }
++    }
++
++    enum AnimalType { Dog, Cat }
++
++    record Result(@JsonProperty("rooms") List<Room> rooms) { }
++
++    private static final String ROOMS_JSON = """
++            {
++                "rooms": [
++                    {
++                      "typ": "Living",
++                      "animals": [
++                            { "typ": "Cat" },
++                            { "typ": "Cat" },
++                            { "typ": "Cat" },
++                            { "typ": "Cat" }
++                      ]
++                    },
++                    {
++                      "typ": "Sleeping",
++                      "animals": [
++                            { "typ": "Dog" },
++                            { "typ": "Dog" },
++                            { "typ": "Dog" },
++                            { "typ": "Dog" }
++                      ]
++                    }
++                ]
++            }
++            """;
++
++    // Use 50 repetitions; original test uses 1000 but 50 should be enough
++    // to trigger the race condition
++    @RepeatedTest(50)
++    public void testConcurrentDeserializationWithJsonIgnoreAndTypeInfo() throws Exception {
++        final JsonMapper mapper = newJsonMapper();
++        final Result result = mapper.readValue(ROOMS_JSON, Result.class);
++
++        int threadCount = 10;
++        CyclicBarrier barrier = new CyclicBarrier(threadCount);
++        CopyOnWriteArrayList<Throwable> errors = new CopyOnWriteArrayList<>();
++        List<Thread> threads = new java.util.ArrayList<>();
++
++        for (int i = 0; i < threadCount; i++) {
++            Thread t = new Thread(() -> {
++                try {
++                    barrier.await();
++                    for (int j = 0; j < 100; j++) {
++                        String json = mapper.writeValueAsString(result);
++                        try {
++                            mapper.readValue(json, Result.class);
++                        } catch (Throwable e) {
++                            // Capture the JSON that caused the failure
++                            errors.add(new RuntimeException("Failed on JSON: " + json, e));
++                            return;
++                        }
++                    }
++                } catch (Throwable e) {
++                    errors.add(e);
++                }
++            });
++            threads.add(t);
++            t.start();
++        }
++
++        for (Thread t : threads) {
++            t.join();
++        }
++
++        assertTrue(errors.isEmpty(),
++                () -> String.format("test failed with %d error(s):\n%s",
++                        errors.size(),
++                        errors.stream()
++                                .map(Throwable::toString)
++                                .collect(Collectors.joining("\n"))));
++    }
++}

@@ -1,0 +1,241 @@
+diff --git a/src/main/java/tools/jackson/databind/jsontype/TypeResolverProvider.java b/src/main/java/tools/jackson/databind/jsontype/TypeResolverProvider.java
+index 20b3bb14a3..c2dfaa40fb 100644
+--- a/src/main/java/tools/jackson/databind/jsontype/TypeResolverProvider.java
++++ b/src/main/java/tools/jackson/databind/jsontype/TypeResolverProvider.java
+@@ -1,10 +1,17 @@
+ package tools.jackson.databind.jsontype;
+ 
+ import java.util.Collection;
++import java.util.List;
++import java.util.Optional;
+ 
+-import com.fasterxml.jackson.annotation.*;
++import com.fasterxml.jackson.annotation.JsonTypeInfo;
+ 
+-import tools.jackson.databind.*;
++import tools.jackson.databind.AnnotationIntrospector;
++import tools.jackson.databind.DeserializationConfig;
++import tools.jackson.databind.DeserializationContext;
++import tools.jackson.databind.JavaType;
++import tools.jackson.databind.SerializationConfig;
++import tools.jackson.databind.SerializationContext;
+ import tools.jackson.databind.cfg.MapperConfig;
+ import tools.jackson.databind.introspect.Annotated;
+ import tools.jackson.databind.introspect.AnnotatedClass;
+@@ -269,16 +276,24 @@ protected TypeResolverBuilder<?> _findTypeResolver(MapperConfig<?> config,
+             if (typeInfo.getIdType() == JsonTypeInfo.Id.NONE) {
+                 return NO_RESOLVER;
+             }
++
++            JavaType detectedBaseType;
+             // 13-Aug-2011, tatu: One complication; external id
+             //   only works for properties; so if declared for a Class, we will need
+             //   to map it to "PROPERTY" instead of "EXTERNAL_PROPERTY"
+-            if (ann instanceof AnnotatedClass) {
++            if (ann instanceof AnnotatedClass annotatedClass) {
+                 JsonTypeInfo.As inclusion = typeInfo.getInclusionType();
+                 if (inclusion == JsonTypeInfo.As.EXTERNAL_PROPERTY) {
+                     typeInfo = typeInfo.withInclusionType(JsonTypeInfo.As.PROPERTY);
+                 }
++
++                detectedBaseType = ai.findPolymorphicBaseType(config, annotatedClass, typeInfo, baseType);
++            } else {
++            	// when method/field annotated, declared type MUST be intended base type
++            	detectedBaseType = null;
+             }
+-            b = _constructStdTypeResolverBuilder(config, typeInfo, baseType);
++
++            b = _constructStdTypeResolverBuilder(config, typeInfo, baseType, detectedBaseType);
+         }
+         // Does it define a custom type id resolver?
+         Object customIdResolverOb = ai.findTypeIdResolver(config, ann);
+@@ -297,7 +312,7 @@ protected TypeResolverBuilder<?> _findTypeResolver(MapperConfig<?> config,
+     }
+ 
+     protected TypeResolverBuilder<?> _constructStdTypeResolverBuilder(MapperConfig<?> config,
+-            JsonTypeInfo.Value typeInfo, JavaType baseType) {
+-        return new StdTypeResolverBuilder(typeInfo);
++            JsonTypeInfo.Value typeInfo, JavaType baseType, JavaType detectedBaseType) {
++        return new StdTypeResolverBuilder(typeInfo, detectedBaseType);
+     }
+ }
+diff --git a/src/main/java/tools/jackson/databind/jsontype/impl/StdTypeResolverBuilder.java b/src/main/java/tools/jackson/databind/jsontype/impl/StdTypeResolverBuilder.java
+index 4015190e2b..5d75038bf0 100644
+--- a/src/main/java/tools/jackson/databind/jsontype/impl/StdTypeResolverBuilder.java
++++ b/src/main/java/tools/jackson/databind/jsontype/impl/StdTypeResolverBuilder.java
+@@ -23,6 +23,13 @@ public class StdTypeResolverBuilder
+     protected JsonTypeInfo.Id _idType;
+ 
+     protected JsonTypeInfo.As _includeAs;
++    
++    /**
++     * The type representing the base class. Typically the class holding the JsonTypeInfo annotation.
++     * 
++     * @since 3.2
++     */
++    protected final JavaType _detectedBaseType;
+ 
+     protected String _typeProperty;
+ 
+@@ -55,16 +62,45 @@ public class StdTypeResolverBuilder
+     /**********************************************************************
+      */
+ 
+-    public StdTypeResolverBuilder() { }
++    public StdTypeResolverBuilder() { 
++        this._detectedBaseType = null;
++    }
+ 
++    /**
++     * @deprecated Prefer similar constructor accepting a JavaType detectedBaseType
++     */
++    @Deprecated(since = "3.2")
+     public StdTypeResolverBuilder(JsonTypeInfo.Value settings) {
++    	this(settings, null);
++    }
++
++    /**
++     * The type representing the base class. Typically the class holding the JsonTypeInfo annotation.
++     * 
++     * @since 3.2
++     */
++    public StdTypeResolverBuilder(JsonTypeInfo.Value settings, JavaType detectedBaseType) {
+         if (settings != null) {
+             withSettings(settings);
+         }
++        _detectedBaseType = detectedBaseType;
+     }
+ 
++    /**
++     * @deprecated Prefer similar constructor accepting a JavaType detectedBaseType
++     */
++    @Deprecated(since = "3.2")
+     public StdTypeResolverBuilder(JsonTypeInfo.Id idType,
+             JsonTypeInfo.As idAs, String propName)
++    {
++        this(idType, idAs, propName, null);
++    }
++
++    /**
++     * @since 3.2
++     */
++    public StdTypeResolverBuilder(JsonTypeInfo.Id idType,
++            JsonTypeInfo.As idAs, String propName, JavaType detectedBaseType)
+     {
+         if (idType == null) {
+             throw new IllegalArgumentException("idType cannot be null");
+@@ -72,6 +108,7 @@ public StdTypeResolverBuilder(JsonTypeInfo.Id idType,
+         _idType = idType;
+         _includeAs = idAs;
+         _typeProperty = _propName(propName, _idType);
++        _detectedBaseType = detectedBaseType;
+     }
+ 
+     protected StdTypeResolverBuilder(StdTypeResolverBuilder base,
+@@ -85,10 +122,11 @@ protected StdTypeResolverBuilder(StdTypeResolverBuilder base,
+ 
+         _defaultImpl = defaultImpl;
+         _requireTypeIdForSubtypes = base._requireTypeIdForSubtypes;
++        _detectedBaseType = base._detectedBaseType;
+     }
+ 
+     public static StdTypeResolverBuilder noTypeInfoBuilder() {
+-        return new StdTypeResolverBuilder(JsonTypeInfo.Id.NONE, null, null);
++        return new StdTypeResolverBuilder(JsonTypeInfo.Id.NONE, null, null, null);
+     }
+ 
+     @Override
+@@ -288,17 +326,20 @@ protected TypeIdResolver idResolver(DatabindContext ctxt,
+         // Custom id resolver?
+         if (_customIdResolver != null) { return _customIdResolver; }
+         if (_idType == null) throw new IllegalStateException("Cannot build, 'init()' not yet called");
++        
++        JavaType actualBaseType = _detectedBaseType != null ? _detectedBaseType : baseType;
++        
+         switch (_idType) {
+         case DEDUCTION: // Deduction produces class names to be resolved
+         case CLASS:
+-            return ClassNameIdResolver.construct(baseType, subtypes, subtypeValidator);
++            return ClassNameIdResolver.construct(actualBaseType, subtypes, subtypeValidator);
+         case MINIMAL_CLASS:
+-            return MinimalClassNameIdResolver.construct(baseType, subtypes, subtypeValidator);
++            return MinimalClassNameIdResolver.construct(actualBaseType, subtypes, subtypeValidator);
+         case SIMPLE_NAME:
+-            return SimpleNameIdResolver.construct(ctxt.getConfig(), baseType,
++            return SimpleNameIdResolver.construct(ctxt.getConfig(), actualBaseType,
+                     subtypes, forSer, forDeser);
+         case NAME:
+-            return TypeNameIdResolver.construct(ctxt.getConfig(), baseType,
++            return TypeNameIdResolver.construct(ctxt.getConfig(), actualBaseType,
+                     subtypes, forSer, forDeser);
+         case NONE: // hmmh. should never get this far with 'none'
+             return null;
+diff --git a/src/test/java/tools/jackson/databind/jsontype/TestSubtypesSubPackage.java b/src/test/java/tools/jackson/databind/jsontype/TestSubtypesSubPackage.java
+new file mode 100644
+index 0000000000..277437b62a
+--- /dev/null
++++ b/src/test/java/tools/jackson/databind/jsontype/TestSubtypesSubPackage.java
+@@ -0,0 +1,49 @@
++package tools.jackson.databind.jsontype;
++
++import static org.junit.jupiter.api.Assertions.assertEquals;
++
++import org.junit.jupiter.api.Test;
++
++import com.fasterxml.jackson.annotation.JsonTypeInfo;
++
++import tools.jackson.databind.ObjectMapper;
++import tools.jackson.databind.jsontype.TestSubtypesSubPackage.SuperType.InnerType;
++import tools.jackson.databind.jsontype.subpackage.SubCSubPackage;
++import tools.jackson.databind.testutil.DatabindTestUtil;
++
++// For [databind#4983]: `JsonTypeInfo.Id.MINIMAL_CLASS` generates invalid type on sub-package
++public class TestSubtypesSubPackage extends DatabindTestUtil
++{
++	// Extended by SubCSubPackage which is in a sub package
++    @JsonTypeInfo(use=JsonTypeInfo.Id.MINIMAL_CLASS)
++    public static abstract class SuperType {
++
++        public static class InnerType extends SuperType {
++        	public int b = 2;
++        }
++    }
++
++    /*
++    /**********************************************************
++    /* Unit tests
++    /**********************************************************
++     */
++
++    private final ObjectMapper MAPPER = new ObjectMapper();
++
++    @Test
++    public void testSubPackage() throws Exception
++    {
++    	// type should be computed consider base=SuperType (as it provides the annotation)
++    	SubCSubPackage bean = new SubCSubPackage();
++        assertEquals("{\"@c\":\".subpackage.SubCSubPackage\",\"c\":2}", MAPPER.writeValueAsString(bean));
++    }
++
++    @Test
++    public void testInner() throws Exception
++    {
++    	// type should be computed consider base=SuperType (as it provides the annotation)
++    	InnerType bean = new InnerType();
++        assertEquals("{\"@c\":\".TestSubtypesSubPackage$SuperType$InnerType\",\"b\":2}", MAPPER.writeValueAsString(bean));
++    }
++}
+diff --git a/src/test/java/tools/jackson/databind/jsontype/subpackage/SubCSubPackage.java b/src/test/java/tools/jackson/databind/jsontype/subpackage/SubCSubPackage.java
+new file mode 100644
+index 0000000000..0f938cd8cc
+--- /dev/null
++++ b/src/test/java/tools/jackson/databind/jsontype/subpackage/SubCSubPackage.java
+@@ -0,0 +1,8 @@
++package tools.jackson.databind.jsontype.subpackage;
++
++import tools.jackson.databind.jsontype.TestSubtypesSubPackage;
++
++//For [databind#4983]: `JsonTypeInfo.Id.MINIMAL_CLASS` generates invalid type on sub-package
++public class SubCSubPackage extends TestSubtypesSubPackage.SuperType {
++	public int c = 2;
++}

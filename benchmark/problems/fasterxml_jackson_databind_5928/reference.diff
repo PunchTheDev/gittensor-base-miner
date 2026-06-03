@@ -1,0 +1,173 @@
+diff --git a/release-notes/CREDITS b/release-notes/CREDITS
+index acec9aa881..0a7bd42102 100644
+--- a/release-notes/CREDITS
++++ b/release-notes/CREDITS
+@@ -426,6 +426,12 @@ Daniel Gerhardt (@dgerhardt)
+  * Reported #3205: ConfigOverrides for merging are not applied for items inside containers
+   [3.2.0]
+ 
++Aurimas Niekis (@aurimasniekis)
++ * Reported #3547: When using type id with `As.EXTERNAL_PROPERTY` together with
++  `@JsonValue` inside type the serialiser omits external type id field
++  from result when `@JsonValue` value is null
++  [3.2.0]
++
+ Andrzej Leśkiewicz (@aleskiewicz)
+  * Reported #3573: Inconsistent handling of nil `UUID` in property inclusion
+   [3.2.0]
+diff --git a/release-notes/VERSION b/release-notes/VERSION
+index 9e4aeb1e07..5063ff13d6 100644
+--- a/release-notes/VERSION
++++ b/release-notes/VERSION
+@@ -126,6 +126,11 @@ Versions: 3.x (for earlier see VERSION-2.x)
+   "Cannot construct instance (although at least one Creator exists)"
+  (reported by @dinopraso)
+  (fix by @JacksonJang)
++#3547: When using type id with `As.EXTERNAL_PROPERTY` together with
++  `@JsonValue` inside type the serialiser omits external type id field
++  from result when `@JsonValue` value is null
++ (reported by Aurimas N)
++ (fix by @cowtowncoder, w/ Claude code)
+ #3573: Inconsistent handling of nil `UUID` in property inclusion
+  (reported by Andrzej L)
+ #3591: Ignored fields not consistently exposed via
+diff --git a/src/main/java/tools/jackson/databind/ser/jackson/JsonValueSerializer.java b/src/main/java/tools/jackson/databind/ser/jackson/JsonValueSerializer.java
+index 7d91917207..3fbdbdc155 100644
+--- a/src/main/java/tools/jackson/databind/ser/jackson/JsonValueSerializer.java
++++ b/src/main/java/tools/jackson/databind/ser/jackson/JsonValueSerializer.java
+@@ -274,6 +274,24 @@ public void serializeWithType(Object bean, JsonGenerator gen, SerializationConte
+         }
+         // and if we got null, can also just write it directly
+         if (value == null) {
++            // [databind#3547]: With `EXTERNAL_PROPERTY` inclusion the type id lives on
++            // the parent object, so even if the `@JsonValue` accessor returns null we
++            // must still emit the type id (derived from the non-null bean) so the parent
++            // writes its external "type" property.
++            //
++            // Scoped to EXTERNAL_PROPERTY only: the parent has already committed to a
++            // sibling "type" field, so dropping it leaves the container in a
++            // schema-inconsistent state. Wrapper modes (WRAPPER_ARRAY / WRAPPER_OBJECT)
++            // have the same roundtrip gap in principle, but changing those would alter
++            // the JSON wire format for null values (bare `null` vs. `["id",null]`) and
++            // risk regressing callers relying on the current output.
++            if (typeSer0.getTypeInclusion() == As.EXTERNAL_PROPERTY) {
++                WritableTypeId typeIdDef = typeSer0.writeTypePrefix(gen, ctxt,
++                        typeSer0.typeId(bean, JsonToken.VALUE_NULL));
++                ctxt.defaultSerializeNullValue(gen);
++                typeSer0.writeTypeSuffix(gen, ctxt, typeIdDef);
++                return;
++            }
+             ctxt.defaultSerializeNullValue(gen);
+             return;
+         }
+diff --git a/src/test/java/tools/jackson/databind/jsontype/ext/ExternalPropertyWithJsonValueNull3547Test.java b/src/test/java/tools/jackson/databind/jsontype/ext/ExternalPropertyWithJsonValueNull3547Test.java
+new file mode 100644
+index 0000000000..32532c0c33
+--- /dev/null
++++ b/src/test/java/tools/jackson/databind/jsontype/ext/ExternalPropertyWithJsonValueNull3547Test.java
+@@ -0,0 +1,105 @@
++package tools.jackson.databind.jsontype.ext;
++
++import org.junit.jupiter.api.Test;
++
++import com.fasterxml.jackson.annotation.JsonCreator;
++import com.fasterxml.jackson.annotation.JsonSubTypes;
++import com.fasterxml.jackson.annotation.JsonSubTypes.Type;
++import com.fasterxml.jackson.annotation.JsonTypeInfo;
++import com.fasterxml.jackson.annotation.JsonTypeInfo.As;
++import com.fasterxml.jackson.annotation.JsonTypeInfo.Id;
++import com.fasterxml.jackson.annotation.JsonValue;
++
++import tools.jackson.databind.ObjectMapper;
++import tools.jackson.databind.testutil.DatabindTestUtil;
++
++import static org.junit.jupiter.api.Assertions.assertEquals;
++import static org.junit.jupiter.api.Assertions.assertInstanceOf;
++import static org.junit.jupiter.api.Assertions.assertNotNull;
++
++// [databind#3547]: When combining `As.EXTERNAL_PROPERTY` with `@JsonValue`, the serializer
++// used to omit the external type id field when the `@JsonValue` return value was null.
++public class ExternalPropertyWithJsonValueNull3547Test extends DatabindTestUtil
++{
++    public interface GenericType {
++        String getValue();
++        void setValue(String value);
++    }
++
++    public static abstract class AbstractGenericType implements GenericType {
++        protected String value;
++        public AbstractGenericType() { }
++        public AbstractGenericType(String value) { this.value = value; }
++        @Override @JsonValue public String getValue() { return value; }
++        @Override public void setValue(String value) { this.value = value; }
++    }
++
++    public static class FooType extends AbstractGenericType {
++        public FooType() { super(); }
++        @JsonCreator public FooType(String value) { super(value); }
++    }
++
++    public static class Container {
++        @JsonTypeInfo(use = Id.CLASS, include = As.EXTERNAL_PROPERTY, property = "type", visible = true)
++        @JsonSubTypes(value = { @Type(value = FooType.class) })
++        protected GenericType value;
++
++        public GenericType getValue() { return value; }
++        public void setValue(GenericType value) { this.value = value; }
++    }
++
++    private final ObjectMapper MAPPER = newJsonMapper();
++
++    @Test
++    public void serializeWithNonNullJsonValue() throws Exception {
++        Container container = new Container();
++        container.setValue(new FooType("foobar"));
++        String json = MAPPER.writeValueAsString(container);
++        assertEquals(
++            "{\"value\":\"foobar\",\"type\":\"" + FooType.class.getName() + "\"}",
++            json);
++    }
++
++    // The type id must still be emitted even when the `@JsonValue` accessor returns null,
++    // as long as the containing bean itself is non-null.
++    @Test
++    public void serializeWithNullJsonValueShouldStillEmitTypeId() throws Exception {
++        Container container = new Container();
++        container.setValue(new FooType()); // value bean present, but @JsonValue getter returns null
++        String json = MAPPER.writeValueAsString(container);
++        assertEquals(
++            "{\"value\":null,\"type\":\"" + FooType.class.getName() + "\"}",
++            json);
++    }
++
++    // Sanity check: if the bean itself is null, no type id should be emitted.
++    @Test
++    public void serializeWithNullBean() throws Exception {
++        Container container = new Container();
++        String json = MAPPER.writeValueAsString(container);
++        assertEquals("{\"value\":null}", json);
++    }
++
++    @Test
++    public void deserializeWithNonNullJsonValue() throws Exception {
++        String json = "{\"value\":\"foobar\",\"type\":\"" + FooType.class.getName() + "\"}";
++        Container container = MAPPER.readValue(json, Container.class);
++        assertNotNull(container.value);
++        assertInstanceOf(FooType.class, container.value);
++        assertEquals("foobar", container.value.getValue());
++    }
++
++    @Test
++    public void roundtripWithNonNullJsonValue() throws Exception {
++        Container in = new Container();
++        in.setValue(new FooType("foobar"));
++        String json = MAPPER.writeValueAsString(in);
++        Container out = MAPPER.readValue(json, Container.class);
++        assertInstanceOf(FooType.class, out.value);
++        assertEquals("foobar", out.value.getValue());
++    }
++
++    // 18-Apr-2026, tatu: Note: no deser test for surrogate `null` value as
++    //   it is not quite clear what should happen (or rather, how to make
++    //   round-trip handling work as expected)
++}

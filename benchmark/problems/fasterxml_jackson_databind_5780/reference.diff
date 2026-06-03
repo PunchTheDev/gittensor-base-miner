@@ -1,0 +1,485 @@
+diff --git a/release-notes/CREDITS b/release-notes/CREDITS
+index f8d488984e..8c45deff94 100644
+--- a/release-notes/CREDITS
++++ b/release-notes/CREDITS
+@@ -224,6 +224,9 @@ Lee Jiwon (@dlwldnjs1009)
+  * Contributed #3064: `@JsonPropertyOrder(alphabetic=true)` is ignored in case indices
+    are defined for `@JsonProperty` -- add `MapperFeature.SORT_PROPERTIES_BY_INDEX`
+   [3.2.0]
++ * Implemented #3166: Ability to sort `Set`s before serialization (add
++   `SerializationFeature.ORDER_SET_ELEMENTS`)
++  [3.2.0]
+ 
+ Garret Wilson (@garretwilson)
+  * Suggested #4157: Add `MapperFeature.INFER_RECORD_GETTERS_FROM_COMPONENTS_ONLY` to ignore
+diff --git a/release-notes/VERSION b/release-notes/VERSION
+index 33e1607de5..1f6890cdf3 100644
+--- a/release-notes/VERSION
++++ b/release-notes/VERSION
+@@ -70,6 +70,10 @@ Versions: 3.x (for earlier see VERSION-2.x)
+ #3083: `@JsonIncludeProperties` could be used like `@JsonPropertyOrder`
+  (suggested by Marcel O)
+  (fix by @cowtowncoder, w/ Claude code)
++#3166: Ability to sort `Set`s before serialization (add
++  `SerializationFeature.ORDER_SET_ELEMENTS`)
++ (requested by @mjustin)
++ (implemented by @Lee Jiwon)
+ #3194: Deserialization of 2-dimensional arrays of final types fails when
+   using `DefaultTyping.NON_FINAL`
+  (reported by Klaas D)
+diff --git a/src/main/java/tools/jackson/databind/SerializationFeature.java b/src/main/java/tools/jackson/databind/SerializationFeature.java
+index 07e092e026..ada7dea764 100644
+--- a/src/main/java/tools/jackson/databind/SerializationFeature.java
++++ b/src/main/java/tools/jackson/databind/SerializationFeature.java
+@@ -256,6 +256,39 @@ public enum SerializationFeature implements ConfigFeature
+      */
+     FAIL_ON_ORDER_MAP_BY_INCOMPARABLE_KEY(false),
+ 
++    /**
++     * Feature that determines whether entries of {@link java.util.Set}s
++     * are first sorted before serialization or not: if enabled, additional sorting step
++     * is performed if necessary (not necessary for
++     * {@link java.util.SortedSet}s or {@link java.util.EnumSet}s),
++     * if disabled, no additional sorting is needed.
++     *<p>
++     * Note that sorting requires set elements to implement {@link java.lang.Comparable};
++     * behavior when encountering non-Comparable elements is controlled by
++     * {@link #FAIL_ON_ORDER_SET_BY_INCOMPARABLE_ELEMENT}.
++     *<p>
++     * Feature is disabled by default.
++     *
++     * @since 3.2
++     */
++    ORDER_SET_ELEMENTS(false),
++
++    /**
++     * Feature that determines whether to fail when attempting to sort
++     * {@link java.util.Set} entries with non-Comparable or mutually incomparable elements.
++     *<p>
++     * If enabled, will throw an exception when set elements cannot be sorted.
++     * If disabled, will silently skip sorting and use the original iteration order.
++     *<p>
++     * Note that this feature has only effect when set entry ordering is enabled via
++     * {@link #ORDER_SET_ELEMENTS}.
++     *<p>
++     * Feature is disabled by default.
++     *
++     * @since 3.2
++     */
++    FAIL_ON_ORDER_SET_BY_INCOMPARABLE_ELEMENT(false),
++
+     /**
+      * Feature that determines whether {@code JsonInclude#content()} configured
+      * filtering is applied to elements of {@link java.util.Collection} and
+diff --git a/src/main/java/tools/jackson/databind/ser/jdk/CollectionSerializer.java b/src/main/java/tools/jackson/databind/ser/jdk/CollectionSerializer.java
+index c63ac0bfef..3dd6566351 100644
+--- a/src/main/java/tools/jackson/databind/ser/jdk/CollectionSerializer.java
++++ b/src/main/java/tools/jackson/databind/ser/jdk/CollectionSerializer.java
+@@ -1,8 +1,6 @@
+ package tools.jackson.databind.ser.jdk;
+ 
+-import java.util.Collection;
+-import java.util.EnumSet;
+-import java.util.Iterator;
++import java.util.*;
+ 
+ import tools.jackson.core.*;
+ import tools.jackson.databind.BeanProperty;
+@@ -11,6 +9,7 @@
+ import tools.jackson.databind.SerializationContext;
+ import tools.jackson.databind.ValueSerializer;
+ import tools.jackson.databind.jsontype.TypeSerializer;
++import tools.jackson.databind.util.ClassUtil;
+ import tools.jackson.databind.ser.impl.PropertySerializerMap;
+ import tools.jackson.databind.ser.std.AsArraySerializerBase;
+ import tools.jackson.databind.ser.std.StdContainerSerializer;
+@@ -132,11 +131,21 @@ private void serializeContentsImpl(Collection<?> value, JsonGenerator g,
+             SerializationContext ctxt)
+         throws JacksonException
+     {
++        // [databind#3166]: sort Set elements if feature enabled
++        Collection<?> toSerialize = value;
++        if (value instanceof Set<?> set
++            && ctxt.isEnabled(SerializationFeature.ORDER_SET_ELEMENTS)
++            && !(set instanceof SortedSet<?>
++                || set instanceof EnumSet<?>
++                || set.isEmpty())) {
++            toSerialize = _orderElements(value, ctxt);
++        }
++
+         if (_elementSerializer != null) {
+-            serializeContentsUsingImpl(value, g, ctxt, _elementSerializer);
++            serializeContentsUsingImpl(toSerialize, g, ctxt, _elementSerializer);
+             return;
+         }
+-        Iterator<?> it = value.iterator();
++        Iterator<?> it = toSerialize.iterator();
+         if (!it.hasNext()) {
+             return;
+         }
+@@ -185,6 +194,49 @@ private void serializeContentsImpl(Collection<?> value, JsonGenerator g,
+         }
+     }
+ 
++    /**
++     * Helper method to sort Set elements for deterministic serialization.
++     *
++     * @since 3.2
++     */
++    @SuppressWarnings("unchecked")
++    protected Collection<?> _orderElements(Collection<?> input,
++            SerializationContext ctxt)
++        throws JacksonException
++    {
++        // [databind#3166] Quick pre-check: first non-null element must be Comparable
++        // (same pattern as MapSerializer._orderEntries; first element is a good enough sample)
++        for (Object elem : input) {
++            if (!(elem instanceof Comparable<?>) && (elem != null)) {
++                if (!ctxt.isEnabled(
++                        SerializationFeature.FAIL_ON_ORDER_SET_BY_INCOMPARABLE_ELEMENT)) {
++                    return input;
++                }
++                ctxt.reportBadDefinition(input.getClass(),
++                    String.format(
++"Cannot order `Set` entries: element of type %s is not `java.util.Comparable`,"
+++" consider disabling `SerializationFeature.FAIL_ON_ORDER_SET_BY_INCOMPARABLE_ELEMENT`"
+++" to simply skip sorting",
++ClassUtil.classNameOf(elem)));
++            }
++            break;
++        }
++        try {
++            List<Object> sorted = new ArrayList<>(input);
++            sorted.sort((Comparator<Object>)(Comparator<?>)
++                    Comparator.nullsLast(Comparator.naturalOrder()));
++            return sorted;
++        } catch (ClassCastException e) {
++            if (!ctxt.isEnabled(SerializationFeature.FAIL_ON_ORDER_SET_BY_INCOMPARABLE_ELEMENT)) {
++                return input;
++            }
++            return ctxt.reportBadDefinition(input.getClass(),
++"Cannot order `Set` entries: elements are not mutually `java.util.Comparable`,"
+++" consider disabling `SerializationFeature.FAIL_ON_ORDER_SET_BY_INCOMPARABLE_ELEMENT`"
+++" to simply skip sorting");
++        }
++    }
++
+     private void serializeContentsUsingImpl(Collection<?> value, JsonGenerator g,
+             SerializationContext ctxt, ValueSerializer<Object> ser)
+         throws JacksonException
+diff --git a/src/main/java/tools/jackson/databind/ser/jdk/StringCollectionSerializer.java b/src/main/java/tools/jackson/databind/ser/jdk/StringCollectionSerializer.java
+index 6fb4bc565c..0c3c1fea8a 100644
+--- a/src/main/java/tools/jackson/databind/ser/jdk/StringCollectionSerializer.java
++++ b/src/main/java/tools/jackson/databind/ser/jdk/StringCollectionSerializer.java
+@@ -138,10 +138,19 @@ private final void serializeContentsImpl(Collection<String> value, JsonGenerator
+              SerializationContext ctxt, boolean filtered)
+             throws JacksonException
+     {
+-        int i = 0;
++        // [databind#3166]: sort Set<String> if feature enabled
++        Collection<String> toSerialize = value;
++        if (value instanceof Set<?> && !(value instanceof SortedSet<?>)) {
++            if (ctxt.isEnabled(SerializationFeature.ORDER_SET_ELEMENTS)) {
++                List<String> sorted = new ArrayList<>(value);
++                sorted.sort(Comparator.nullsLast(Comparator.naturalOrder()));
++                toSerialize = sorted;
++            }
++        }
+ 
++        int i = 0;
+         try {
+-            for (String str : value) {
++            for (String str : toSerialize) {
+                 if (str == null) {
+                     if (filtered && _suppressNulls) {
+                         ++i;
+diff --git a/src/test/java/tools/jackson/databind/ser/jdk/CollectionSerializationOrderTest.java b/src/test/java/tools/jackson/databind/ser/jdk/CollectionSerializationOrderTest.java
+new file mode 100644
+index 0000000000..58d8e710bc
+--- /dev/null
++++ b/src/test/java/tools/jackson/databind/ser/jdk/CollectionSerializationOrderTest.java
+@@ -0,0 +1,284 @@
++package tools.jackson.databind.ser.jdk;
++
++import java.util.*;
++
++import org.junit.jupiter.api.Test;
++
++import tools.jackson.core.JsonGenerator;
++
++import tools.jackson.databind.*;
++import tools.jackson.databind.annotation.JsonSerialize;
++import tools.jackson.databind.testutil.DatabindTestUtil;
++import tools.jackson.databind.testutil.NoCheckSubTypeValidator;
++
++import static org.junit.jupiter.api.Assertions.*;
++
++/**
++ * Tests for {@link SerializationFeature#ORDER_SET_ELEMENTS}
++ * and {@link SerializationFeature#FAIL_ON_ORDER_SET_BY_INCOMPARABLE_ELEMENT}.
++ */
++public class CollectionSerializationOrderTest extends DatabindTestUtil
++{
++    // Helper bean wrapping Set<String> — routes through StringCollectionSerializer
++    static class StringSetBean {
++        public Set<String> values;
++
++        StringSetBean(Set<String> v) { values = v; }
++    }
++
++    // Non-Comparable type for testing incomparable scenarios
++    static class NonComparable {
++        public final String name;
++
++        NonComparable(String n) { name = n; }
++    }
++
++    // Custom String serializer that wraps output in angle brackets — used to verify
++    // StaticListSerializerBase.createContextual() fallback to CollectionSerializer
++    static class WrappingStringSerializer extends ValueSerializer<String> {
++        @Override
++        public void serialize(String value, JsonGenerator g, SerializationContext ctxt) {
++            g.writeString("<" + value + ">");
++        }
++    }
++
++    // Bean with custom content serializer to trigger fallback path
++    static class CustomSerStringSetBean {
++        @JsonSerialize(contentUsing = WrappingStringSerializer.class)
++        public Set<String> values;
++
++        CustomSerStringSetBean(Set<String> v) { values = v; }
++    }
++
++    private ObjectMapper orderedMapper() {
++        return jsonMapperBuilder()
++                .enable(SerializationFeature.ORDER_SET_ELEMENTS)
++                .build();
++    }
++
++    /*
++    /**********************************************************************
++    /* Test methods: basic ordering
++    /**********************************************************************
++     */
++
++    // #1: Feature disabled (default) → no sorting applied
++    @Test
++    public void testFeatureDisabledNoSorting() throws Exception {
++        ObjectMapper mapper = newJsonMapper(); // default: feature disabled
++        // LinkedHashSet preserves insertion order: c, a, b
++        Set<String> set = new LinkedHashSet<>(Arrays.asList("c", "a", "b"));
++        assertEquals("[\"c\",\"a\",\"b\"]", mapper.writeValueAsString(set));
++    }
++
++    // #2: HashSet<Integer> sorted numerically (CollectionSerializer path)
++    @Test
++    public void testOrderedHashSetWithIntegers() throws Exception {
++        ObjectMapper mapper = orderedMapper();
++        Set<Integer> set = new LinkedHashSet<>(Arrays.asList(3, 1, 2));
++        assertEquals("[1,2,3]", mapper.writeValueAsString(set));
++    }
++
++    // #3: Set<String> bean property — verifies StringCollectionSerializer path
++    @Test
++    public void testSetStringBeanProperty() throws Exception {
++        ObjectMapper mapper = orderedMapper();
++        Set<String> set = new LinkedHashSet<>(Arrays.asList("z", "a", "m"));
++        assertEquals(a2q("{'values':['a','m','z']}"),
++                mapper.writeValueAsString(new StringSetBean(set)));
++    }
++
++    // #4: SortedSet is already sorted — no additional sorting needed
++    @Test
++    public void testSortedSetUnchanged() throws Exception {
++        ObjectMapper mapper = orderedMapper();
++        Set<String> set = new TreeSet<>(Arrays.asList("c", "a", "b"));
++        assertEquals("[\"a\",\"b\",\"c\"]", mapper.writeValueAsString(set));
++    }
++
++    // #4b: SortedSet with custom comparator — preserve comparator order
++    @Test
++    public void testSortedSetWithCustomComparatorPreserved() throws Exception {
++        ObjectMapper mapper = orderedMapper();
++        Set<String> set = new TreeSet<>(Comparator.reverseOrder());
++        set.addAll(Arrays.asList("a", "b", "c"));
++        // Even with ordering enabled, SortedSet keeps its own comparator order
++        assertEquals("[\"c\",\"b\",\"a\"]", mapper.writeValueAsString(set));
++    }
++
++    // #5: EnumSet preserves ordinal order — not re-sorted
++    @Test
++    public void testEnumSetOrderUnchanged() throws Exception {
++        ObjectMapper mapper = orderedMapper();
++        // EnumSet iteration is always by ordinal, verify it stays that way
++        Set<Thread.State> set = EnumSet.of(
++                Thread.State.TERMINATED, Thread.State.NEW, Thread.State.RUNNABLE);
++        String json = mapper.writeValueAsString(set);
++        // NEW(0), RUNNABLE(1), TERMINATED(5) — ordinal order
++        assertEquals("[\"NEW\",\"RUNNABLE\",\"TERMINATED\"]", json);
++    }
++
++    // #6: empty set — no issues
++    @Test
++    public void testEmptySet() throws Exception {
++        ObjectMapper mapper = orderedMapper();
++        assertEquals("[]", mapper.writeValueAsString(new HashSet<>()));
++    }
++
++    /*
++    /**********************************************************************
++    /* Test methods: incomparable elements
++    /**********************************************************************
++     */
++
++    // #7: non-Comparable elements + FAIL enabled → exception
++    @Test
++    public void testNonComparableElementsFail() throws Exception {
++        ObjectMapper mapper = jsonMapperBuilder()
++                .enable(SerializationFeature.ORDER_SET_ELEMENTS)
++                .enable(SerializationFeature.FAIL_ON_ORDER_SET_BY_INCOMPARABLE_ELEMENT)
++                .build();
++        Set<Object> set = new LinkedHashSet<>();
++        set.add(new NonComparable("x"));
++        set.add(new NonComparable("y"));
++        assertThrows(DatabindException.class,
++                () -> mapper.writeValueAsString(set));
++    }
++
++    // #8: non-Comparable elements + FAIL disabled → skip sorting, original order
++    @Test
++    public void testNonComparableElementsSkip() throws Exception {
++        ObjectMapper mapper = jsonMapperBuilder()
++                .enable(SerializationFeature.ORDER_SET_ELEMENTS)
++                .disable(SerializationFeature.FAIL_ON_ORDER_SET_BY_INCOMPARABLE_ELEMENT)
++                .build();
++        Set<Object> set = new LinkedHashSet<>();
++        set.add(new NonComparable("x"));
++        set.add(new NonComparable("y"));
++        // Sorting skipped; LinkedHashSet insertion order preserved
++        assertEquals(a2q("[{'name':'x'},{'name':'y'}]"),
++                mapper.writeValueAsString(set));
++    }
++
++    // #9: null elements in Set → nullsLast sorting (CollectionSerializer path — root level)
++    @Test
++    public void testSetWithNullElements() throws Exception {
++        ObjectMapper mapper = orderedMapper();
++        Set<String> set = new LinkedHashSet<>(Arrays.asList(null, "b", "a"));
++        // nulls sorted to end
++        assertEquals("[\"a\",\"b\",null]", mapper.writeValueAsString(set));
++    }
++
++    // #10: DayOfWeek (original issue use case)
++    @Test
++    public void testDayOfWeekSet() throws Exception {
++        ObjectMapper mapper = orderedMapper();
++        Set<java.time.DayOfWeek> set = new LinkedHashSet<>(Arrays.asList(
++                java.time.DayOfWeek.FRIDAY,
++                java.time.DayOfWeek.MONDAY,
++                java.time.DayOfWeek.WEDNESDAY));
++        String json = mapper.writeValueAsString(set);
++        // DayOfWeek implements Comparable; natural order is MONDAY < WEDNESDAY < FRIDAY
++        assertEquals("[\"MONDAY\",\"WEDNESDAY\",\"FRIDAY\"]", json);
++    }
++
++    /*
++    /**********************************************************************
++    /* Test methods: non-Set collections not affected
++    /**********************************************************************
++     */
++
++    // #11: List is NOT affected (Set-specific feature)
++    @Test
++    public void testListNotAffected() throws Exception {
++        ObjectMapper mapper = orderedMapper();
++        List<String> list = Arrays.asList("c", "a", "b");
++        // List order preserved, not sorted
++        assertEquals("[\"c\",\"a\",\"b\"]", mapper.writeValueAsString(list));
++    }
++
++    // #12: LinkedHashSet (insertion order) → sorting overrides insertion order
++    @Test
++    public void testLinkedHashSetSorted() throws Exception {
++        ObjectMapper mapper = orderedMapper();
++        Set<String> set = new LinkedHashSet<>(Arrays.asList("c", "a", "b"));
++        assertEquals("[\"a\",\"b\",\"c\"]", mapper.writeValueAsString(set));
++    }
++
++    /*
++    /**********************************************************************
++    /* Test methods: polymorphic and edge cases
++    /**********************************************************************
++     */
++
++    // #13: @JsonTypeInfo + Set → serializeWithType() path also sorts
++    @Test
++    public void testPolymorphicSetSorted() throws Exception {
++        ObjectMapper mapper = jsonMapperBuilder()
++                .enable(SerializationFeature.ORDER_SET_ELEMENTS)
++                .activateDefaultTyping(NoCheckSubTypeValidator.instance,
++                        DefaultTyping.NON_FINAL)
++                .build();
++        Set<String> set = new LinkedHashSet<>(Arrays.asList("c", "a", "b"));
++        String json = mapper.writeValueAsString(set);
++        // With default typing, output includes type info but elements should be sorted
++        assertTrue(json.contains("\"a\""));
++        // Verify order: a before b before c
++        int posA = json.indexOf("\"a\"");
++        int posB = json.indexOf("\"b\"");
++        int posC = json.indexOf("\"c\"");
++        assertTrue(posA < posB && posB < posC,
++                "Elements should be sorted: " + json);
++    }
++
++    // #14: mixed incomparable types (Set<Object> with String + Integer)
++    @Test
++    public void testMixedIncomparableTypes() throws Exception {
++        ObjectMapper mapper = jsonMapperBuilder()
++                .enable(SerializationFeature.ORDER_SET_ELEMENTS)
++                .disable(SerializationFeature.FAIL_ON_ORDER_SET_BY_INCOMPARABLE_ELEMENT)
++                .build();
++        Set<Object> set = new LinkedHashSet<>();
++        set.add("hello");
++        set.add(42);
++        // ClassCastException caught, sorting skipped, insertion order preserved
++        assertEquals("[\"hello\",42]", mapper.writeValueAsString(set));
++    }
++
++    // #15: null + multiple non-Comparable → ClassCastException caught, skip
++    @Test
++    public void testNullAndNonComparableMixed() throws Exception {
++        ObjectMapper mapper = jsonMapperBuilder()
++                .enable(SerializationFeature.ORDER_SET_ELEMENTS)
++                .disable(SerializationFeature.FAIL_ON_ORDER_SET_BY_INCOMPARABLE_ELEMENT)
++                .build();
++        Set<Object> set = new LinkedHashSet<>();
++        set.add(null);
++        set.add(new NonComparable("x"));
++        set.add(new NonComparable("y"));
++        // ClassCastException caught, sorting skipped, insertion order preserved
++        assertEquals(a2q("[null,{'name':'x'},{'name':'y'}]"),
++                mapper.writeValueAsString(set));
++    }
++
++    // #16: Set<String> bean property with null → StringCollectionSerializer path nullsLast
++    @Test
++    public void testSetStringBeanPropertyWithNull() throws Exception {
++        ObjectMapper mapper = orderedMapper();
++        Set<String> set = new LinkedHashSet<>(Arrays.asList(null, "b", "a"));
++        // Bean property routes through StringCollectionSerializer; nulls sorted to end
++        assertEquals(a2q("{'values':['a','b',null]}"),
++                mapper.writeValueAsString(new StringSetBean(set)));
++    }
++
++    // #17: Set<String> + custom serializer → fallback to CollectionSerializer, still sorted
++    @Test
++    public void testSetStringWithCustomSerializerFallback() throws Exception {
++        ObjectMapper mapper = orderedMapper();
++        Set<String> set = new LinkedHashSet<>(Arrays.asList("c", "a", "b"));
++        CustomSerStringSetBean bean = new CustomSerStringSetBean(set);
++        String json = mapper.writeValueAsString(bean);
++        // Custom serializer wraps in <>, AND elements are sorted
++        assertEquals(a2q("{'values':['<a>','<b>','<c>']}"), json);
++    }
++}

@@ -1,0 +1,138 @@
+diff --git a/release-notes/CREDITS b/release-notes/CREDITS
+index 38da763aa4..339fc88e36 100644
+--- a/release-notes/CREDITS
++++ b/release-notes/CREDITS
+@@ -367,6 +367,10 @@ Balys Valentukevicius (@balysv)
+    deserializing a collection of interfaces (immutables.io compatibility)
+   [3.2.0]
+ 
++Andrey Ustalakov (@austalakov)
++ * Reported #2955: Handling UnresolvedForwardReference by pre-processing illegal values
++  [3.2.0]
++
+ Benedikt Posch (@benediktsatalia)
+  * Reported #3030: Correctly deserialize forward `@JsonIdentityInfo` references
+    when using `@JsonCreator`
+diff --git a/release-notes/VERSION b/release-notes/VERSION
+index 3b56db7ad6..a0941f2a20 100644
+--- a/release-notes/VERSION
++++ b/release-notes/VERSION
+@@ -61,6 +61,9 @@ Versions: 3.x (for earlier see VERSION-2.x)
+   in untyped collections fails
+  (reported by @ alex-t0)
+  (fix by @cowtowncoder, w/ Claude code)
++#2955: Handling UnresolvedForwardReference by pre-processing illegal values
++ (reported by Andrey U)
++ (fix by @cowtowncoder, w/ Claude code)
+ #3030: Correctly deserialize forward `@JsonIdentityInfo` references
+   when using `@JsonCreator`
+  (reported by Benedikt P)
+diff --git a/src/main/java/tools/jackson/databind/deser/bean/BeanDeserializerBase.java b/src/main/java/tools/jackson/databind/deser/bean/BeanDeserializerBase.java
+index eb0a254f3a..f4c14d9be1 100644
+--- a/src/main/java/tools/jackson/databind/deser/bean/BeanDeserializerBase.java
++++ b/src/main/java/tools/jackson/databind/deser/bean/BeanDeserializerBase.java
+@@ -1539,7 +1539,8 @@ protected Object _handleTypedObjectId(JsonParser p, DeserializationContext ctxt,
+      */
+     @SuppressWarnings("resource") // TokenBuffers don't need close, nor parser thereof
+     protected Object _convertObjectId(JsonParser p, DeserializationContext ctxt,
+-            Object rawId, ValueDeserializer<Object> idDeser) throws JacksonException
++            Object rawId, ValueDeserializer<Object> idDeser)
++        throws JacksonException
+     {
+         TokenBuffer buf = ctxt.bufferForInputBuffering(p);
+         if (rawId instanceof String rString) {
+@@ -1579,22 +1580,29 @@ protected Object deserializeWithObjectId(JsonParser p, DeserializationContext ct
+      * Method called in cases where it looks like we got an Object Id
+      * to parse and use as a reference.
+      */
+-    protected Object deserializeFromObjectId(JsonParser p, DeserializationContext ctxt) throws JacksonException
++    protected Object deserializeFromObjectId(JsonParser p, DeserializationContext ctxt)
++        throws JacksonException
+     {
+         Object id = _objectIdReader.readObjectReference(p, ctxt);
+         ReadableObjectId roid = ctxt.findObjectId(id, _objectIdReader.generator, _objectIdReader.resolver);
+         // do we have it resolved?
+         Object pojo = roid.resolve();
+-        if (pojo == null) { // not yet; should wait...
+-            throw new UnresolvedForwardReference(p,
+-                    "Could not resolve Object Id ["+id+"] (for "+_beanType+").",
+-                    p.currentLocation(), roid);
++        if (pojo == null) {
++            // 12-Apr-2026: [databind#2955]: if we are not to fail on unresolved
++            //     Object Ids, return null
++            if (ctxt.isEnabled(DeserializationFeature.FAIL_ON_UNRESOLVED_OBJECT_IDS)) {
++                throw new UnresolvedForwardReference(p,
++                        "Could not resolve Object Id ["+id+"] (for "+_beanType+").",
++                        p.currentLocation(), roid);
++            }
++            // fall through
+         }
+         return pojo;
+     }
+ 
+     protected Object deserializeFromObjectUsingNonDefault(JsonParser p,
+-            DeserializationContext ctxt) throws JacksonException
++            DeserializationContext ctxt)
++        throws JacksonException
+     {
+         // 02-Jul-2024, tatu: [databind#4602] Need to tweak regular and "array" delegating
+         //   Creator handling
+diff --git a/src/test/java/tools/jackson/databind/objectid/ObjectIdDeserializationTest.java b/src/test/java/tools/jackson/databind/objectid/ObjectIdDeserializationTest.java
+index b7666459f9..f10269345f 100644
+--- a/src/test/java/tools/jackson/databind/objectid/ObjectIdDeserializationTest.java
++++ b/src/test/java/tools/jackson/databind/objectid/ObjectIdDeserializationTest.java
+@@ -284,6 +284,15 @@ public boolean equals(Object o) {
+         public int hashCode() { return name.hashCode(); }
+     }
+ 
++    // // // For [databind#2955]: unresolved scalar Object Id with FAIL_ON_UNRESOLVED_OBJECT_IDS disabled
++
++    @JsonIdentityInfo(generator = ObjectIdGenerators.PropertyGenerator.class, property = "id")
++    static class Node2955 {
++        public int id;
++        public String name;
++        public Node2955 ref;
++    }
++
+     // // // For ObjectReader + FAIL_ON_UNRESOLVED_OBJECT_IDS [databind#5542]
+ 
+     public static class ReaderWrapper5542 {
+@@ -898,4 +907,38 @@ public void testObjectReaderWithResolvedObjectIds5542() throws Exception {
+             assertSame(wrapper.node, wrapper.node.next.node);
+         }
+     }
++
++    /*
++    /**********************************************************
++    /* Unit tests, [databind#2955]: unresolved scalar Object Ids
++    /**********************************************************
++     */
++
++    // [databind#2955]: default behavior should throw on unresolved scalar Object Id
++    @Test
++    public void testUnresolvedScalarObjectIdFails2955() throws Exception {
++        // Node with id=1 references node with id=999 which doesn't exist
++        String json = a2q("{'id':1,'name':'a','ref':{'id':2,'name':'b','ref':999}}");
++
++        try {
++            MAPPER.readValue(json, Node2955.class);
++            fail("Should have thrown UnresolvedForwardReference");
++        } catch (UnresolvedForwardReference e) {
++            verifyException(e, "Object id");
++        }
++    }
++
++    // [databind#2955]: with feature disabled, unresolved scalar Object Id should become null
++    @Test
++    public void testUnresolvedScalarObjectIdAsNull2955() throws Exception {
++        String json = a2q("{'id':1,'name':'a','ref':{'id':2,'name':'b','ref':999}}");
++
++        Node2955 result = DISABLED_MAPPER.readValue(json, Node2955.class);
++        assertNotNull(result);
++        assertEquals("a", result.name);
++        assertNotNull(result.ref);
++        assertEquals("b", result.ref.name);
++        // unresolved id=999 should become null instead of throwing
++        assertNull(result.ref.ref);
++    }
+ }

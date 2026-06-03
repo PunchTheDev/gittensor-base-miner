@@ -1,0 +1,146 @@
+diff --git a/release-notes/VERSION b/release-notes/VERSION
+index c666b5407f..f3da6feb5e 100644
+--- a/release-notes/VERSION
++++ b/release-notes/VERSION
+@@ -128,6 +128,9 @@ Versions: 3.x (for earlier see VERSION-2.x)
+ #5851: Regression of `JsonTypeInfo.Id.MINIMAL_CLASS` in the 3.x branch
+  (reported by @wrongwrong)
+  (fix by @cowtowncoder, w/ Claude code)
++#5861: Allow injecting `MissingNode` for "absent" `JsonNode` via Creator (with
++  `JsonNodeFeature.MAP_ABSENT_TO_MISSING`)
++ (fix by @cowtowncoder, w/ Claude code)
+ - Remove project-specific Android SDK compatibility level, use shared;
+   no change level itself (stillAndroid SDK 34)
+ 
+diff --git a/src/main/java/tools/jackson/databind/cfg/JsonNodeFeature.java b/src/main/java/tools/jackson/databind/cfg/JsonNodeFeature.java
+index 7c505a679c..5aeedba316 100644
+--- a/src/main/java/tools/jackson/databind/cfg/JsonNodeFeature.java
++++ b/src/main/java/tools/jackson/databind/cfg/JsonNodeFeature.java
+@@ -93,6 +93,22 @@ public enum JsonNodeFeature implements DatatypeFeature
+      * depends on more general {@code DeserializationFeature.USE_BIG_DECIMAL_FOR_FLOATS}).
+      */
+     USE_BIG_DECIMAL_FOR_FLOATS(false),
++
++    /**
++     * Feature that determines what value is used for absent {@link tools.jackson.databind.JsonNode}
++     * valued properties: if enabled, {@link tools.jackson.databind.node.MissingNode} will be used;
++     * if disabled (default), Java {@code null} is used.
++     *<p>
++     * This is relevant when deserializing POJO properties of type {@code JsonNode}
++     * (or its subtypes) where the JSON input does not contain a matching property.
++     * By default, such missing values are represented as Java {@code null}, but enabling
++     * this feature will instead use {@code MissingNode.getInstance()}.
++     *<p>
++     * Default value: {@code false}
++     *
++     * @since 3.2
++     */
++    MAP_ABSENT_TO_MISSING(false),
+     ;
+ 
+     private final static int FEATURE_INDEX = DatatypeFeatures.FEATURE_INDEX_JSON_NODE;
+diff --git a/src/main/java/tools/jackson/databind/deser/jackson/JsonNodeDeserializer.java b/src/main/java/tools/jackson/databind/deser/jackson/JsonNodeDeserializer.java
+index 0555977799..d9441c763d 100644
+--- a/src/main/java/tools/jackson/databind/deser/jackson/JsonNodeDeserializer.java
++++ b/src/main/java/tools/jackson/databind/deser/jackson/JsonNodeDeserializer.java
+@@ -2,6 +2,7 @@
+ 
+ import tools.jackson.core.*;
+ import tools.jackson.databind.*;
++import tools.jackson.databind.cfg.JsonNodeFeature;
+ import tools.jackson.databind.node.*;
+ 
+ /**
+@@ -64,9 +65,16 @@ public JsonNode getNullValue(DeserializationContext ctxt) {
+     /**
+      * Overridden variant to ensure that absent values are NOT coerced into
+      * {@code NullNode}s, unlike incoming {@code null} values.
++     * Will return {@code MissingNode} if
++     * {@link JsonNodeFeature#MAP_ABSENT_TO_MISSING} is enabled;
++     * Java {@code null} otherwise.
+      */
+     @Override // since 2.13
+     public Object getAbsentValue(DeserializationContext ctxt) {
++        // [databind#5861] Optionally map absent to MissingNode
++        if (ctxt.isEnabled(JsonNodeFeature.MAP_ABSENT_TO_MISSING)) {
++            return ctxt.getNodeFactory().missingNode();
++        }
+         return null;
+     }
+ 
+diff --git a/src/test/java/tools/jackson/databind/node/AbsentNodeToMissing5861Test.java b/src/test/java/tools/jackson/databind/node/AbsentNodeToMissing5861Test.java
+new file mode 100644
+index 0000000000..0f9a7d370c
+--- /dev/null
++++ b/src/test/java/tools/jackson/databind/node/AbsentNodeToMissing5861Test.java
+@@ -0,0 +1,70 @@
++package tools.jackson.databind.node;
++
++import org.junit.jupiter.api.Test;
++
++import com.fasterxml.jackson.annotation.JsonCreator;
++import com.fasterxml.jackson.annotation.JsonProperty;
++
++import tools.jackson.databind.*;
++import tools.jackson.databind.cfg.JsonNodeFeature;
++import tools.jackson.databind.testutil.DatabindTestUtil;
++
++import static org.junit.jupiter.api.Assertions.*;
++
++// [databind#5861]: Allow mapping of absent `JsonNode` to `MissingNode`
++public class AbsentNodeToMissing5861Test extends DatabindTestUtil
++{
++    static class CreatorBean5861
++    {
++        public final JsonNode node;
++
++        @JsonCreator
++        public CreatorBean5861(@JsonProperty("node") JsonNode n) {
++            this.node = n;
++        }
++    }
++
++    private final ObjectMapper DEFAULT_MAPPER = newJsonMapper();
++
++    private final ObjectMapper MISSING_MAPPER = jsonMapperBuilder()
++            .enable(JsonNodeFeature.MAP_ABSENT_TO_MISSING)
++            .build();
++
++    // Verify default behavior: absent -> null (backwards compatible)
++    @Test
++    public void testAbsentCreatorDefaultGivesNull() throws Exception
++    {
++        CreatorBean5861 result = DEFAULT_MAPPER.readValue("{}", CreatorBean5861.class);
++        assertNull(result.node);
++    }
++
++    // With MAP_ABSENT_TO_MISSING enabled: absent -> MissingNode
++    @Test
++    public void testAbsentCreatorGivesMissingNode() throws Exception
++    {
++        CreatorBean5861 result = MISSING_MAPPER.readValue("{}", CreatorBean5861.class);
++        assertNotNull(result.node);
++        assertTrue(result.node.isMissingNode(),
++                "Expected MissingNode, got: " + result.node.getClass().getSimpleName());
++    }
++
++    // Explicit null should still give NullNode regardless of feature
++    @Test
++    public void testExplicitNullStillGivesNullNode() throws Exception
++    {
++        CreatorBean5861 result = MISSING_MAPPER.readValue("{\"node\":null}", CreatorBean5861.class);
++        assertNotNull(result.node);
++        assertTrue(result.node.isNull(),
++                "Expected NullNode, got: " + result.node.getClass().getSimpleName());
++    }
++
++    // Explicit value should work normally regardless of feature
++    @Test
++    public void testExplicitValueUnaffected() throws Exception
++    {
++        CreatorBean5861 result = MISSING_MAPPER.readValue("{\"node\":42}", CreatorBean5861.class);
++        assertNotNull(result.node);
++        assertTrue(result.node.isNumber());
++        assertEquals(42, result.node.intValue());
++    }
++}

@@ -71,6 +71,9 @@ EXTERNAL_REPOS = [
     "clap-rs/clap",           # 14k stars — Rust CLI parser, cargo test, self-contained
     "hyperium/hyper",         # 14k stars — Rust HTTP library, cargo test, real HTTP bug-fixes
     "tokio-rs/axum",          # 20k stars — Rust web framework (hyper/tokio), cargo test
+    # JVM external repos
+    "FasterXML/jackson-databind",  # 10k stars — Java JSON library, Gradle, real deserialization bugs
+    "square/okhttp",               # 45k stars — Kotlin/Java HTTP client, Gradle, real protocol bugs
 ]
 
 
@@ -225,13 +228,17 @@ def infer_test_cmd(repo: str, diff: str) -> list[str]:
     """Infer the test command from changed files in the diff.
 
     Handles TypeScript (npm test), Python (pytest), Ruby (bundle exec rspec),
-    Rust (cargo test), with Python as default.
+    Rust (cargo test), JVM/Gradle (./gradlew test), with Python as default.
     """
     changed = re.findall(r"^diff --git a/(.+) b/", diff, re.MULTILINE)
 
     # Rust: any .rs file → cargo test
     if any(p.endswith(".rs") for p in changed):
         return ["cargo", "test"]
+
+    # JVM (Java/Kotlin/Scala): any .java or .kt or .scala file → gradlew test
+    if any(p.endswith((".java", ".kt", ".scala")) for p in changed):
+        return ["./gradlew", "test", "--no-daemon", "-q"]
 
     # TypeScript/JavaScript: *.test.ts / *.spec.ts → npm test
     # npm runner in Docker handles npm ci + npm test; can't easily target individual files

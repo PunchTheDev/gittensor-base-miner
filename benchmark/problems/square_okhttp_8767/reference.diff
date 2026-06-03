@@ -1,0 +1,956 @@
+diff --git a/.github/workflows/build.yml b/.github/workflows/build.yml
+index b6e9f01dac8a..a1599a947778 100644
+--- a/.github/workflows/build.yml
++++ b/.github/workflows/build.yml
+@@ -704,3 +704,23 @@ jobs:
+       - name: Run maven test
+         working-directory: ./maven-tests
+         run: ./mvnw -q verify
++
++  test_java_modules:
++    runs-on: ubuntu-latest
++
++    steps:
++      - name: Checkout
++        uses: actions/checkout@v4
++
++      - name: Configure JDK
++        uses: actions/setup-java@v4
++        with:
++          distribution: 'zulu'
++          java-version: 24
++
++      - name: Setup Gradle
++        uses: gradle/actions/setup-gradle@v4
++
++      - name: Run with Jlink
++        run: ./gradlew module-tests:imageRun
++
+diff --git a/README.md b/README.md
+index a39b2272aed9..6f9d46d7e3ca 100644
+--- a/README.md
++++ b/README.md
+@@ -214,6 +214,36 @@ $ ./gradlew okcurl:nativeImage
+ $ ./okcurl/build/graal/okcurl https://httpbin.org/get
+ ```
+ 
++Java Modules
++------------
++
++OkHttp (5.3+) implements Java 9 Modules.
++
++With this in place Java builds should fail if apps attempt to use internal packages.
++
++```
++error: package okhttp3.internal.platform is not visible
++    okhttp3.internal.platform.Platform.get();
++                    ^
++  (package okhttp3.internal.platform is declared in module okhttp3,
++    which does not export it to module i.am.bad.and.i.should.feel.bad)
++```
++
++The stable public API is based on the list of defined modules:
++
++- okhttp3
++- okhttp3.brotli
++- okhttp3.coroutines
++- okhttp3.dnsoverhttps
++- okhttp3.java.net.cookiejar
++- okhttp3.logging
++- okhttp3.sse
++- okhttp3.tls
++- okhttp3.urlconnection
++- mockwebserver3
++- mockwebserver3.junit4
++- mockwebserver3.junit5
++
+ License
+ -------
+ 
+diff --git a/android-test/build.gradle.kts b/android-test/build.gradle.kts
+index 8b97915e931b..60e705263d64 100644
+--- a/android-test/build.gradle.kts
++++ b/android-test/build.gradle.kts
+@@ -54,7 +54,8 @@ android {
+     "META-INF/LICENSE.md",
+     "META-INF/LICENSE-notice.md",
+     "README.txt",
+-    "org/bouncycastle/LICENSE"
++    "org/bouncycastle/LICENSE",
++    "META-INF/versions/9/OSGI-INF/MANIFEST.MF"
+   )
+ }
+ 
+diff --git a/build.gradle.kts b/build.gradle.kts
+index aa96ba569379..ab490994e531 100644
+--- a/build.gradle.kts
++++ b/build.gradle.kts
+@@ -91,6 +91,7 @@ subprojects {
+   if (project.name == "regression-test") return@subprojects
+   if (project.name == "android-test-app") return@subprojects
+   if (project.name == "container-tests") return@subprojects
++  if (project.name == "module-tests") return@subprojects
+ 
+   apply(plugin = "checkstyle")
+   apply(plugin = "ru.vyarus.animalsniffer")
+@@ -243,8 +244,13 @@ subprojects {
+   }
+ 
+   tasks.withType<JavaCompile> {
+-    sourceCompatibility = projectJavaVersion.toString()
+-    targetCompatibility = projectJavaVersion.toString()
++    if (name.contains("Java9")) {
++      sourceCompatibility = "9"
++      targetCompatibility = "9"
++    } else {
++      sourceCompatibility = projectJavaVersion.toString()
++      targetCompatibility = projectJavaVersion.toString()
++    }
+   }
+ }
+ 
+diff --git a/buildSrc/build.gradle.kts b/buildSrc/build.gradle.kts
+index 16dcc6831fd1..66da41144889 100644
+--- a/buildSrc/build.gradle.kts
++++ b/buildSrc/build.gradle.kts
+@@ -20,12 +20,13 @@ plugins {
+ 
+ repositories {
+   mavenCentral()
++  gradlePluginPortal()
+ }
+ 
+ dependencies {
+-  // TODO (https://github.com/square/okhttp/issues/8612) we will need a consistent version
+-  // 7.1.0 is used because it avoids this error
+-  // Could not create an instance of type aQute.bnd.gradle.BundleTaskExtension.
+-  // Cannot change attributes of configuration ':native-image-tests:compileClasspath' after it has been locked for mutation
+-  implementation("biz.aQute.bnd:biz.aQute.bnd.gradle:7.1.0")
++  implementation(libs.gradlePlugin.bnd)
++
++  implementation(libs.kotlin.gradle.plugin.api)
++
++  implementation(libs.gradlePlugin.mrjar)
+ }
+diff --git a/buildSrc/settings.gradle.kts b/buildSrc/settings.gradle.kts
+index ae6fdeecb742..677f4940c4c3 100644
+--- a/buildSrc/settings.gradle.kts
++++ b/buildSrc/settings.gradle.kts
+@@ -1 +1,9 @@
+ rootProject.name = "okhttp-buildSrc"
++
++dependencyResolutionManagement {
++  versionCatalogs {
++    create("libs") {
++      from(files("../gradle/libs.versions.toml"))
++    }
++  }
++}
+diff --git a/buildSrc/src/main/kotlin/JavaModules.kt b/buildSrc/src/main/kotlin/JavaModules.kt
+new file mode 100644
+index 000000000000..57324670a419
+--- /dev/null
++++ b/buildSrc/src/main/kotlin/JavaModules.kt
+@@ -0,0 +1,59 @@
++/*
++ * Copyright (C) 2025 Square, Inc.
++ *
++ * Licensed under the Apache License, Version 2.0 (the "License");
++ * you may not use this file except in compliance with the License.
++ * You may obtain a copy of the License at
++ *
++ *    https://www.apache.org/licenses/LICENSE-2.0
++ *
++ * Unless required by applicable law or agreed to in writing, software
++ * distributed under the License is distributed on an "AS IS" BASIS,
++ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++ * See the License for the specific language governing permissions and
++ * limitations under the License.
++ */
++
++import me.champeau.mrjar.MultiReleaseExtension
++import org.gradle.api.Project
++import org.gradle.api.tasks.compile.JavaCompile
++import org.gradle.kotlin.dsl.configure
++import org.gradle.kotlin.dsl.named
++import org.jetbrains.kotlin.gradle.tasks.KotlinJvmCompile
++
++fun Project.applyJavaModules(
++  moduleName: String,
++  defaultVersion: Int = 8,
++  javaModuleVersion: Int = 9,
++  enableValidation: Boolean = true,
++) {
++  plugins.apply("me.champeau.mrjar")
++
++  configure<MultiReleaseExtension> {
++    targetVersions(defaultVersion, javaModuleVersion)
++  }
++
++  tasks.named<JavaCompile>("compileJava9Java").configure {
++    val compileKotlinTask = tasks.getByName("compileKotlin") as KotlinJvmCompile
++    dependsOn(compileKotlinTask)
++
++    if (enableValidation) {
++      compileKotlinTask.source(file("src/main/java9"))
++    }
++
++    // Ignore warnings about using 'requires transitive' on automatic modules.
++    // not needed when compiling with recent JDKs, e.g. 17
++    options.compilerArgs.add("-Xlint:-requires-transitive-automatic")
++
++    // Patch the compileKotlinJvm output classes into the compilation so exporting packages works correctly.
++    options.compilerArgs.addAll(
++      listOf(
++        "--patch-module",
++        "$moduleName=${compileKotlinTask.destinationDirectory.get().asFile}",
++      ),
++    )
++
++    classpath = compileKotlinTask.libraries
++    modularity.inferModulePath.set(true)
++  }
++}
+diff --git a/gradle/libs.versions.toml b/gradle/libs.versions.toml
+index 4b5171a60995..371abd4956ef 100644
+--- a/gradle/libs.versions.toml
++++ b/gradle/libs.versions.toml
+@@ -60,6 +60,7 @@ gradlePlugin-kotlinSerialization = { module = "org.jetbrains.kotlin:kotlin-seria
+ gradlePlugin-ksp = { module = "com.google.devtools.ksp:symbol-processing-gradle-plugin", version.ref = "ksp" }
+ gradlePlugin-mavenPublish = "com.vanniktech:gradle-maven-publish-plugin:0.34.0"
+ gradlePlugin-mavenSympathy = "io.github.usefulness.maven-sympathy:io.github.usefulness.maven-sympathy.gradle.plugin:0.3.0"
++gradlePlugin-mrjar = "me.champeau.mrjar:me.champeau.mrjar.gradle.plugin:0.1.1"
+ gradlePlugin-shadow = "com.gradleup.shadow:shadow-gradle-plugin:9.1.0"
+ gradlePlugin-spotless = "com.diffplug.spotless:spotless-plugin-gradle:7.2.1"
+ hamcrestLibrary = "org.hamcrest:hamcrest-library:3.0"
+@@ -82,6 +83,7 @@ junit-vintage-engine = { module = "org.junit.vintage:junit-vintage-engine", vers
+ junit-pioneer = "org.junit-pioneer:junit-pioneer:1.9.1"
+ junit5android-core = { module = "de.mannodermaus.junit5:android-test-core", version.ref = "de-mannodermaus-junit5" }
+ junit5android-runner = { module = "de.mannodermaus.junit5:android-test-runner", version.ref = "de-mannodermaus-junit5" }
++kotlin-gradle-plugin-api = { module = "org.jetbrains.kotlin:kotlin-gradle-plugin-api", version.ref = "org-jetbrains-kotlin" }
+ kotlin-junit5 = { module = "org.jetbrains.kotlin:kotlin-test-junit5", version.ref = "org-jetbrains-kotlin" }
+ kotlin-reflect = { module = "org.jetbrains.kotlin:kotlin-reflect", version.ref = "org-jetbrains-kotlin" }
+ kotlin-stdlib = { module = "org.jetbrains.kotlin:kotlin-stdlib", version.ref = "org-jetbrains-kotlin" }
+diff --git a/mockwebserver-deprecated/build.gradle.kts b/mockwebserver-deprecated/build.gradle.kts
+index 76ecee9b654f..5b2e1601cadf 100644
+--- a/mockwebserver-deprecated/build.gradle.kts
++++ b/mockwebserver-deprecated/build.gradle.kts
+@@ -8,11 +8,7 @@ plugins {
+   id("binary-compatibility-validator")
+ }
+ 
+-tasks.jar {
+-  manifest {
+-    attributes("Automatic-Module-Name" to "okhttp3.mockwebserver")
+-  }
+-}
++project.applyJavaModules("okhttp3.mockwebserver")
+ 
+ dependencies {
+   "friendsApi"(projects.okhttp)
+diff --git a/mockwebserver-deprecated/src/main/java9/module-info.java b/mockwebserver-deprecated/src/main/java9/module-info.java
+new file mode 100644
+index 000000000000..5cbe5dcf8688
+--- /dev/null
++++ b/mockwebserver-deprecated/src/main/java9/module-info.java
+@@ -0,0 +1,6 @@
++@SuppressWarnings("module")
++module okhttp3.mockwebserver {
++  requires okhttp3;
++  exports okhttp3.mockwebserver;
++  requires java.logging;
++}
+diff --git a/mockwebserver-junit4/build.gradle.kts b/mockwebserver-junit4/build.gradle.kts
+index adc6c3e15ae4..42c260db6206 100644
+--- a/mockwebserver-junit4/build.gradle.kts
++++ b/mockwebserver-junit4/build.gradle.kts
+@@ -8,11 +8,7 @@ plugins {
+   id("binary-compatibility-validator")
+ }
+ 
+-tasks.jar {
+-  manifest {
+-    attributes("Automatic-Module-Name" to "mockwebserver3.junit4")
+-  }
+-}
++project.applyJavaModules("mockwebserver3.junit4")
+ 
+ dependencies {
+   api(projects.okhttp)
+diff --git a/mockwebserver-junit4/src/main/java9/module-info.java b/mockwebserver-junit4/src/main/java9/module-info.java
+new file mode 100644
+index 000000000000..9b8df1850ed1
+--- /dev/null
++++ b/mockwebserver-junit4/src/main/java9/module-info.java
+@@ -0,0 +1,6 @@
++@SuppressWarnings("module")
++module mockwebserver3.junit4 {
++  requires okhttp3;
++  exports mockwebserver3.junit4;
++  requires java.logging;
++}
+diff --git a/mockwebserver-junit5/build.gradle.kts b/mockwebserver-junit5/build.gradle.kts
+index 97e70bab403f..e99b14b18f72 100644
+--- a/mockwebserver-junit5/build.gradle.kts
++++ b/mockwebserver-junit5/build.gradle.kts
+@@ -8,12 +8,9 @@ plugins {
+   id("binary-compatibility-validator")
+ }
+ 
++project.applyJavaModules("mockwebserver3.junit5")
++
+ tasks {
+-  jar {
+-    manifest {
+-      attributes("Automatic-Module-Name" to "mockwebserver3.junit5")
+-    }
+-  }
+   test {
+     useJUnitPlatform()
+   }
+diff --git a/mockwebserver-junit5/src/main/java9/module-info.java b/mockwebserver-junit5/src/main/java9/module-info.java
+new file mode 100644
+index 000000000000..a17efe6c8e70
+--- /dev/null
++++ b/mockwebserver-junit5/src/main/java9/module-info.java
+@@ -0,0 +1,5 @@
++@SuppressWarnings("module")
++module mockwebserver3.junit5 {
++  requires okhttp3;
++  opens mockwebserver3.junit5.internal;
++}
+diff --git a/mockwebserver/build.gradle.kts b/mockwebserver/build.gradle.kts
+index 914117652b7d..ed25fc7ad1af 100644
+--- a/mockwebserver/build.gradle.kts
++++ b/mockwebserver/build.gradle.kts
+@@ -9,11 +9,7 @@ plugins {
+   id("binary-compatibility-validator")
+ }
+ 
+-tasks.jar {
+-  manifest {
+-    attributes("Automatic-Module-Name" to "mockwebserver3")
+-  }
+-}
++project.applyJavaModules("mockwebserver3")
+ 
+ dependencies {
+   "friendsApi"(projects.okhttp)
+diff --git a/mockwebserver/src/main/java9/module-info.java b/mockwebserver/src/main/java9/module-info.java
+new file mode 100644
+index 000000000000..c0f61f230c2f
+--- /dev/null
++++ b/mockwebserver/src/main/java9/module-info.java
+@@ -0,0 +1,6 @@
++@SuppressWarnings("module")
++module mockwebserver3 {
++  requires okhttp3;
++  exports mockwebserver3;
++  requires java.logging;
++}
+diff --git a/module-tests/build.gradle.kts b/module-tests/build.gradle.kts
+new file mode 100644
+index 000000000000..570e38dbcd95
+--- /dev/null
++++ b/module-tests/build.gradle.kts
+@@ -0,0 +1,67 @@
++plugins {
++  id("java")
++  id("application")
++  id("com.github.iherasymenko.jlink") version "0.7"
++  id("org.gradlex.extra-java-module-info") version "1.13"
++}
++
++dependencies {
++  implementation(projects.okhttp)
++  implementation(projects.loggingInterceptor)
++
++  testImplementation(projects.okhttp)
++  testImplementation(projects.loggingInterceptor)
++  testImplementation(projects.mockwebserver3)
++  testImplementation(projects.mockwebserver3Junit5)
++
++  testImplementation(libs.junit.jupiter.api)
++  testRuntimeOnly(libs.junit.jupiter.engine)
++  testRuntimeOnly(libs.junit.platform.launcher)
++}
++
++application {
++  mainClass = "okhttp3.modules.Main"
++  mainModule = "okhttp3.modules"
++}
++
++jlinkApplication {
++  stripDebug = true
++  stripJavaDebugAttributes = true
++  compress.set("zip-9")
++  addModules.addAll("jdk.crypto.ec", "java.logging")
++  vm.set("server")
++}
++
++extraJavaModuleInfo {
++  module("org.jetbrains:annotations", "org.jetbrains.annotations") {
++    exportAllPackages()
++  }
++  module("com.squareup.okio:okio-jvm", "okio") {
++    exportAllPackages()
++    requires("kotlin.stdlib")
++    requires("java.logging")
++  }
++  module("com.squareup.okio:okio", "okio") {
++    exportAllPackages()
++  }
++}
++
++val testJavaVersion = System.getProperty("test.java.version", "21").toInt()
++
++tasks.withType<Test> {
++  useJUnitPlatform()
++
++  enabled = testJavaVersion > 8
++
++  javaLauncher.set(javaToolchains.launcherFor {
++    languageVersion.set(JavaLanguageVersion.of(testJavaVersion))
++  })
++}
++
++java {
++  sourceCompatibility = JavaVersion.VERSION_11
++  targetCompatibility = JavaVersion.VERSION_11
++  toolchain {
++    languageVersion.set(JavaLanguageVersion.of(21))
++  }
++}
+diff --git a/module-tests/src/main/java/module-info.java b/module-tests/src/main/java/module-info.java
+new file mode 100644
+index 000000000000..c4f26a544128
+--- /dev/null
++++ b/module-tests/src/main/java/module-info.java
+@@ -0,0 +1,7 @@
++@SuppressWarnings("module")
++module okhttp3.modules {
++  requires okhttp3;
++  requires okhttp3.logging;
++  requires jdk.crypto.ec;
++  exports okhttp3.modules;
++}
+diff --git a/module-tests/src/main/java/okhttp3/modules/Main.java b/module-tests/src/main/java/okhttp3/modules/Main.java
+new file mode 100644
+index 000000000000..0467303f4716
+--- /dev/null
++++ b/module-tests/src/main/java/okhttp3/modules/Main.java
+@@ -0,0 +1,30 @@
++/*
++ * Copyright (C) 2025 Block, Inc.
++ *
++ * Licensed under the Apache License, Version 2.0 (the "License");
++ * you may not use this file except in compliance with the License.
++ * You may obtain a copy of the License at
++ *
++ *      http://www.apache.org/licenses/LICENSE-2.0
++ *
++ * Unless required by applicable law or agreed to in writing, software
++ * distributed under the License is distributed on an "AS IS" BASIS,
++ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++ * See the License for the specific language governing permissions and
++ * limitations under the License.
++ */
++
++package okhttp3.modules;
++
++import okhttp3.Call;
++import okhttp3.HttpUrl;
++
++import java.io.IOException;
++
++public class Main {
++  public static void main(String[] args) throws IOException {
++    Call call = OkHttpCaller.callOkHttp(HttpUrl.get("https://square.com/robots.txt"));
++
++    System.out.println(call.execute().body().string());
++  }
++}
+diff --git a/module-tests/src/main/java/okhttp3/modules/OkHttpCaller.java b/module-tests/src/main/java/okhttp3/modules/OkHttpCaller.java
+new file mode 100644
+index 000000000000..a5e11395eaec
+--- /dev/null
++++ b/module-tests/src/main/java/okhttp3/modules/OkHttpCaller.java
+@@ -0,0 +1,37 @@
++/*
++ * Copyright (C) 2025 Block, Inc.
++ *
++ * Licensed under the Apache License, Version 2.0 (the "License");
++ * you may not use this file except in compliance with the License.
++ * You may obtain a copy of the License at
++ *
++ *      http://www.apache.org/licenses/LICENSE-2.0
++ *
++ * Unless required by applicable law or agreed to in writing, software
++ * distributed under the License is distributed on an "AS IS" BASIS,
++ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++ * See the License for the specific language governing permissions and
++ * limitations under the License.
++ */
++
++package okhttp3.modules;
++
++import okhttp3.Call;
++import okhttp3.HttpUrl;
++import okhttp3.OkHttpClient;
++import okhttp3.Request;
++import okhttp3.logging.HttpLoggingInterceptor;
++import okhttp3.logging.LoggingEventListener;
++
++/**
++ * Just checking compilation works
++ */
++public class OkHttpCaller {
++  public static Call callOkHttp(HttpUrl url) {
++    OkHttpClient client = new OkHttpClient
++      .Builder()
++      .eventListenerFactory(new LoggingEventListener.Factory(HttpLoggingInterceptor.Logger.DEFAULT))
++      .build();
++    return client.newCall(new Request.Builder().url(url).build());
++  }
++}
+diff --git a/module-tests/src/test/java/module-info.java b/module-tests/src/test/java/module-info.java
+new file mode 100644
+index 000000000000..492bc17656f3
+--- /dev/null
++++ b/module-tests/src/test/java/module-info.java
+@@ -0,0 +1,11 @@
++@SuppressWarnings("module")
++module okhttp3.modules.test {
++  requires okhttp3;
++  requires okhttp3.logging;
++  requires mockwebserver3;
++  requires mockwebserver3.junit5;
++  requires jdk.crypto.ec;
++  requires org.junit.jupiter.api;
++  requires okhttp3.modules;
++  opens okhttp3.modules.test to org.junit.platform.commons;
++}
+diff --git a/module-tests/src/test/java/okhttp3/modules/test/JavaModuleTest.java b/module-tests/src/test/java/okhttp3/modules/test/JavaModuleTest.java
+new file mode 100644
+index 000000000000..a6c5e91eb4bf
+--- /dev/null
++++ b/module-tests/src/test/java/okhttp3/modules/test/JavaModuleTest.java
+@@ -0,0 +1,66 @@
++/*
++ * Copyright (C) 2025 Block, Inc.
++ *
++ * Licensed under the Apache License, Version 2.0 (the "License");
++ * you may not use this file except in compliance with the License.
++ * You may obtain a copy of the License at
++ *
++ *      http://www.apache.org/licenses/LICENSE-2.0
++ *
++ * Unless required by applicable law or agreed to in writing, software
++ * distributed under the License is distributed on an "AS IS" BASIS,
++ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++ * See the License for the specific language governing permissions and
++ * limitations under the License.
++ */
++
++package okhttp3.modules.test;
++
++import mockwebserver3.MockResponse;
++import mockwebserver3.MockWebServer;
++import okhttp3.Call;
++import okhttp3.Headers;
++import okhttp3.HttpUrl;
++import okhttp3.OkHttpClient;
++import okhttp3.Response;
++import okhttp3.logging.HttpLoggingInterceptor;
++import okhttp3.modules.OkHttpCaller;
++import org.junit.jupiter.api.Test;
++
++import java.io.IOException;
++
++import static org.junit.jupiter.api.Assertions.assertEquals;
++import static org.junit.jupiter.api.Assertions.assertTrue;
++
++class JavaModuleTest {
++  @Test
++  public void testVisibility() {
++    // Just check we can run code that depends on OkHttp types
++    OkHttpCaller.callOkHttp(HttpUrl.get("https://square.com/robots.txt"));
++  }
++
++  @Test
++  public void testMockWebServer() throws IOException {
++    MockWebServer server = new MockWebServer();
++    server.enqueue(new MockResponse(200, Headers.of(), "Hello, Java9!"));
++    server.start();
++
++    // Just check we can run code that depends on OkHttp types
++    Call call = OkHttpCaller.callOkHttp(server.url("/"));
++
++    try (Response response = call.execute();) {
++      System.out.println(response.body().string());
++    }
++  }
++
++  @Test
++  public void testModules() {
++    Module okHttpModule = OkHttpClient.class.getModule();
++    assertEquals("okhttp3", okHttpModule.getName());
++    assertTrue(okHttpModule.getPackages().contains("okhttp3"));
++
++    Module loggingInterceptorModule = HttpLoggingInterceptor.class.getModule();
++    assertEquals("okhttp3.logging", loggingInterceptorModule.getName());
++    assertTrue(loggingInterceptorModule.getPackages().contains("okhttp3.logging"));
++  }
++}
+diff --git a/okhttp-brotli/build.gradle.kts b/okhttp-brotli/build.gradle.kts
+index 15ecef065fb7..a0cf017c5d43 100644
+--- a/okhttp-brotli/build.gradle.kts
++++ b/okhttp-brotli/build.gradle.kts
+@@ -10,10 +10,11 @@ plugins {
+ 
+ project.applyOsgi(
+   "Export-Package: okhttp3.brotli",
+-  "Automatic-Module-Name: okhttp3.brotli",
+   "Bundle-SymbolicName: com.squareup.okhttp3.brotli"
+ )
+ 
++project.applyJavaModules("okhttp3.brotli")
++
+ dependencies {
+   "friendsApi"(projects.okhttp)
+   api(libs.brotli.dec)
+diff --git a/okhttp-brotli/src/main/java9/module-info.java b/okhttp-brotli/src/main/java9/module-info.java
+new file mode 100644
+index 000000000000..488eb21d0843
+--- /dev/null
++++ b/okhttp-brotli/src/main/java9/module-info.java
+@@ -0,0 +1,5 @@
++@SuppressWarnings("module")
++module okhttp3.brotli {
++  requires okhttp3;
++  exports okhttp3.brotli;
++}
+diff --git a/okhttp-coroutines/build.gradle.kts b/okhttp-coroutines/build.gradle.kts
+index 3c96b52c9d3e..c6ed8a804bb8 100644
+--- a/okhttp-coroutines/build.gradle.kts
++++ b/okhttp-coroutines/build.gradle.kts
+@@ -10,10 +10,11 @@ plugins {
+ 
+ project.applyOsgi(
+   "Export-Package: okhttp3.coroutines",
+-  "Automatic-Module-Name: okhttp3.coroutines",
+   "Bundle-SymbolicName: com.squareup.okhttp3.coroutines"
+ )
+ 
++project.applyJavaModules("okhttp3.coroutines")
++
+ dependencies {
+   api(projects.okhttp)
+   implementation(libs.kotlinx.coroutines.core)
+diff --git a/okhttp-coroutines/src/main/java9/module-info.java b/okhttp-coroutines/src/main/java9/module-info.java
+new file mode 100644
+index 000000000000..13ec76f4b1e5
+--- /dev/null
++++ b/okhttp-coroutines/src/main/java9/module-info.java
+@@ -0,0 +1,5 @@
++@SuppressWarnings("module")
++module okhttp3.coroutines {
++  requires okhttp3;
++  exports okhttp3.coroutines;
++}
+diff --git a/okhttp-dnsoverhttps/build.gradle.kts b/okhttp-dnsoverhttps/build.gradle.kts
+index 2869b5de4352..f691598dee99 100644
+--- a/okhttp-dnsoverhttps/build.gradle.kts
++++ b/okhttp-dnsoverhttps/build.gradle.kts
+@@ -10,10 +10,11 @@ plugins {
+ 
+ project.applyOsgi(
+   "Export-Package: okhttp3.dnsoverhttps",
+-  "Automatic-Module-Name: okhttp3.dnsoverhttps",
+   "Bundle-SymbolicName: com.squareup.okhttp3.dnsoverhttps"
+ )
+ 
++project.applyJavaModules("okhttp3.dnsoverhttps")
++
+ dependencies {
+   "friendsApi"(projects.okhttp)
+ 
+diff --git a/okhttp-dnsoverhttps/src/main/java9/module-info.java b/okhttp-dnsoverhttps/src/main/java9/module-info.java
+new file mode 100644
+index 000000000000..51bac70ba42f
+--- /dev/null
++++ b/okhttp-dnsoverhttps/src/main/java9/module-info.java
+@@ -0,0 +1,5 @@
++@SuppressWarnings("module")
++module okhttp3.dnsoverhttps {
++  requires okhttp3;
++  exports okhttp3.dnsoverhttps;
++}
+diff --git a/okhttp-java-net-cookiejar/build.gradle.kts b/okhttp-java-net-cookiejar/build.gradle.kts
+index 3266739206b1..55ac31516bac 100644
+--- a/okhttp-java-net-cookiejar/build.gradle.kts
++++ b/okhttp-java-net-cookiejar/build.gradle.kts
+@@ -10,10 +10,11 @@ plugins {
+ 
+ project.applyOsgi(
+   "Export-Package: okhttp3.java.net.cookiejar",
+-  "Automatic-Module-Name: okhttp3.java.net.cookiejar",
+   "Bundle-SymbolicName: com.squareup.okhttp3.java.net.cookiejar"
+ )
+ 
++project.applyJavaModules("okhttp3.java.net.cookiejar")
++
+ dependencies {
+   "friendsApi"(projects.okhttp)
+   compileOnly(libs.animalsniffer.annotations)
+diff --git a/okhttp-java-net-cookiejar/src/main/java9/module-info.java b/okhttp-java-net-cookiejar/src/main/java9/module-info.java
+new file mode 100644
+index 000000000000..eb204e7e4696
+--- /dev/null
++++ b/okhttp-java-net-cookiejar/src/main/java9/module-info.java
+@@ -0,0 +1,5 @@
++@SuppressWarnings("module")
++module okhttp3.java.net.cookiejar {
++  requires okhttp3;
++  exports okhttp3.java.net.cookiejar;
++}
+diff --git a/okhttp-logging-interceptor/build.gradle.kts b/okhttp-logging-interceptor/build.gradle.kts
+index 8f5885342e87..6c3cfbb8c6d5 100644
+--- a/okhttp-logging-interceptor/build.gradle.kts
++++ b/okhttp-logging-interceptor/build.gradle.kts
+@@ -10,10 +10,11 @@ plugins {
+ 
+ project.applyOsgi(
+   "Export-Package: okhttp3.logging",
+-  "Automatic-Module-Name: okhttp3.logging",
+   "Bundle-SymbolicName: com.squareup.okhttp3.logging"
+ )
+ 
++project.applyJavaModules("okhttp3.logging")
++
+ dependencies {
+   "friendsApi"(projects.okhttp)
+ 
+diff --git a/okhttp-logging-interceptor/src/main/java9/module-info.java b/okhttp-logging-interceptor/src/main/java9/module-info.java
+new file mode 100644
+index 000000000000..3bd226e16d89
+--- /dev/null
++++ b/okhttp-logging-interceptor/src/main/java9/module-info.java
+@@ -0,0 +1,5 @@
++@SuppressWarnings("module")
++module okhttp3.logging {
++  requires okhttp3;
++  exports okhttp3.logging;
++}
+diff --git a/okhttp-sse/build.gradle.kts b/okhttp-sse/build.gradle.kts
+index 8958727542e9..4e1a201d89ba 100644
+--- a/okhttp-sse/build.gradle.kts
++++ b/okhttp-sse/build.gradle.kts
+@@ -10,10 +10,11 @@ plugins {
+ 
+ project.applyOsgi(
+   "Export-Package: okhttp3.sse",
+-  "Automatic-Module-Name: okhttp3.sse",
+   "Bundle-SymbolicName: com.squareup.okhttp3.sse"
+ )
+ 
++project.applyJavaModules("okhttp3.sse")
++
+ dependencies {
+   api(projects.okhttp)
+ 
+diff --git a/okhttp-sse/src/main/java9/module-info.java b/okhttp-sse/src/main/java9/module-info.java
+new file mode 100644
+index 000000000000..1c9afaa9e84b
+--- /dev/null
++++ b/okhttp-sse/src/main/java9/module-info.java
+@@ -0,0 +1,5 @@
++@SuppressWarnings("module")
++module okhttp3.sse {
++  requires okhttp3;
++  exports okhttp3.sse;
++}
+diff --git a/okhttp-tls/build.gradle.kts b/okhttp-tls/build.gradle.kts
+index 17366c9f47b4..312283164925 100644
+--- a/okhttp-tls/build.gradle.kts
++++ b/okhttp-tls/build.gradle.kts
+@@ -11,10 +11,11 @@ plugins {
+ 
+ project.applyOsgi(
+   "Export-Package: okhttp3.tls",
+-  "Automatic-Module-Name: okhttp3.tls",
+   "Bundle-SymbolicName: com.squareup.okhttp3.tls"
+ )
+ 
++project.applyJavaModules("okhttp3.tls")
++
+ dependencies {
+   api(libs.squareup.okio)
+   "friendsImplementation"(projects.okhttp)
+diff --git a/okhttp-tls/src/main/java9/module-info.java b/okhttp-tls/src/main/java9/module-info.java
+new file mode 100644
+index 000000000000..64ab58c72120
+--- /dev/null
++++ b/okhttp-tls/src/main/java9/module-info.java
+@@ -0,0 +1,5 @@
++@SuppressWarnings("module")
++module okhttp3.tls {
++  requires okhttp3;
++  exports okhttp3.tls;
++}
+diff --git a/okhttp-urlconnection/build.gradle.kts b/okhttp-urlconnection/build.gradle.kts
+index 3d156aad8073..569cbb92511c 100644
+--- a/okhttp-urlconnection/build.gradle.kts
++++ b/okhttp-urlconnection/build.gradle.kts
+@@ -10,11 +10,12 @@ plugins {
+ 
+ project.applyOsgi(
+   "Fragment-Host: com.squareup.okhttp3; bundle-version=\"\${range;[==,+);\${version_cleanup;${projects.okhttp.version}}}\"",
+-  "Automatic-Module-Name: okhttp3.urlconnection",
+   "Bundle-SymbolicName: com.squareup.okhttp3.urlconnection",
+   "-removeheaders: Private-Package"
+ )
+ 
++project.applyJavaModules("okhttp3.urlconnection")
++
+ dependencies {
+   "friendsApi"(projects.okhttp)
+   api(projects.okhttpJavaNetCookiejar)
+diff --git a/okhttp-urlconnection/src/main/java9/module-info.java b/okhttp-urlconnection/src/main/java9/module-info.java
+new file mode 100644
+index 000000000000..fb3501129fa6
+--- /dev/null
++++ b/okhttp-urlconnection/src/main/java9/module-info.java
+@@ -0,0 +1,4 @@
++@SuppressWarnings("module")
++module okhttp3.urlconnection {
++  requires okhttp3;
++}
+diff --git a/okhttp/build.gradle.kts b/okhttp/build.gradle.kts
+index 3198289c19f4..327e36ca52f6 100644
+--- a/okhttp/build.gradle.kts
++++ b/okhttp/build.gradle.kts
+@@ -3,6 +3,7 @@
+ import com.vanniktech.maven.publish.JavadocJar
+ import com.vanniktech.maven.publish.KotlinMultiplatform
+ import org.jetbrains.kotlin.gradle.dsl.JvmTarget
++import org.jetbrains.kotlin.gradle.tasks.KotlinJvmCompile
+ import ru.vyarus.gradle.plugin.animalsniffer.AnimalSniffer
+ import ru.vyarus.gradle.plugin.animalsniffer.AnimalSnifferExtension
+ import org.jetbrains.kotlin.gradle.tasks.KotlinCompile
+@@ -210,6 +211,82 @@ android {
+   }
+ }
+ 
++// From https://github.com/Kotlin/kotlinx-atomicfu/blob/master/atomicfu/build.gradle.kts
++val compileJavaModuleInfo by tasks.registering(JavaCompile::class) {
++  val moduleName = "okhttp3"
++  val compilation = kotlin.targets["jvm"].compilations["main"]
++  val compileKotlinTask = compilation.compileTaskProvider.get() as KotlinJvmCompile
++  val targetDir = compileKotlinTask.destinationDirectory.dir("../java9")
++  val sourceDir = file("src/jvmMain/java9/")
++
++  // Use a Java 11 compiler for the module info.
++  javaCompiler.set(project.javaToolchains.compilerFor { languageVersion.set(JavaLanguageVersion.of(11)) })
++
++  // Always compile kotlin classes before the module descriptor.
++  dependsOn(compileKotlinTask)
++
++  // Add the module-info source file.
++  source(sourceDir)
++
++  // Also add the module-info.java source file to the Kotlin compile task.
++  // The Kotlin compiler will parse and check module dependencies,
++  // but it currently won't compile to a module-info.class file.
++  // Note that module checking only works on JDK 9+,
++  // because the JDK built-in base modules are not available in earlier versions.
++  val javaVersion = compileKotlinTask.kotlinJavaToolchain.javaVersion.getOrNull()
++  when {
++    javaVersion?.isJava9Compatible == true -> {
++      logger.info("Module-info checking is enabled; $compileKotlinTask is compiled using Java $javaVersion")
++      // Disabled as this module can't see the others in this build for some reason
++//      compileKotlinTask.source(sourceDir)
++    }
++
++    else -> {
++      logger.info("Module-info checking is disabled")
++    }
++  }
++  // Set the task outputs and destination dir
++  outputs.dir(targetDir)
++  destinationDirectory.set(targetDir)
++
++  // Configure JVM compatibility
++  sourceCompatibility = JavaVersion.VERSION_1_9.toString()
++  targetCompatibility = JavaVersion.VERSION_1_9.toString()
++
++  // Set the Java release version.
++  options.release.set(9)
++
++  // Ignore warnings about using 'requires transitive' on automatic modules.
++  // not needed when compiling with recent JDKs, e.g. 17
++  options.compilerArgs.add("-Xlint:-requires-transitive-automatic")
++
++  // Patch the compileKotlinJvm output classes into the compilation so exporting packages works correctly.
++  options.compilerArgs.addAll(
++    listOf(
++      "--patch-module",
++      "$moduleName=${compileKotlinTask.destinationDirectory.get().asFile}"
++    )
++  )
++
++  // Use the classpath of the compileKotlinJvm task.
++  // Also, ensure that the module path is used instead of the classpath.
++  classpath = compileKotlinTask.libraries
++  modularity.inferModulePath.set(true)
++}
++
++// Call the convention when the task has finished, to modify the jar to contain OSGi metadata.
++tasks.named<Jar>("jvmJar").configure {
++  manifest {
++    attributes(
++      "Multi-Release" to true,
++    )
++  }
++
++  from(compileJavaModuleInfo.get().destinationDirectory) {
++    into("META-INF/versions/9/")
++  }
++}
++
+ project.applyOsgiMultiplatform(
+   "Export-Package: okhttp3,okhttp3.internal.*;okhttpinternal=true;mandatory:=okhttpinternal",
+   "Import-Package: " +
+diff --git a/okhttp/src/jvmMain/java9/module-info.java b/okhttp/src/jvmMain/java9/module-info.java
+new file mode 100644
+index 000000000000..7ff3c9e58c44
+--- /dev/null
++++ b/okhttp/src/jvmMain/java9/module-info.java
+@@ -0,0 +1,15 @@
++@SuppressWarnings("module")
++module okhttp3 {
++  requires transitive kotlin.stdlib;
++  requires transitive okio;
++  requires java.logging;
++  exports okhttp3;
++  exports okhttp3.internal to okhttp3.logging, okhttp3.sse, okhttp3.java.net.cookiejar, okhttp3.dnsoverhttps, mockwebserver3, okhttp3.mockwebserver, okhttp3.coroutines, okhttp3.tls;
++  exports okhttp3.internal.concurrent to mockwebserver3, okhttp3.mockwebserver;
++  exports okhttp3.internal.connection to mockwebserver3, okhttp3.mockwebserver;
++  exports okhttp3.internal.http to okhttp3.logging, okhttp3.brotli, mockwebserver3;
++  exports okhttp3.internal.http2 to mockwebserver3, okhttp3.mockwebserver;
++  exports okhttp3.internal.platform to okhttp3.logging, okhttp3.java.net.cookiejar, okhttp3.dnsoverhttps, mockwebserver3, okhttp3.mockwebserver, okhttp3.tls;
++  exports okhttp3.internal.publicsuffix to okhttp3.dnsoverhttps;
++  exports okhttp3.internal.ws to mockwebserver3, okhttp3.mockwebserver;
++}
+diff --git a/settings.gradle.kts b/settings.gradle.kts
+index c478b91586c5..1d5b3bd39f92 100644
+--- a/settings.gradle.kts
++++ b/settings.gradle.kts
+@@ -52,6 +52,7 @@ include(":samples:static-server")
+ include(":samples:tlssurvey")
+ include(":samples:unixdomainsockets")
+ include(":container-tests")
++include(":module-tests")
+ 
+ project(":okhttp-logging-interceptor").name = "logging-interceptor"
+ 

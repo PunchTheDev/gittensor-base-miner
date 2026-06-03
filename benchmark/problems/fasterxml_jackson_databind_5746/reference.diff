@@ -1,0 +1,249 @@
+diff --git a/release-notes/CREDITS b/release-notes/CREDITS
+index 104855f1aa..c167d233aa 100644
+--- a/release-notes/CREDITS
++++ b/release-notes/CREDITS
+@@ -288,6 +288,11 @@ Kyrylo Merzlikin (@kirmerzlikin)
+    encoded as String
+   [3.1.0]
+ 
++Klaas Dellschaft (@klaasdellschaft)
++ * Reported #3194: Deserialization of 2-dimensional arrays of final types fails when
++   using `DefaultTyping.NON_FINAL`
++  [3.2.0]
++
+ Martin Uhlen (@MartinUhlen)
+  * Reported #5734: `DeserializationFeature.FAIL_ON_NULL_FOR_PRIMITIVES` treats
+    absent field same as explicit `null`
+diff --git a/release-notes/VERSION b/release-notes/VERSION
+index 7c794cf0ab..422b6632f4 100644
+--- a/release-notes/VERSION
++++ b/release-notes/VERSION
+@@ -14,6 +14,10 @@ Versions: 3.x (for earlier see VERSION-2.x)
+ #1755: Get NPE on deserializing values with recursive `@JsonIgnoreProperties`
+  (reported by @Romain-P)
+  (fix by @cowtowncoder, w/ Claude code)
++#3194: Deserialization of 2-dimensional arrays of final types fails when
++  using `DefaultTyping.NON_FINAL`
++ (reported by Klaas D)
++ (fix by @cowtowncoder, w/ Claude code)
+ #3216: Delegating `@JsonCreator` does not prevent unnecessary introspection
+   of properties, leading to bogus failure
+  (reported by @awildturtok)
+diff --git a/src/main/java/tools/jackson/databind/ser/jdk/ObjectArraySerializer.java b/src/main/java/tools/jackson/databind/ser/jdk/ObjectArraySerializer.java
+index 64c9988fea..d5adb592ca 100644
+--- a/src/main/java/tools/jackson/databind/ser/jdk/ObjectArraySerializer.java
++++ b/src/main/java/tools/jackson/databind/ser/jdk/ObjectArraySerializer.java
+@@ -329,6 +329,10 @@ public void serializeContentsUsing(Object[] value, JsonGenerator g,
+         final int len = value.length;
+         final TypeSerializer typeSer = _valueTypeSerializer;
+         final boolean filtered = _needToCheckFiltering(ctxt);
++        // [databind#3194]: only need per-element type id check when elements
++        // are themselves arrays (nested array case like Object[][])
++        final TypeIdCheck typeIdCheck = ((typeSer != null) && _elementType.isArrayType())
++                ? new TypeIdCheck() : null;
+ 
+         int i = 0;
+         Object elem = null;
+@@ -348,6 +352,11 @@ public void serializeContentsUsing(Object[] value, JsonGenerator g,
+                 }
+                 if (typeSer == null) {
+                     ser.serialize(elem, g, ctxt);
++                // [databind#3194]: for nested array elements, skip type id if runtime
++                // array type unwraps to final component (e.g. String[] -> String is final)
++                } else if ((typeIdCheck != null)
++                        && !typeIdCheck.needsTypeId(ctxt, elem.getClass())) {
++                    ser.serialize(elem, g, ctxt);
+                 } else {
+                     ser.serializeWithType(elem, g, ctxt, typeSer);
+                 }
+@@ -363,6 +372,10 @@ public void serializeTypedContents(Object[] value, JsonGenerator g, Serializatio
+         final int len = value.length;
+         final TypeSerializer typeSer = _valueTypeSerializer;
+         final boolean filtered = _needToCheckFiltering(ctxt);
++        // [databind#3194]: only need per-element type id check when elements
++        // are themselves arrays (nested array case like Object[][])
++        final TypeIdCheck typeIdCheck = _elementType.isArrayType()
++                ? new TypeIdCheck() : null;
+         int i = 0;
+         Object elem = null;
+         try {
+@@ -384,13 +397,51 @@ public void serializeTypedContents(Object[] value, JsonGenerator g, Serializatio
+                 if (filtered && !_shouldSerializeElement(ctxt, elem, serializer)) {
+                     continue;
+                 }
+-                serializer.serializeWithType(elem, g, ctxt, typeSer);
++                // [databind#3194]: for nested array elements, skip type id if runtime
++                // array type unwraps to final component (e.g. String[] -> String is final)
++                if ((typeIdCheck != null)
++                        && !typeIdCheck.needsTypeId(ctxt, cc)) {
++                    serializer.serialize(elem, g, ctxt);
++                } else {
++                    serializer.serializeWithType(elem, g, ctxt, typeSer);
++                }
+             }
+         } catch (Exception e) {
+             wrapAndThrow(ctxt, e, elem, i);
+         }
+     }
+ 
++    /*
++    /**********************************************************************
++    /* Helper class for type id checking
++    /**********************************************************************
++     */
++
++    /**
++     * One-entry cache for checking whether the runtime array element type
++     * requires a type id. In practice elements of a typed array are almost
++     * always the same type, so this avoids repeated {@code findTypeSerializer}
++     * lookups.
++     *<p>
++     * See [databind#3194] for details.
++     *
++     * @since 3.1
++     */
++    protected static final class TypeIdCheck {
++        private Class<?> _cachedClass;
++        private boolean _cachedResult;
++
++        public boolean needsTypeId(SerializationContext ctxt, Class<?> runtimeType) {
++            if (runtimeType == _cachedClass) {
++                return _cachedResult;
++            }
++            _cachedClass = runtimeType;
++            _cachedResult = ctxt.findTypeSerializer(
++                    ctxt.constructType(runtimeType)) != null;
++            return _cachedResult;
++        }
++    }
++
+     /*
+     /**********************************************************************
+     /* Helper methods for content filtering
+diff --git a/src/test/java/tools/jackson/databind/tofix/PolymorphicArrays3194Test.java b/src/test/java/tools/jackson/databind/jsontype/deftyping/PolymorphicArrays3194Test.java
+similarity index 56%
+rename from src/test/java/tools/jackson/databind/tofix/PolymorphicArrays3194Test.java
+rename to src/test/java/tools/jackson/databind/jsontype/deftyping/PolymorphicArrays3194Test.java
+index f73076eff1..22981f429e 100644
+--- a/src/test/java/tools/jackson/databind/tofix/PolymorphicArrays3194Test.java
++++ b/src/test/java/tools/jackson/databind/jsontype/deftyping/PolymorphicArrays3194Test.java
+@@ -1,4 +1,4 @@
+-package tools.jackson.databind.tofix;
++package tools.jackson.databind.jsontype.deftyping;
+ 
+ import org.junit.jupiter.api.Test;
+ 
+@@ -10,12 +10,11 @@
+ import tools.jackson.databind.jsontype.BasicPolymorphicTypeValidator;
+ import tools.jackson.databind.jsontype.PolymorphicTypeValidator;
+ import tools.jackson.databind.testutil.DatabindTestUtil;
+-import tools.jackson.databind.testutil.failure.JacksonTestFailureExpected;
+ 
+ import static org.assertj.core.api.Assertions.assertThat;
+ import static org.junit.jupiter.api.Assertions.assertEquals;
+ 
+-// [databund#3194]: Discrepancy between Type Id inclusion on serialization vs
++// [databind#3194]: Discrepancy between Type Id inclusion on serialization vs
+ // expectation during deserialization causes mismatch and fails deserialization.
+ class PolymorphicArrays3194Test extends DatabindTestUtil
+ {
+@@ -23,6 +22,21 @@ static final class ArrayBean3194 {
+         public Object[][] value;
+     }
+ 
++    static final class UntypedBean3194 {
++        public Object value;
++    }
++
++    static final class Bean3194 {
++        public int x;
++        public String y;
++
++        protected Bean3194() { }
++        Bean3194(int x, String y) {
++            this.x = x;
++            this.y = y;
++        }
++    }
++
+     static class UntypedWrapper3195 {
+         @JsonTypeInfo(use = JsonTypeInfo.Id.CLASS,
+                 include = JsonTypeInfo.As.WRAPPER_ARRAY)
+@@ -34,7 +48,7 @@ static class UntypedWrapper3195 {
+                 .allowIfSubTypeIsArray()
+                 .allowIfSubType(Object.class)
+                 .build();
+-    
++
+     @Test
+     void twoDimensionalArrayViaUntyped() throws Exception
+     {
+@@ -60,7 +74,7 @@ void twoDimensionalArrayViaUntyped() throws Exception
+         assertEquals(strs[0][1], resultStrs[0][1]);
+     }
+ 
+-    @JacksonTestFailureExpected
++    // [databind#3194]
+     @Test
+     void twoDimensionalArrayViaDefaultTyping() throws Exception
+     {
+@@ -75,17 +89,49 @@ void twoDimensionalArrayViaDefaultTyping() throws Exception
+                 .writerWithDefaultPrettyPrinter()
+                 .writeValueAsString(instance);
+ 
+-        // Note: we'll see something like:
+-        //
+-//  {
+-//    "value" : [ "[[Ljava.lang.String;", [ [ "[Ljava.lang.String;", [ "1.1", "1.2" ] ], [ "[Ljava.lang.String;", [ "2.1", "2.2" ] ] ] ]
+-//  }
+-
+-        // that is, type ids for both array levels.
+-
+-// System.err.println("JSON:\n"+json);
+-        ArrayBean3194 result = mapper.readValue(json, ArrayBean3194.class); // fails
++        ArrayBean3194 result = mapper.readValue(json, ArrayBean3194.class);
+         assertEquals(String[][].class, result.value.getClass());
+         assertEquals(String[].class, result.value[0].getClass());
+     }
++
++    // [databind#3194]: same as above but for primitive (int) 2D arrays
++    @Test
++    void twoDimensionalPrimitiveArrayViaDefaultTyping() throws Exception
++    {
++        ObjectMapper mapper = JsonMapper
++                .builder()
++                .activateDefaultTyping(OBJECT_ALLOWING_VALIDATOR, DefaultTyping.NON_FINAL)
++                .build();
++
++        // int[][] cannot be assigned to Object[][], so use Object field wrapper
++        UntypedBean3194 input = new UntypedBean3194();
++        input.value = new int[][]{{1, 2}, {3, 4}};
++        String json = mapper.writeValueAsString(input);
++
++        UntypedBean3194 result = mapper.readValue(json, UntypedBean3194.class);
++        assertEquals(int[][].class, result.value.getClass());
++        int[][] arr = (int[][]) result.value;
++        assertEquals(2, arr[0][1]);
++        assertEquals(4, arr[1][1]);
++    }
++
++    // [databind#3194]: same as above but for POJO (non-final) 2D arrays
++    @Test
++    void twoDimensionalPojoArrayViaDefaultTyping() throws Exception
++    {
++        ObjectMapper mapper = JsonMapper
++                .builder()
++                .activateDefaultTyping(OBJECT_ALLOWING_VALIDATOR, DefaultTyping.NON_FINAL)
++                .build();
++
++        ArrayBean3194 instance = new ArrayBean3194();
++        instance.value = new Bean3194[][]{{new Bean3194(1, "a")}, {new Bean3194(2, "b")}};
++        String json = mapper.writeValueAsString(instance);
++
++        ArrayBean3194 result = mapper.readValue(json, ArrayBean3194.class);
++        assertEquals(Bean3194[][].class, result.value.getClass());
++        assertEquals(Bean3194[].class, result.value[0].getClass());
++        assertEquals(1, ((Bean3194) result.value[0][0]).x);
++        assertEquals("b", ((Bean3194) result.value[1][0]).y);
++    }
+ }
