@@ -2622,3 +2622,20 @@ No other issues found this cycle. System healthy: API pool=441, oracle=13.03, no
 - Median parity confirmed 1.00× — 358/412 within 10× of DAS
 - None of the outlier problems are in the current shard
 - Sunday rotation will re-run baselines with the fix, updating the 27 previously-zero oracle entries
+
+## Step 159 — 2026-06-03
+
+**Re-scored baselines ahead of Sunday rotation** (commit `578d7a0`)
+
+The patch-apply bug fix (`b51d955`) corrected `score_diff_quality` but baselines.json still held pre-fix values — 6 problems had `local=0, DAS>0`. Re-ran `baseline_scores.py` manually to apply the fix immediately:
+
+| Metric | Before | After |
+|---|---|---|
+| Oracle (weighted) | 13.03 | **13.39** |
+| Oracle (arithmetic) | 12.08 | **12.43** |
+| Parity within 10× | 358/412 | **362/412** |
+| Low outliers (local<DAS) | 27 | **21** |
+
+4 remaining zero-score problems all have `das_base_score=0.0` — confirmed as genuine zeros (DAS agrees).
+
+Updated: `results/baselines.json`, `results/leaderboard.json` (oracle row), `docs/dashboard_data.json`. API restarted — oracle_score now reads 13.39.
