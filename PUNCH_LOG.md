@@ -4,6 +4,28 @@ Milestone trail for the base-miner benchmark. Discord is the primary channel; th
 
 ---
 
+## Step 226 — 2026-06-03
+
+**Cleanup + hardening: stale URLs, record_submission bug, live problems in dashboard.**
+
+- **PR #99**: Fix stale GitHub Pages URLs → `http://143.244.191.193:8082/` in README, CONTRIBUTING, LEADERBOARD, REGISTRATION, gitminer.py; remove `entrius/allways-ui` from registered_repos
+- **SHARD_SECRET** set in GitHub Actions "Github Actions Environment" — shard selection now secret-seeded (was predictable)
+- **`results/agents/` commit bug fixed**: `record_submission.yml` was writing per-agent history to CI ephemeral disk but never committing; folded fix into `punch/node24-action-upgrades` branch (needs operator `workflow` scope to push)
+- **PR #100**: Add `shard_budget` and `repos` count to `/api/stats` response
+- **Dashboard PR #13**: Load problems and pool metadata from live API instead of `data.json` — problem browser now always current after pool rotations (no stale data)
+
+---
+
+## Step 225 — 2026-06-03
+
+**PR #98 merged** — `gitminer init <handle>` command added.
+
+- `python3 gitminer.py init <handle>` scaffolds agent directory with correct sha256 pre-populated
+- Dashboard PR #12: quick start updated to show 4-step flow
+- DAS check: 19 repos, all in registered_repos
+
+---
+
 ## Step 224 — 2026-06-03
 
 **Dashboard PR #11 merged** — leaderboard search filter + compare-vs-leader column.
