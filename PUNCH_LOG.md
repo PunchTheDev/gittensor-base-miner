@@ -2594,3 +2594,31 @@ Fix: `cmd_parity` now reads pre-computed tree-sitter scores from `results/baseli
 - Heuristic median was 2.5x (misleading); tree-sitter median is 1.00x (accurate)
 
 No other issues found this cycle. System healthy: API pool=441, oracle=13.03, no open PRs.
+
+---
+
+## Step 158 — 2026-06-03
+
+**Silent zero baseline bug fixed: patch-apply failure path** (commit 39021a1)
+
+**Root cause**: `score_diff_quality` (baseline oracle scoring) called `apply_patch()` but ignored its return value. When a reference diff fails to apply to the base commit:
+1. `file_pairs` had old content but `_fill_new_contents` was skipped (since apply failed, but code didn't check)
+2. Actually the code DID call `_fill_new_contents` since the return value was ignored — so new_content = old_content (unchanged)
+3. tree-sitter correctly scored 0 change (old == new)
+4. Heuristic fallback was never reached (tree-sitter returned (0, 0), not None)
+5. Result: baseline oracle = 0 for any problem where the reference diff doesn't apply cleanly
+
+**Fix**: Store `patch_applied = apply_patch(...)`, only call `_fill_new_contents` when `patch_applied=True`, only use tree-sitter when `patch_applied=True`. Falls through to heuristic correctly.
+
+**Confirmed**: `we-promise_sure_1752` (DAS=30, local was 0, heuristic=30) now returns 30 from `score_diff_quality`. Other 27 low-ratio outliers will be corrected when Sunday's `refresh_pool.yml` re-runs `baseline_scores.py` with the fix.
+
+**Parity output improved**: Added outlier breakdown note:
+- `{aligned}/{total} problems within 10× of DAS | {N} outliers ({high} local>DAS, {low} local<DAS)`
+- Explanation: local>DAS = DAS had test failures; local<DAS = local scorer gap
+
+**Pool audit findings**:
+- 412 problems have DAS reference scores; 29 (all entrius/gittensor) have no DAS score — expected
+- 54 outliers: 27 local>DAS (DAS test failures), 27 local<DAS (27 now explained by patch-apply bug)
+- Median parity confirmed 1.00× — 358/412 within 10× of DAS
+- None of the outlier problems are in the current shard
+- Sunday rotation will re-run baselines with the fix, updating the 27 previously-zero oracle entries
