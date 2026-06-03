@@ -3573,3 +3573,29 @@ Added three models to `benchmark/harness/allowed_models.txt` that were missing f
 - Allowed models: 21 (was 18)
 - Pool rotation: Sunday 2026-06-08 (automated)
 - CI: all green
+
+---
+
+## Step 199 — 2026-06-03
+
+**Oracle value sync** (PR #76)
+
+Propagated oracle correction from PR #73 (12.70 → 12.61) to 8 remaining files that still showed the stale value. Also corrected stale pool stats in docs/api.md (repos 46→47, typescript 165→188, difficulty distribution).
+
+**Files updated:**
+- `gitminer.py`: CLI docstring comment + `_oracle_weighted()` fallback
+- `benchmark/evaluate.py`: oracle mode fallback
+- `scripts/record_result.py`: `_oracle_scores_from_baselines()` exception fallback
+- `scripts/generate_dashboard_data.py`: `_load_oracle_row()` exception fallback
+- `README.md`: calibration check comment
+- `LEADERBOARD.md`: oracle row + pool stats table
+- `docs/api.md`: example JSON responses + stale pool counts
+- `docs/rewards.md`: "Beat the oracle" tip
+
+### System state after step 199
+
+- base-miner main: 360d0ae7 (post-PR#76)
+- Benchmark: 1154 problems, oracle **12.61** weighted / 11.48 arithmetic, 47 repos, 6 languages
+- Allowed models: 21
+- Pool rotation: Sunday 2026-06-08 (automated)
+- CI: all green
