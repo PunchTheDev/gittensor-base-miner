@@ -25,14 +25,23 @@ import json
 import hashlib
 import os
 import random
+import sys
 from datetime import date, timedelta
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from typing import Any
 from urllib.parse import parse_qs, urlparse
 
+# Add repo root to sys.path so benchmark.catalog is importable when running
+# this file directly (e.g. python api/server.py) as well as via gitminer.py.
+_REPO_ROOT = Path(__file__).parent.parent
+if str(_REPO_ROOT) not in sys.path:
+    sys.path.insert(0, str(_REPO_ROOT))
 
-REPO_ROOT = Path(__file__).parent.parent
+from benchmark.catalog import REPO_CATEGORY  # noqa: E402
+
+
+REPO_ROOT = _REPO_ROOT
 POOL_DIR = REPO_ROOT / "benchmark" / "problems"
 POOL_CONFIG = REPO_ROOT / "benchmark" / "pool_config.json"
 BASELINES = REPO_ROOT / "results" / "baselines.json"
@@ -42,53 +51,6 @@ CORS_HEADERS = {
     "Access-Control-Allow-Origin": "*",
     "Access-Control-Allow-Methods": "GET, OPTIONS",
     "Access-Control-Allow-Headers": "Content-Type",
-}
-
-# Mirrors benchmark/evaluate.py — repo → language category used everywhere else.
-REPO_CATEGORY: dict[str, str] = {
-    "entrius/gittensor": "python",
-    "entrius/allways": "python",
-    "entrius/das-github-mirror": "python",
-    "entrius/allways-ui": "typescript",
-    "entrius/gittensor-ui": "typescript",
-    "entrius/oc-1": "typescript",
-    "aglover1221/product-data-extractor": "python",
-    "cogniax/tao-pulse-app": "typescript",
-    "e35ventura/taopedia": "python",
-    "e35ventura/taopedia-articles": "python",
-    "geniepod/genie-claw": "rust",
-    "infiniflow/ragflow": "python",
-    "jsonbored/awesome-claude": "typescript",
-    "jsonbored/gittensory": "typescript",
-    "mkdev11/gittensor-hub": "typescript",
-    "vouchdev/vouch": "python",
-    "phase-rs/phase": "rust",
-    "seroperson/jvm-live-reload": "jvm",
-    "touchpilot/touchpilot": "jvm",
-    "we-promise/sure": "ruby",
-    "rubocop/rubocop": "ruby",
-    "rubocop/rubocop-rails": "ruby",
-    "colinhacks/zod": "typescript",
-    "vitest-dev/vitest": "typescript",
-    "trpc/trpc": "typescript",
-    "vuejs/core": "typescript",
-    "python/mypy": "python",
-    "tokio-rs/tokio": "rust",
-    "clap-rs/clap": "rust",
-    "hyperium/hyper": "rust",
-    "tokio-rs/axum": "rust",
-    "fasterxml/jackson-databind": "jvm",
-    "square/okhttp": "jvm",
-    # Go external repos
-    "gin-gonic/gin": "go",
-    "labstack/echo": "go",
-    "gofiber/fiber": "go",
-    "grpc/grpc-go": "go",
-    "spf13/cobra": "go",
-    "google/guava": "jvm",
-    "serde-rs/serde": "rust",
-    "sindresorhus/got": "typescript",
-    "tanstack/query": "typescript",
 }
 
 
