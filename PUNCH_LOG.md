@@ -2501,3 +2501,19 @@ Both now point to the canonical `gitminer` CLI commands documented throughout RE
 The `?lang=` alias in the server accepts it but maps to the same `cat_filter` comparison — the value still had to be the full category name, not a shorthand.
 
 **System health:** API pool=441, oracle=13.03, no open PRs. Holding pre-registration.
+
+---
+
+## Step 152 — 2026-06-03
+
+**Defensive KeyError fix in `/api/leaderboard`** (benchmark commit `df82d8f`)
+
+Codebase audit found one remaining bug:
+
+| Bug | File | Root cause | Fix |
+|---|---|---|---|
+| Potential `KeyError` on leaderboard "score" field | `api/server.py:408-409` | `e["score"]` with bracket notation in two places within the leaderboard endpoint — if any entry somehow lacks "score", it would raise `KeyError` instead of gracefully returning `None` | → `e.get("score", 0)` / `top.get("score")` |
+
+The `ranked` filter on line 406 already guards `e.get("score") is not None`, so this would only bite a manually-edited leaderboard — but defensive is correct.
+
+**System health:** API pool=441, oracle=13.03, shard=30, next_rotation=2026-06-08. No open PRs. Clean.
