@@ -3932,3 +3932,31 @@ Then the changes can be pushed. This must happen before June 16.
 - Benchmark: 1123 problems, oracle 12.64 weighted / 11.49 arithmetic, 47 repos
 - Model whitelist: **34 models** (all verified live 2026-06-03)
 - Pool rotation: Sunday 2026-06-08 (5 days, protected)
+
+---
+
+## Step 213 — 2026-06-03
+
+**Action:** Fix `gitminer doctor` — validate meta.json model + sha256 explicitly
+
+**PR #91 merged** (deaf6264): Replace heuristic regex source-scan in `doctor --agent` with explicit meta.json validation.
+
+**Root cause:** `doctor --agent` was scanning agent.py source code with a regex looking for model strings. CI actually validates `meta.json["model"]` against allowed_models.txt — a miner with a non-whitelisted model in meta.json would pass doctor but fail CI.
+
+**What changed in doctor:**
+- Reads `meta.json` next to agent.py (hard fail if missing — CI requires it)
+- Checks `meta.json["model"]` against `allowed_models.txt` exactly (same check CI runs)
+- Verifies `meta.json["sha256"]` matches current agent.py content
+- Failure messages include actionable instructions (`gitminer hash` command)
+
+**Other maintenance:**
+- Cleaned up 14 stale merged local branches (squash-merge leaves no git --merged trace)
+- DAS repo check: 18 repos live, all in registered_repos — no new registrations
+- Action versions re-verified vs GitHub API: checkout v6, setup-python v6, cache v5, upload-artifact v7, github-script v9 all confirmed latest for Node.js 24 branch
+
+**System state post-step:**
+- base-miner main: deaf6264 (PR #91 merged)
+- Benchmark: 1123 problems, oracle 12.64 weighted / 11.49 arithmetic, 47 repos
+- Model whitelist: **34 models** (all verified live 2026-06-03)
+- Pool rotation: Sunday 2026-06-08 (protected)
+- Node.js 24 upgrade: branch `punch/node24-workflow-upgrades` ready locally (operator needs `workflow` scope)
