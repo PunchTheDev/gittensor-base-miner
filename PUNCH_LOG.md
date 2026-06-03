@@ -4045,3 +4045,22 @@ Pool 1123, oracle 12.64, whitelist **65 models**, rotation Sunday 2026-06-08 (al
 ### Status
 Pool 1123, oracle 12.64, whitelist **65 models**, rotation Sunday 2026-06-08 (5 days, green).
 Deploy artifacts now in repo. Operator blocked items: nginx hookup, Node.js 24 workflow scope, registration.
+
+---
+
+## Step 218 — 2026-06-03
+
+### Actions
+- **PR #95**: Fix `gitminer submit` meta.json model preservation (merged fcb770f5)
+  - Bug: running `gitminer submit agent.py` without `--model` silently overwrote
+    the miner's existing `meta.json` with `deepseek/deepseek-chat`, clobbering their
+    model selection even if they'd followed CONTRIBUTING.md instructions exactly
+  - Fix: reads existing `meta.json["model"]` before fallback
+  - Resolution order: `--model` flag > existing meta.json model > deepseek/deepseek-chat
+  - Updated `--model` help text to reflect new behavior
+- All 65 whitelisted models re-verified against OpenRouter API — 0 missing ✅
+- Stale local branches cleaned: `punch/doctor-meta-validation`, `punch/whitelist-comprehensive-2026-06-03`
+
+### Status
+Pool 1123, oracle 12.64, whitelist 65 models, rotation Sunday 2026-06-08 (5 days, green).
+All 65 whitelist models confirmed live on OpenRouter. Submit footgun fixed.
