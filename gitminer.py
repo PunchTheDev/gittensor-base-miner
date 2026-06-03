@@ -1158,9 +1158,9 @@ def cmd_mine(args: argparse.Namespace) -> None:
     Autonomous mining daemon — run your agent against the current shard and
     auto-submit if you beat the champion.
 
-    In --loop mode the daemon waits for the next shard rotation (Monday 00:00
-    UTC) and repeats.  This is the "idle compute" mode: point it at your agent
-    and walk away.
+    In --loop mode the daemon waits for the next shard rotation (7-day epoch
+    from 2024-01-01) and repeats.  This is the "idle compute" mode: point it
+    at your agent and walk away.
 
     Examples:
         python3 gitminer.py mine --agent agent/submissions/myhandle/agent.py --no-sandbox
@@ -1493,8 +1493,7 @@ def cmd_init(args: argparse.Namespace) -> None:
         }
         if model not in allowed:
             print(f"Warning: '{model}' is not in benchmark/harness/allowed_models.txt")
-            print("CI will reject the submission. Run: python3 gitminer.py problems --cat python "
-                  "to see available models, or check benchmark/harness/allowed_models.txt")
+            print("CI will reject the submission. Allowed models: " + ", ".join(sorted(allowed)))
 
     src_dir = REPO_ROOT / "agent" / "example"
     dst_dir = REPO_ROOT / "agent" / "submissions" / handle
