@@ -2777,3 +2777,29 @@ Updated: `results/baselines.json`, `results/leaderboard.json` (oracle row), `doc
 - 🚨 Daytona integration — model enforcement + static agent detection
 - 🚨 Per-miner OpenRouter key
 - Commit-reveal (private eval)
+
+---
+
+## Step 167 — 2026-06-03
+
+### Changes
+
+**PR #20** — Model whitelist 11 → 16 models, fix --show-ref without agent
+- Added: `deepseek/deepseek-v3`, `qwen/qwen-2.5-coder-32b-instruct`, `meta-llama/llama-3.3-70b-instruct`, `google/gemini-2.0-flash-001`, `mistralai/codestral-2501`
+- Added contamination policy comment explaining the training-data overlap tradeoff
+- Fixed: `gitminer run --show-ref` without `--agent` no longer tries to run an agent (was failing with OPENROUTER_KEY not set)
+- Updated CONTRIBUTING.md example meta.json to use deepseek/deepseek-v3
+
+**PR #21** — Sync stale oracle/shard fallback constants
+- `benchmark/evaluate.py`: DEFAULT_SHARD_BUDGET corrected to match pool_config.json (python:10, rust:10, typescript:6); oracle fallback 15.99→14.81
+- `scripts/generate_dashboard_data.py`: oracle fallback 12.08/13.03/441 → 13.50/14.81/681
+- `.github/workflows/eval.yml`: hardcoded 13.03 fallback → 14.81 in two places
+
+**PR #22** — Go Docker image for sandbox runner (bug fix)
+- Root cause: 40 benchmark problems (infiniflow/ragflow Go driver issues) use `go test ./...` but `_LANG_IMAGES` had no Go entry → fell back to `python:3.12-slim` → tests fail silently
+- Fix: added `"go": "golang:1.23-bookworm"` to `_LANG_IMAGES`, go mod download install block, python3-minimal apt install for capture_files.py
+
+### Critical gaps (unchanged, still need operator input)
+- 🚨 Daytona integration — model enforcement + static agent detection
+- 🚨 Per-miner OpenRouter key
+- Commit-reveal (private eval server)
