@@ -4,6 +4,20 @@ Milestone trail for the base-miner benchmark. Discord is the primary channel; th
 
 ---
 
+## Step 241 — 2026-06-03
+
+**Swagger/OpenAPI docs added.**
+
+- **PR #106 merged** (benchmark `03e19677`): Add Swagger UI + OpenAPI 3.0 spec
+  - `GET /api/openapi.json` — full spec: all endpoints, query params, request/response schemas
+  - `GET /docs` — Swagger UI (CDN), live try-it-now for every endpoint
+  - `_agents()` discovery doc updated: `api.docs` and `api.spec` fields now point to Swagger
+- **Dashboard PR #19 merged** (`660fb60`): Link Swagger from mining page
+  - Hero "API Docs" button → `{API}/docs` (live URL, not static GitHub markdown)
+  - Mining page API table: 2 new rows (`/api/openapi.json`, `/docs`); info-box links to Swagger; base URL row has inline Swagger link
+
+---
+
 ## Step 231 — 2026-06-03
 
 **Dashboard sub-pages + model whitelist curation.**
