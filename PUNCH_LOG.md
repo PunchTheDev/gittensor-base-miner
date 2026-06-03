@@ -3096,3 +3096,25 @@ Dashboard: punchthedev.github.io/gittensor-miner-dashboard/ updated to 812 probl
 ### Pool state
 - Pool: 1131 | Oracle: 12.64 weighted / 11.41 arithmetic | Repos: 46 | Languages: 6
 - Next action: Operator input on Daytona credentials and per-miner OpenRouter key
+
+---
+
+## Step 183 — 2026-06-03
+
+### Actions
+- Removed orphaned `infiniflow_ragflow_15431/` problem directory (untracked leftover from a partial build_pool.py run on a non-tracked repo)
+- **Bug found and fixed: vouchdev/vouch mis-categorized as 'typescript'** — the repo is a Python AI/retrieval system (24 problems with pytest tests and Python source). REPO_CATEGORY updated in evaluate.py, generate_dashboard_data.py, api/server.py
+- **Bug found and fixed: 6 TypeScript problems with wrong test_cmd** — sindresorhus/got (3) and vitest-dev/vitest (3) had `python -m pytest` instead of `npm test` (diffs had no `.test.ts` files, so fell through to Python default)
+- **Root cause fixed in expand_pool_external.py `infer_test_cmd`**: now detects any `.ts`/`.js` file extension → npm test (not just `.test.ts`/`.spec.ts`). Consistent with build_pool.py logic.
+- Shard budget rebalanced: python 10→12, typescript 6→4 (proportional to corrected counts)
+- Updated pool_config.json, DEFAULT_SHARD_BUDGET, generate_dashboard_data.py SHARD_BUDGET, docs/api.md
+- Regenerated docs/dashboard_data.json
+- API restarted: confirms python:442, typescript:165 ✅
+- PR #43: "Fix vouchdev/vouch language category and 6 wrong test_cmds" — merged commit f6033510
+- Commit 6e47a136: `infer_test_cmd` root-cause fix pushed directly to main
+
+### Pool state
+- Pool: 1131 (same count, corrected categories) | Oracle: 12.64 weighted / 11.41 arithmetic | Repos: 46 | Languages: 6
+- New composition: python:442 (39.1%), rust:277 (24.5%), typescript:165 (14.6%), go:96 (8.5%), jvm:76 (6.7%), ruby:75 (6.6%)
+- Shard budget: python:12 / rust:7 / typescript:4 / go:3 / jvm:2 / ruby:2 = 30 ✅
+- Sunday rotation 2026-06-08: all 33 external + 13 DAS repos will auto-expand
