@@ -53,6 +53,7 @@ _LANG_IMAGES: dict[str, str] = {
     "cargo":  "rust:1.82-slim",
     "./gradlew": "eclipse-temurin:21-jdk-jammy",
     "bundle": "ruby:3.3-slim",
+    "go":     "golang:1.23-bookworm",
 }
 
 # Scorer assets bundled with the harness — copied to staging for Phase 2.
@@ -325,6 +326,13 @@ def _install_block(test_cmd: list[str]) -> str:
             bundle install --quiet 2>/dev/null || true
         """)
 
+    if runner == "go":
+        return textwrap.dedent("""\
+            if [ -f go.mod ]; then
+                go mod download 2>/dev/null || true
+            fi
+        """)
+
     return ""
 
 
@@ -349,6 +357,12 @@ def _git_apt_block(runner: str) -> str:
         return (
             "apt-get update -qq >/dev/null && "
             "apt-get install -y -qq git python3-minimal >/dev/null"
+        )
+    if runner == "go":
+        # golang:1.23-bookworm — has go + git; needs python3-minimal for capture_files.py
+        return (
+            "apt-get update -qq >/dev/null && "
+            "apt-get install -y -qq python3-minimal >/dev/null"
         )
     # python:3.12-slim — has python3, needs git
     return "apt-get update -qq >/dev/null && apt-get install -y -qq git >/dev/null"
