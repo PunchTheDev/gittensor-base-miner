@@ -3257,3 +3257,25 @@ Four dimensions now captured:
 benchmark_score          = test_pass_rate × relative_score × anti_gaming_multiplier
 weighted_benchmark_score = sum(benchmark_score_i × weight_i) / sum(weight_i)
 ```
+
+## Step 188 — 2026-06-03
+
+### Critical scoring bug fixes: sandbox metric parity + partial credit (PRs #49, #50)
+
+**Bug 1 — Sandbox metric parity (PR #49, merged ba464817)**
+
+The Phase 2 Docker scorer script only emitted `base_score` and `tests_passed`. Missing: `test_pass_rate`, `relative_score`, `benchmark_score`, `anti_gaming_multiplier`, `file_coverage`, `test_deletion_warning`. This meant `weighted_benchmark_score` (the PRIMARY leaderboard metric) was always `None` in real CI sandbox runs — the metric we built the entire ranking on never actually computed in production.
+
+**Fix**: Added `_enrich_result()` to `runner.py`. After `_run_container()` returns but before the staging temp dir is cleaned up, reads `test_out.txt`, parses test counts, and computes all missing metrics using the same functions as `score.score_patch()`. Both execution paths (sandbox + local) now return identical result shapes.
+
+Also renamed underscore-prefixed public helpers in `score.py` to remove the `_` prefix (`parse_test_count`, `file_coverage_stats`, `detect_test_deletion`, `relative_score_for`, `load_baselines`, `is_test_file`, `parse_diff_paths`, `cached_repo`, `repo_cache_dir`). Updated all callers in `gitminer.py`.
+
+**Bug 2 — Partial credit broken in Phase 2 (PR #50, merged 4f5fd2b2)**
+
+Phase 2 exited early with `base_score: 0.0` when `tests_passed == False`. Since `benchmark_score = test_pass_rate × relative_score`, setting `base_score = 0` meant a submission passing 7/10 tests earned `0.7 × 0.0 = 0.0` instead of `0.7 × oracle_quality`. The local `score_patch()` path didn't have this bug — local runs computed `base_score` always.
+
+**Fix**: Removed the early-exit block in `_SCORE_RESULT_SCRIPT`. Phase 2 now always computes diff quality (tree-sitter or heuristic) regardless of test result. Also fixed hardcoded `"tests_passed": True` in the success output — now uses the actual `tests_passed` bool. Renamed `_compute_base` → `compute_base`, `_try_tree_sitter` → `try_tree_sitter` in the embedded script.
+
+### Why these bugs were silent
+
+Both bugs affected only sandbox (Docker CI) runs, not `--no-sandbox` local dev mode. Since there are no miner submissions yet, nobody had tested the full CI pipeline end-to-end with an actual agent submission. The bugs would have produced systematically wrong scores for all miners once registration goes live — everyone would have seen `weighted_benchmark_score: 0.0` regardless of actual performance.
