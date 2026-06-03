@@ -428,6 +428,7 @@ def run_evaluation(
 
         weighted_total = weighted_count = 0.0
         rel_total = rel_count = 0
+        bench_total = bench_count = 0
         for r, d in zip(results, selected):
             tier, w = problem_difficulty(d)
             r["difficulty"] = tier
@@ -439,13 +440,19 @@ def run_evaluation(
             if rel is not None and isinstance(rel, (int, float)):
                 rel_total += rel
                 rel_count += 1
+            bench = r.get("benchmark_score")
+            if bench is not None and isinstance(bench, (int, float)):
+                bench_total += bench
+                bench_count += 1
         weighted_mean = weighted_total / weighted_count if weighted_count else 0.0
         mean_relative = round(rel_total / rel_count, 4) if rel_count else None
+        mean_benchmark = round(bench_total / bench_count, 4) if bench_count else None
 
         return {
             "mean_score": round(mean, 4),
             "weighted_mean_score": round(weighted_mean, 4),
             "mean_relative_score": mean_relative,
+            "mean_benchmark_score": mean_benchmark,
             "problems_evaluated": len(results),
             "pool_size": len(all_problem_dirs),
             "shard_size": len(selected),
@@ -509,6 +516,7 @@ def run_evaluation(
 
     weighted_total = weighted_count = 0.0
     rel_total = rel_count = 0
+    bench_total = bench_count = 0
     for r, d in zip(results, selected):
         tier, w = problem_difficulty(d)
         r["difficulty"] = tier
@@ -520,13 +528,22 @@ def run_evaluation(
         if rel is not None and isinstance(rel, (int, float)):
             rel_total += rel
             rel_count += 1
+        bench = r.get("benchmark_score")
+        if bench is not None and isinstance(bench, (int, float)):
+            bench_total += bench
+            bench_count += 1
     weighted_mean = weighted_total / weighted_count if weighted_count else 0.0
     mean_relative = round(rel_total / rel_count, 4) if rel_count else None
+    mean_benchmark = round(bench_total / bench_count, 4) if bench_count else None
 
     return {
         "mean_score": round(mean, 4),
         "weighted_mean_score": round(weighted_mean, 4),
         "mean_relative_score": mean_relative,
+        # mean_benchmark_score: PRIMARY leaderboard metric.
+        # = mean(test_pass_rate × relative_score) across all evaluated problems.
+        # Combines correctness (partial test pass) and quality (vs oracle).
+        "mean_benchmark_score": mean_benchmark,
         "problems_evaluated": len(results),
         "pool_size": len(all_problem_dirs),
         "shard_size": len(selected),
@@ -584,7 +601,11 @@ def main() -> None:
     )
 
     pool_info = f"{results['shard_size']}/{results['pool_size']} problems"
-    print(f"\nMean score:          {results['mean_score']} ({pool_info})")
+    bench = results.get("mean_benchmark_score")
+    if bench is not None:
+        pct = round(bench * 100, 1)
+        print(f"\nBenchmark score:     {bench}  ({pct}% — PRIMARY metric: test_pass_rate × quality/oracle)")
+    print(f"Mean score:          {results['mean_score']} ({pool_info})")
     print(f"Weighted mean score: {results['weighted_mean_score']} (easy×1 / medium×1.5 / hard×2)")
     rel = results.get("mean_relative_score")
     if rel is not None:

@@ -133,6 +133,91 @@ def run_tests(repo_dir: Path, test_cmd: list[str]) -> tuple[bool, str, bool]:
     return passed, output, all_skipped
 
 
+# --- Test count parsers (per test runner) -----------------------------------
+
+# pytest: "5 passed, 2 failed, 1 error in 3.4s"  or  "5 passed in 1.2s"
+_PYTEST_SUMMARY_RE = re.compile(
+    r"=+\s*(?:(\d+)\s+passed)?.*?(?:(\d+)\s+failed)?.*?(?:(\d+)\s+error(?:s)?)?\s*=+"
+)
+_PYTEST_PASSED_RE = re.compile(r"(\d+)\s+passed")
+_PYTEST_FAILED_RE = re.compile(r"(\d+)\s+(?:failed|error)")
+
+# cargo test: "test result: ok. 10 passed; 0 failed; 0 ignored"
+_CARGO_RE = re.compile(r"test result:.*?(\d+)\s+passed;\s*(\d+)\s+failed")
+
+# go test: count "--- PASS:" and "--- FAIL:" lines
+_GO_PASS_RE = re.compile(r"^--- PASS:", re.MULTILINE)
+_GO_FAIL_RE = re.compile(r"^--- FAIL:", re.MULTILINE)
+
+# jest/vitest: "Tests: 2 failed, 8 passed, 10 total"
+_JEST_RE = re.compile(r"Tests?:.*?(\d+)\s+passed.*?(\d+)\s+total", re.DOTALL)
+_JEST_TOTAL_RE = re.compile(r"(\d+)\s+total")
+_JEST_PASSED_RE = re.compile(r"(\d+)\s+passed")
+_JEST_FAILED_RE = re.compile(r"(\d+)\s+failed")
+
+# rspec: "10 examples, 2 failures"
+_RSPEC_RE = re.compile(r"(\d+)\s+examples?,\s*(\d+)\s+failures?")
+
+# gradle: "10 tests completed, 2 failed"
+_GRADLE_RE = re.compile(r"(\d+)\s+tests?\s+completed,\s*(\d+)\s+failed")
+
+
+def _parse_test_count(output: str, test_cmd: list[str]) -> tuple[int, int]:
+    """Parse test runner output to extract (tests_passed, tests_total).
+
+    Returns (0, 0) when parsing fails — callers should treat this as unknown,
+    not as 'zero tests passed'. The caller uses the subprocess return code to
+    determine pass/fail when count is unavailable.
+
+    Supports: pytest, cargo test, go test, jest/vitest, rspec, gradle.
+    """
+    runner = test_cmd[0] if test_cmd else ""
+
+    # cargo test
+    if runner == "cargo" or "cargo" in runner:
+        for m in _CARGO_RE.finditer(output):
+            p, f = int(m.group(1)), int(m.group(2))
+            return p, p + f
+
+    # go test
+    if runner == "go" or runner.endswith("/go"):
+        n_pass = len(_GO_PASS_RE.findall(output))
+        n_fail = len(_GO_FAIL_RE.findall(output))
+        if n_pass + n_fail > 0:
+            return n_pass, n_pass + n_fail
+
+    # gradle
+    if "./gradlew" in runner or "gradlew" in runner:
+        m = _GRADLE_RE.search(output)
+        if m:
+            total, failed = int(m.group(1)), int(m.group(2))
+            return total - failed, total
+
+    # rspec
+    if runner in ("rspec", "bundle") or "rspec" in output:
+        m = _RSPEC_RE.search(output)
+        if m:
+            total, failures = int(m.group(1)), int(m.group(2))
+            return total - failures, total
+
+    # jest / vitest (npm test)
+    if runner in ("npm", "npx", "yarn", "bun") or "jest" in output or "vitest" in output:
+        total_m = _JEST_TOTAL_RE.search(output)
+        passed_m = _JEST_PASSED_RE.search(output)
+        if total_m and passed_m:
+            return int(passed_m.group(1)), int(total_m.group(1))
+
+    # pytest (default for python repos and many others)
+    passed_m = _PYTEST_PASSED_RE.search(output)
+    passed = int(passed_m.group(1)) if passed_m else 0
+    failed_ms = _PYTEST_FAILED_RE.findall(output)
+    failed = sum(int(x) for x in failed_ms)
+    if passed + failed > 0:
+        return passed, passed + failed
+
+    return 0, 0
+
+
 # Words to skip when tokenizing added diff lines (noise, not signal)
 _SKIP_PATTERNS = re.compile(
     r"^(#|//|/\*|\*|<!--|\"\"\"|'''|pass$|\.\.\.)"
@@ -561,9 +646,13 @@ def _score_in_worktree(
             "problem_id": problem_id,
             "patch_applied": False,
             "tests_passed": False,
+            "tests_passed_count": 0,
+            "tests_total_count": 0,
+            "test_pass_rate": 0.0,
             "source_token_score": 0.0,
             "base_score": 0.0,
             "relative_score": 0.0,
+            "benchmark_score": 0.0,
             "final_score": 0.0,
         }
 
@@ -577,20 +666,20 @@ def _score_in_worktree(
         for c in raw_cmd
     ]
     tests_passed, test_output, all_skipped = run_tests(repo_dir, test_cmd)
+    n_passed, n_total = _parse_test_count(test_output, test_cmd)
 
-    if not tests_passed:
-        return {
-            "problem_id": problem_id,
-            "patch_applied": True,
-            "tests_passed": False,
-            "test_output": test_output[-2000:],
-            "source_token_score": 0.0,
-            "base_score": 0.0,
-            "relative_score": 0.0,
-            "final_score": 0.0,
-        }
+    # test_pass_rate: fraction of tests that pass.
+    # When parsing fails (n_total=0), fall back to binary: 1.0 if all tests
+    # pass (by return code), 0.0 otherwise. This is a conservative fallback.
+    if n_total > 0:
+        test_pass_rate = round(n_passed / n_total, 4)
+    else:
+        test_pass_rate = 1.0 if tests_passed else 0.0
+        n_passed = n_total = 0  # unknown, leave as 0
 
-    # Primary: tree-sitter AST scorer (matches DAS scoring engine)
+    # Primary: tree-sitter AST scorer (matches DAS scoring engine).
+    # Computed even on partial test pass so quality can be combined with
+    # test_pass_rate in benchmark_score.
     tree_sitter_result = None
     if file_pairs is not None:
         try:
@@ -605,7 +694,6 @@ def _score_in_worktree(
         scoring_method = "tree-sitter"
         scoring_note = "Gittensor native tree-sitter AST scorer (matches DAS)"
     else:
-        # Fallback: heuristic diff-token count
         src_tok, total_tok = approximate_src_token_score(diff_text, saturation_scale)
         scoring_method = "heuristic"
         scoring_note = (
@@ -624,30 +712,45 @@ def _score_in_worktree(
     coverage = _file_coverage(problem_dir, diff_text)
     deletion_info = _detect_test_deletion(diff_text)
 
+    # benchmark_score: composite primary leaderboard metric.
+    #   = test_pass_rate × relative_score
+    # This gives partial credit for partially-correct fixes while still
+    # weighting quality against the oracle. A fully-passing submission
+    # scoring 1.0 relative earns benchmark_score 1.0; a half-passing
+    # submission earns 0.5 × relative_score.
+    benchmark_score = round(test_pass_rate * (rel_score or 0.0), 4)
+
     return {
         "problem_id": problem_id,
         "patch_applied": True,
-        "tests_passed": True,
+        "tests_passed": tests_passed,
+        # Granular test counts (0 = parse failed / unknown, not "zero tests")
+        "tests_passed_count": n_passed,
+        "tests_total_count": n_total,
+        "test_pass_rate": test_pass_rate,
         "tests_skipped_locally": all_skipped,
+        "test_output": test_output[-2000:] if not tests_passed else None,
         "source_token_score": round(src_tok, 2),
         "total_token_score": round(total_tok, 2),
         "scoring_method": scoring_method,
         "base_score": base_score,
-        # relative_score: agent quality / oracle quality for this specific problem.
-        # 1.0 = matches accepted solution, >1.0 = better fix, <1.0 = lower quality.
-        # The primary benchmark metric is mean_relative_score across the shard.
+        # relative_score: agent quality / oracle quality for this problem.
+        # 1.0 = matches accepted solution quality, >1.0 = better, <1.0 = lower quality.
         "relative_score": rel_score,
-        # oracle_base_score: our tree-sitter scorer's score on the reference diff (from baselines.json).
-        # This is the correct denominator for relative_score.
         "oracle_base_score": _load_baselines().get(meta.get("id", ""), 0.0),
+        # benchmark_score: PRIMARY leaderboard metric. test_pass_rate × relative_score.
+        # Captures both correctness (how many tests pass) and quality (vs oracle).
+        "benchmark_score": benchmark_score,
         # file_coverage: fraction of reference-diff source files the agent also touches.
-        # Observational only — a different-but-correct fix needn't match reference files.
+        # Observational only — a different-but-correct fix needn't touch the same files.
         **coverage,
-        # Anti-gaming: flag suspicious test assertion removals (deleted/commented-out tests).
+        # Anti-gaming: flag suspicious test assertion removals.
         **deletion_info,
         # Multipliers (time_decay, review_quality, label, issue) require GitHub
         # API data — local scoring sets them to 1.0 as a conservative estimate.
         "multipliers": {"time_decay": 1.0, "review_quality": 1.0, "label": 1.0, "issue": 1.0},
+        # final_score: Gittensor native score (0–30). Retained for backward compat
+        # and direct comparison to on-chain emissions scoring.
         "final_score": base_score,
         "scoring_note": scoring_note,
     }
