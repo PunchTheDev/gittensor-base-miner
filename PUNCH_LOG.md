@@ -2803,3 +2803,34 @@ Updated: `results/baselines.json`, `results/leaderboard.json` (oracle row), `doc
 - 🚨 Daytona integration — model enforcement + static agent detection
 - 🚨 Per-miner OpenRouter key
 - Commit-reveal (private eval server)
+
+---
+
+## Step 168 — 2026-06-03
+
+### Changes
+
+**PR #23** — Remove 6 test-only problems; add source-change filter to pool (pool 681 → 675)
+
+Root cause: benchmark problems whose reference diffs only touch test files score 0 on Gittensor's src_tok formula. Miners can never beat a 0 baseline — the problem is unsolvable by design. Identified 6 such problems via precise test-file detection (path-based: tests/, test_*, _test.*, _spec.rb, _test.go).
+
+Removed: pallets/click (2731, 2946, 3129), phase-rs/phase (1399, 1857, 1863)
+- DAS confirmed near-zero on phase-rs three (das_base_score ≈ 0.01–0.02)
+- click three had no source file changes at all
+
+Added `has_source_changes()` to `scripts/build_pool.py` and `scripts/expand_pool_external.py`. Future pool ingestion rejects diffs that only touch test files. The filter is precise: checks for at least one changed file that is NOT in a test directory, NOT named test_*/​*_test.*/​*_spec.rb/*_test.go.
+
+Pool: 681 → 675. Oracle: 14.81 → 14.94 weighted, 13.50 → 13.62 arithmetic.
+Updated: baselines.json, leaderboard.json, dashboard_data.json, docs/, README.
+
+**PR #24** — Sync stale oracle/pool values in LEADERBOARD.md and gitminer.py
+
+LEADERBOARD.md was showing pool=441, oracle=13.03 from initial setup — severely stale.
+gitminer.py oracle fallback hardcoded to 13.03.
+Both updated to current values (675 problems, 14.94/13.62).
+
+### Critical gaps (unchanged, still need operator input)
+- 🚨 Daytona integration — model enforcement + static agent detection
+- 🚨 Per-miner OpenRouter key
+- Commit-reveal (private eval server)
+
