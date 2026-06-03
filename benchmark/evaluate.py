@@ -309,6 +309,7 @@ def _annotate_and_aggregate(results: list[dict], selected: list[Path]) -> dict:
     rel_total = rel_count = 0
     bench_total = bench_count = 0
     bench_weighted_total = bench_weighted_count = 0.0
+    total_tokens = 0
 
     for r, d in zip(results, selected):
         tier, w = problem_difficulty(d)
@@ -327,6 +328,7 @@ def _annotate_and_aggregate(results: list[dict], selected: list[Path]) -> dict:
             bench_count += 1
             bench_weighted_total += bench * w
             bench_weighted_count += w
+        total_tokens += int(r.get("tokens_used") or 0)
 
     return {
         "mean_score": round(mean, 4),
@@ -335,6 +337,9 @@ def _annotate_and_aggregate(results: list[dict], selected: list[Path]) -> dict:
         "mean_benchmark_score": round(bench_total / bench_count, 4) if bench_count else None,
         # PRIMARY ranking metric: difficulty-weighted (hard×2 / medium×1.5 / easy×1).
         "weighted_benchmark_score": round(bench_weighted_total / bench_weighted_count, 4) if bench_weighted_count else None,
+        # Total output tokens consumed across all problems in this eval run.
+        # 0 when agent does not report tokens (efficiency_factor=1.0 throughout).
+        "total_tokens_used": total_tokens,
     }
 
 
@@ -378,12 +383,25 @@ def _score_one_problem(
             patch_path = Path(f.name)
 
         try:
+            tokens_used = getattr(patch, "tokens_used", 0) or 0
             if not use_sandbox:
                 from benchmark.harness.score import score_patch
-                score = score_patch(problem_dir, patch_path)
+                score = score_patch(problem_dir, patch_path, tokens_used=tokens_used)
             else:
                 from benchmark.harness.runner import run_in_sandbox
                 score = run_in_sandbox(problem_dir, patch_path)
+                # Fold efficiency into sandbox result when tokens are reported.
+                # Sandbox itself cannot report tokens; inject from patch metadata.
+                if tokens_used > 0 and "benchmark_score" in score:
+                    from benchmark.harness.score import compute_efficiency_factor
+                    meta = json.loads((problem_dir / "meta.json").read_text())
+                    eff = compute_efficiency_factor(
+                        tokens_used,
+                        int(meta.get("output_token_budget", 50_000)),
+                    )
+                    score["tokens_used"] = tokens_used
+                    score["efficiency_factor"] = eff
+                    score["benchmark_score"] = round(score["benchmark_score"] * eff, 4)
 
             score["diff_hash"] = _diff_hash(patch.diff)
         finally:
@@ -630,7 +648,7 @@ def main() -> None:
     bench = results.get("mean_benchmark_score")
     if wbench is not None:
         pct = round(wbench * 100, 1)
-        print(f"\nWeighted benchmark:  {wbench}  ({pct}% — PRIMARY: difficulty-weighted test_pass_rate × quality/oracle)")
+        print(f"\nWeighted benchmark:  {wbench}  ({pct}% — PRIMARY: difficulty-weighted test_pass_rate × quality/oracle × efficiency)")
     if bench is not None:
         pct = round(bench * 100, 1)
         print(f"Benchmark score:     {bench}  ({pct}% — arithmetic mean benchmark_score)")
@@ -640,6 +658,11 @@ def main() -> None:
     if rel is not None:
         pct = round(rel * 100, 1)
         print(f"Relative score:      {rel}  ({pct}% of oracle — 1.0 = matches accepted solution)")
+    total_tok = results.get("total_tokens_used", 0)
+    if total_tok > 0:
+        n = results.get("problems_evaluated", 1)
+        avg = total_tok // n if n else 0
+        print(f"Token efficiency:    {total_tok:,} total output tokens  (avg {avg:,}/problem)")
 
     if args.output:
         Path(args.output).write_text(json.dumps(results, indent=2))
