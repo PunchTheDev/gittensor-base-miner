@@ -357,10 +357,16 @@ class Handler(BaseHTTPRequestHandler):
         # Include full file tree and context file paths (not content, to keep response light)
         context_dir = POOL_DIR / pid / "context"
         context_paths: list[str] = []
+        test_files: list[str] = []
         if context_dir.exists():
-            context_paths = sorted(
-                str(p.relative_to(context_dir)) for p in context_dir.rglob("*") if p.is_file()
-            )
+            _TEST_PATS = ("test_", "_test.", ".test.", ".spec.", "/tests/", "/test/", "/spec/")
+            for p in sorted(context_dir.rglob("*")):
+                if p.is_file():
+                    rel = str(p.relative_to(context_dir))
+                    context_paths.append(rel)
+                    rel_fwd = rel.replace("\\", "/")
+                    if any(pat in rel_fwd for pat in _TEST_PATS):
+                        test_files.append(rel)
         return {
             **summary,
             "base_commit": meta.get("base_commit", ""),
@@ -368,6 +374,7 @@ class Handler(BaseHTTPRequestHandler):
             "issue_body": meta.get("issue_body", ""),
             "file_tree": meta.get("file_tree", []),
             "context_files": context_paths,
+            "test_files": test_files,
             "das_score": meta.get("das_score"),
             "das_token_score": meta.get("das_token_score"),
             "time_limit_seconds": meta.get("time_limit_seconds", 120),
