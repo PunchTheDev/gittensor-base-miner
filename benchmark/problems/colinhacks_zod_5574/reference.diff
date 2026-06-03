@@ -1,0 +1,83 @@
+diff --git a/packages/zod/src/v4/classic/tests/registries.test.ts b/packages/zod/src/v4/classic/tests/registries.test.ts
+index af0c4c339e..10d1e0b1a2 100644
+--- a/packages/zod/src/v4/classic/tests/registries.test.ts
++++ b/packages/zod/src/v4/classic/tests/registries.test.ts
+@@ -206,3 +206,38 @@ test("test .clear()", () => {
+   reg.clear();
+   expect(reg.has(a)).toEqual(false);
+ });
++
++test("re-registering same id silently overwrites", () => {
++  const reg = z.registry<z.core.GlobalMeta>();
++  const a = z.string();
++  const b = z.number();
++
++  reg.add(a, { id: "shared-id" });
++  reg.add(b, { id: "shared-id" });
++
++  // No error thrown, b now owns the id
++  expect(reg._idmap.get("shared-id")).toBe(b);
++});
++
++test("toJSONSchema throws on duplicate id across different schemas", () => {
++  const reg = z.registry<z.core.GlobalMeta>();
++  const a = z.string().register(reg, { id: "duplicate-id" });
++  const b = z.number().register(reg, { id: "duplicate-id" });
++
++  const wrapper = z.object({ a, b });
++
++  expect(() => z.toJSONSchema(wrapper, { metadata: reg })).toThrow(
++    'Duplicate schema id "duplicate-id" detected during JSON Schema conversion. Two different schemas cannot share the same id when converted together.'
++  );
++});
++
++test("toJSONSchema allows same schema with same id", () => {
++  const reg = z.registry<z.core.GlobalMeta>();
++  const shared = z.string().register(reg, { id: "shared-id" });
++
++  const wrapper = z.object({ a: shared, b: shared });
++
++  // Should not throw - same schema instance used twice
++  const result = z.toJSONSchema(wrapper, { metadata: reg });
++  expect(result.$defs?.["shared-id"]).toBeDefined();
++});
+diff --git a/packages/zod/src/v4/core/registries.ts b/packages/zod/src/v4/core/registries.ts
+index b8cfc3460a..6d04ea1585 100644
+--- a/packages/zod/src/v4/core/registries.ts
++++ b/packages/zod/src/v4/core/registries.ts
+@@ -37,9 +37,6 @@ export class $ZodRegistry<Meta extends MetadataType = MetadataType, Schema exten
+     const meta: any = _meta[0];
+     this._map.set(schema, meta!);
+     if (meta && typeof meta === "object" && "id" in meta) {
+-      if (this._idmap.has(meta.id!)) {
+-        throw new Error(`ID ${meta.id} already exists in the registry`);
+-      }
+       this._idmap.set(meta.id!, schema);
+     }
+     return this as any;
+diff --git a/packages/zod/src/v4/core/to-json-schema.ts b/packages/zod/src/v4/core/to-json-schema.ts
+index 532cfc2a7e..fd1333ef27 100644
+--- a/packages/zod/src/v4/core/to-json-schema.ts
++++ b/packages/zod/src/v4/core/to-json-schema.ts
+@@ -221,6 +221,21 @@ export function extractDefs<T extends schemas.$ZodType>(
+ 
+   if (!root) throw new Error("Unprocessed schema. This is a bug in Zod.");
+ 
++  // Track ids to detect duplicates across different schemas
++  const idToSchema = new Map<string, schemas.$ZodType>();
++  for (const entry of ctx.seen.entries()) {
++    const id = ctx.metadataRegistry.get(entry[0])?.id;
++    if (id) {
++      const existing = idToSchema.get(id);
++      if (existing && existing !== entry[0]) {
++        throw new Error(
++          `Duplicate schema id "${id}" detected during JSON Schema conversion. Two different schemas cannot share the same id when converted together.`
++        );
++      }
++      idToSchema.set(id, entry[0]);
++    }
++  }
++
+   // returns a ref to the schema
+   // defId will be empty if the ref points to an external schema (or #)
+   const makeURI = (entry: [schemas.$ZodType<unknown, unknown>, Seen]): { ref: string; defId?: string } => {

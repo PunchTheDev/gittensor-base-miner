@@ -68,6 +68,7 @@ REPO_CATEGORY: dict[str, str] = {
     "we-promise/sure": "ruby",
     "rubocop/rubocop": "ruby",
     "rubocop/rubocop-rails": "ruby",
+    "colinhacks/zod": "typescript",
 }
 
 

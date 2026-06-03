@@ -43,6 +43,8 @@ REPO_CATEGORY: dict[str, str] = {
     # Ruby external repos
     "rubocop/rubocop": "ruby",
     "rubocop/rubocop-rails": "ruby",
+    # TypeScript external repos
+    "colinhacks/zod": "typescript",
 }
 
 # Shard sampling budget per category (sums to 30)
