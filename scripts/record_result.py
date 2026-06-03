@@ -41,7 +41,7 @@ ORACLE_ROW = {
     "weighted_score": _oracle_weighted,
     "model": "—",
     "date": "—",
-    "note": "Weighted mean tree-sitter score across accepted solutions (Gittensor DAS network only)",
+    "note": "Weighted mean tree-sitter score across accepted solutions (DAS + external prestige repos)",
 }
 
 
