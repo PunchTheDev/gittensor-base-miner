@@ -1,0 +1,78 @@
+diff --git a/CHANGES.rst b/CHANGES.rst
+index 14f575ad5..abf382d7b 100644
+--- a/CHANGES.rst
++++ b/CHANGES.rst
+@@ -14,6 +14,9 @@ Unreleased
+ -   A :class:`Group` with ``invoke_without_command=True`` marks its subcommand as
+     optional in the usage help, showing ``[COMMAND]`` instead of ``COMMAND``.
+     :issue:`3059` :pr:`3507`
++-   ``echo_via_pager`` flushes after each write, so passing a generator streams
++    output to the pager incrementally instead of staying hidden until the pipe
++    buffer fills. :issue:`3242` :issue:`2542` :pr:`3534`
+ 
+ 
+ Version 8.4.1
+diff --git a/src/click/termui.py b/src/click/termui.py
+index 91ef6e19b..9bc88db14 100644
+--- a/src/click/termui.py
++++ b/src/click/termui.py
+@@ -346,6 +346,10 @@ def echo_via_pager(
+     with get_pager_file(color=color) as pager:
+         for text in itertools.chain(text_generator, "\n"):
+             pager.write(text)
++            # Flush after each write so a slow generator streams to the pager
++            # incrementally rather than staying invisible until the pipe buffer
++            # fills (~8 KB).
++            pager.flush()
+ 
+ 
+ @t.overload
+diff --git a/tests/test_termui.py b/tests/test_termui.py
+index f715154ee..b228b21b9 100644
+--- a/tests/test_termui.py
++++ b/tests/test_termui.py
+@@ -726,6 +726,44 @@ def test_echo_via_pager_real_pager_handles_ansi(monkeypatch, capfd, color, expec
+     assert out == expected
+ 
+ 
++def test_echo_via_pager_streams_each_write(monkeypatch):
++    """Each write is flushed so a slow generator streams to the pager
++    incrementally instead of buffering until the end (issues #3242, #2542).
++    """
++    calls = []
++
++    class RecordingStream(io.StringIO):
++        def __init__(self):
++            super().__init__()
++            self.color = None
++
++        def write(self, s):
++            calls.append("write")
++            return super().write(s)
++
++        def flush(self):
++            calls.append("flush")
++
++    stream = RecordingStream()
++    monkeypatch.setattr(click._termui_impl, "isatty", lambda _: False)
++    monkeypatch.setattr(click._termui_impl, "_default_text_stdout", lambda: stream)
++
++    def generate():
++        yield "a\n"
++        yield "b\n"
++        yield "c\n"
++
++    click.echo_via_pager(generate())
++
++    # No two writes are adjacent: every chunk is flushed before the next one,
++    # so the pager sees output as it is produced.
++    assert not any(
++        calls[i] == "write" and calls[i + 1] == "write" for i in range(len(calls) - 1)
++    )
++    assert calls.count("write") == 4  # three chunks plus the trailing newline
++    assert stream.getvalue() == "a\nb\nc\n\n"
++
++
+ def test_get_pager_file_pager_missing_binary_falls_back(monkeypatch, tmp_path):
+     """``PAGER`` pointing to a nonexistent binary falls back to the text stdout."""
+     pager_out = tmp_path / "pager_out.txt"

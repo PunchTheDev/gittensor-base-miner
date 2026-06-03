@@ -1,0 +1,141 @@
+diff --git a/changelog/3697.bugfix.rst b/changelog/3697.bugfix.rst
+new file mode 100644
+index 00000000000..59f1872786d
+--- /dev/null
++++ b/changelog/3697.bugfix.rst
+@@ -0,0 +1,3 @@
++Logging capture now works for non-propagating loggers.
++Previously only logs which reached the root logger were captured.
++This includes :fixture:`caplog` and the "Captured log calls" test reporting.
+diff --git a/src/_pytest/logging.py b/src/_pytest/logging.py
+index 6f34c1b93fd..2a22c9eb4aa 100644
+--- a/src/_pytest/logging.py
++++ b/src/_pytest/logging.py
+@@ -342,18 +342,34 @@ def add_option_ini(option, dest, default=None, type=None, **kwargs):
+ class catching_logs(Generic[_HandlerType]):
+     """Context manager that prepares the whole logging machinery properly."""
+ 
+-    __slots__ = ("handler", "level", "orig_level")
++    __slots__ = ("attached_loggers", "handler", "level", "orig_level")
+ 
+     def __init__(self, handler: _HandlerType, level: int | None = None) -> None:
+         self.handler = handler
+         self.level = level
++        self.attached_loggers: list[logging.Logger] = []
+ 
+     def __enter__(self) -> _HandlerType:
+         root_logger = logging.getLogger()
+         if self.level is not None:
+             self.handler.setLevel(self.level)
++        # Attach to root logger.
+         root_logger.addHandler(self.handler)
++        self.attached_loggers.append(root_logger)
++        # Attach to all non-propagating loggers (won't reach root).
++        # Note that will miss loggers that *become* non-propagating
++        # after the `__enter__`. Not worth the trouble for now.
++        for logger in root_logger.manager.loggerDict.values():
++            if (
++                isinstance(logger, logging.Logger)
++                and not logger.propagate
++                and logger is not root_logger
++            ):
++                logger.addHandler(self.handler)
++                self.attached_loggers.append(logger)
+         if self.level is not None:
++            # Non-propagating loggers still inherit the level (unless a logger
++            # explicitly set level), so only do this on the root logger.
+             self.orig_level = root_logger.level
+             root_logger.setLevel(min(self.orig_level, self.level))
+         return self.handler
+@@ -367,7 +383,9 @@ def __exit__(
+         root_logger = logging.getLogger()
+         if self.level is not None:
+             root_logger.setLevel(self.orig_level)
+-        root_logger.removeHandler(self.handler)
++        for logger in self.attached_loggers:
++            logger.removeHandler(self.handler)
++        self.attached_loggers.clear()
+ 
+ 
+ class LogCaptureHandler(logging_StreamHandler):
+diff --git a/testing/logging/test_fixture.py b/testing/logging/test_fixture.py
+index 5f94cb8508a..c98b7d84258 100644
+--- a/testing/logging/test_fixture.py
++++ b/testing/logging/test_fixture.py
+@@ -411,6 +411,33 @@ def test_log_level_override(request, caplog):
+     assert result.ret == 0
+ 
+ 
++def test_can_capture_non_propagating_logger(pytester: Pytester) -> None:
++    """Logs emitted by non-propagating loggers are still captured (#3697)."""
++    pytester.makepyfile(
++        """
++        import logging
++
++        logger = logging.getLogger("catchlog")
++        logger.propagate = False
++        child_logger = logging.getLogger("catchlog.child")
++
++        def test_non_propagating_logger(caplog):
++            caplog.set_level(logging.INFO)
++
++            logger.info("parent logger message")
++            child_logger.info("child logger message")
++
++            assert caplog.record_tuples == [
++                ("catchlog", logging.INFO, "parent logger message"),
++                ("catchlog.child", logging.INFO, "child logger message"),
++            ]
++        """
++    )
++
++    result = pytester.runpytest()
++    result.assert_outcomes(passed=1)
++
++
+ def test_captures_despite_exception(pytester: Pytester) -> None:
+     pytester.makepyfile(
+         """
+diff --git a/testing/logging/test_reporting.py b/testing/logging/test_reporting.py
+index 4974532e888..11013fdd749 100644
+--- a/testing/logging/test_reporting.py
++++ b/testing/logging/test_reporting.py
+@@ -1255,6 +1255,38 @@ def test_foo():
+     )
+ 
+ 
++def test_log_propagation_false(pytester: Pytester) -> None:
++    pytester.makepyfile(
++        """
++        import pytest
++        import logging
++
++        logging.getLogger('foo').propagate = False
++
++        def test_log_file():
++            logging.getLogger().warning("log goes to root logger")
++            logging.getLogger('foo').warning("log goes to initially non-propagating logger")
++            logging.getLogger('foo.bar').warning("log goes to initially non-propagating nested logger")
++            assert False, "intentionally fail to trigger report logging output"
++    """
++    )
++
++    reprec = pytester.inline_run()
++    reports = reprec.getfailures()
++    assert len(reports) == 1
++    report = reports[0]
++    sections = list(report.get_sections("Captured log call"))
++    assert len(sections) == 1
++    assert sections[0][1] == "\n".join(
++        [
++            "WARNING  root:test_log_propagation_false.py:7 log goes to root logger",
++            "WARNING  foo:test_log_propagation_false.py:8 log goes to initially non-propagating logger",
++            "WARNING  foo.bar:test_log_propagation_false.py:9 log goes to initially non-propagating nested logger",
++        ]
++    )
++    assert not list(report.get_sections("Captured stderr call"))
++
++
+ def test_colored_ansi_esc_caplogtext(pytester: Pytester) -> None:
+     """Make sure that caplog.text does not contain ANSI escape sequences."""
+     pytester.makepyfile(

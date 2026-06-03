@@ -1,0 +1,123 @@
+diff --git a/AUTHORS b/AUTHORS
+index f2f419cf642..620ed218886 100644
+--- a/AUTHORS
++++ b/AUTHORS
+@@ -373,6 +373,7 @@ Piotr Banaszkiewicz
+ Piotr Helm
+ Poulami Sau
+ Prakhar Gurunani
++Praneeth Kodumagulla
+ Prashant Anand
+ Prashant Sharma
+ Pulkit Goyal
+diff --git a/changelog/14442.bugfix.rst b/changelog/14442.bugfix.rst
+new file mode 100644
+index 00000000000..90999cc9572
+--- /dev/null
++++ b/changelog/14442.bugfix.rst
+@@ -0,0 +1,3 @@
++Fixed a regression in pytest 9.0 where :option:`--strict-markers` and :option:`--strict-config` specified through :confval:`addopts` were silently ignored.
++
++Note that when targeting pytest >= 9.0, it's nicer to use :confval:`strict_markers` and :confval:`strict_config`, or :ref:`strict mode <strict mode>`.
+diff --git a/src/_pytest/config/__init__.py b/src/_pytest/config/__init__.py
+index 4cd8d317f6e..67d9a0aa111 100644
+--- a/src/_pytest/config/__init__.py
++++ b/src/_pytest/config/__init__.py
+@@ -50,6 +50,7 @@
+ from .exceptions import UsageError as UsageError
+ from .findpaths import ConfigValue
+ from .findpaths import determine_setup
++from .findpaths import parse_override_ini
+ from _pytest import __version__
+ import _pytest._code
+ from _pytest._code import ExceptionInfo
+@@ -1535,6 +1536,12 @@ def parse(self, args: list[str], addopts: bool = True) -> None:
+         self.known_args_namespace = self._parser.parse_known_args(
+             args, namespace=copy.copy(self.option)
+         )
++        if addopts:
++            # addopts may have added overrides (especially via OverrideIniAction).
++            # The thing can be endlessly circular but we only do one level (#14442).
++            if overrides := parse_override_ini(self.known_args_namespace.override_ini):
++                self._inicfg.update(overrides)
++                self._inicache.clear()
+         self._checkversion()
+         self._consider_importhook()
+         self._configure_python_path()
+diff --git a/testing/test_config.py b/testing/test_config.py
+index f086778ad1e..4496e94d0f4 100644
+--- a/testing/test_config.py
++++ b/testing/test_config.py
+@@ -459,16 +459,21 @@ def test_silence_unknown_key_warning(self, pytester: Pytester) -> None:
+         result = pytester.runpytest()
+         result.stdout.no_fnmatch_line("*PytestConfigWarning*")
+ 
+-    @pytest.mark.parametrize("option_name", ["strict_config", "strict"])
+-    def test_strict_config_ini_option(
+-        self, pytester: Pytester, option_name: str
+-    ) -> None:
++    @pytest.mark.parametrize(
++        "option",
++        [
++            "strict_config = true",
++            "strict = true",
++            "addopts = --strict-config",
++        ],
++    )
++    def test_strict_config_ini_option(self, pytester: Pytester, option: str) -> None:
+         """Test that strict_config and strict ini options enable strict config checking."""
+         pytester.makeini(
+             f"""
+             [pytest]
+             unknown_option = 1
+-            {option_name} = True
++            {option}
+             """
+         )
+         result = pytester.runpytest()
+diff --git a/testing/test_mark.py b/testing/test_mark.py
+index 8d76ea310eb..70df03be2fd 100644
+--- a/testing/test_mark.py
++++ b/testing/test_mark.py
+@@ -184,11 +184,16 @@ def test_hello():
+ 
+ 
+ @pytest.mark.parametrize(
+-    "option_name", ["--strict-markers", "--strict", "strict_markers", "strict"]
++    "option",
++    [
++        "--strict-markers",
++        "--strict",
++        "strict_markers = true",
++        "strict = true",
++        "addopts = --strict-markers",
++    ],
+ )
+-def test_strict_prohibits_unregistered_markers(
+-    pytester: Pytester, option_name: str
+-) -> None:
++def test_strict_prohibits_unregistered_markers(pytester: Pytester, option: str) -> None:
+     pytester.makepyfile(
+         """
+         import pytest
+@@ -197,16 +202,16 @@ def test_hello():
+             pass
+     """
+     )
+-    if option_name in ("strict_markers", "strict"):
++    if option.startswith("-"):
++        result = pytester.runpytest(option)
++    else:
+         pytester.makeini(
+             f"""
+             [pytest]
+-            {option_name} = true
++            {option}
+             """
+         )
+         result = pytester.runpytest()
+-    else:
+-        result = pytester.runpytest(option_name)
+     assert result.ret != 0
+     result.stdout.fnmatch_lines(
+         ["'unregisteredmark' not found in `markers` configuration option"]

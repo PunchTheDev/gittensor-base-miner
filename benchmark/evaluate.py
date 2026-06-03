@@ -72,6 +72,12 @@ REPO_CATEGORY: dict[str, str] = {
     "seroperson/jvm-live-reload": "jvm",
     "touchpilot/touchpilot": "jvm",
     "we-promise/sure": "ruby",
+    # External prestige repos (not in Gittensor DAS — added via expand_pool_external.py)
+    "pytest-dev/pytest": "python",
+    "pallets/click": "python",
+    "pallets/werkzeug": "python",
+    "encode/starlette": "python",
+    "psf/requests": "python",
 }
 
 # Default per-category shard budget (sums to 30) — overridable via pool_config.json
@@ -329,10 +335,10 @@ def run_evaluation(
         selected = select_shard(all_problem_dirs, config)
 
     # Oracle mode: score reference diffs directly — no agent call needed.
-    # Used for pipeline calibration; expected weighted mean is ~13.03 (the stored oracle baseline).
+    # Used for pipeline calibration; expected weighted mean matches baselines.json.
     if use_oracle:
-        _oracle_weighted = 13.03
-        _oracle_arithmetic = 12.08
+        _oracle_weighted = 15.99
+        _oracle_arithmetic = 14.97
         _baselines_path = Path(__file__).parent.parent / "results" / "baselines.json"
         if _baselines_path.exists():
             try:

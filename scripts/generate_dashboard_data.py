@@ -27,6 +27,12 @@ REPO_CATEGORY: dict[str, str] = {
     "seroperson/jvm-live-reload": "jvm",
     "touchpilot/touchpilot": "jvm",
     "we-promise/sure": "ruby",
+    # External prestige repos (not in Gittensor DAS — added via expand_pool_external.py)
+    "pytest-dev/pytest": "python",
+    "pallets/click": "python",
+    "pallets/werkzeug": "python",
+    "encode/starlette": "python",
+    "psf/requests": "python",
 }
 
 # Shard sampling budget per category (sums to ~30)

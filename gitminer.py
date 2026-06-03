@@ -273,7 +273,7 @@ def cmd_parity(args: argparse.Namespace) -> None:
 
     for meta_path in problems:
         meta = _json.loads(meta_path.read_text())
-        if "das_base_score" not in meta:
+        if meta.get("das_base_score") is None:
             skipped += 1
             continue
 
