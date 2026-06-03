@@ -284,10 +284,20 @@ def run_evaluation(
         selected = select_shard(all_problem_dirs, config)
 
     # Oracle mode: score reference diffs directly — no agent call needed.
-    # Used for pipeline calibration; expected mean is ~23.46 (the stored oracle baseline).
+    # Used for pipeline calibration; expected weighted mean is ~13.03 (the stored oracle baseline).
     if use_oracle:
+        _oracle_weighted = 13.03
+        _oracle_arithmetic = 12.08
+        _baselines_path = Path(__file__).parent.parent / "results" / "baselines.json"
+        if _baselines_path.exists():
+            try:
+                _b = json.loads(_baselines_path.read_text())
+                _oracle_weighted = _b.get("weighted_mean_score", _oracle_weighted)
+                _oracle_arithmetic = _b.get("mean_score", _oracle_arithmetic)
+            except Exception:
+                pass
         print("Oracle mode: scoring reference diffs to verify pipeline calibration.")
-        print(f"Expected mean: ~23.46 / 30.00 (stored oracle baseline)\n")
+        print(f"Expected weighted mean: ~{_oracle_weighted:.2f} / 30.00  (arithmetic: ~{_oracle_arithmetic:.2f})\n")
         results = []
         for problem_dir in selected:
             ref_diff = problem_dir / "reference.diff"
