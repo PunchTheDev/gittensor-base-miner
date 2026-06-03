@@ -22,11 +22,14 @@ Endpoints:
 
 from __future__ import annotations
 
+import collections
 import json
 import hashlib
 import os
 import random
 import sys
+import threading
+import time
 from datetime import date, timedelta
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
@@ -54,6 +57,19 @@ CORS_HEADERS = {
     "Access-Control-Allow-Methods": "GET, OPTIONS",
     "Access-Control-Allow-Headers": "Content-Type",
 }
+
+# ---------------------------------------------------------------------------
+# Rate limiting (per-IP token bucket)
+# ---------------------------------------------------------------------------
+# Protects pool-inspection endpoints (/api/shard, /api/problems) from scraping.
+# 120 requests/minute per IP — generous for normal use, blocks bulk scanners.
+
+_RATE_LIMIT = 120          # max requests per window
+_RATE_WINDOW = 60.0        # seconds
+_RATE_LIMITED_PATHS = {"/api/shard", "/api/problems"}
+
+_rate_lock = threading.Lock()
+_rate_buckets: dict[str, collections.deque] = {}
 
 
 # ---------------------------------------------------------------------------
@@ -165,6 +181,26 @@ class Handler(BaseHTTPRequestHandler):
     def log_message(self, fmt: str, *args) -> None:  # quiet mode
         pass
 
+    def _check_rate_limit(self, path: str) -> bool:
+        """Return True if request is allowed; False if rate limit exceeded."""
+        base = path.split("?")[0].rstrip("/")
+        # Match prefix: /api/problems includes /api/problems/{id}
+        limited = base in _RATE_LIMITED_PATHS or base.startswith("/api/problems")
+        if not limited:
+            return True
+        ip = self.client_address[0]
+        now = time.monotonic()
+        with _rate_lock:
+            bucket = _rate_buckets.setdefault(ip, collections.deque())
+            # Drop timestamps outside the window
+            cutoff = now - _RATE_WINDOW
+            while bucket and bucket[0] < cutoff:
+                bucket.popleft()
+            if len(bucket) >= _RATE_LIMIT:
+                return False
+            bucket.append(now)
+        return True
+
     def do_OPTIONS(self) -> None:
         self._send(200, {})
 
@@ -172,6 +208,10 @@ class Handler(BaseHTTPRequestHandler):
         parsed = urlparse(self.path)
         path = parsed.path.rstrip("/")
         qs = parse_qs(parsed.query)
+
+        if not self._check_rate_limit(path):
+            self._send(429, {"error": "rate limit exceeded", "retry_after": int(_RATE_WINDOW)})
+            return
 
         try:
             body = self._route(path, qs)
@@ -488,6 +528,8 @@ class Handler(BaseHTTPRequestHandler):
             self.send_header(k, v)
         self.send_header("Content-Type", "application/json")
         self.send_header("Content-Length", str(len(payload)))
+        if status == 429:
+            self.send_header("Retry-After", str(int(_RATE_WINDOW)))
         self.end_headers()
         self.wfile.write(payload)
 
