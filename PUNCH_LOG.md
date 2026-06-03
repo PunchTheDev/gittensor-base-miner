@@ -4,6 +4,33 @@ Milestone trail for the base-miner benchmark. Discord is the primary channel; th
 
 ---
 
+## Step 165 — 2026-06-03
+
+**External Python pool expansion: 584→644 (+60 problems)**
+
+Pool grew from 584 to 644 by adding 60 problems from two prestigious external Python repos (not in Gittensor DAS — supplementary high-quality problems):
+
+| Repo | Added | Notes |
+|---|---|---|
+| pytest-dev/pytest | 30 | Real bugs: fixtures, assertions, markers, logging, JUnit XML |
+| pallets/click | 30 | Real bugs: CliRunner, shell completion, option parsing, termui |
+
+Both pass identical curation criteria as DAS problems: linked issue, test files in diff, ≥5 added lines, issue body ≥50 chars. Scored via tree-sitter, oracle updated to **15.23 weighted / 14.03 arithmetic** (slight pulldown from compact Python fixes — expected).
+
+**Other fixes shipped in same commit (PR #15, merged):**
+- `REPO_CATEGORY` in `evaluate.py` + `generate_dashboard_data.py` now includes all 5 external prestige repos
+- Parity command bug: `"das_base_score" not in meta` → `meta.get("das_base_score") is None` (external problems carry `null`, not missing key — old check would crash on `float(None)`)
+- Stale oracle fallback in `evaluate.py` corrected: 13.03/12.08 → 15.99/14.97
+
+**Pool composition (644 problems):**
+- python: 260 (was 200) | rust: 206 | typescript: 98 | jvm: 42 | ruby: 38
+- hard: 350, medium: 242, easy: 52
+- Repos: 15 (13 DAS + 2 external)
+
+**API verified**: pool=644, oracle=15.23, repos=15
+
+---
+
 ## 2026-06-03 — Pool 446 → 532 + dashboard deep links (step 163)
 
 **Pool expanded: 446 → 532 problems** (PR #12 merged)
