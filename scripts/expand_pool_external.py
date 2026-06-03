@@ -107,6 +107,37 @@ def has_test_files(diff: str) -> bool:
     )
 
 
+def has_source_changes(diff: str) -> bool:
+    """True if the diff modifies at least one non-test source file.
+
+    Filters out test-only PRs — those score 0 for miners regardless of
+    correctness because src_tok counts source file changes only.
+    """
+    for line in diff.splitlines():
+        if not line.startswith("diff --git "):
+            continue
+        m = re.search(r" b/(.+)$", line)
+        if not m:
+            continue
+        path = m.group(1)
+        parts = path.lower().split("/")
+        filename = parts[-1]
+        if any(d in ("tests", "test", "__tests__", "spec") for d in parts[:-1]):
+            continue
+        if filename.startswith("test_") or "_test." in filename:
+            continue
+        if ".spec." in filename or filename.endswith(".spec"):
+            continue
+        if re.search(r"tests?(?:case)?\.(?:java|kt|scala)$", filename):
+            continue
+        if filename.endswith("_spec.rb"):
+            continue
+        if filename.endswith("_test.go"):
+            continue
+        return True
+    return False
+
+
 def has_additions(diff: str) -> bool:
     added = [
         line for line in diff.splitlines()
@@ -283,6 +314,10 @@ def curate_github_pr(
 
     if not has_test_files(diff):
         print(f"  Skip {repo}#{pr_number}: no test files in diff")
+        return False
+
+    if not has_source_changes(diff):
+        print(f"  Skip {repo}#{pr_number}: test-only diff (no source changes; scores 0)")
         return False
 
     if not has_additions(diff):
