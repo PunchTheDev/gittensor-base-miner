@@ -75,6 +75,8 @@ REPO_CATEGORY: dict[str, str] = {
     "python/mypy": "python",
     "tokio-rs/tokio": "rust",
     "clap-rs/clap": "rust",
+    "hyperium/hyper": "rust",
+    "tokio-rs/axum": "rust",
 }
 
 

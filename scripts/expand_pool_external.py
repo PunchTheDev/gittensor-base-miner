@@ -69,6 +69,8 @@ EXTERNAL_REPOS = [
     # Rust external repos
     "tokio-rs/tokio",         # 28k stars — Rust async runtime, cargo test, real regression bugs
     "clap-rs/clap",           # 14k stars — Rust CLI parser, cargo test, self-contained
+    "hyperium/hyper",         # 14k stars — Rust HTTP library, cargo test, real HTTP bug-fixes
+    "tokio-rs/axum",          # 20k stars — Rust web framework (hyper/tokio), cargo test
 ]
 
 
