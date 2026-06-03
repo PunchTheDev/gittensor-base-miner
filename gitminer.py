@@ -1257,16 +1257,21 @@ def cmd_mine(args: argparse.Namespace) -> None:
         if args.loop:
             print("Submission ready. Waiting for next shard rotation to mine again...\n")
 
-    def _seconds_to_next_monday() -> int:
-        """Seconds until next Monday 00:00 UTC."""
+    def _seconds_to_next_rotation() -> int:
+        """Seconds until next shard rotation (epoch-based 7-day cycle, matches evaluate.py)."""
+        from datetime import date as _date, timedelta as _td
         now = datetime.now(timezone.utc)
-        days_ahead = (7 - now.weekday()) % 7 or 7
-        return days_ahead * 86400 - (now.hour * 3600 + now.minute * 60 + now.second)
+        epoch = _date(2024, 1, 1)
+        days_since = (now.date() - epoch).days
+        next_day = (days_since // 7 + 1) * 7  # day offset when seed next advances
+        next_date = epoch + _td(days=next_day)
+        midnight = datetime(next_date.year, next_date.month, next_date.day, tzinfo=timezone.utc)
+        return max(0, int((midnight - now).total_seconds()))
 
     _run_cycle()
     if args.loop:
         while True:
-            wait = _seconds_to_next_monday()
+            wait = _seconds_to_next_rotation()
             h, m = divmod(wait // 60, 60)
             print(f"Sleeping {h}h {m}m until next shard rotation...")
             time.sleep(wait)
@@ -1394,10 +1399,18 @@ def cmd_doctor(args: argparse.Namespace) -> None:
     # Shard connectivity
     try:
         from benchmark.evaluate import load_pool_config, select_shard
+        from datetime import date as _date, timedelta as _td
         config = load_pool_config()
         shard_dirs = sorted(pool_dir.glob("*/meta.json"))
         shard_size = config.get("shard_size", 30)
-        ok("Shard config", f"size={shard_size}, rotation={config.get('rotation_policy', 'weekly')}")
+        # Compute next rotation date from epoch (matches evaluate.py logic)
+        _epoch = _date(2024, 1, 1)
+        _today = _date.today()
+        _days_since = (_today - _epoch).days
+        _next_day = (_days_since // 7 + 1) * 7
+        _next_rotation = _epoch + _td(days=_next_day)
+        _days_away = (_next_rotation - _today).days
+        ok("Shard config", f"size={shard_size}, rotation={config.get('rotation_policy', 'weekly')}, next={_next_rotation} ({_days_away}d)")
     except Exception as e:
         fail("Shard config", str(e))
 
