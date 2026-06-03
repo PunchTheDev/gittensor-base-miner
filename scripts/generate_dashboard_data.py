@@ -81,9 +81,9 @@ def _load_oracle_row() -> dict:
         except Exception:
             pass
     if mean_score is None:
-        mean_score = 12.08
-        weighted_score = 13.03
-        count = 441
+        mean_score = 13.50
+        weighted_score = 14.81
+        count = 681
     return {
         "rank": None,
         "agent": "Oracle (accepted solution)",
