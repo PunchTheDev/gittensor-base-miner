@@ -4,6 +4,18 @@ Milestone trail for the base-miner benchmark. Discord is the primary channel; th
 
 ---
 
+## 2026-06-03 — mine command fixes (commit 3c01104)
+
+Three issues fixed in `gitminer mine`:
+1. **Zero-score guard**: when no tests pass (score = 0), the command now prints a helpful message instead of prompting "FIRST SUBMISSION!" with a score of 0.
+2. **Dead code removed**: `_seconds_to_next_monday` had a `delta_days` variable computed but never used; removed.
+3. **Default model updated**: `cmd_submit` and help text used stale `claude-3-5-haiku-20241022` instead of the operator-confirmed `deepseek/deepseek-chat`.
+4. **Oracle gap shown on beat**: output now includes oracle context so miners know how far they are from the theoretical max.
+
+All systems healthy: API pool=441, oracle=13.03, 0 submissions.
+
+---
+
 ## 2026-06-03 — Docs accuracy fixes (benchmark commit 3fef8d1)
 
 - README: `gitminer hash your_patch.diff` → `gitminer hash agent/submissions/yourhandle/agent.py` — the `hash` command was renamed to take an agent file in commit 7940f68 but the README example was missed.
