@@ -4,6 +4,18 @@ Milestone trail for the base-miner benchmark. Discord is the primary channel; th
 
 ---
 
+## 2026-06-03 — Oracle row stays fresh after pool rotation (commit 1d5f9c9)
+
+**Bug**: After every pool rotation, `refresh_pool.yml` recalibrates `baselines.json` with new oracle scores, but `generate_dashboard_data.py` read the oracle row from `leaderboard.json` (where it was frozen). Dashboard would show stale oracle scores and the stale static note.
+
+**Fix**:
+- `generate_dashboard_data.py::load_leaderboard()`: always replaces stored oracle row with fresh values computed from `baselines.json` — oracle scores in dashboard now auto-update after every rotation.
+- `refresh_pool.yml`: new step "Refresh oracle row in leaderboard.json" updates the oracle row on disk after recalibration, and stages `results/leaderboard.json` for commit — so `gitminer mine` oracle gap is also correct after `git pull`.
+
+Net effect: oracle scores in dashboard, API (`baselines.json` direct read — already correct), and local CLI are all consistent post-rotation.
+
+---
+
 ## 2026-06-03 — Three latent bugs fixed (commits 2149015, 50d5622, 146d9f4)
 
 Pre-submission audit of CI workflows and API found three bugs that would have caused silent failures or crashes once miners start submitting.
