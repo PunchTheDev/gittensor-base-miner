@@ -4,6 +4,15 @@ Milestone trail for the base-miner benchmark. Discord is the primary channel; th
 
 ---
 
+## 2026-06-03 — Docs accuracy fixes (benchmark commit 3fef8d1)
+
+- README: `gitminer hash your_patch.diff` → `gitminer hash agent/submissions/yourhandle/agent.py` — the `hash` command was renamed to take an agent file in commit 7940f68 but the README example was missed.
+- `docs/threat_model.md` Threat 2 (overfitting): removed false "20% private held-out set" claim — no such set exists. Replaced with accurate description of the SHARD_SECRET mitigation (shard is unpredictable without the secret) + time segmentation. Summary table updated: "held-out set" → "secret shard".
+
+All systems healthy: API pool=441, oracle=13.03, 0 submissions.
+
+---
+
 ## 2026-06-03 — Dashboard stale placeholder fix (dashboard commit 8f886f0)
 
 Static hero pool-count placeholders (`430`) in `index.html` were never reached by JS on slow connections — showed stale count briefly before the dynamic `d.pool_size = 441` update fired. Fixed both inline occurrences to `441`.
