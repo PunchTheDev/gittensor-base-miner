@@ -2343,3 +2343,14 @@ Repos evaluated and rejected: `celery/celery` (Redis/RabbitMQ integration tests)
 - `CONTRIBUTING.md`: removed salted Python snippet + phase-2 reveal ceremony; unified to single flow using `gitminer hash` and `gitminer submit`
 
 **Effect**: Miners now see one consistent commit-reveal flow: `gitminer hash` → paste hash → `gitminer submit`.
+
+---
+
+## 2026-06-03 — Minor doc accuracy fixes (benchmark commits e135ee1, 3f74101)
+
+Two small accuracy issues found during a docs sweep:
+
+- `README.md`: missing `export OPENROUTER_KEY=your_key_here` in the "Running the benchmark locally" code block — first-time miners would hit a runtime error without it
+- `docs/rewards.md` chain diagram: showed `contributor cut (59.5%)` — stale from before the maintainer_cut was tuned to 0.15; fixed to `55%` to match the emission table directly below it
+
+Both fixes are cosmetic/accuracy — no logic changes.
