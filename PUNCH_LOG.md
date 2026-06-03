@@ -3766,3 +3766,29 @@ Two pre-launch accuracy fixes:
 - Oracle: weighted 12.61 → 12.64, arithmetic 11.48 → 11.49
 - Synced oracle across all fallback values, docs, leaderboard.json, and dashboard data
 - API restarted: confirmed pool_size=1123, oracle=12.64
+
+## Step 207 — 2026-06-03
+
+**Dashboard + docs: sync pool 1123 / oracle 12.64 post-ragflow-removal**
+
+Step 206 removed 31 ragflow problems (pool 1154→1123, oracle 12.61→12.64) but several stale references remained:
+
+**Dashboard PR #6 (gittensor-miner-dashboard):** Hardcoded hero fallback values still showed old stats:
+- `<meta name="description">`: 1154 → 1123
+- `hero-pool-size` fallback: 1154 → 1123
+- `hs-pool` fallback: 1154 → 1123
+- `hs-oracle` fallback: 12.61 → 12.64
+These values show to static crawlers/social scrapers before JS loads. Dashboard data.json also regenerated (oracle 12.61→12.64, pool 1154→1123).
+
+**PR #85 (gittensor-base-miner):** Two docs still referenced 1154:
+- `REGISTRATION.md`: "1154 problems" → "1123 problems"
+- `docs/threat_model.md`: "30/1154" × 2, "all 1154" × 1 → 1123
+
+**System state post-step:**
+- base-miner main: 68e06ec6 (PR #85 merged)
+- dashboard main: f749ae1 (dashboard PR #6 merged)
+- Benchmark: 1123 problems, oracle 12.64 weighted / 11.49 arithmetic, 47 repos
+- Pool composition: python:411/rust:277/typescript:188/go:96/jvm:76/ruby:75
+- Model whitelist: 28 models, all verified live on OpenRouter
+- Pool rotation: Sunday 2026-06-08 (automated, 5 days)
+- API: pool_size=1123, oracle=12.64 ✅
