@@ -2885,3 +2885,26 @@ Fixes shipped alongside expansion:
 - Shard budget rebalanced: python:13 rust:9 typescript:5 jvm:2 ruby:1
 
 Dashboard: punchthedev.github.io/gittensor-miner-dashboard/ updated to 812 problems, oracle 13.62.
+
+---
+
+### Pool quality pruning: 49 sub-threshold problems removed; oracle 13.62→14.26
+
+**PRs #27, #28** — Docs sync + retroactive pool cleanup
+
+**Step 171 changes:**
+
+*PR #27 (merged) — Sync docs to pool 812 and oracle 13.62:*
+- README.md, LEADERBOARD.md, docs/api.md, docs/rewards.md, docs/threat_model.md
+- All stale 675/681/14.94/14.81 references updated to 812/13.62
+
+*PR #28 (merged) — Prune 49 problems with base_score < 0.5:*
+- **Root cause**: `is_substantive(baseScore > 0.5)` filter was added in step 162, but 49 problems were added in earlier steps before the filter existed. These slipped through and remained in the pool.
+- **Effect**: These problems score 0.01–0.49 even for perfect solutions — miners get near-zero reward for solving them. Low-signal, poor miner UX.
+- **Fix**: Removed all 49 problem directories. Ran `--incremental` baseline update.
+- Pool: 812 → **763**
+- Oracle: **14.26** weighted / **12.99** arithmetic (was 13.62 / 12.22)
+- Repos cleaned: entrius/gittensor (8), twisted (9), aiohttp (5), celery (5), werkzeug (4), vouchdev/vouch (4), click (3), pytest (3), trio (3), others (5)
+- All oracle fallbacks updated: evaluate.py, gitminer.py, eval.yml (14.26)
+- pool_config.json: pool_size=763
+- API restarted: confirmed pool=763, oracle=14.26
