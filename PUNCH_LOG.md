@@ -4,6 +4,20 @@ Milestone trail for the base-miner benchmark. Discord is the primary channel; th
 
 ---
 
+## 2026-06-03 — scorer image build fixed (commits cc21881, e2ddd16)
+
+**Critical bug found and fixed: Docker scorer image had never successfully built.**
+
+Root cause chain:
+1. First failure (`ERROR: Cache export is not supported for the docker driver`): `build-scorer.yml` used `cache-to: type=gha,mode=max` without setting up Docker Buildx first. Added `docker/setup-buildx-action@v3` step.
+2. Second failure (`repository name must be lowercase`): `IMAGE_NAME: ${{ github.repository_owner }}/gitminer-scorer` expands to `PunchTheDev/gitminer-scorer` — GHCR requires lowercase. Hardcoded to `punchthedev/gitminer-scorer`.
+
+Third build now queued (2026-06-03T02:27Z). This unblocks real Docker-sandboxed CI evaluations; previously the sandbox always fell back to heuristic scoring.
+
+Also fixed: `record_submission.yml` "Update champion" step wrote `score` (arithmetic mean) to champion `meta.json` — now writes `weighted_score` (the actual ranking metric).
+
+---
+
 ## 2026-06-03 — mine command fixes (commit 3c01104)
 
 Three issues fixed in `gitminer mine`:
