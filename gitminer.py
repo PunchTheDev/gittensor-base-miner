@@ -1334,18 +1334,46 @@ def cmd_doctor(args: argparse.Namespace) -> None:
                 ok("Handle", handle)
             else:
                 warn("Handle", f"looks generic ({handle!r}) — use agent/submissions/<your-handle>/agent.py")
-            # Check model against allowlist
-            if models_path.exists():
+
+            # meta.json — model whitelist + sha256 integrity
+            meta_path_agent = p.parent / "meta.json"
+            if meta_path_agent.exists():
                 try:
-                    src = p.read_text(errors="replace")
-                    import re
-                    model_hits = re.findall(r'"([\w\-./]+)"', src)
-                    used = [m for m in model_hits if "/" in m and not m.startswith("http")]
-                    for model in set(used):
-                        if any(model.startswith(a) or a.startswith(model.split(":")[0]) for a in models):
-                            pass  # plausibly whitelisted — don't spam per-model output
-                except Exception:
-                    pass
+                    import hashlib
+                    import re as _re
+                    meta_data = json.loads(meta_path_agent.read_text())
+                    declared_model = meta_data.get("model", "")
+                    declared_sha = meta_data.get("sha256", "")
+
+                    # Model whitelist check (meta.json is the authoritative source CI uses)
+                    if models_path.exists() and declared_model:
+                        if declared_model in models:
+                            ok("Model (meta.json)", declared_model)
+                        else:
+                            fail(
+                                "Model (meta.json)",
+                                f"{declared_model!r} not in allowed_models.txt — pick a whitelisted model",
+                            )
+                    elif not declared_model:
+                        fail("Model (meta.json)", "missing 'model' key in meta.json")
+
+                    # sha256 integrity: declared hash must match current agent.py
+                    if declared_sha:
+                        normalized = _re.sub(r"\r\n", "\n", p.read_text(errors="replace"))
+                        actual_sha = hashlib.sha256(normalized.encode()).hexdigest()
+                        if actual_sha == declared_sha:
+                            ok("sha256 (meta.json)", "matches agent.py")
+                        else:
+                            fail(
+                                "sha256 (meta.json)",
+                                "mismatch — run `python gitminer.py hash agent/submissions/<handle>/agent.py` and update meta.json",
+                            )
+                    else:
+                        fail("sha256 (meta.json)", "missing 'sha256' key — CI will reject submission")
+                except Exception as exc:
+                    warn("meta.json", f"could not parse: {exc}")
+            else:
+                fail("meta.json", f"not found at {meta_path_agent} — CI requires meta.json alongside agent.py")
         else:
             fail("Agent file", f"not found: {agent_path}")
 
