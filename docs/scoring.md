@@ -2,13 +2,27 @@
 
 ## Overview
 
-Submissions are scored by replaying real Gittensor issues in an isolated sandbox using **Gittensor's native tree-sitter scoring engine** — the same AST-based scorer the DAS validator uses. Local scores match validator output closely.
+Submissions are scored by replaying real Gittensor issues in an isolated sandbox using **Gittensor's native tree-sitter scoring engine** — the same AST-based scorer the DAS validator uses.
 
 **Correctness gates quality.** A patch that doesn't pass the test suite scores 0, regardless of code quality.
 
-## Formula
+## Metrics
 
-Mirrors Gittensor's native scoring formula exactly (constants from `gittensor/constants.py`):
+Three complementary signals are reported for each evaluation:
+
+| Metric | Scale | Meaning |
+|---|---|---|
+| `final_score` | 0–30 | Gittensor's native AST quality score for the agent's patch |
+| `relative_score` | 0–2.0 | Agent quality / oracle quality for this specific problem |
+| `file_coverage` | 0–1.0 | Fraction of reference diff source files the agent also touches |
+
+**`mean_relative_score` is the primary benchmark ranking metric.** It normalizes each problem's contribution so a tiny 2-point fix and a large 25-point fix count equally. An agent that consistently matches the oracle scores 1.0; a better agent scores above 1.0.
+
+`weighted_mean_score` (difficulty-weighted Gittensor score) is retained for backward compatibility and direct comparison to Gittensor native emissions.
+
+## Base quality formula
+
+Mirrors Gittensor's native scoring exactly (constants from `gittensor/constants.py`):
 
 ```
 base_score   = 25 × (1 − exp(−src_tokens / 58.0))   # quality term, 0–25
@@ -18,11 +32,35 @@ final_score  = base_score + bonus_score               # 0–30 total
 
 If tests do not pass, `final_score = 0`.
 
+## Relative score
+
+```
+relative_score = min(agent_final_score / oracle_base_score, 2.0)
+```
+
+`oracle_base_score` is the DAS validator's score on the accepted reference diff for that specific problem (stored in `meta.json` as `das_base_score`). The cap of 2.0 prevents inflating scores with extremely verbose patches.
+
+Interpretation:
+- `1.0` — agent's fix has the same quality signal as the accepted solution
+- `> 1.0` — agent wrote a higher-quality fix (more structured code changes)
+- `< 1.0` — agent's fix is lower quality than the accepted solution (but may still be correct)
+- `None` — oracle score unavailable for this problem (doesn't affect the mean)
+
+The leaderboard ranks agents by `mean_relative_score` across all evaluated problems.
+
+## File coverage (observational)
+
+```
+file_coverage = |agent_source_files ∩ reference_source_files| / |reference_source_files|
+```
+
+Test files are excluded. This is a diagnostic signal, not part of any score. A value of 1.0 means the agent touched exactly the same source files as the reference. A value < 1.0 may indicate the agent found a different (potentially better or worse) approach. Not touching the same files is not penalized — the tests are the arbiter of correctness.
+
 ## Correctness check
 
 1. Apply the patch to the repository at `base_commit` (the commit just before the issue was filed).
 2. Run the test suite (`test_cmd` from `meta.json`).
-3. If all tests pass, proceed to quality scoring. Otherwise `final_score = 0`.
+3. If all tests pass, proceed to quality scoring. Otherwise `final_score = 0`, `relative_score = 0`.
 
 The test suite is the arbiter of correctness. An agent that finds a *better* fix than the reference solution is not penalized — if it passes the tests, it earns a full quality score.
 

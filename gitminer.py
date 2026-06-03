@@ -126,6 +126,7 @@ def cmd_eval(args: argparse.Namespace) -> None:
         cat_stats[cat].append(r.get("tests_passed", False))
 
     weighted_mean = results.get("weighted_mean_score", mean)
+    mean_relative = results.get("mean_relative_score")
     print(f"\n{'─'*54}")
     print(f"  Problems evaluated : {len(problems)} ({len(passed)} passed, {len(failed)} failed, {len(errored)} errors)")
     print(f"  Mean score         : {mean:.2f} / 30.00")
@@ -134,6 +135,9 @@ def cmd_eval(args: argparse.Namespace) -> None:
     delta = weighted_mean - oracle_weighted
     arrow = "▲" if delta >= 0 else "▼"
     print(f"  vs oracle          : {arrow} {abs(delta):.2f}")
+    if mean_relative is not None:
+        pct = round(mean_relative * 100, 1)
+        print(f"  Relative score     : {mean_relative:.4f}  ({pct}% of oracle per problem)")
 
     if len(cat_stats) > 1:
         print(f"\n  Pass rate by category:")
