@@ -192,6 +192,17 @@ def main():
     if weighted_benchmark is not None:
         entry["weighted_benchmark_score"] = round(float(weighted_benchmark), 4)
 
+    # Aggregate token efficiency across all problems
+    entry["total_tokens_used"] = sum(b["tokens_used"] for b in breakdown)
+    if breakdown:
+        entry["avg_efficiency_factor"] = round(
+            sum(b["efficiency_factor"] if b["efficiency_factor"] is not None else 1.0 for b in breakdown)
+            / len(breakdown),
+            4,
+        )
+    else:
+        entry["avg_efficiency_factor"] = 1.0
+
     prev_sota = current_sota(leaderboard)
     my_primary = primary_score(entry)
     gain = marginal_gain(my_primary, prev_sota)
