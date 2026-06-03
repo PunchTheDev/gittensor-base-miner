@@ -3553,3 +3553,23 @@ Miner ranking was **not affected** — `weighted_benchmark_score` is always comp
 - Benchmark: 1154 problems, oracle **12.61** weighted / 11.48 arithmetic, 47 repos, 6 languages
 - Pool rotation: Sunday 2026-06-08 (automated)
 - CI: all green
+
+---
+
+## Step 198 — 2026-06-03
+
+**Model whitelist expansion** (PR #75)
+
+Added three models to `benchmark/harness/allowed_models.txt` that were missing from the initial list:
+
+- `deepseek/deepseek-r1` — full DeepSeek R1 thinking model; most popular reasoning model for SWE-agent work and the most notable gap
+- `deepseek/deepseek-r1-distill-llama-70b` — the Llama-70B R1 distill; popular for its cost/performance ratio in agentic loops
+- `meta-llama/llama-3.1-405b-instruct` — 405B Llama flagship; the 8B and 70B variants were already listed; 405B rounds out the family
+
+### System state after step 198
+
+- base-miner main: e7263c82 (post-PR#75)
+- Benchmark: 1154 problems, oracle **12.61** weighted / 11.48 arithmetic, 47 repos, 6 languages
+- Allowed models: 21 (was 18)
+- Pool rotation: Sunday 2026-06-08 (automated)
+- CI: all green
