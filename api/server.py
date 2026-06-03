@@ -406,8 +406,8 @@ class Handler(BaseHTTPRequestHandler):
             entries = json.loads(LEADERBOARD.read_text())
             ranked = [e for e in entries if e.get("rank") is not None and e.get("score") is not None]
             if ranked:
-                top = max(ranked, key=lambda e: e["score"])
-                champion_score = top["score"]
+                top = max(ranked, key=lambda e: e.get("weighted_score") or e["score"])
+                champion_score = top.get("weighted_score") or top["score"]
                 champion_agent = top.get("agent")
 
         oracle_score = _oracle_weighted_score()
