@@ -2426,3 +2426,16 @@ Both fixes are cosmetic/accuracy — no logic changes.
 - API running: pool=441, oracle=13.03, shard=30, next_rotation=2026-06-08
 - `load_problem` and `load_agent` both work correctly on current pool
 - No open PRs in either repo
+
+---
+
+## Step 144 — 2026-06-03
+
+**Fixed: local shard ≠ CI shard not documented** (commit `437cbb3`)
+
+- `CONTRIBUTING.md`: Changed "same as CI" → "same scoring method as CI" (the shard differs because CI uses SHARD_SECRET). Added note block explaining the shard difference and recommending `--all` for stable local benchmarking.
+- `gitminer.py` `cmd_eval`: Added runtime note when `SHARD_SECRET` is absent and user is evaluating a shard (not `--all` or specific `--problems`) — "local shard may differ from CI shard (server-side anti-gaming). Use --all for a stable benchmark."
+
+**Root cause**: Miners could be confused when local Docker score didn't match CI score because CI uses a secret-seeded shard different from the default.
+
+**System health**: pool=441, oracle=13.03, API healthy, no open PRs.
