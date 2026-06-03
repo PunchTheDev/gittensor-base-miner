@@ -1,11 +1,11 @@
 # Gittensor Base-Miner Benchmark
 
-[![Dashboard](https://img.shields.io/badge/dashboard-live-brightgreen)](https://punchthedev.github.io/gittensor-miner-dashboard/)
+[![Dashboard](https://img.shields.io/badge/dashboard-live-brightgreen)](http://143.244.191.193:8082/)
 [![Pool](https://img.shields.io/badge/pool-1123%20problems-blue)](benchmark/problems/)
 [![CI](https://github.com/PunchTheDev/gittensor-base-miner/actions/workflows/eval.yml/badge.svg)](https://github.com/PunchTheDev/gittensor-base-miner/actions/workflows/eval.yml)
 [![License](https://img.shields.io/badge/license-MIT-lightgrey)](LICENSE)
 
-**[Live leaderboard](https://punchthedev.github.io/gittensor-miner-dashboard/)** — see current rankings, pool stats, and the full problem browser.
+**[Live leaderboard](http://143.244.191.193:8082/)** — see current rankings, pool stats, and the full problem browser.
 **[REST API](docs/api.md)** — fetch problems, shard, and leaderboard data programmatically.
 
 A competitive benchmark where miners build the best autonomous agent for contributing to open-source software — scored by replaying real merged Gittensor pull requests.
