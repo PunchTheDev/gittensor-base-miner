@@ -34,100 +34,15 @@ import os
 import random
 import sys
 import time
-from datetime import date, timedelta
+from datetime import date
 from pathlib import Path
+
+from benchmark.catalog import DIFFICULTY_TIERS, DEFAULT_SHARD_BUDGET, REPO_CATEGORY
 
 
 REPO_ROOT = Path(__file__).parent.parent
 POOL_DIR = Path(__file__).parent / "problems"
 POOL_CONFIG_PATH = Path(__file__).parent / "pool_config.json"
-
-# Difficulty tiers based on reference diff patch size (added lines, ignoring test files).
-# Weights increase the contribution of hard problems to the weighted mean.
-DIFFICULTY_TIERS = [
-    ("easy",   30,  1.0),   # < 30 added lines → weight 1.0×
-    ("medium", 150, 1.5),   # 30–149 → weight 1.5×
-    ("hard",   None, 2.0),  # 150+ → weight 2.0×
-]
-
-# Repo → language category (mirrors generate_dashboard_data.py)
-REPO_CATEGORY: dict[str, str] = {
-    "entrius/gittensor": "python",
-    "entrius/allways": "python",
-    "entrius/das-github-mirror": "python",
-    "entrius/allways-ui": "typescript",
-    "entrius/gittensor-ui": "typescript",
-    "entrius/oc-1": "typescript",
-    "aglover1221/product-data-extractor": "python",
-    "cogniax/tao-pulse-app": "typescript",
-    "e35ventura/taopedia": "python",
-    "e35ventura/taopedia-articles": "python",
-    "geniepod/genie-claw": "rust",
-    "infiniflow/ragflow": "python",
-    "jsonbored/awesome-claude": "typescript",
-    "jsonbored/gittensory": "typescript",
-    "mkdev11/gittensor-hub": "typescript",
-    "vouchdev/vouch": "python",
-    "phase-rs/phase": "rust",
-    "seroperson/jvm-live-reload": "jvm",
-    "touchpilot/touchpilot": "jvm",
-    "we-promise/sure": "ruby",
-    # External prestige repos (not in Gittensor DAS — added via expand_pool_external.py)
-    "pytest-dev/pytest": "python",
-    "pallets/click": "python",
-    "pallets/werkzeug": "python",
-    "encode/starlette": "python",
-    "psf/requests": "python",
-    "aio-libs/aiohttp": "python",
-    "pallets/flask": "python",
-    "tiangolo/fastapi": "python",
-    "tornadoweb/tornado": "python",
-    "twisted/twisted": "python",
-    "python-trio/trio": "python",
-    "celery/celery": "python",
-    # Ruby external repos
-    "rubocop/rubocop": "ruby",
-    "rubocop/rubocop-rails": "ruby",
-    # TypeScript external repos
-    "colinhacks/zod": "typescript",
-    "vitest-dev/vitest": "typescript",
-    "trpc/trpc": "typescript",
-    "vuejs/core": "typescript",
-    # Python external repos (continued)
-    "python/mypy": "python",
-    # Rust external repos
-    "tokio-rs/tokio": "rust",
-    "clap-rs/clap": "rust",
-    "hyperium/hyper": "rust",
-    "tokio-rs/axum": "rust",
-    # JVM external repos
-    "fasterxml/jackson-databind": "jvm",
-    "square/okhttp": "jvm",
-    # Go external repos
-    "gin-gonic/gin": "go",
-    "labstack/echo": "go",
-    "gofiber/fiber": "go",
-    "grpc/grpc-go": "go",
-    "spf13/cobra": "go",
-    # JVM external repos (continued)
-    "google/guava": "jvm",
-    # Rust external repos (continued)
-    "serde-rs/serde": "rust",
-    # TypeScript external repos (continued)
-    "sindresorhus/got": "typescript",
-    "tanstack/query": "typescript",
-}
-
-# Default per-category shard budget (sums to 30) — overridable via pool_config.json
-# Proportional to pool composition: python:38% rust:24% typescript:16% go:8% jvm:7% ruby:7%
-DEFAULT_SHARD_BUDGET: dict[str, int] = {
-    "python": 11,
-    "rust": 7,
-    "typescript": 5,
-    "ruby": 2,
-    "jvm": 2,
-    "go": 3,
-}
 
 
 def problem_difficulty(problem_dir: Path) -> tuple[str, float]:
@@ -352,6 +267,47 @@ def load_problem(problem_dir: Path):
     )
 
 
+def _annotate_and_aggregate(results: list[dict], selected: list[Path]) -> dict:
+    """Annotate each result with difficulty/category and return aggregate metrics.
+
+    Mutates result dicts in-place (adds difficulty, difficulty_weight, category).
+    Returns a dict of aggregate metrics suitable for merging into the eval output.
+    """
+    mean = sum(r["final_score"] for r in results) / len(results) if results else 0.0
+
+    weighted_total = weighted_count = 0.0
+    rel_total = rel_count = 0
+    bench_total = bench_count = 0
+    bench_weighted_total = bench_weighted_count = 0.0
+
+    for r, d in zip(results, selected):
+        tier, w = problem_difficulty(d)
+        r["difficulty"] = tier
+        r["difficulty_weight"] = w
+        r["category"] = _problem_category(d)
+        weighted_total += r["final_score"] * w
+        weighted_count += w
+        rel = r.get("relative_score")
+        if rel is not None and isinstance(rel, (int, float)):
+            rel_total += rel
+            rel_count += 1
+        bench = r.get("benchmark_score")
+        if bench is not None and isinstance(bench, (int, float)):
+            bench_total += bench
+            bench_count += 1
+            bench_weighted_total += bench * w
+            bench_weighted_count += w
+
+    return {
+        "mean_score": round(mean, 4),
+        "weighted_mean_score": round(weighted_total / weighted_count, 4) if weighted_count else 0.0,
+        "mean_relative_score": round(rel_total / rel_count, 4) if rel_count else None,
+        "mean_benchmark_score": round(bench_total / bench_count, 4) if bench_count else None,
+        # PRIMARY ranking metric: difficulty-weighted (hard×2 / medium×1.5 / easy×1).
+        "weighted_benchmark_score": round(bench_weighted_total / bench_weighted_count, 4) if bench_weighted_count else None,
+    }
+
+
 def run_evaluation(
     agent_path: str | None = None,
     problem_ids: list[str] | None = None,
@@ -423,44 +379,9 @@ def run_evaluation(
                 })
                 print(f"       ERROR: {e}")
 
-        total = sum(r["final_score"] for r in results)
-        mean = total / len(results) if results else 0.0
-
-        weighted_total = weighted_count = 0.0
-        rel_total = rel_count = 0
-        bench_total = bench_count = 0
-        bench_weighted_total = bench_weighted_count = 0.0
-        for r, d in zip(results, selected):
-            tier, w = problem_difficulty(d)
-            r["difficulty"] = tier
-            r["difficulty_weight"] = w
-            r["category"] = _problem_category(d)
-            weighted_total += r["final_score"] * w
-            weighted_count += w
-            rel = r.get("relative_score")
-            if rel is not None and isinstance(rel, (int, float)):
-                rel_total += rel
-                rel_count += 1
-            bench = r.get("benchmark_score")
-            if bench is not None and isinstance(bench, (int, float)):
-                bench_total += bench
-                bench_count += 1
-                bench_weighted_total += bench * w
-                bench_weighted_count += w
-        weighted_mean = weighted_total / weighted_count if weighted_count else 0.0
-        mean_relative = round(rel_total / rel_count, 4) if rel_count else None
-        mean_benchmark = round(bench_total / bench_count, 4) if bench_count else None
-        weighted_benchmark = round(bench_weighted_total / bench_weighted_count, 4) if bench_weighted_count else None
-
+        agg = _annotate_and_aggregate(results, selected)
         return {
-            "mean_score": round(mean, 4),
-            "weighted_mean_score": round(weighted_mean, 4),
-            "mean_relative_score": mean_relative,
-            "mean_benchmark_score": mean_benchmark,
-            # weighted_benchmark_score: PRIMARY ranking metric.
-            # Applies difficulty weights (hard×2 / medium×1.5 / easy×1) to benchmark_score.
-            # Hard fixes contribute twice as much as easy ones to the final rank.
-            "weighted_benchmark_score": weighted_benchmark,
+            **agg,
             "problems_evaluated": len(results),
             "pool_size": len(all_problem_dirs),
             "shard_size": len(selected),
@@ -519,44 +440,9 @@ def run_evaluation(
             })
             print(f"       ERROR: {e}")
 
-    total = sum(r["final_score"] for r in results)
-    mean = total / len(results) if results else 0.0
-
-    weighted_total = weighted_count = 0.0
-    rel_total = rel_count = 0
-    bench_total = bench_count = 0
-    bench_weighted_total = bench_weighted_count = 0.0
-    for r, d in zip(results, selected):
-        tier, w = problem_difficulty(d)
-        r["difficulty"] = tier
-        r["difficulty_weight"] = w
-        r["category"] = _problem_category(d)
-        weighted_total += r["final_score"] * w
-        weighted_count += w
-        rel = r.get("relative_score")
-        if rel is not None and isinstance(rel, (int, float)):
-            rel_total += rel
-            rel_count += 1
-        bench = r.get("benchmark_score")
-        if bench is not None and isinstance(bench, (int, float)):
-            bench_total += bench
-            bench_count += 1
-            bench_weighted_total += bench * w
-            bench_weighted_count += w
-    weighted_mean = weighted_total / weighted_count if weighted_count else 0.0
-    mean_relative = round(rel_total / rel_count, 4) if rel_count else None
-    mean_benchmark = round(bench_total / bench_count, 4) if bench_count else None
-    weighted_benchmark = round(bench_weighted_total / bench_weighted_count, 4) if bench_weighted_count else None
-
+    agg = _annotate_and_aggregate(results, selected)
     return {
-        "mean_score": round(mean, 4),
-        "weighted_mean_score": round(weighted_mean, 4),
-        "mean_relative_score": mean_relative,
-        "mean_benchmark_score": mean_benchmark,
-        # weighted_benchmark_score: PRIMARY ranking metric.
-        # Applies difficulty weights (hard×2 / medium×1.5 / easy×1) to benchmark_score.
-        # Hard fixes contribute twice as much as easy ones. This is what the leaderboard ranks by.
-        "weighted_benchmark_score": weighted_benchmark,
+        **agg,
         "problems_evaluated": len(results),
         "pool_size": len(all_problem_dirs),
         "shard_size": len(selected),

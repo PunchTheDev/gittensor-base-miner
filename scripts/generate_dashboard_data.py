@@ -5,81 +5,14 @@ import pathlib
 import sys
 from datetime import date
 
-# Repo → language category mapping (all Gittensor DAS registered repos)
-REPO_CATEGORY: dict[str, str] = {
-    "entrius/gittensor": "python",
-    "entrius/allways": "python",
-    "entrius/das-github-mirror": "python",
-    "entrius/allways-ui": "typescript",
-    "entrius/gittensor-ui": "typescript",
-    "entrius/oc-1": "typescript",
-    "aglover1221/product-data-extractor": "python",
-    "cogniax/tao-pulse-app": "typescript",
-    "e35ventura/taopedia": "python",
-    "e35ventura/taopedia-articles": "python",
-    "geniepod/genie-claw": "rust",
-    "infiniflow/ragflow": "python",
-    "jsonbored/awesome-claude": "typescript",
-    "jsonbored/gittensory": "typescript",
-    "mkdev11/gittensor-hub": "typescript",
-    "vouchdev/vouch": "python",
-    "phase-rs/phase": "rust",
-    "seroperson/jvm-live-reload": "jvm",
-    "touchpilot/touchpilot": "jvm",
-    "we-promise/sure": "ruby",
-    # External prestige repos (not in Gittensor DAS — added via expand_pool_external.py)
-    "pytest-dev/pytest": "python",
-    "pallets/click": "python",
-    "pallets/werkzeug": "python",
-    "encode/starlette": "python",
-    "psf/requests": "python",
-    "aio-libs/aiohttp": "python",
-    "pallets/flask": "python",
-    "tiangolo/fastapi": "python",
-    "tornadoweb/tornado": "python",
-    "twisted/twisted": "python",
-    "python-trio/trio": "python",
-    "celery/celery": "python",
-    # Ruby external repos
-    "rubocop/rubocop": "ruby",
-    "rubocop/rubocop-rails": "ruby",
-    # TypeScript external repos
-    "colinhacks/zod": "typescript",
-    "vitest-dev/vitest": "typescript",
-    "trpc/trpc": "typescript",
-    "vuejs/core": "typescript",
-    # Python external repos (continued)
-    "python/mypy": "python",
-    # Rust external repos
-    "tokio-rs/tokio": "rust",
-    "clap-rs/clap": "rust",
-    "hyperium/hyper": "rust",
-    "tokio-rs/axum": "rust",
-    # JVM external repos
-    "fasterxml/jackson-databind": "jvm",
-    "square/okhttp": "jvm",
-    # Go external repos
-    "gin-gonic/gin": "go",
-    "labstack/echo": "go",
-    "gofiber/fiber": "go",
-    "grpc/grpc-go": "go",
-    "spf13/cobra": "go",
-    "google/guava": "jvm",
-    "serde-rs/serde": "rust",
-    "sindresorhus/got": "typescript",
-    "tanstack/query": "typescript",
-}
+# Repo root on sys.path so benchmark.catalog is importable when run directly.
+_REPO_ROOT = pathlib.Path(__file__).parent.parent
+if str(_REPO_ROOT) not in sys.path:
+    sys.path.insert(0, str(_REPO_ROOT))
 
-# Shard sampling budget per category (sums to 30)
-# Proportional to pool: python:38% rust:24% typescript:16% go:8% jvm:7% ruby:6%
-SHARD_BUDGET: dict[str, int] = {
-    "python": 11,
-    "rust": 7,
-    "typescript": 5,
-    "ruby": 2,
-    "jvm": 2,
-    "go": 3,
-}
+from benchmark.catalog import DEFAULT_SHARD_BUDGET, REPO_CATEGORY, problem_tier  # noqa: E402
+
+SHARD_BUDGET = DEFAULT_SHARD_BUDGET
 
 
 def repo_category(repo: str) -> str:
@@ -88,20 +21,11 @@ def repo_category(repo: str) -> str:
 
 
 def difficulty_tier(added_lines: int) -> str:
-    """Classify a problem by difficulty based on reference diff added-line count.
+    """Return tier name for the given added-line count (matches catalog.problem_tier)."""
+    name, _ = problem_tier(added_lines)
+    return name
 
-    Mirrors evaluate.py DIFFICULTY_TIERS so dashboard badges match scoring weights:
-      easy   < 30 added lines  (weight 1.0×) — surgical, targeted fixes
-      medium  30–149            (weight 1.5×) — moderate changes
-      hard   >= 150             (weight 2.0×) — substantial additions; highest scoring weight
-    """
-    if added_lines < 30:
-        return "easy"
-    if added_lines < 150:
-        return "medium"
-    return "hard"
-
-REPO_ROOT = pathlib.Path(__file__).parent.parent
+REPO_ROOT = _REPO_ROOT
 PROBLEMS_DIR = REPO_ROOT / "benchmark" / "problems"
 RESULTS_DIR = REPO_ROOT / "results"
 
