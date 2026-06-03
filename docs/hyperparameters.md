@@ -37,6 +37,10 @@ This document maps every Gittensor repository hyperparameter to our configuratio
       "sigmoid_midpoint_days": 14,
       "sigmoid_steepness": 0.35,
       "min_multiplier": 0.08
+    },
+    "marginal_gain": {
+      "champion_multiplier": 3.0,
+      "participation_multiplier": 1.0
     }
   }
 }
@@ -87,6 +91,15 @@ Two-week half-life. Contributions should be recent but benchmark infrastructure 
 
 ### `time_decay.grace_period_hours: 24`
 24h grace (vs. 12h default). Some benchmark problems take a full day to verify, and maintainers shouldn't lose score for the wait.
+
+### `marginal_gain.champion_multiplier: 3.0` / `participation_multiplier: 1.0`
+This is our local leaderboard weighting formula (not a Gittensor validator parameter):
+
+```
+contribution_weight = score × 1.0 + max(0, score − sota_at_submission) × 3.0
+```
+
+A submission that merely ties the current leader earns only the participation term. A new champion earns disproportionately more, rewarding genuine improvement over copying. The Gittensor validator then multiplies this by the label multiplier and time decay factors.
 
 ## What to change and when
 
