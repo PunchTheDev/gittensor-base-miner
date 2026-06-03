@@ -4,6 +4,20 @@ Milestone trail for the base-miner benchmark. Discord is the primary channel; th
 
 ---
 
+## 2026-06-03 — CLI and docs consistency sweep (commits 3d6c793, 2d167a0, 1a40c37, cded40a, d38c0ae)
+
+**Fixes shipped** — all in `gitminer.py`, `README.md`, `docs/api.md`:
+
+- `_oracle_mean()` renamed to `_oracle_weighted()`: now reads `weighted_score` (13.03) from leaderboard instead of arithmetic `score` (12.08); fallback updated 23.46 → 13.03
+- `vs oracle` comparison in `eval` output now uses `weighted_mean` vs `oracle_weighted` (apples-to-apples)
+- Per-category pass rate breakdown uses `REPO_CATEGORY` map instead of test_cmd runner heuristic (old code mapped Ruby repos to "Python" as default)
+- `mine` and `leaderboard` commands use `weighted_score` for champion and oracle comparisons
+- All `python gitminer.py` → `python3 gitminer.py` across gitminer.py, README.md, docs/api.md (CONTRIBUTING.md was already fixed in a prior step)
+
+**Effect**: `gitminer leaderboard` now shows "13.03 (weighted)" as the oracle target. Category breakdown is accurate in eval output.
+
+---
+
 ## 2026-06-03 — Weighted oracle consistency fix (commits 768ba4b, e712227, a917b42, f463f35, 9dacbb7)
 
 **Root cause**: The oracle score displayed everywhere (11.83) was the arithmetic mean of all 430 baseline scores. But `evaluate.py` computes `weighted_mean_score` (hard×2, medium×1.5, easy×1) as the primary ranking metric for miners. Miners comparing their weighted mean against the arithmetic oracle would see artificially favorable comparisons. Weighted oracle = **12.77**.
