@@ -88,9 +88,34 @@ def current_sota(leaderboard: list[dict]) -> float:
     return max((s for s in real if s > 0), default=0.0)
 
 
+# Crown margin constants.
+# To earn non-zero marginal gain a submission must beat SOTA by at least
+# crown_threshold(sota). The required absolute margin decays linearly to zero
+# as SOTA approaches the theoretical ceiling, so near the top even small
+# genuine improvements are rewarded while LLM variance alone can't steal the
+# crown when SOTA is low.
+_CROWN_BASE_MARGIN = 0.02  # 2 pp required when SOTA is at zero
+_CROWN_CEILING = 2.0       # theoretical max benchmark_score
+
+
+def crown_threshold(sota: float) -> float:
+    """Minimum score needed to earn any marginal gain.
+
+    margin = BASE × (ceiling - sota) / ceiling
+    At sota=0.0 → need +0.02; at sota=1.0 → need +0.01; at sota=1.9 → need +0.001.
+    """
+    margin = _CROWN_BASE_MARGIN * max(_CROWN_CEILING - sota, 0.0) / _CROWN_CEILING
+    return sota + margin
+
+
 def marginal_gain(score: float, sota: float) -> float:
-    """Score delta above current SOTA; zero for at-or-below SOTA submissions."""
-    return max(0.0, score - sota)
+    """Genuine score delta above the crown threshold; zero if below threshold.
+
+    Submissions that copy the leader or beat it only via LLM variance earn
+    zero marginal gain — their contribution_weight collapses to the
+    participation term.
+    """
+    return max(0.0, score - crown_threshold(sota))
 
 
 def contribution_weight(score: float, sota: float, champion_mult: float = 3.0, participation_mult: float = 1.0) -> float:
@@ -98,10 +123,11 @@ def contribution_weight(score: float, sota: float, champion_mult: float = 3.0, p
     Emission weight for this submission.
 
     contribution_weight = (score × participation_mult
-                          + max(0, score - sota) × champion_mult)
+                          + marginal_gain(score, sota) × champion_mult)
 
-    A submission that copies the leader (score == sota) earns only the
-    participation term. A new champion earns disproportionately more.
+    marginal_gain is zero unless the submission clears the decaying crown
+    threshold, so a clone of the leader earns only the participation term.
+    A genuine improvement above the threshold earns disproportionately more.
     Label multiplier and time decay are applied by the Gittensor validator
     on top of this weight.
     """
@@ -205,10 +231,12 @@ def main():
 
     prev_sota = current_sota(leaderboard)
     my_primary = primary_score(entry)
+    threshold = crown_threshold(prev_sota)
     gain = marginal_gain(my_primary, prev_sota)
     weight = contribution_weight(my_primary, prev_sota)
 
     entry["sota_at_submission"] = round(prev_sota, 4)
+    entry["crown_threshold"] = round(threshold, 4)
     entry["marginal_gain"] = round(gain, 4)
     entry["contribution_weight"] = round(weight, 4)
 
