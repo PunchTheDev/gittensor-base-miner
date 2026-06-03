@@ -3402,3 +3402,48 @@ Fix: `git log origin/main --since=7 days ago` — only counts commits already on
 - Benchmark: 1154 problems, oracle 12.70 weighted, 47 repos, 6 languages
 - Scoring model v4: `benchmark_score = test_pass_rate × relative_score × anti_gaming_multiplier`
   `weighted_benchmark_score = sum(benchmark × difficulty_weight) / sum(weight)` (PRIMARY)
+
+---
+
+## Step 192 — Multi-factor difficulty + agent plan-step assertion injection
+
+### Summary
+
+Principal-engineer audit focused on scoring sophistication (operator asked explicitly) and agent quality improvements. Three PRs merged.
+
+### Changes
+
+**Multi-factor difficulty scoring** (PR #62):
+- `problem_difficulty()` in `evaluate.py` now uses complexity modifiers on top of line count
+- Multi-file modifier (×1.3): when reference diff touches ≥5 files
+- New-file modifier (×1.2): when reference diff creates at least one new file
+- Modifiers stack: ×1.56 for both active
+- Distribution shift: 55 medium → hard, 16 easy → medium (final: easy 9.8%, medium 40.2%, hard 50.0%)
+- `generate_dashboard_data.py` updated to use `problem_difficulty()` instead of line-count-only `difficulty_tier()`
+- `docs/scoring.md` difficulty tiers section rewritten to document multi-factor model
+
+**Baselines.json backfill** (PR #64):
+- 71 problems had stale `difficulty` fields from old line-count-only model
+- CI PR comment reads difficulty from baselines.json for display — would show wrong tiers without fix
+- No score changes, metadata only
+
+**Agent plan-step assertion injection** (PR #63):
+- `_extract_assertions()` now called before OBSERVE_PROMPT is built
+- Extracted assertions injected as `PLAN_ASSERTIONS_SECTION_TEMPLATE` between test files and source files
+- Helps model's step-1 analysis (test contract) for large keyword-windowed test files
+- Assertion count logged per problem
+- Section omitted when no recognizable assertions found
+
+### PRs
+
+- **PR #62**: Multi-factor difficulty scoring (merged e27b7f6c)
+- **PR #63**: Agent plan-step assertion injection (merged a5f0343e)
+- **PR #64**: Baselines.json difficulty backfill (merged 38605835)
+
+### System state after step 192
+
+- base-miner main: 38605835
+- Benchmark: 1154 problems, oracle 12.70 weighted, 47 repos, 6 languages
+- Scoring model v5: multi-factor difficulty (multi-file/new-file modifiers) + all v4 features
+- Distribution: easy 9.8%, medium 40.2%, hard 50.0%
+- Agent: plan-step assertion injection added (plan quality improvement)
