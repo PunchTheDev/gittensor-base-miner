@@ -78,13 +78,14 @@
 
 ## Threat 6: LLM variance gaming (lucky-run exploitation)
 
-**Attack**: Miner submits many times, exploiting non-determinism in model outputs to get a lucky high score.
+**Attack**: Miner submits many times, exploiting non-determinism in model outputs to get a lucky high score, or forks the champion agent and re-submits hoping a lucky run edges out the leader.
 
 **Mitigations**:
 - **Rate limiting — [Implemented, advisory]**: `scripts/check_rate_limit.py` caps merges at 5/week. Currently advisory (logged, not hard-blocking) to avoid false-positive impact on legitimate resubmissions.
 - **Deterministic eval seeds — [Implemented]**: The harness seeds the shard selection with `SHARD_SECRET + week_number`. Same agent, same week → same 30 problems.
+- **Decaying crown threshold — [Implemented]**: To earn any marginal gain (and the champion emission bonus), a submission must beat the current SOTA by at least `crown_threshold(sota) = sota + 0.02 × (2.0 − sota) / 2.0`. At SOTA=0 this requires +0.02; at SOTA=1.0 (oracle level) it requires +0.01; at SOTA=1.9 it requires +0.001. A clone that scores within the threshold earns zero marginal gain and only the participation term of contribution_weight. The threshold is stored per entry as `crown_threshold` for full transparency.
 
-**Residual risk**: Low. Deterministic seeds mean LLM randomness is the only remaining variance, and repeated submissions hit the rate limit.
+**Residual risk**: Low. Deterministic seeds mean LLM randomness is the only remaining variance for same-shard evals. The crown threshold prevents marginal-variance forks from earning champion emissions without genuine improvement. Repeated submissions still hit the rate limit.
 
 ---
 
@@ -139,7 +140,7 @@
 | Pool overfitting | Medium | Secret shard + time segmentation | Resource-heavy miners can pre-compute |
 | Frontier model use | High | Allowed models list | **No runtime enforcement — Daytona needed** |
 | Sybil submissions | Low | Output similarity (hard-block) + credibility gate | — |
-| LLM variance gaming | Low | Deterministic seeds + rate limit | — |
+| LLM variance gaming | Low | Deterministic seeds + rate limit + decaying crown threshold | — |
 | Behavioral cloning | Medium | Output fingerprint (hard-block) | Partial match evasion |
 | CI flooding | Medium | Concurrency limit + rate limit | Shared API key at scale |
 | Static agent (no LLM) | High | Reference copy check, output similarity | **No runtime LLM call verification — Daytona needed** |
