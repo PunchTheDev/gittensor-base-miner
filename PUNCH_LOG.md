@@ -2700,3 +2700,29 @@ Updated: `results/baselines.json`, `results/leaderboard.json` (oracle row), `doc
 **Meta.json CI validation**: New hard-blocking step in eval.yml checks that submissions include meta.json with a whitelisted model and SHA matching agent.py. CONTRIBUTING.md updated with meta.json format docs.
 
 **Commits**: a8d4248, 3d99594, e2ec824 (PRs #8, #9, #10 — all merged)
+
+## Step 164 — 2026-06-03
+
+**Difficulty-stratified shard + pool expansion 532→584 + adversarial probe + threat model**
+
+### Changes shipped (PR #14, merged to main, commit 68e01f5)
+
+| Change | Detail |
+|---|---|
+| Difficulty stratification in `select_shard` | Added `_sample_difficulty_balanced()` — within each language bucket, problems are now sampled proportionally across hard/medium/easy tiers. Guarantees every shard has a realistic difficulty spread, not just language diversity. |
+| `gitminer shard` shows difficulty | Header: `difficulty[hard:18 medium:11 easy:1]`, per-row `[hard]`/`[medium]`/`[easy]` tag |
+| Pool 532→584 (+52 problems) | geniepod/genie-claw +50, infiniflow/ragflow +1, we-promise/sure +1 |
+| Shard budget rebalanced | Pool is now 35.3% Rust / 34.2% Python. Budget changed from python:12/rust:5 to python:10/rust:10 to reflect actual composition |
+| Oracle updated | 15.62 → 15.99 weighted / 14.57 → 14.97 arithmetic |
+| Adversarial probe | Tested oracle-copy attack directly: confirmed `check_reference_copy.py` blocks it at 100% match rate (exit 1) |
+| Threat 9 added | "Static agent (no LLM)" — documents gap between meta.json model check and actual runtime enforcement |
+
+### Pool state
+- **584 problems**: rust:206, python:200, typescript:98, jvm:42, ruby:38
+- **Oracle**: 15.99 weighted / 14.97 arithmetic
+- **Shard**: [python:10 rust:10 typescript:6 jvm:2 ruby:2] difficulty-stratified
+
+### Critical gaps (unchanged, still need operator input)
+- 🚨 Daytona integration — model enforcement + static agent detection
+- 🚨 Per-miner OpenRouter key
+- Commit-reveal (private eval)
