@@ -46,7 +46,7 @@ After adding secrets, open a test PR (or manually trigger workflows):
 gh workflow run refresh_dashboard.yml --repo PunchTheDev/gittensor-base-miner
 ```
 
-Check: https://punchthedev.github.io/gittensor-miner-dashboard/ updates within a few minutes.
+Check: http://143.244.191.193:8082/ updates within a few minutes.
 
 The eval workflow (`eval.yml`) fires automatically on PRs. Once a miner opens a PR, the CI comment should appear with a score out of 30.
 

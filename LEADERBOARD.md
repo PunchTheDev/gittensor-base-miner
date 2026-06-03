@@ -1,6 +1,6 @@
 # Leaderboard
 
-**Live rankings: [punchthedev.github.io/gittensor-miner-dashboard](https://punchthedev.github.io/gittensor-miner-dashboard/)**
+**Live rankings: [143.244.191.193:8082](http://143.244.191.193:8082/)**
 
 The dashboard is updated automatically after each merged submission. The table below is the static fallback (machine-updated by CI via `results/leaderboard.json`).
 

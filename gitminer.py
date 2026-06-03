@@ -556,7 +556,7 @@ def cmd_leaderboard(args: argparse.Namespace) -> None:
             wbs = oracle.get("weighted_benchmark_score") or oracle.get("benchmark_score")
             if wbs is not None:
                 print(f"\nOracle normalized score: {wbs:.4f}  ← beat this to be champion")
-        print(f"\nDashboard: https://punchthedev.github.io/gittensor-miner-dashboard/")
+        print(f"\nDashboard: http://143.244.191.193:8082/")
         return
 
     handle_w = max(len(r.get("agent", "")) for r in ranked)
@@ -587,7 +587,7 @@ def cmd_leaderboard(args: argparse.Namespace) -> None:
         wbs = oracle.get("weighted_benchmark_score") or oracle.get("benchmark_score")
         if wbs is not None:
             print(f"Oracle (accepted solutions): {wbs:.4f}  (normalized; champion must exceed this)")
-    print(f"Dashboard: https://punchthedev.github.io/gittensor-miner-dashboard/")
+    print(f"Dashboard: http://143.244.191.193:8082/")
     print()
 
 
