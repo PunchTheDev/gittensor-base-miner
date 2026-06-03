@@ -1,0 +1,176 @@
+diff --git a/packages/reactivity/__tests__/effectScope.spec.ts b/packages/reactivity/__tests__/effectScope.spec.ts
+index 8f1c1e12d5e..071c8286c4f 100644
+--- a/packages/reactivity/__tests__/effectScope.spec.ts
++++ b/packages/reactivity/__tests__/effectScope.spec.ts
+@@ -296,6 +296,25 @@ describe('reactivity/effect/scope', () => {
+     })
+   })
+ 
++  it('calling .off() out of order should unlink the scope from the active chain', () => {
++    const parentScope = effectScope(true)
++    const firstScope = effectScope(true)
++    const secondScope = effectScope(true)
++
++    parentScope.on()
++    firstScope.on()
++    secondScope.on()
++
++    firstScope.off()
++    expect(getCurrentScope()).toBe(secondScope)
++
++    secondScope.off()
++    expect(getCurrentScope()).toBe(parentScope)
++
++    parentScope.off()
++    expect(getCurrentScope()).toBeUndefined()
++  })
++
+   it('should pause/resume EffectScope', async () => {
+     const counter = reactive({ num: 0 })
+     const fnSpy = vi.fn(() => counter.num)
+diff --git a/packages/reactivity/src/effectScope.ts b/packages/reactivity/src/effectScope.ts
+index f94f7c4237a..7b93c000271 100644
+--- a/packages/reactivity/src/effectScope.ts
++++ b/packages/reactivity/src/effectScope.ts
+@@ -124,7 +124,26 @@ export class EffectScope {
+    */
+   off(): void {
+     if (this._on > 0 && --this._on === 0) {
+-      activeEffectScope = this.prevScope
++      // Fast path: in the common LIFO case this scope is still at the top
++      // of the active chain, so we can restore the previous scope directly.
++      if (activeEffectScope === this) {
++        activeEffectScope = this.prevScope
++      } else {
++        // withAsyncContext() restores the current component scope for the
++        // current async continuation, then defers its cleanup to a microtask.
++        // If sibling continuations interleave (A restore -> B restore ->
++        // A cleanup), activeEffectScope is already B instead of this scope A
++        // when A's cleanup calls off(). Unlink A from the middle of the
++        // active chain so a stale scope doesn't remain globally reachable.
++        let current = activeEffectScope
++        while (current) {
++          if (current.prevScope === this) {
++            current.prevScope = this.prevScope
++            break
++          }
++          current = current.prevScope
++        }
++      }
+       this.prevScope = undefined
+     }
+   }
+diff --git a/packages/server-renderer/__tests__/ssrWatch.spec.ts b/packages/server-renderer/__tests__/ssrWatch.spec.ts
+index 4cf4b2952f7..2b1ad98d219 100644
+--- a/packages/server-renderer/__tests__/ssrWatch.spec.ts
++++ b/packages/server-renderer/__tests__/ssrWatch.spec.ts
+@@ -3,6 +3,7 @@ import {
+   defineComponent,
+   h,
+   nextTick,
++  onScopeDispose,
+   ref,
+   watch,
+   watchEffect,
+@@ -10,6 +11,14 @@ import {
+ } from 'vue'
+ import { type SSRContext, renderToString } from '../src'
+ 
++const gc = () =>
++  new Promise<void>(resolve => {
++    setTimeout(() => {
++      global.gc!()
++      resolve()
++    })
++  })
++
+ describe('ssr: watch', () => {
+   // #6013
+   test('should work w/ flush:sync', async () => {
+@@ -284,3 +293,62 @@ describe('ssr: watchEffect', () => {
+     expect(msg).toBe('unchanged')
+   })
+ })
++
++describe.skipIf(!global.gc)('ssr: watch gc', () => {
++  test('should not retain apps when a watcher stop handle is registered with onScopeDispose after async context restore', async () => {
++    const weakRefs: { deref(): unknown | undefined }[] = []
++
++    const ComponentA = defineComponent({
++      async setup() {
++        let __temp: any, __restore: any
++        ;[__temp, __restore] = withAsyncContext(() => Promise.resolve(false))
++        const enabled = await __temp
++        __restore()
++
++        const el = ref(null)
++        const stop = watch(
++          () => el.value,
++          () => {},
++          { immediate: true },
++        )
++        onScopeDispose(stop)
++
++        return () => h('div', { ref: el }, `Component A ${enabled}`)
++      },
++    })
++
++    const ComponentB = defineComponent({
++      async setup() {
++        let __temp: any, __restore: any
++        ;[__temp, __restore] = withAsyncContext(() => Promise.resolve(false))
++        const enabled = await __temp
++        __restore()
++
++        return () => h('div', `Component B ${enabled}`)
++      },
++    })
++
++    async function renderOnce() {
++      const app = createSSRApp({
++        render: () => h('div', [h(ComponentA), h(ComponentB)]),
++      })
++      // @ts-expect-error ES2021 API
++      weakRefs.push(new WeakRef(app))
++
++      const html = await renderToString(app)
++
++      expect(html).toContain('Component A false')
++      expect(html).toContain('Component B false')
++    }
++
++    for (let i = 0; i < 10; i++) {
++      await renderOnce()
++    }
++
++    for (let i = 0; i < 5; i++) {
++      await gc()
++    }
++
++    expect(weakRefs.filter(ref => ref.deref()).length).toBe(0)
++  })
++})
+diff --git a/vitest.config.ts b/vitest.config.ts
+index 3634021504e..1ce6ce82b69 100644
+--- a/vitest.config.ts
++++ b/vitest.config.ts
+@@ -56,9 +56,19 @@ export default defineConfig({
+             ...configDefaults.exclude,
+             '**/e2e/**',
+             '**/{vue,vue-compat,runtime-dom}/**',
++            'packages/server-renderer/__tests__/ssrWatch.spec.ts',
+           ],
+         },
+       },
++      {
++        extends: true,
++        test: {
++          name: 'unit-gc',
++          pool: 'forks',
++          include: ['packages/server-renderer/__tests__/ssrWatch.spec.ts'],
++          execArgv: ['--expose-gc'],
++        },
++      },
+       {
+         extends: true,
+         test: {

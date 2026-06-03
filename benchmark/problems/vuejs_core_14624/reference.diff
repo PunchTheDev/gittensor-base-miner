@@ -1,0 +1,158 @@
+diff --git a/packages/compiler-core/__tests__/transforms/__snapshots__/vMemo.spec.ts.snap b/packages/compiler-core/__tests__/transforms/__snapshots__/vMemo.spec.ts.snap
+index 86e0b3d2fd5..19222fd2360 100644
+--- a/packages/compiler-core/__tests__/transforms/__snapshots__/vMemo.spec.ts.snap
++++ b/packages/compiler-core/__tests__/transforms/__snapshots__/vMemo.spec.ts.snap
+@@ -7,7 +7,7 @@ export function render(_ctx, _cache) {
+   return (_openBlock(), _createElementBlock("div", null, [
+     (_openBlock(true), _createElementBlock(_Fragment, null, _renderList(_ctx.tableData, (data, __, ___, _cached) => {
+       const _memo = (_ctx.getLetter(data))
+-      if (_cached && _cached.key === _ctx.getId(data) && _isMemoSame(_cached, _memo)) return _cached
++      if (_cached && _cached.el && _cached.key === _ctx.getId(data) && _isMemoSame(_cached, _memo)) return _cached
+       const _item = (_openBlock(), _createElementBlock("span", {
+         key: _ctx.getId(data)
+       }))
+@@ -55,7 +55,7 @@ export function render(_ctx, _cache) {
+   return (_openBlock(), _createElementBlock("div", null, [
+     (_openBlock(true), _createElementBlock(_Fragment, null, _renderList(_ctx.list, ({ x, y }, __, ___, _cached) => {
+       const _memo = ([x, y === _ctx.z])
+-      if (_cached && _cached.key === x && _isMemoSame(_cached, _memo)) return _cached
++      if (_cached && _cached.el && _cached.key === x && _isMemoSame(_cached, _memo)) return _cached
+       const _item = (_openBlock(), _createElementBlock("span", { key: x }, "foobar"))
+       _item.memo = _memo
+       return _item
+@@ -71,7 +71,7 @@ export function render(_ctx, _cache) {
+   return (_openBlock(), _createElementBlock("div", null, [
+     (_openBlock(true), _createElementBlock(_Fragment, null, _renderList(_ctx.list, ({ x, y }, __, ___, _cached) => {
+       const _memo = ([x, y === _ctx.z])
+-      if (_cached && _cached.key === x && _isMemoSame(_cached, _memo)) return _cached
++      if (_cached && _cached.el && _cached.key === x && _isMemoSame(_cached, _memo)) return _cached
+       const _item = (_openBlock(), _createElementBlock("div", { key: x }, [
+         _createElementVNode("span", null, "foobar")
+       ]))
+diff --git a/packages/compiler-core/src/transforms/vFor.ts b/packages/compiler-core/src/transforms/vFor.ts
+index 8d4e9d4ce12..6c466538714 100644
+--- a/packages/compiler-core/src/transforms/vFor.ts
++++ b/packages/compiler-core/src/transforms/vFor.ts
+@@ -221,7 +221,7 @@ export const transformFor: NodeTransform = createStructuralDirectiveTransform(
+           loop.body = createBlockStatement([
+             createCompoundExpression([`const _memo = (`, memo.exp!, `)`]),
+             createCompoundExpression([
+-              `if (_cached`,
++              `if (_cached && _cached.el`,
+               ...(keyExp ? [` && _cached.key === `, keyExp] : []),
+               ` && ${context.helperString(
+                 IS_MEMO_SAME,
+diff --git a/packages/runtime-core/__tests__/helpers/withMemo.spec.ts b/packages/runtime-core/__tests__/helpers/withMemo.spec.ts
+index 32f89b1d8e9..dfe71817e4b 100644
+--- a/packages/runtime-core/__tests__/helpers/withMemo.spec.ts
++++ b/packages/runtime-core/__tests__/helpers/withMemo.spec.ts
+@@ -204,6 +204,71 @@ describe('v-memo', () => {
+     )
+   })
+ 
++  test('on v-if + v-for', async () => {
++    const [el, vm] = mount({
++      template: `<span v-if="show">
++          <span v-for="elem in [1]" :key="elem" v-memo="[count]">{{ count }}</span>
++        </span>`,
++      data: () => ({
++        show: true,
++        count: 0,
++      }),
++    })
++
++    expect(el.innerHTML).toBe(`<span><span>0</span></span>`)
++
++    vm.show = false
++    await nextTick()
++    expect(el.innerHTML).toBe(`<!--v-if-->`)
++
++    vm.show = true
++    await nextTick()
++    expect(el.innerHTML).toBe(`<span><span>0</span></span>`)
++
++    vm.count++
++    await nextTick()
++    expect(el.innerHTML).toBe(`<span><span>1</span></span>`)
++
++    vm.count++
++    await nextTick()
++    expect(el.innerHTML).toBe(`<span><span>2</span></span>`)
++  })
++
++  test('on v-if + v-for in production mode', async () => {
++    __DEV__ = false
++    try {
++      const [el, vm] = mount({
++        template: `<span v-if="show">
++            <span v-for="elem in [1]" :key="elem" v-memo="[count]">{{ count }}</span>
++          </span>`,
++        data: () => ({
++          show: true,
++          count: 0,
++        }),
++      })
++
++      expect(el.innerHTML).toBe(`<span><span>0</span></span>`)
++
++      vm.show = false
++      await nextTick()
++      expect(el.innerHTML).toBe(`<!---->`)
++
++      vm.show = true
++      await nextTick()
++      expect(el.innerHTML).toBe(`<span><span>0</span></span>`)
++
++      vm.count++
++      await nextTick()
++      expect(el.innerHTML).toBe(`<span><span>1</span></span>`)
++
++      vm.count++
++      await nextTick()
++      expect(el.innerHTML).toBe(`<span><span>2</span></span>`)
++    } finally {
++      __DEV__ = true
++    }
++  })
++
+   test('on v-for /w constant expression ', async () => {
+     const [el, vm] = mount({
+       template: `<div v-for="item in 3"  v-memo="[count < 2 ? true : count]">
+diff --git a/packages/runtime-core/src/renderer.ts b/packages/runtime-core/src/renderer.ts
+index 51508b35fab..35c68829bae 100644
+--- a/packages/runtime-core/src/renderer.ts
++++ b/packages/runtime-core/src/renderer.ts
+@@ -2122,6 +2122,7 @@ function baseCreateRenderer(
+       patchFlag,
+       dirs,
+       cacheIndex,
++      memo,
+     } = vnode
+ 
+     if (patchFlag === PatchFlags.BAIL) {
+@@ -2210,15 +2211,24 @@ function baseCreateRenderer(
+       }
+     }
+ 
++    // v-for + v-memo stores cached vnodes inside renderList's array cache rather
++    // than component renderCache. Invalidate detached cached vnodes after
++    // unmount so a later v-if remount won't reuse a vnode whose DOM is gone.
++    const shouldInvalidateMemo = memo != null && cacheIndex == null
++
+     if (
+       (shouldInvokeVnodeHook &&
+         (vnodeHook = props && props.onVnodeUnmounted)) ||
+-      shouldInvokeDirs
++      shouldInvokeDirs ||
++      shouldInvalidateMemo
+     ) {
+       queuePostRenderEffect(() => {
+         vnodeHook && invokeVNodeHook(vnodeHook, parentComponent, vnode)
+         shouldInvokeDirs &&
+           invokeDirectiveHook(vnode, null, parentComponent, 'unmounted')
++        if (shouldInvalidateMemo) {
++          vnode.el = null
++        }
+       }, parentSuspense)
+     }
+   }

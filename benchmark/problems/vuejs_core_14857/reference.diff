@@ -1,0 +1,134 @@
+diff --git a/packages/runtime-core/__tests__/hydration.spec.ts b/packages/runtime-core/__tests__/hydration.spec.ts
+index 92b2edb7833..2fe64910403 100644
+--- a/packages/runtime-core/__tests__/hydration.spec.ts
++++ b/packages/runtime-core/__tests__/hydration.spec.ts
+@@ -2143,6 +2143,53 @@ describe('SSR hydration', () => {
+       expect(`Hydration children mismatch`).toHaveBeenWarned()
+     })
+ 
++    test('children mismatch is checked once when removing excess nodes', () => {
++      const hasAttribute = vi.spyOn(Element.prototype, 'hasAttribute')
++
++      try {
++        const { container } = mountWithHydration(
++          `<div><span>foo</span><span>bar</span><span>baz</span></div>`,
++          () => h('div', [h('span', 'foo')]),
++        )
++        const el = container.firstChild as Element
++        const allowMismatchCheckCount = hasAttribute.mock.calls.filter(
++          ([key], i) =>
++            key === 'data-allow-mismatch' &&
++            hasAttribute.mock.contexts[i] === el,
++        ).length
++
++        expect(container.innerHTML).toBe('<div><span>foo</span></div>')
++        expect(`Hydration children mismatch`).toHaveBeenWarnedTimes(1)
++        expect(allowMismatchCheckCount).toBe(1)
++      } finally {
++        hasAttribute.mockRestore()
++      }
++    })
++
++    test('children mismatch is checked once when mounting missing nodes', () => {
++      const hasAttribute = vi.spyOn(Element.prototype, 'hasAttribute')
++
++      try {
++        const { container } = mountWithHydration(`<div></div>`, () =>
++          h('div', [h('span', 'foo'), h('span', 'bar'), h('span', 'baz')]),
++        )
++        const el = container.firstChild as Element
++        const allowMismatchCheckCount = hasAttribute.mock.calls.filter(
++          ([key], i) =>
++            key === 'data-allow-mismatch' &&
++            hasAttribute.mock.contexts[i] === el,
++        ).length
++
++        expect(container.innerHTML).toBe(
++          '<div><span>foo</span><span>bar</span><span>baz</span></div>',
++        )
++        expect(`Hydration children mismatch`).toHaveBeenWarnedTimes(1)
++        expect(allowMismatchCheckCount).toBe(1)
++      } finally {
++        hasAttribute.mockRestore()
++      }
++    })
++
+     test('complete mismatch', () => {
+       const { container } = mountWithHydration(
+         `<div><span>foo</span><span>bar</span></div>`,
+diff --git a/packages/runtime-core/src/hydration.ts b/packages/runtime-core/src/hydration.ts
+index a687d28d380..464db7519b6 100644
+--- a/packages/runtime-core/src/hydration.ts
++++ b/packages/runtime-core/src/hydration.ts
+@@ -427,23 +427,16 @@ export function createHydrationFunctions(
+           slotScopeIds,
+           optimized,
+         )
+-        let hasWarned = false
++        if (next && !isMismatchAllowed(el, MismatchTypes.CHILDREN)) {
++          ;(__DEV__ || __FEATURE_PROD_HYDRATION_MISMATCH_DETAILS__) &&
++            warn(
++              `Hydration children mismatch on`,
++              el,
++              `\nServer rendered element contains more child nodes than client vdom.`,
++            )
++          logMismatchError()
++        }
+         while (next) {
+-          if (!isMismatchAllowed(el, MismatchTypes.CHILDREN)) {
+-            if (
+-              (__DEV__ || __FEATURE_PROD_HYDRATION_MISMATCH_DETAILS__) &&
+-              !hasWarned
+-            ) {
+-              warn(
+-                `Hydration children mismatch on`,
+-                el,
+-                `\nServer rendered element contains more child nodes than client vdom.`,
+-              )
+-              hasWarned = true
+-            }
+-            logMismatchError()
+-          }
+-
+           // The SSRed DOM contains more nodes than it should. Remove them.
+           const cur = next
+           next = next.nextSibling
+@@ -567,7 +560,7 @@ export function createHydrationFunctions(
+     optimized = optimized || !!parentVNode.dynamicChildren
+     const children = parentVNode.children as VNode[]
+     const l = children.length
+-    let hasWarned = false
++    let hasCheckedMismatch = false
+     for (let i = 0; i < l; i++) {
+       const vnode = optimized
+         ? children[i]
+@@ -605,19 +598,17 @@ export function createHydrationFunctions(
+         // because server rendered HTML won't contain a text node
+         insert((vnode.el = createText('')), container)
+       } else {
+-        if (!isMismatchAllowed(container, MismatchTypes.CHILDREN)) {
+-          if (
+-            (__DEV__ || __FEATURE_PROD_HYDRATION_MISMATCH_DETAILS__) &&
+-            !hasWarned
+-          ) {
+-            warn(
+-              `Hydration children mismatch on`,
+-              container,
+-              `\nServer rendered element contains fewer child nodes than client vdom.`,
+-            )
+-            hasWarned = true
++        if (!hasCheckedMismatch) {
++          hasCheckedMismatch = true
++          if (!isMismatchAllowed(container, MismatchTypes.CHILDREN)) {
++            ;(__DEV__ || __FEATURE_PROD_HYDRATION_MISMATCH_DETAILS__) &&
++              warn(
++                `Hydration children mismatch on`,
++                container,
++                `\nServer rendered element contains fewer child nodes than client vdom.`,
++              )
++            logMismatchError()
+           }
+-          logMismatchError()
+         }
+ 
+         // the SSRed DOM didn't contain enough nodes. Mount the missing ones.

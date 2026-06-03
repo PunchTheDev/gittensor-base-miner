@@ -1,0 +1,118 @@
+diff --git a/mypy/checker.py b/mypy/checker.py
+index 5e6c6eb2f2687..4d4f376f25dda 100644
+--- a/mypy/checker.py
++++ b/mypy/checker.py
+@@ -6910,6 +6910,10 @@ def narrow_type_by_identity_equality(
+                 if should_coerce_literals:
+                     target_type = coerce_to_literal(target_type)
+ 
++                # Morally what we want to do is narrow for each branch based on:
++                # `if_type, else_type = conditional_types(expr_type, target)`
++                # What we actually do is first munge expr_type based on target_type to handle some
++                # special cased known `__eq__` implementations.
+                 narrowable_expr_type, ambiguous_expr_type = partition_equality_ambiguous_types(
+                     expr_type, target_type, is_identity=is_identity_comparison
+                 )
+@@ -6964,8 +6968,8 @@ def narrow_type_by_identity_equality(
+                 continue
+             union_expr_type = get_proper_type(operand_types[i])
+             if not isinstance(union_expr_type, UnionType):
+-                # Here we won't be able to do any positive narrowing, because we can't conclude
+-                # anything from a custom __eq__ returning True.
++                # Here we don't do any positive narrowing, because we can't conclude much
++                # from a custom __eq__ returning True.
+                 # But we might be able to do some negative narrowing, since we can assume
+                 # a custom __eq__ is reflexive. This should only apply to custom __eq__ enums,
+                 # see testNarrowingEqualityCustomEqualityEnum
+@@ -7038,7 +7042,10 @@ def narrow_type_by_identity_equality(
+                     if_map, else_map = conditional_types_to_typemaps(
+                         operands[i], if_type, else_type
+                     )
+-                    or_if_maps.append(if_map)
++                    if not isinstance(get_proper_type(expr_type), AnyType):
++                        # We avoid positive narrowing for Any here, for consistency with the
++                        # non-union branch above and to preserve the gradual guarantee
++                        or_if_maps.append(if_map)
+                     if is_target_for_value_narrowing(get_proper_type(target_type)):
+                         or_else_maps.append(else_map)
+ 
+diff --git a/test-data/unit/check-narrowing.test b/test-data/unit/check-narrowing.test
+index 8bfcf305cd275..6ae8a3ae11d8b 100644
+--- a/test-data/unit/check-narrowing.test
++++ b/test-data/unit/check-narrowing.test
+@@ -944,11 +944,11 @@ from typing import Any
+ def realistic(x: dict[str, Any]):
+     val = x.get("hey")
+     if val == 12:
+-        reveal_type(val)  # N: Revealed type is "Any | Literal[12]?"
++        reveal_type(val)  # N: Revealed type is "Any"
+ 
+ def f1(x: Any | None):
+     if x == 12:
+-        reveal_type(x)  # N: Revealed type is "Any | Literal[12]?"
++        reveal_type(x)  # N: Revealed type is "Any"
+ 
+ class Custom:
+     def __eq__(self, other: object) -> bool:
+@@ -980,7 +980,7 @@ def f3(x: str | Custom, y: str | int):
+ 
+ def f4(x: str | Any, y: str | int):
+     if x == y:
+-        reveal_type(x)  # N: Revealed type is "builtins.str | Any | builtins.int"
++        reveal_type(x)  # N: Revealed type is "builtins.str | Any"
+         reveal_type(y)  # N: Revealed type is "builtins.str | builtins.int"
+     else:
+         reveal_type(x)  # N: Revealed type is "builtins.str | Any"
+@@ -3284,6 +3284,38 @@ def f2(x: Any) -> None:
+     reveal_type(x)  # N: Revealed type is "Any"
+ [builtins fixtures/tuple.pyi]
+ 
++[case testNarrowAnyUnion]
++from typing import Any
++
++class A: ...
++
++def f1(x: A | int, y: Any):
++    if x == y:
++        reveal_type(x)  # N: Revealed type is "__main__.A | builtins.int"
++        reveal_type(y)  # N: Revealed type is "Any"
++    else:
++        reveal_type(x)  # N: Revealed type is "__main__.A | builtins.int"
++        reveal_type(y)  # N: Revealed type is "Any"
++
++def f2(x: A | int, y: Any | None):
++    if x == y:
++        reveal_type(x)  # N: Revealed type is "__main__.A | builtins.int"
++        reveal_type(y)  # N: Revealed type is "Any"
++    else:
++        reveal_type(x)  # N: Revealed type is "__main__.A | builtins.int"
++        reveal_type(y)  # N: Revealed type is "Any | None"
++
++class AA(A): ...
++
++def f3(x: A | int, y: AA | Any):
++    if x == y:
++        reveal_type(x)  # N: Revealed type is "__main__.A | builtins.int"
++        reveal_type(y)  # N: Revealed type is "__main__.AA | Any"
++    else:
++        reveal_type(x)  # N: Revealed type is "__main__.A | builtins.int"
++        reveal_type(y)  # N: Revealed type is "__main__.AA | Any"
++[builtins fixtures/primitives.pyi]
++
+ [case testNarrowChainedContainment]
+ # flags: --strict-equality --warn-unreachable
+ 
+@@ -3324,11 +3356,11 @@ def f2(a: Any | None, b: str | None) -> None:
+ def f3(a: str | None, b: Any | None) -> None:
+     if None is not a == b:
+         reveal_type(a)  # N: Revealed type is "builtins.str"
+-        reveal_type(b)  # N: Revealed type is "Any | builtins.str"
++        reveal_type(b)  # N: Revealed type is "Any"
+ 
+     if (None is not a) and (a == b):
+         reveal_type(a)  # N: Revealed type is "builtins.str"
+-        reveal_type(b)  # N: Revealed type is "Any | builtins.str"
++        reveal_type(b)  # N: Revealed type is "Any"
+ 
+ def f4(a: str | None, b: str | None, c: str | None) -> None:
+     if None is not a == b == c:

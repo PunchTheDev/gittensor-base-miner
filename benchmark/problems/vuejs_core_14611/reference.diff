@@ -1,0 +1,159 @@
+diff --git a/packages/runtime-core/src/components/BaseTransition.ts b/packages/runtime-core/src/components/BaseTransition.ts
+index 8788bb80d6a..8184395fb39 100644
+--- a/packages/runtime-core/src/components/BaseTransition.ts
++++ b/packages/runtime-core/src/components/BaseTransition.ts
+@@ -21,6 +21,7 @@ import { onBeforeUnmount, onMounted } from '../apiLifecycle'
+ import { isTeleport } from './Teleport'
+ import type { RendererElement } from '../renderer'
+ import { SchedulerJobFlags } from '../scheduler'
++import { isHmrUpdating } from '../hmr'
+ 
+ type Hook<T = () => void> = T | T[]
+ 
+@@ -401,7 +402,7 @@ export function resolveTransitionHooks(
+ 
+     enter(el) {
+       // prevent enter if leave is in progress
+-      if (leavingVNodesCache[key] === vnode) return
++      if (!isHmrUpdating && leavingVNodesCache[key] === vnode) return
+       let hook = onEnter
+       let afterHook = onAfterEnter
+       let cancelHook = onEnterCancelled
+diff --git a/packages/runtime-core/src/hmr.ts b/packages/runtime-core/src/hmr.ts
+index 4191a34f82f..18ad691b19b 100644
+--- a/packages/runtime-core/src/hmr.ts
++++ b/packages/runtime-core/src/hmr.ts
+@@ -14,6 +14,14 @@ type HMRComponent = ComponentOptions | ClassComponent
+ 
+ export let isHmrUpdating = false
+ 
++export const setHmrUpdating = (v: boolean): boolean => {
++  try {
++    return isHmrUpdating
++  } finally {
++    isHmrUpdating = v
++  }
++}
++
+ export const hmrDirtyComponents: Map<
+   ConcreteComponent,
+   Set<ComponentInternalInstance>
+diff --git a/packages/runtime-core/src/renderer.ts b/packages/runtime-core/src/renderer.ts
+index 51508b35fab..1cc28173f5a 100644
+--- a/packages/runtime-core/src/renderer.ts
++++ b/packages/runtime-core/src/renderer.ts
+@@ -71,7 +71,12 @@ import {
+   type TeleportVNode,
+ } from './components/Teleport'
+ import { type KeepAliveContext, isKeepAlive } from './components/KeepAlive'
+-import { isHmrUpdating, registerHMR, unregisterHMR } from './hmr'
++import {
++  isHmrUpdating,
++  registerHMR,
++  setHmrUpdating,
++  unregisterHMR,
++} from './hmr'
+ import { type RootHydrateFunction, createHydrationFunctions } from './hydration'
+ import { invokeDirectiveHook } from './directives'
+ import { endMeasure, startMeasure } from './profiling'
+@@ -733,10 +738,17 @@ function baseCreateRenderer(
+       needCallTransitionHooks ||
+       dirs
+     ) {
++      const isHmr = __DEV__ && isHmrUpdating
+       queuePostRenderEffect(() => {
+-        vnodeHook && invokeVNodeHook(vnodeHook, parentComponent, vnode)
+-        needCallTransitionHooks && transition!.enter(el)
+-        dirs && invokeDirectiveHook(vnode, null, parentComponent, 'mounted')
++        let prev
++        if (__DEV__) prev = setHmrUpdating(isHmr)
++        try {
++          vnodeHook && invokeVNodeHook(vnodeHook, parentComponent, vnode)
++          needCallTransitionHooks && transition!.enter(el)
++          dirs && invokeDirectiveHook(vnode, null, parentComponent, 'mounted')
++        } finally {
++          if (__DEV__) setHmrUpdating(prev!)
++        }
+       }, parentSuspense)
+     }
+   }
+diff --git a/packages/vue/__tests__/e2e/Transition.spec.ts b/packages/vue/__tests__/e2e/Transition.spec.ts
+index 46e9b10aff7..79ea90b196e 100644
+--- a/packages/vue/__tests__/e2e/Transition.spec.ts
++++ b/packages/vue/__tests__/e2e/Transition.spec.ts
+@@ -1655,6 +1655,75 @@ describe('e2e: Transition', () => {
+       E2E_TIMEOUT,
+     )
+ 
++    // #14608
++    test(
++      'hmr reload child wrapped in KeepAlive (out-in mode)',
++      async () => {
++        await page().evaluate(
++          async ({ duration, childId }) => {
++            const { createApp } = (window as any).Vue
++            const { createRecord } = (window as any).__VUE_HMR_RUNTIME__
++
++            const Child = {
++              __hmrId: childId,
++              name: 'OriginalChild',
++              data() {
++                return { count: 0 }
++              },
++              template: `<div class="test">{{ count }}</div>`,
++            }
++
++            createRecord(childId, Child)
++
++            createApp({
++              components: { Child },
++              data() {
++                return { toggle: true }
++              },
++              template: `
++                <div id="container">
++                  <transition name="test" mode="out-in" :duration="${duration}">
++                    <KeepAlive>
++                      <Child v-if="toggle" />
++                    </KeepAlive>
++                  </transition>
++                </div>
++              `,
++            }).mount('#app')
++
++            await (window as any).Vue.nextTick()
++          },
++          { duration, childId: 'transition-keepalive-out-in-hmr' },
++        )
++
++        expect(await html('#container')).toBe('<div class="test">0</div>')
++
++        await page().evaluate(async childId => {
++          const { reload } = (window as any).__VUE_HMR_RUNTIME__
++          reload(childId, {
++            __hmrId: childId,
++            name: 'UpdatedChild',
++            data() {
++              return { count: 1 }
++            },
++            template: `<div class="test">{{ count }}</div>`,
++          })
++
++          await (window as any).Vue.nextTick()
++        }, 'transition-keepalive-out-in-hmr')
++
++        await nextFrame()
++        expect(await html('#container')).toBe(
++          '<div class="test test-leave-active test-leave-to">0</div>' +
++            '<div class="test test-enter-active test-enter-to">1</div>',
++        )
++
++        await transitionFinish()
++        expect(await html('#container')).toBe('<div class="test">1</div>')
++      },
++      E2E_TIMEOUT,
++    )
++
+     // #12860
+     test(
+       'unmount children',

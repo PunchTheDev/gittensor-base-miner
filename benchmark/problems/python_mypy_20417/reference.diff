@@ -1,0 +1,69 @@
+diff --git a/mypy/stubtest.py b/mypy/stubtest.py
+index ff5a04b740eb1..a6780984c1f54 100644
+--- a/mypy/stubtest.py
++++ b/mypy/stubtest.py
+@@ -424,6 +424,18 @@ def _belongs_to_runtime(r: types.ModuleType, attr: str) -> bool:
+ 
+     for entry in sorted(to_check):
+         stub_entry = stub.names[entry].node if entry in stub.names else MISSING
++        if entry in stub.names:
++            if xref := stub.names[entry].cross_ref:
++                orig_module = xref.rsplit(".", 1)[0]
++            elif isinstance(stub_entry, nodes.SymbolNode) and (name := stub_entry.fullname):
++                orig_module = name.rsplit(".", 1)[0]
++            else:
++                orig_module = None
++
++            if orig_module and orig_module != stub.fullname and orig_module in _all_stubs:
++                # Skip re-exported names whose defining module will be checked separately.
++                continue
++
+         if isinstance(stub_entry, nodes.MypyFile):
+             # Don't recursively check exported modules, since that leads to infinite recursion
+             continue
+diff --git a/mypy/test/teststubtest.py b/mypy/test/teststubtest.py
+index 0a64addc6d3dc..18f68356c8553 100644
+--- a/mypy/test/teststubtest.py
++++ b/mypy/test/teststubtest.py
+@@ -10,6 +10,7 @@
+ import textwrap
+ import unittest
+ from collections.abc import Callable, Iterator
++from pathlib import Path
+ from typing import Any
+ 
+ from pytest import raises
+@@ -2748,6 +2749,33 @@ def test_output(self) -> None:
+         )
+         assert output == expected
+ 
++    def test_reexport_reports_import_location(self) -> None:
++        with use_tmp_dir(TEST_MODULE_NAME) as tmp_dir:
++            Path("builtins.pyi").write_text(stubtest_builtins_stub)
++            Path("typing.pyi").write_text(stubtest_typing_stub)
++            Path("enum.pyi").write_text(stubtest_enum_stub)
++
++            os.makedirs("test_module", exist_ok=True)
++            Path("test_module/__init__.pyi").write_text("from .mod import f")
++            Path("test_module/__init__.py").write_text("from .mod import f")
++            Path("test_module/mod.pyi").write_text("def f(self) -> None: ...")
++            Path("test_module/mod.py").write_text("def f(self, x): pass")
++
++            output = io.StringIO()
++            outerr = io.StringIO()
++            with contextlib.redirect_stdout(output), contextlib.redirect_stderr(outerr):
++                test_stubs(parse_options([TEST_MODULE_NAME]), use_builtins_fixtures=True)
++
++            filtered_output = remove_color_code(
++                output.getvalue()
++                .replace(os.path.realpath(tmp_dir) + os.sep, "")
++                .replace(tmp_dir + os.sep, "")
++            )
++
++        assert filtered_output.count('stub does not have parameter "x"') == 1
++        assert "__init__.pyi" not in filtered_output
++        assert "mod.py:1" in filtered_output
++
+     def test_ignore_flags(self) -> None:
+         output = run_stubtest(
+             stub="", runtime="__all__ = ['f']\ndef f(): pass", options=["--ignore-missing-stub"]

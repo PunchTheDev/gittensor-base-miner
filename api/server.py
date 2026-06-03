@@ -71,6 +71,8 @@ REPO_CATEGORY: dict[str, str] = {
     "colinhacks/zod": "typescript",
     "vitest-dev/vitest": "typescript",
     "trpc/trpc": "typescript",
+    "vuejs/core": "typescript",
+    "python/mypy": "python",
 }
 
 
