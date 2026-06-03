@@ -2670,3 +2670,17 @@ Updated: `results/baselines.json`, `results/leaderboard.json` (oracle row), `doc
 **Pool expanded**: 441 → 446 (5 new phase-rs/phase problems from recent merged PRs). `pool_config.json` updated.
 
 **Commits**: f067f2b, a141dad, 6ac0c57, 93148a6, 0a50526, 2a2b2ea, e14fd8b, 0bfc4f2, 1ba3c18, 1481585
+
+---
+
+## Step 162 — 2026-06-03
+
+**Pool filter fix**: `has_test_files()` in `build_pool.py` now recognizes Rust inline `#[cfg(test)]` blocks. Rust PRs that modify `src/` files with embedded tests were previously skipped as "no test files in diff." Sunday rotation will pick up additional phase-rs/geniepod problems.
+
+**Config cleanup**: Renamed `max_problems_per_repo: 30` → `max_new_per_rotation: 50` in pool_config.json. The field was misnamed — it limits new additions per rotation run, not the total per repo.
+
+**Oracle sync**: leaderboard.json oracle row was stale (pre-Rust-fix values); updated to weighted=15.15, arithmetic=14.04, count=446. API restarted.
+
+**Meta.json CI validation**: New hard-blocking step in eval.yml checks that submissions include meta.json with a whitelisted model and SHA matching agent.py. CONTRIBUTING.md updated with meta.json format docs.
+
+**Commits**: a8d4248, 3d99594, e2ec824 (PRs #8, #9, #10 — all merged)
