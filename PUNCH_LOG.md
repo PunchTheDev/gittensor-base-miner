@@ -3660,3 +3660,34 @@ Two bugs found in `api/server.py` via live API audit:
 - API: serving correct difficulty tiers + v5 scoring formula
 - Pool rotation: Sunday 2026-06-08 (automated, 5 days)
 - CI: all green
+
+---
+
+## Step 203 — 2026-06-03
+
+**Model whitelist expansion** (PR #79 merged — 6188f962)
+
+Expanded the model whitelist from 19 to 27 models, adding 2025-era models now available via OpenRouter:
+
+| Added | Family |
+|---|---|
+| `deepseek/deepseek-r1-0528` | DeepSeek |
+| `anthropic/claude-3-5-sonnet` | Anthropic |
+| `openai/gpt-4.1-mini` | OpenAI |
+| `openai/gpt-4.1` | OpenAI |
+| `google/gemini-2.5-flash` | Google |
+| `meta-llama/llama-4-scout` | Meta |
+| `meta-llama/llama-4-maverick` | Meta |
+| `qwen/qwen-2.5-72b-instruct` | Qwen |
+
+Whitelist stays budget-accessible: no ultra-expensive frontier models. Scaffolding competition, not API spend race.
+
+Dashboard auto-reads the file — will reflect 27 models on next CI refresh.
+
+### System state after step 203
+
+- base-miner main: 6188f962 (PR #79 merged)
+- Benchmark: 1154 problems, oracle **12.61** weighted / 11.48 arithmetic, 47 repos
+- Model whitelist: 27 models across 7 families
+- Pool rotation: Sunday 2026-06-08 (automated, 5 days)
+- CI: all green
