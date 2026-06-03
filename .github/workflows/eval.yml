@@ -67,6 +67,67 @@ jobs:
       - name: Install dependencies
         run: pip install -r requirements.txt
 
+      - name: Validate submission metadata
+        run: |
+          python3 - <<'PYEOF'
+          import json, sys, hashlib
+          from pathlib import Path
+
+          handle = "${{ needs.detect.outputs.handle }}"
+          agent_path = Path("${{ needs.detect.outputs.agent_path }}")
+          meta_path = agent_path.parent / "meta.json"
+          allowed_path = Path("benchmark/harness/allowed_models.txt")
+
+          errors = []
+
+          # meta.json must exist
+          if not meta_path.exists():
+              errors.append(f"meta.json not found at {meta_path}. Required fields: handle, model, sha256")
+          else:
+              try:
+                  meta = json.loads(meta_path.read_text())
+              except json.JSONDecodeError as e:
+                  errors.append(f"meta.json is not valid JSON: {e}")
+                  meta = {}
+
+              # Model must be declared
+              declared_model = meta.get("model", "")
+              if not declared_model:
+                  errors.append("meta.json missing 'model' field")
+              elif allowed_path.exists():
+                  allowed = {
+                      ln.strip() for ln in allowed_path.read_text().splitlines()
+                      if ln.strip() and not ln.startswith("#")
+                  }
+                  if declared_model not in allowed:
+                      errors.append(
+                          f"Declared model '{declared_model}' is not in the whitelist "
+                          f"(benchmark/harness/allowed_models.txt). "
+                          f"Allowed: {', '.join(sorted(allowed))}"
+                      )
+
+              # SHA-256 must match agent file (commit-reveal integrity)
+              declared_sha = meta.get("sha256", "")
+              if declared_sha and agent_path.exists():
+                  actual_sha = hashlib.sha256(agent_path.read_bytes()).hexdigest()
+                  if actual_sha != declared_sha:
+                      errors.append(
+                          f"meta.json sha256 mismatch — declared {declared_sha[:16]}… "
+                          f"but agent.py hashes to {actual_sha[:16]}…. "
+                          f"Run: python3 gitminer.py hash {agent_path}"
+                      )
+
+          if errors:
+              print("Submission metadata validation FAILED:", file=sys.stderr)
+              for e in errors:
+                  print(f"  - {e}", file=sys.stderr)
+              sys.exit(1)
+          else:
+              model = json.loads(meta_path.read_text()).get("model", "?")
+              print(f"Metadata valid — handle={handle}, model={model}")
+          PYEOF
+        # Hard-blocking — invalid metadata means we can't record the result correctly
+
       - name: Rate limit check (anti-spam)
         run: |
           python scripts/check_rate_limit.py \
