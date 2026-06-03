@@ -3118,3 +3118,26 @@ Dashboard: punchthedev.github.io/gittensor-miner-dashboard/ updated to 812 probl
 - New composition: python:442 (39.1%), rust:277 (24.5%), typescript:165 (14.6%), go:96 (8.5%), jvm:76 (6.7%), ruby:75 (6.6%)
 - Shard budget: python:12 / rust:7 / typescript:4 / go:3 / jvm:2 / ruby:2 = 30 ✅
 - Sunday rotation 2026-06-08: all 33 external + 13 DAS repos will auto-expand
+
+## Step 184 — 2026-06-03
+
+### Actions
+- **TypeScript pool expansion: TanStack/query +23 problems (1131→1154)** — PR #44, merged commit 98aba2bd
+  - TanStack/query (38k stars): React Query / async data-fetching — 27 ingested, 4 pruned (base_score < 0.5), +23 net
+  - Pruned: tanstack_query_10772 (0.17), tanstack_query_10716 (0.29), tanstack_query_10642 (0.32), tanstack_query_10337 (0.49)
+  - Coverage: query-core async observers, React/Solid/Preact/Angular framework bugs, devtools, ESLint plugin rules
+  - TypeScript: 165 → 188 problems (14.6% → 16.3% of pool)
+  - Shard budget: typescript 4→5, python 12→11 (stays at 30 total)
+  - Repos: 46 → 47 (13 DAS + 34 external)
+  - Oracle: 12.64 → **12.70** weighted / 11.41 → **11.48** arithmetic
+  - All oracle fallbacks updated: evaluate.py, gitminer.py, eval.yml
+  - REPO_CATEGORY + EXTERNAL_REPOS updated: evaluate.py, api/server.py, generate_dashboard_data.py, expand_pool_external.py
+  - results/baselines.json fully rescored (1154 problems, took ~8 min)
+  - Dashboard regenerated, docs synced: README, LEADERBOARD, api.md, rewards.md, threat_model.md
+  - API confirmed: pool=1154, oracle=12.70, repos=47, typescript=188
+
+### Pool state
+- Pool: **1154 problems** | Oracle: **12.70** weighted / **11.48** arithmetic | Repos: **47** (13 DAS + 34 external) | Languages: 6
+- Composition: python:442 (38.3%), rust:277 (24.0%), typescript:188 (16.3%), go:96 (8.3%), jvm:76 (6.6%), ruby:75 (6.5%)
+- Shard budget: python:11 / rust:7 / typescript:5 / go:3 / jvm:2 / ruby:2 = 30 ✅
+- Sunday rotation 2026-06-08: all 34 external + 13 DAS repos will auto-expand
