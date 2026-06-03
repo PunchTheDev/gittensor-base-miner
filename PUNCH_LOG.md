@@ -2429,6 +2429,20 @@ Both fixes are cosmetic/accuracy — no logic changes.
 
 ---
 
+## Step 145 — 2026-06-03
+
+**Two maintenance fixes** (commits `ad91e9d`, `3eba1b8`)
+
+1. **Committed untracked `agent/example/meta.json`** — the example agent had `agent.py` tracked but `meta.json` untracked since it was never committed. The sha256 matched the current `agent.py` content. Tracked it so the example submission is complete (miners can see both files as a reference).
+
+2. **`refresh_pool.yml`: regenerate `docs/dashboard_data.json` on pool refresh** — the weekly pool refresh added new problems and recalibrated baselines but never updated `docs/dashboard_data.json` in the repo (the static copy used by local devs). Fixed: added a step to call `generate_dashboard_data.py docs/dashboard_data.json` before the commit, and staged the file. Also tightened the `NEW` problem count in the commit message from `grep 'meta.json'` (would have counted `dashboard_data.json` as a meta.json) to `grep 'benchmark/problems.*meta.json'`.
+
+   Note: the live dashboard (`gittensor-miner-dashboard`) is already handled by `refresh_dashboard.yml` which fires automatically when `results/**` or `benchmark/problems/**` change — this fix is specifically for the local docs copy.
+
+**System health**: pool=441, oracle=13.03, API healthy, no open PRs.
+
+---
+
 ## Step 144 — 2026-06-03
 
 **Fixed: local shard ≠ CI shard not documented** (commit `437cbb3`)
