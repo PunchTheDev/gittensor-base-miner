@@ -41,7 +41,7 @@ Pool-level statistics: category and difficulty distribution, repo count, oracle 
   "pool_size": 430,
   "shard_size": 30,
   "repos": 18,
-  "oracle_score": 11.83,
+  "oracle_score": 12.77,
   "by_category": { "python": 198, "typescript": 87, "rust": 66, "jvm": 42, "ruby": 37 },
   "by_difficulty": { "easy": 169, "medium": 106, "hard": 155 },
   "rotation_policy": "weekly"
@@ -178,9 +178,10 @@ Current ranked submissions.
       "rank": null,
       "agent": "Oracle (accepted solution)",
       "score": 11.83,
+      "weighted_score": 12.77,
       "model": "—",
       "date": "—",
-      "note": "Mean tree-sitter score across 430 accepted solutions (Gittensor DAS network only)"
+      "note": "Weighted mean tree-sitter score across accepted solutions (Gittensor DAS network only)"
     }
   ]
 }
@@ -208,7 +209,7 @@ in a single parseable JSON object.
   "scoring": {
     "formula": "25 * (1 - exp(-tokens / 58)) + bonus",
     "max_score": 30,
-    "oracle_score": 11.83,
+    "oracle_score": 12.77,
     "champion_score": null
   },
   "constraints": {
