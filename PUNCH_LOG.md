@@ -3980,3 +3980,27 @@ Model whitelist expansion 34 → 48: all 14 new models verified live on OpenRout
 
 ### Status
 Pool 1123, oracle 12.64, whitelist 48 models, rotation Sunday 2026-06-08 (5 days, protected).
+
+## Step 215 — 2026-06-03
+
+### Action
+Comprehensive model whitelist audit: 48 → 65 models. Full OpenRouter `/v1/models` scan surfaced 17 additional code-relevant models that passed verification.
+
+### Added models (all verified live 2026-06-03)
+- Anthropic: `claude-sonnet-4`, `claude-opus-4.1` (gaps in Sonnet-4 / Opus-4.1 series)
+- OpenAI GPT-4.1: `gpt-4.1-nano` (completes nano/mini/full family)
+- OpenAI GPT-5: `gpt-5`, `gpt-5-codex`, `gpt-5-mini`, `gpt-5-pro` (base GPT-5 family; codex is code-specialized)
+- OpenAI GPT-5.1: `gpt-5.1-codex`, `gpt-5.1-codex-mini` (code-specialized models)
+- OpenAI GPT-5.4: `gpt-5.4`, `gpt-5.4-pro` (completes 5.4 family; prev only nano/mini)
+- Google: `gemini-2.5-flash-lite` (lighter Gemini 2.5 option)
+- Qwen: `qwen3-coder-flash`, `qwen3-coder-next`, `qwen3-max`
+- Mistral: `mistral-large-2512`, `mistral-medium-3`
+
+### Results
+- PR #93 merged (6a44d488)
+- gitminer doctor confirms: **65 models whitelisted** ✅
+- API restarted: pool_size=1123, status=ok
+
+### Status
+Pool 1123, oracle 12.64, whitelist **65 models**, rotation Sunday 2026-06-08 (5 days).
+Node.js 24 upgrade: branch `punch/node24-workflow-upgrades` ready locally (operator needs `workflow` scope).
