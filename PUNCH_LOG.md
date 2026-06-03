@@ -4,6 +4,18 @@ Milestone trail for the base-miner benchmark. Discord is the primary channel; th
 
 ---
 
+## 2026-06-03 — Fix SOTA comparison: weighted_score throughout (commit 450180f)
+
+Found and fixed two interrelated ranking bugs:
+
+1. **`scripts/record_result.py` `current_sota()`**: was returning `max(r["score"])` (arithmetic mean) but the leaderboard ranks by `weighted_score`. `marginal_gain` and `contribution_weight` were computed against the wrong baseline — a submission with a high weighted score but lower arithmetic score could incorrectly undercount its marginal gain.
+
+2. **`.github/workflows/eval.yml` champion detection**: `isNewChampion = mean > sota` compared arithmetic `mean` against `sota` derived from `max(r.weighted_score)`. A new champion with a high weighted score but lower arithmetic score could be missed. Fixed to `effectiveScore = weightedMean ?? mean`.
+
+Both now use `weighted_score` end-to-end, consistent with `update_leaderboard()` which already sorted by `weighted_score`.
+
+---
+
 ## 2026-06-03 — info command difficulty fix (commit e88f422)
 
 Fixed `gitminer info` displaying wrong difficulty tier. It was using score-based thresholds (`score ≥ 15 → easy`) instead of the canonical line-count system. A problem like `infiniflow_ragflow_13650` (+598 lines, hard×2) was showing "easy" because its reference score (23.06) was high. Now reads `difficulty` and `weight` directly from `results/baselines.json` — consistent with `gitminer problems`, the dashboard, and `evaluate.py`.
