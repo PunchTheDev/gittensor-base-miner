@@ -112,6 +112,24 @@
 
 ---
 
+## Threat 9: Static agent (no LLM, pre-computed answers)
+
+**Attack**: Miner submits a `solve()` implementation that contains pre-computed diffs hardcoded by problem ID, or uses a lookup table rather than calling an LLM. The meta.json SHA check verifies the submitted code is what they claimed, but does not verify the code calls an LLM.
+
+**Why this matters**: This is harder to detect than reference diff copying because the pre-computed answers may have been independently generated (e.g., by an LLM offline) rather than copied verbatim from `reference.diff`. A static lookup agent can score high without reasoning at runtime.
+
+**Mitigations**:
+- **Reference copy check — [Implemented]**: Catches pre-computed diffs identical to stored reference diffs.
+- **Output behavior similarity — [Implemented]**: Catches static agents that produce the same outputs as a prior agent.
+- **Meta.json model check — [Implemented, partial]**: Verifies the declared model is whitelisted, but does not verify the model was called. A static agent can declare `claude-3-5-haiku` in meta.json without using it.
+- **Network monitoring — [Planned]**: Daytona integration would restrict outbound network to the whitelisted model API only, and could verify at least one API call was made per problem.
+
+**Residual risk**: High until Daytona is integrated. A miner who pre-computes diffs with a good LLM offline and hard-codes them is undetectable without runtime network monitoring.
+
+**Probe result**: Verified 2026-06-03 — a simulated oracle-copy agent (returning exact reference diffs) was correctly blocked by `check_reference_copy.py` (100.0% match rate, exit 1). A static agent returning pre-computed non-verbatim diffs would currently pass.
+
+---
+
 ## Summary
 
 | Threat | Severity | Implemented mitigations | Gaps |
@@ -124,9 +142,10 @@
 | LLM variance gaming | Low | Deterministic seeds + rate limit | — |
 | Behavioral cloning | Medium | Output fingerprint (hard-block) | Partial match evasion |
 | CI flooding | Medium | Concurrency limit + rate limit | Shared API key at scale |
+| Static agent (no LLM) | High | Reference copy check, output similarity | **No runtime LLM call verification — Daytona needed** |
 
 ### Critical gaps for launch readiness
 
-1. **Frontier model enforcement**: No network sandboxing. Daytona integration required to restrict agent network access to whitelisted models only.
+1. **Frontier model enforcement + static agent detection**: No network sandboxing. Daytona integration required to restrict agent network access to whitelisted models only and verify at least one model API call was made per problem.
 2. **Shared OPENROUTER_KEY**: All CI evals use the same key. Fine for 10 miners; dangerous at 100+. Fix: per-miner key registration.
 3. **Commit-reveal**: Currently, scores are posted publicly as soon as eval runs. A miner who watches eval results can update their submission to exploit the visible benchmark. Private eval (hash-first) requires a two-phase PR flow.
