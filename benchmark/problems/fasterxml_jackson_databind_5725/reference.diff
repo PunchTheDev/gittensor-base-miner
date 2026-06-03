@@ -1,0 +1,895 @@
+diff --git a/release-notes/CREDITS b/release-notes/CREDITS
+index eb3b901331..c55421059e 100644
+--- a/release-notes/CREDITS
++++ b/release-notes/CREDITS
+@@ -344,6 +344,16 @@ Andrzej Leśkiewicz (@aleskiewicz)
+  * Reported #3573: Inconsistent handling of nil `UUID` in property inclusion
+   [3.2.0]
+ 
++Christoffer Hammarström (@kreiger)
++ * Reported #5330: `@JsonProperty`on enum values with
++  `@JsonFormat(shape = JsonFormat.Shape.NUMBER)` is ignored
++  [3.2.0]
++
++Lee Hyeonsoo (@znight1020)
++ * Fixed #5330: `@JsonProperty`on enum values with
++  `@JsonFormat(shape = JsonFormat.Shape.NUMBER)` is ignored
++  [3.2.0]
++
+ Eran Leshem (@eranl)
+  * Suggested #5353: Preserve order of `@JsonAnySetter` creator property arguments
+   [3.2.0]
+diff --git a/release-notes/VERSION b/release-notes/VERSION
+index 85cc17c9b5..6186c9a6bb 100644
+--- a/release-notes/VERSION
++++ b/release-notes/VERSION
+@@ -85,6 +85,10 @@ Versions: 3.x (for earlier see VERSION-2.x)
+   `BeanDescription.getIgnoredPropertyNames()`
+  (requested by Oliver D)
+  (fix by @cowtowncoder, w/ Claude code)
++#5330: `@JsonProperty`on enum values with
++  `@JsonFormat(shape = JsonFormat.Shape.NUMBER)` is ignored
++ (reported by Christoffer H)
++ (fixed by Lee H)
+ #5353: Preserve order of `@JsonAnySetter` creator property arguments
+  (suggested by Eran L)
+  (fix by @cowtowncoder, w/ Claude code)
+diff --git a/src/main/java/tools/jackson/databind/deser/jdk/EnumDeserializer.java b/src/main/java/tools/jackson/databind/deser/jdk/EnumDeserializer.java
+index 95daa903ad..769a1ed2ae 100644
+--- a/src/main/java/tools/jackson/databind/deser/jdk/EnumDeserializer.java
++++ b/src/main/java/tools/jackson/databind/deser/jdk/EnumDeserializer.java
+@@ -1,5 +1,6 @@
+ package tools.jackson.databind.deser.jdk;
+ 
++import java.util.Map;
+ import java.util.Objects;
+ import java.util.Optional;
+ 
+@@ -39,11 +40,24 @@ public class EnumDeserializer
+      */
+     protected final CompactStringObjectMap _lookupByToString;
+ 
++    /**
++     * @since 3.2
++     */
++    protected final Map<Integer, Enum<?>> _lookupByNumericIndex;
++
+     protected final Boolean _caseInsensitive;
+ 
+     private Boolean _useDefaultValueForUnknownEnum;
+     private Boolean _useNullForUnknownEnum;
+ 
++    /**
++     * Marker flag to indicate whether numeric input (JSON number or quoted number)
++     * should use numeric-index lookup derived from {@code @JsonProperty} values.
++     * Intended to be enabled when {@code @JsonFormat(shape = NUMBER/ARRAY)} selects
++     * numeric representation for Enum values.
++     */
++    protected final boolean _useNumericIndexForNumbers;
++
+     /**
+      * Marker flag for cases where we expect actual integral value for Enum,
+      * based on {@code @JsonValue} (and equivalent) annotated accessor.
+@@ -77,10 +91,13 @@ public EnumDeserializer(EnumResolver byNameResolver, boolean caseInsensitive,
+         _isFromIntValue = byNameResolver.isFromIntValue();
+         _lookupByEnumNaming = byEnumNamingResolver == null ? null : byEnumNamingResolver.constructLookup();
+         _lookupByToString = toStringResolver == null ? null : toStringResolver.constructLookup();
++        _lookupByNumericIndex = byNameResolver.getNumericIndexLookup();
++        _useNumericIndexForNumbers = byNameResolver.useNumericIndexForNumbers();
+     }
+ 
+     protected EnumDeserializer(EnumDeserializer base, boolean caseInsensitive,
+-            Boolean useDefaultValueForUnknownEnum, Boolean useNullForUnknownEnum)
++            Boolean useDefaultValueForUnknownEnum, Boolean useNullForUnknownEnum,
++            boolean useNumericIndexForNumbers)
+     {
+         super(base);
+         _lookupByName = base._lookupByName;
+@@ -93,6 +110,8 @@ protected EnumDeserializer(EnumDeserializer base, boolean caseInsensitive,
+         _useNullForUnknownEnum = useNullForUnknownEnum;
+         _lookupByEnumNaming = base._lookupByEnumNaming;
+         _lookupByToString = base._lookupByToString;
++        _lookupByNumericIndex = base._lookupByNumericIndex;
++        _useNumericIndexForNumbers = useNumericIndexForNumbers;
+     }
+ 
+     /**
+@@ -131,14 +150,17 @@ public static ValueDeserializer<?> deserializerForNoArgsCreator(DeserializationC
+     }
+ 
+     public EnumDeserializer withResolved(Boolean caseInsensitive,
+-            Boolean useDefaultValueForUnknownEnum, Boolean useNullForUnknownEnum) {
++            Boolean useDefaultValueForUnknownEnum, Boolean useNullForUnknownEnum,
++            boolean useNumericIndexForNumbers) {
+         if (Objects.equals(_caseInsensitive, caseInsensitive)
+-          && Objects.equals(_useDefaultValueForUnknownEnum, useDefaultValueForUnknownEnum)
+-          && Objects.equals(_useNullForUnknownEnum, useNullForUnknownEnum)) {
++                && Objects.equals(_useDefaultValueForUnknownEnum, useDefaultValueForUnknownEnum)
++                && Objects.equals(_useNullForUnknownEnum, useNullForUnknownEnum)
++                && _useNumericIndexForNumbers == useNumericIndexForNumbers) {
+             return this;
+         }
+         return new EnumDeserializer(this, caseInsensitive,
+-                useDefaultValueForUnknownEnum, useNullForUnknownEnum);
++                useDefaultValueForUnknownEnum, useNullForUnknownEnum,
++                useNumericIndexForNumbers);
+     }
+ 
+     @Override
+@@ -146,13 +168,27 @@ public ValueDeserializer<?> createContextual(DeserializationContext ctxt,
+             BeanProperty property)
+     {
+         Boolean caseInsensitive = Optional.ofNullable(findFormatFeature(ctxt, property, handledType(),
+-          JsonFormat.Feature.ACCEPT_CASE_INSENSITIVE_PROPERTIES)).orElse(_caseInsensitive);
++                JsonFormat.Feature.ACCEPT_CASE_INSENSITIVE_PROPERTIES)).orElse(_caseInsensitive);
+         Boolean useDefaultValueForUnknownEnum = Optional.ofNullable(findFormatFeature(ctxt, property, handledType(),
+-          JsonFormat.Feature.READ_UNKNOWN_ENUM_VALUES_USING_DEFAULT_VALUE)).orElse(_useDefaultValueForUnknownEnum);
++                JsonFormat.Feature.READ_UNKNOWN_ENUM_VALUES_USING_DEFAULT_VALUE)).orElse(_useDefaultValueForUnknownEnum);
+         Boolean useNullForUnknownEnum = Optional.ofNullable(findFormatFeature(ctxt, property, handledType(),
+-          JsonFormat.Feature.READ_UNKNOWN_ENUM_VALUES_AS_NULL)).orElse(_useNullForUnknownEnum);
+-        
+-        return withResolved(caseInsensitive, useDefaultValueForUnknownEnum, useNullForUnknownEnum);
++                JsonFormat.Feature.READ_UNKNOWN_ENUM_VALUES_AS_NULL)).orElse(_useNullForUnknownEnum);
++
++        boolean useNumericIndexForNumbers = _useNumericIndexForNumbers;
++        JsonFormat.Value value = findFormatOverrides(ctxt, property, handledType());
++        if (value != null) {
++            JsonFormat.Shape shape = value.getShape();
++            if (shape != null) {
++                if (shape == JsonFormat.Shape.ANY || shape == JsonFormat.Shape.SCALAR) {
++                    // keep base
++                } else {
++                    useNumericIndexForNumbers = shape.isNumeric() || shape == JsonFormat.Shape.ARRAY;
++                }
++            }
++        }
++
++        return withResolved(caseInsensitive, useDefaultValueForUnknownEnum, useNullForUnknownEnum,
++                useNumericIndexForNumbers);
+     }
+ 
+     /*
+@@ -263,6 +299,12 @@ protected Object _fromInteger(JsonParser p, DeserializationContext ctxt,
+         case TryConvert:
+         default:
+         }
++        if (_useNumericIndexForNumbers && _lookupByNumericIndex != null) {
++            Object match = _lookupByNumericIndex.get(index);
++            if (match != null) {
++                return match;
++            }
++        }
+         if (index >= 0 && index < _enumsByIndex.length) {
+             return _enumsByIndex[index];
+         }
+@@ -346,6 +388,12 @@ private final Object _deserializeAltString(JsonParser p, DeserializationContext
+ "value looks like quoted Enum index, but `DeserializationFeature.ALLOW_COERCION_OF_SCALARS` prevents use"
+                                         );
+                             }
++                            if (_useNumericIndexForNumbers && _lookupByNumericIndex != null) {
++                                Object match = _lookupByNumericIndex.get(index);
++                                if (match != null) {
++                                    return match;
++                                }
++                            }
+                             if (index >= 0 && index < _enumsByIndex.length) {
+                                 return _enumsByIndex[index];
+                             }
+diff --git a/src/main/java/tools/jackson/databind/deser/std/StdDeserializer.java b/src/main/java/tools/jackson/databind/deser/std/StdDeserializer.java
+index 695f80439a..08813a0880 100644
+--- a/src/main/java/tools/jackson/databind/deser/std/StdDeserializer.java
++++ b/src/main/java/tools/jackson/databind/deser/std/StdDeserializer.java
+@@ -27,6 +27,7 @@
+ import tools.jackson.databind.util.AccessPattern;
+ import tools.jackson.databind.util.ClassUtil;
+ import tools.jackson.databind.util.Converter;
++import tools.jackson.databind.util.NumberUtil;
+ 
+ /**
+  * Base class for common deserializers. Contains shared
+@@ -1801,35 +1802,11 @@ protected ValueDeserializer<Object> findDeserializer(DeserializationContext ctxt
+      * Helper method to check whether given text refers to what looks like a clean simple
+      * integer number, consisting of optional sign followed by a sequence of digits.
+      *<p>
+-     * Note that definition is quite loose as leading zeroes are allowed, in addition
+-     * to plus sign (not just minus).
++     * Since 3.2 calls {@link NumberUtil#isValidJDKIntNumber(String)}
+      */
+-    protected final boolean _isIntNumber(String text)
++    protected boolean _isIntNumber(String text)
+     {
+-        final int len = text.length();
+-        if (len > 0) {
+-            char c = text.charAt(0);
+-            // skip leading sign (plus not allowed for strict JSON numbers but...)
+-            int i;
+-
+-            if (c == '-' || c == '+') {
+-                if (len == 1) {
+-                    return false;
+-                }
+-                i = 1;
+-            } else {
+-                i = 0;
+-            }
+-            // We will allow leading
+-            for (; i < len; ++i) {
+-                int ch = text.charAt(i);
+-                if (ch > '9' || ch < '0') {
+-                    return false;
+-                }
+-            }
+-            return true;
+-        }
+-        return false;
++        return NumberUtil.isValidJDKIntNumber(text);
+     }
+ 
+     /*
+diff --git a/src/main/java/tools/jackson/databind/ext/javatime/deser/JSR310DeserializerBase.java b/src/main/java/tools/jackson/databind/ext/javatime/deser/JSR310DeserializerBase.java
+index 50ecd08869..336e95f029 100644
+--- a/src/main/java/tools/jackson/databind/ext/javatime/deser/JSR310DeserializerBase.java
++++ b/src/main/java/tools/jackson/databind/ext/javatime/deser/JSR310DeserializerBase.java
+@@ -31,6 +31,7 @@
+ import tools.jackson.databind.jsontype.TypeDeserializer;
+ import tools.jackson.databind.type.LogicalType;
+ import tools.jackson.databind.util.ClassUtil;
++import tools.jackson.databind.util.NumberUtil;
+ 
+ /**
+  * Base class that indicates that all JSR310 datatypes are deserialized from scalar JSON types.
+@@ -128,7 +129,8 @@ protected boolean _isValidTimestampString(String str) {
+         // 30-Sep-2020, tatu: Need to support "numbers as Strings" for data formats
+         //    that only have String values for scalars (CSV, Properties, XML)
+         // NOTE: we do allow negative values, but has to fit in 64-bits:
+-        return _isIntNumber(str) && NumberInput.inLongRange(str, (str.charAt(0) == '-'));
++        return NumberUtil.isValidJDKIntNumber(str)
++                && NumberInput.inLongRange(str, (str.charAt(0) == '-'));
+     }
+ 
+     protected <BOGUS> BOGUS _reportWrongToken(DeserializationContext context,
+diff --git a/src/main/java/tools/jackson/databind/ser/jdk/EnumSerializer.java b/src/main/java/tools/jackson/databind/ser/jdk/EnumSerializer.java
+index 3a892924a0..fb743fc09e 100644
+--- a/src/main/java/tools/jackson/databind/ser/jdk/EnumSerializer.java
++++ b/src/main/java/tools/jackson/databind/ser/jdk/EnumSerializer.java
+@@ -119,7 +119,11 @@ public final void serialize(Enum<?> en, JsonGenerator g, SerializationContext ct
+     {
+         // Serialize as index?
+         if (_serializeAsIndex(ctxt)) {
+-            g.writeNumber(en.ordinal());
++            if (_serializeAsIndex == null) {
++                g.writeNumber(en.ordinal());
++            } else {
++                g.writeNumber(_enumValuesToWrite.resolvedIndexFor(en));
++            }
+             return;
+         }
+         final MapperConfig<?> config = ctxt.getConfig();
+diff --git a/src/main/java/tools/jackson/databind/util/EnumResolver.java b/src/main/java/tools/jackson/databind/util/EnumResolver.java
+index 40bec48d1f..3a89de6452 100644
+--- a/src/main/java/tools/jackson/databind/util/EnumResolver.java
++++ b/src/main/java/tools/jackson/databind/util/EnumResolver.java
+@@ -2,6 +2,8 @@
+ 
+ import java.util.*;
+ 
++import com.fasterxml.jackson.annotation.JsonFormat;
++
+ import tools.jackson.databind.*;
+ import tools.jackson.databind.cfg.MapperConfig;
+ import tools.jackson.databind.introspect.AnnotatedClass;
+@@ -21,6 +23,11 @@ public class EnumResolver implements java.io.Serializable
+ 
+     protected final HashMap<String, Enum<?>> _enumsById;
+ 
++    /**
++     * @since 3.2
++     */
++    protected final Map<Integer, Enum<?>> _enumsByNumericIndex;
++
+     protected final Enum<?> _defaultValue;
+ 
+     /**
+@@ -41,29 +48,45 @@ public class EnumResolver implements java.io.Serializable
+     /**
+      * Marker for case where enum values to match are from {@code @JsonValue}-annotated
+      * method.
+-     *
+-     * @since 2.20
+      */
+     protected final boolean _hasAsValueAnnotation;
+ 
++    /**
++     * Marker for case where numeric input (JSON number or quoted number) should be
++     * resolved using numeric-index lookup derived from {@code @JsonProperty} values,
++     * instead of ordinal index (Enum.values()).
++     * <p>
++     * Intended to be enabled when {@code @JsonFormat(shape = NUMBER/ARRAY)} selects
++     * numeric representation for Enum values.
++     *
++     * @since 3.2
++     */
++    protected final boolean _useNumericIndexForNumbers;
++
+     /*
+     /**********************************************************************
+     /* Constructors
+     /**********************************************************************
+      */
+ 
++    /**
++     * @since 3.2 (added 2 more arguments)
++     */
+     protected EnumResolver(Class<Enum<?>> enumClass, Enum<?>[] enums,
+             HashMap<String, Enum<?>> enumsById, Enum<?> defaultValue,
+             boolean isIgnoreCase, boolean isFromIntValue,
+-            boolean hasAsValueAnnotation)
++            boolean hasAsValueAnnotation,
++            Map<Integer, Enum<?>> enumsByNumericIndex, boolean useNumericIndexForNumbers)
+     {
+         _enumClass = enumClass;
+         _enums = enums;
+         _enumsById = enumsById;
++        _enumsByNumericIndex = enumsByNumericIndex;
+         _defaultValue = defaultValue;
+         _isIgnoreCase = isIgnoreCase;
+         _isFromIntValue = isFromIntValue;
+         _hasAsValueAnnotation = hasAsValueAnnotation;
++        _useNumericIndexForNumbers = useNumericIndexForNumbers;
+     }
+ 
+     /*
+@@ -90,6 +113,12 @@ public static EnumResolver constructFor(DeserializationConfig config, AnnotatedC
+         final Enum<?>[] enumConstants = _enumConstants(enumCls);
+         final Enum<?> defaultEnum = _enumDefault(config, annotatedClass, enumConstants);
+ 
++        // Determine whether numeric values should use numeric-index lookup, based on
++        // class-level @JsonFormat(shape=NUMBER/ARRAY...). Uses AnnotatedClass so Mix-ins apply.
++        JsonFormat.Value value = ai.findFormat(config, annotatedClass);
++        boolean useNumericIndexForNumbers = (value != null)
++                && (value.getShape().isNumeric() || value.getShape() == JsonFormat.Shape.ARRAY);
++
+         // introspect
+         String[] names = ai.findEnumValues(config, annotatedClass,
+                 enumConstants, new String[enumConstants.length]);
+@@ -98,13 +127,26 @@ public static EnumResolver constructFor(DeserializationConfig config, AnnotatedC
+ 
+         // finally, build
+         HashMap<String, Enum<?>> map = new HashMap<>();
++        Map<Integer, Enum<?>> numericIndexMap = null;
+         for (int i = 0, len = enumConstants.length; i < len; ++i) {
+             final Enum<?> enumValue = enumConstants[i];
+-            String name = names[i];
++            final String rawName = names[i];
++            String name = rawName;
+             if (name == null) {
+                 name = enumValue.name();
+             }
+             map.put(name, enumValue);
++            if (rawName != null && NumberUtil.isValidJDKIntNumber(rawName)) {
++                try {
++                    final int numericIndex = Integer.parseInt(rawName);
++                    if (numericIndexMap == null) {
++                        numericIndexMap = new HashMap<>();
++                    }
++                    numericIndexMap.put(numericIndex, enumValue);
++                } catch (NumberFormatException e) {
++                    // out of int range, ignore
++                }
++            }
+             String[] aliases = allAliases[i];
+             if (aliases != null) {
+                 for (String alias : aliases) {
+@@ -114,14 +156,13 @@ public static EnumResolver constructFor(DeserializationConfig config, AnnotatedC
+             }
+         }
+         return new EnumResolver(enumCls, enumConstants, map,
+-                defaultEnum, isIgnoreCase, false, false);
++                defaultEnum, isIgnoreCase, false, false,
++                numericIndexMap, useNumericIndexForNumbers);
+     }
+ 
+     /**
+      * Factory method for constructing resolver that maps from Enum.toString() into
+      * Enum value
+-     *
+-     * @since 2.16
+      */
+     public static EnumResolver constructUsingToString(DeserializationConfig config, AnnotatedClass annotatedClass) {
+         // prepare data
+@@ -159,7 +200,8 @@ public static EnumResolver constructUsingToString(DeserializationConfig config,
+             }
+         }
+         return new EnumResolver(enumCls, enumConstants, map,
+-                defaultEnum, isIgnoreCase, false, false);
++                defaultEnum, isIgnoreCase, false, false,
++                null, false);
+     }
+ 
+     /**
+@@ -183,13 +225,12 @@ public static EnumResolver constructUsingIndex(DeserializationConfig config, Ann
+             map.put(String.valueOf(i), enumValue);
+         }
+         return new EnumResolver(enumCls, enumConstants, map,
+-                defaultEnum, isIgnoreCase, false, false);
++                defaultEnum, isIgnoreCase, false, false,
++                null, false);
+     }
+ 
+     /**
+      * Factory method for constructing an {@link EnumResolver} with {@link EnumNamingStrategy} applied.
+-     *
+-     * @since 2.16
+      */
+     public static EnumResolver constructUsingEnumNamingStrategy(DeserializationConfig config,
+         AnnotatedClass annotatedClass, EnumNamingStrategy enumNamingStrategy) 
+@@ -232,7 +273,8 @@ public static EnumResolver constructUsingEnumNamingStrategy(DeserializationConfi
+         }
+ 
+         return new EnumResolver(enumCls, enumConstants, map,
+-                defaultEnum, isIgnoreCase, false, false);
++                defaultEnum, isIgnoreCase, false, false,
++                null, false);
+     }
+ 
+     /**
+@@ -267,7 +309,8 @@ public static EnumResolver constructUsingMethod(DeserializationConfig config,
+                 defaultEnum, isIgnoreCase,
+                 // 26-Sep-2021, tatu: [databind#1850] Need to consider "from int" case
+                 _isIntType(accessor.getRawType()),
+-                true
++                true,
++                null, false
+         );
+     }
+ 
+@@ -290,8 +333,6 @@ public CompactStringObjectMap constructLookup() {
+ 
+     /**
+      * Internal helper method used to resolve {@link com.fasterxml.jackson.annotation.JsonEnumDefaultValue}
+-     *
+-     * @since 2.16
+      */
+     protected static Enum<?> _enumDefault(MapperConfig<?> config,
+             AnnotatedClass annotatedClass, Enum<?>[] enums) {
+@@ -367,6 +408,23 @@ public Collection<String> getEnumIds() {
+ 
+     public int lastValidIndex() { return _enums.length-1; }
+ 
++    /**
++     * @since 3.2
++     */
++    public Map<Integer, Enum<?>> getNumericIndexLookup() {
++        return _enumsByNumericIndex;
++    }
++
++    /**
++     * Accessor for checking whether numeric input should use numeric-index lookup
++     * derived from {@code @JsonProperty} values.
++     *
++     * @since 3.2
++     */
++    public boolean useNumericIndexForNumbers() {
++        return _useNumericIndexForNumbers;
++    }
++
+     /**
+      * Accessor for checking if we have a special case in which value to map
+      * is from {@code @JsonValue} annotated accessor with integral type: this
+diff --git a/src/main/java/tools/jackson/databind/util/EnumValuesToWrite.java b/src/main/java/tools/jackson/databind/util/EnumValuesToWrite.java
+index e6bac15d90..7cceb0c692 100644
+--- a/src/main/java/tools/jackson/databind/util/EnumValuesToWrite.java
++++ b/src/main/java/tools/jackson/databind/util/EnumValuesToWrite.java
+@@ -19,6 +19,7 @@ public class EnumValuesToWrite
+     private final EnumNamingStrategy _enumNamingStrategy;
+     private final Enum<?>[] _enumConstants;
+     private final SerializableString[] _explicitNames;
++    private final int[] _indexes;
+ 
+     private volatile SerializableString[] _enumNames;
+     private volatile SerializableString[] _enumNamesLC;
+@@ -27,12 +28,13 @@ public class EnumValuesToWrite
+ 
+     private EnumValuesToWrite(AnnotatedClass annotatedClass,
+             EnumNamingStrategy enumNamingStrategy,
+-            Enum<?>[] enumConstants, SerializableString[] explicitNames)
++            Enum<?>[] enumConstants, SerializableString[] explicitNames, int[] indexes)
+     {
+         _annotatedClass = annotatedClass;
+         _enumNamingStrategy = enumNamingStrategy;
+         _enumConstants = enumConstants;
+         _explicitNames = explicitNames;
++        _indexes = indexes;
+     }
+ 
+     public static EnumValuesToWrite construct(MapperConfig<?> config,
+@@ -42,11 +44,21 @@ public static EnumValuesToWrite construct(MapperConfig<?> config,
+     {
+         final int len = explicitNames0.length;
+         SerializableString[] explicitNames = new SerializableString[len];
++        int[] indexes = new int[len];
+         for (int i = 0; i < len; ++i) {
+             explicitNames[i] = config.compileString(explicitNames0[i]);
++            int index = i;
++            if (explicitNames0[i] != null && NumberUtil.isValidJDKIntNumber(explicitNames0[i])) {
++                try {
++                    index = Integer.parseInt(explicitNames0[i]);
++                } catch (NumberFormatException e) {
++                    // out of int range -> fallback to ordinal
++                }
++            }
++            indexes[i] = index;
+         }
+         return new EnumValuesToWrite(annotatedClass,
+-                enumNamingStrategy, enumConstants, explicitNames);
++                enumNamingStrategy, enumConstants, explicitNames, indexes);
+     }
+ 
+     @SuppressWarnings("unchecked")
+@@ -103,6 +115,13 @@ public SerializableString[] allEnumValuesFromToString(MapperConfig<?> config) {
+         return strs;
+     }
+ 
++    /**
++     * @since 3.2
++     */
++    public int resolvedIndexFor(Enum<?> en) {
++        return _indexes[en.ordinal()];
++    }
++
+     private String _nameWithStrategy(MapperConfig<?> config, Enum<?> en) {
+         String str = en.name();
+         if (_enumNamingStrategy != null) {
+@@ -136,4 +155,5 @@ private SerializableString[] _fetch(MapperConfig<?> config,
+         }
+         return serStrs;
+     }
++
+ }
+diff --git a/src/main/java/tools/jackson/databind/util/ExceptionUtil.java b/src/main/java/tools/jackson/databind/util/ExceptionUtil.java
+index 9f9c05753a..073b955ad2 100644
+--- a/src/main/java/tools/jackson/databind/util/ExceptionUtil.java
++++ b/src/main/java/tools/jackson/databind/util/ExceptionUtil.java
+@@ -5,13 +5,10 @@
+ import tools.jackson.databind.DeserializationFeature;
+ 
+ /**
+- * Utility methods for dealing with exceptions/throwables
+- *
+- * @since 2.15
++ * Utility methods for dealing with exceptions/throwables.
+  */
+-public class ExceptionUtil {
+-    private ExceptionUtil() {}
+-
++public abstract class ExceptionUtil
++{
+     /**
+      * It is important never to catch all <code>Throwable</code>s. Some like
+      * {@link InterruptedException} should be rethrown. Based on
+diff --git a/src/main/java/tools/jackson/databind/util/NumberUtil.java b/src/main/java/tools/jackson/databind/util/NumberUtil.java
+new file mode 100644
+index 0000000000..12eb89e7bc
+--- /dev/null
++++ b/src/main/java/tools/jackson/databind/util/NumberUtil.java
+@@ -0,0 +1,47 @@
++package tools.jackson.databind.util;
++
++/**
++ * Shared utility methods for number validation.
++ *
++ * @since 3.2
++ */
++public abstract class NumberUtil
++{
++    /**
++     * Helper method to check whether given text refers to what looks like a clean simple
++     * integer number, consisting of optional sign followed by a sequence of digits.
++     *<p>
++     * Note that definition is quite loose as leading zeroes are allowed, in addition
++     * to plus sign (not just minus).
++     *
++     * @since 3.2 as {@code public static} (formerly {@code protected})
++     */
++    public static boolean isValidJDKIntNumber(String text)
++    {
++        final int len = text.length();
++        if (len > 0) {
++            char c = text.charAt(0);
++            // skip leading sign (plus not allowed for strict JSON numbers but...)
++            int i;
++
++            if (c == '-' || c == '+') {
++                if (len == 1) {
++                    return false;
++                }
++                i = 1;
++            } else {
++                i = 0;
++            }
++            // We will allow leading 0, too
++            for (; i < len; ++i) {
++                int ch = text.charAt(i);
++                if (ch > '9' || ch < '0') {
++                    return false;
++                }
++            }
++            return true;
++        }
++        return false;
++    }
++
++}
+diff --git a/src/test/java/tools/jackson/databind/deser/enums/EnumDeserNumberJsonProperty5330Test.java b/src/test/java/tools/jackson/databind/deser/enums/EnumDeserNumberJsonProperty5330Test.java
+new file mode 100644
+index 0000000000..06054dc07f
+--- /dev/null
++++ b/src/test/java/tools/jackson/databind/deser/enums/EnumDeserNumberJsonProperty5330Test.java
+@@ -0,0 +1,95 @@
++package tools.jackson.databind.deser.enums;
++
++import java.util.*;
++
++import org.junit.jupiter.api.Test;
++
++import com.fasterxml.jackson.annotation.JsonFormat;
++import com.fasterxml.jackson.annotation.JsonProperty;
++
++import tools.jackson.databind.*;
++import tools.jackson.databind.cfg.EnumFeature;
++import tools.jackson.databind.exc.MismatchedInputException;
++import tools.jackson.databind.testutil.DatabindTestUtil;
++
++import static org.junit.jupiter.api.Assertions.assertEquals;
++import static org.junit.jupiter.api.Assertions.assertThrows;
++
++/**
++ * [databind#5330] Deserialization: {@code @JsonProperty} value used as numeric index
++ * for Enums with {@code Shape.NUMBER}
++ */
++public class EnumDeserNumberJsonProperty5330Test extends DatabindTestUtil
++{
++    // no JsonFormat override: used to verify that numeric @JsonProperty is NOT used as index.
++    public enum MyEnumNoFormat {
++        @JsonProperty("7")
++        FOO,
++        @JsonProperty("42")
++        BAR
++    }
++
++    @JsonFormat(shape = JsonFormat.Shape.NUMBER)
++    public enum MyEnum {
++        @JsonProperty("7")
++        FOO,
++        @JsonProperty("42")
++        BAR
++    }
++
++    @JsonFormat(shape = JsonFormat.Shape.NUMBER)
++    public enum NonNumericEnum {
++        @JsonProperty("NOT_A_NUMBER")
++        VALUE
++    }
++
++    private final ObjectMapper MAPPER = newJsonMapper();
++
++    @Test
++    public void shouldDeserializeFromNumericAndQuotedNumericIndex() throws Exception {
++        assertEquals(MyEnum.FOO, MAPPER.readValue("7", MyEnum.class));
++        assertEquals(MyEnum.FOO, MAPPER.readValue(q("7"), MyEnum.class));
++    }
++
++    @Test
++    public void shouldDeserializeEnumMapKeysUsingNumericJsonPropertyIndex() throws Exception {
++        JavaType type = MAPPER.getTypeFactory().constructMapType(HashMap.class, MyEnum.class, String.class);
++        Map<MyEnum, String> result = MAPPER.readValue(a2q("{'7':'lucky'}"), type);
++
++        assertEquals(1, result.size());
++        assertEquals("lucky", result.get(MyEnum.FOO));
++    }
++
++    @Test
++    public void shouldFallbackToOrdinalWhenJsonPropertyIsNotNumeric() throws Exception {
++        assertEquals(NonNumericEnum.VALUE, MAPPER.readValue("0", NonNumericEnum.class));
++    }
++
++    @Test
++    public void shouldNotUseNumericJsonPropertyIndexWithoutNumberShape() throws Exception {
++        ObjectMapper mapper = jsonMapperBuilder().build();
++
++        // numeric token: should NOT treat @JsonProperty("7"/"42") as numeric index
++        assertThrows(MismatchedInputException.class, () -> mapper.readValue("7", MyEnumNoFormat.class));
++        assertThrows(MismatchedInputException.class, () -> mapper.readValue("42", MyEnumNoFormat.class));
++
++        // string token: should map by NAME (i.e. @JsonProperty), regardless of number-shape
++        assertEquals(MyEnumNoFormat.FOO, mapper.readValue(q("7"), MyEnumNoFormat.class));
++        assertEquals(MyEnumNoFormat.BAR, mapper.readValue(q("42"), MyEnumNoFormat.class));
++    }
++
++    @Test
++    public void shouldNotUseNumericJsonPropertyIndexWithoutNumberShapeEvenWhenGlobalIndexFeatureIsEnabled() throws Exception {
++        ObjectMapper mapper = jsonMapperBuilder()
++            .enable(EnumFeature.WRITE_ENUMS_USING_INDEX)
++            .build();
++
++        // still must not treat numeric @JsonProperty as numeric index
++        assertThrows(MismatchedInputException.class, () -> mapper.readValue("7", MyEnumNoFormat.class));
++        assertThrows(MismatchedInputException.class, () -> mapper.readValue("42", MyEnumNoFormat.class));
++
++        // but quoted values are names -> should work
++        assertEquals(MyEnumNoFormat.FOO, mapper.readValue(q("7"), MyEnumNoFormat.class));
++        assertEquals(MyEnumNoFormat.BAR, mapper.readValue(q("42"), MyEnumNoFormat.class));
++    }
++}
+diff --git a/src/test/java/tools/jackson/databind/ser/enums/EnumSerNumberJsonProperty5330Test.java b/src/test/java/tools/jackson/databind/ser/enums/EnumSerNumberJsonProperty5330Test.java
+new file mode 100644
+index 0000000000..cbfeb75324
+--- /dev/null
++++ b/src/test/java/tools/jackson/databind/ser/enums/EnumSerNumberJsonProperty5330Test.java
+@@ -0,0 +1,95 @@
++package tools.jackson.databind.ser.enums;
++
++import java.util.*;
++
++import org.junit.jupiter.api.Test;
++
++import com.fasterxml.jackson.annotation.JsonFormat;
++import com.fasterxml.jackson.annotation.JsonProperty;
++
++import tools.jackson.databind.*;
++import tools.jackson.databind.cfg.EnumFeature;
++import tools.jackson.databind.testutil.DatabindTestUtil;
++
++import static org.junit.jupiter.api.Assertions.assertEquals;
++
++/**
++ * [databind#5330] Serialization: {@code @JsonProperty} value used as numeric index
++ * for Enums with {@code Shape.NUMBER}
++ */
++public class EnumSerNumberJsonProperty5330Test extends DatabindTestUtil
++{
++    // no JsonFormat override: used to verify that global WRITE_ENUMS_USING_INDEX keeps ordinal semantics.
++    public enum MyEnumNoFormat {
++        @JsonProperty("7")
++        FOO,
++        @JsonProperty("42")
++        BAR
++    }
++
++    @JsonFormat(shape = JsonFormat.Shape.NUMBER)
++    public enum MyEnum {
++        @JsonProperty("7")
++        FOO,
++        @JsonProperty("42")
++        BAR
++    }
++
++    @JsonFormat(shape = JsonFormat.Shape.NUMBER)
++    public enum NonNumericEnum {
++        @JsonProperty("NOT_A_NUMBER")
++        VALUE
++    }
++
++    static class EnumBean {
++        public MyEnum value = MyEnum.BAR;
++    }
++
++    private final ObjectMapper MAPPER = newJsonMapper();
++
++    @Test
++    public void shouldSerializeUsingNumericJsonPropertyAsIndex() throws Exception {
++        assertEquals("7", MAPPER.writeValueAsString(MyEnum.FOO));
++
++        assertEquals(a2q("{'value':42}"), MAPPER.writeValueAsString(new EnumBean()));
++        assertEquals("[7,42]", MAPPER.writeValueAsString(Arrays.asList(MyEnum.FOO, MyEnum.BAR)));
++        assertEquals("[7]", MAPPER.writeValueAsString(EnumSet.of(MyEnum.FOO)));
++    }
++
++    @Test
++    public void shouldSerializeEnumMapKeysUsingNumericJsonPropertyIndex() throws Exception {
++        Map<MyEnum, String> map = new HashMap<>();
++        map.put(MyEnum.FOO, "lucky");
++
++        assertEquals(a2q("{'7':'lucky'}"), MAPPER.writeValueAsString(map));
++    }
++
++    @Test
++    public void shouldOverrideGlobalIndexFeatureDisable() throws Exception {
++        ObjectMapper mapper = jsonMapperBuilder()
++            .disable(EnumFeature.WRITE_ENUMS_USING_INDEX)
++            .build();
++
++        assertEquals("7", mapper.writeValueAsString(MyEnum.FOO));
++    }
++
++    @Test
++    public void shouldKeepOrdinalWhenGlobalIndexFeatureIsEnabledWithoutFormatOverride() throws Exception {
++        ObjectMapper mapper = jsonMapperBuilder()
++            .enable(EnumFeature.WRITE_ENUMS_USING_INDEX)
++            .build();
++
++        // ordinal semantics: FOO=0, BAR=1 (NOT @JsonProperty("7"/"42"))
++        assertEquals("0", mapper.writeValueAsString(MyEnumNoFormat.FOO));
++        assertEquals("1", mapper.writeValueAsString(MyEnumNoFormat.BAR));
++
++        // also verify container use-cases (same serializer path)
++        assertEquals("[0,1]", mapper.writeValueAsString(Arrays.asList(MyEnumNoFormat.FOO, MyEnumNoFormat.BAR)));
++        assertEquals("[1]", mapper.writeValueAsString(EnumSet.of(MyEnumNoFormat.BAR)));
++    }
++
++    @Test
++    public void shouldFallbackToOrdinalWhenJsonPropertyIsNotNumeric() throws Exception {
++        assertEquals("0", MAPPER.writeValueAsString(NonNumericEnum.VALUE));
++    }
++}
+diff --git a/src/test/java/tools/jackson/databind/util/NumberUtilTest.java b/src/test/java/tools/jackson/databind/util/NumberUtilTest.java
+new file mode 100644
+index 0000000000..0cbe6df334
+--- /dev/null
++++ b/src/test/java/tools/jackson/databind/util/NumberUtilTest.java
+@@ -0,0 +1,65 @@
++package tools.jackson.databind.util;
++
++import org.junit.jupiter.api.Test;
++
++import static org.junit.jupiter.api.Assertions.*;
++
++/**
++ * @since 3.2
++ */
++public class NumberUtilTest
++{
++    @Test
++    public void testSimpleDigits() {
++        assertTrue(NumberUtil.isValidJDKIntNumber("0"));
++        assertTrue(NumberUtil.isValidJDKIntNumber("1"));
++        assertTrue(NumberUtil.isValidJDKIntNumber("42"));
++        assertTrue(NumberUtil.isValidJDKIntNumber("1234567890"));
++    }
++
++    @Test
++    public void testLeadingZeroes() {
++        assertTrue(NumberUtil.isValidJDKIntNumber("007"));
++        assertTrue(NumberUtil.isValidJDKIntNumber("00"));
++    }
++
++    @Test
++    public void testSignedNumbers() {
++        assertTrue(NumberUtil.isValidJDKIntNumber("-1"));
++        assertTrue(NumberUtil.isValidJDKIntNumber("+1"));
++        assertTrue(NumberUtil.isValidJDKIntNumber("-0"));
++        assertTrue(NumberUtil.isValidJDKIntNumber("+42"));
++        assertTrue(NumberUtil.isValidJDKIntNumber("-1234567890"));
++    }
++
++    @Test
++    public void testEmptyAndSignOnly() {
++        assertFalse(NumberUtil.isValidJDKIntNumber(""));
++        assertFalse(NumberUtil.isValidJDKIntNumber("-"));
++        assertFalse(NumberUtil.isValidJDKIntNumber("+"));
++    }
++
++    @Test
++    public void testNonNumeric() {
++        assertFalse(NumberUtil.isValidJDKIntNumber("abc"));
++        assertFalse(NumberUtil.isValidJDKIntNumber("12a"));
++        assertFalse(NumberUtil.isValidJDKIntNumber("a12"));
++        assertFalse(NumberUtil.isValidJDKIntNumber("NOT_A_NUMBER"));
++    }
++
++    @Test
++    public void testDecimalAndFloat() {
++        assertFalse(NumberUtil.isValidJDKIntNumber("1.0"));
++        assertFalse(NumberUtil.isValidJDKIntNumber("3.14"));
++        assertFalse(NumberUtil.isValidJDKIntNumber("1e10"));
++        assertFalse(NumberUtil.isValidJDKIntNumber("1E10"));
++    }
++
++    @Test
++    public void testWhitespaceAndSpecialChars() {
++        assertFalse(NumberUtil.isValidJDKIntNumber(" 1"));
++        assertFalse(NumberUtil.isValidJDKIntNumber("1 "));
++        assertFalse(NumberUtil.isValidJDKIntNumber(" "));
++        assertFalse(NumberUtil.isValidJDKIntNumber("1,000"));
++    }
++}

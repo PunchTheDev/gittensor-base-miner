@@ -100,6 +100,9 @@ REPO_CATEGORY: dict[str, str] = {
     "clap-rs/clap": "rust",
     "hyperium/hyper": "rust",
     "tokio-rs/axum": "rust",
+    # JVM external repos
+    "fasterxml/jackson-databind": "jvm",
+    "square/okhttp": "jvm",
 }
 
 # Default per-category shard budget (sums to 30) — overridable via pool_config.json
@@ -360,8 +363,8 @@ def run_evaluation(
     # Oracle mode: score reference diffs directly — no agent call needed.
     # Used for pipeline calibration; expected weighted mean matches baselines.json.
     if use_oracle:
-        _oracle_weighted = 12.86
-        _oracle_arithmetic = 11.57
+        _oracle_weighted = 12.75
+        _oracle_arithmetic = 11.49
         _baselines_path = Path(__file__).parent.parent / "results" / "baselines.json"
         if _baselines_path.exists():
             try:

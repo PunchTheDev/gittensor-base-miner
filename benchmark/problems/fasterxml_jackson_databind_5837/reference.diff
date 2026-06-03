@@ -1,0 +1,137 @@
+diff --git a/release-notes/VERSION b/release-notes/VERSION
+index 7ce6a0354a..b3832c9a88 100644
+--- a/release-notes/VERSION
++++ b/release-notes/VERSION
+@@ -82,6 +82,9 @@ Versions: 3.x (for earlier see VERSION-2.x)
+   of properties, leading to bogus failure
+  (reported by @awildturtok)
+  (fix by @cowtowncoder, w/ Claude code)
++#3229: Existing instance of a local/anonymous Class cannot be updated
++ (reported by @avshenuk)
++ (fix by @cowtowncoder, w/ Claude code)
+ #3355: Deserialization fails depending on the order of deserialized objects with
+   "Cannot construct instance (although at least one Creator exists)"
+  (reported by @dinopraso)
+diff --git a/src/main/java/tools/jackson/databind/deser/BeanDeserializerFactory.java b/src/main/java/tools/jackson/databind/deser/BeanDeserializerFactory.java
+index d9e438d820..d48c77a02e 100644
+--- a/src/main/java/tools/jackson/databind/deser/BeanDeserializerFactory.java
++++ b/src/main/java/tools/jackson/databind/deser/BeanDeserializerFactory.java
+@@ -1048,12 +1048,10 @@ protected boolean isPotentialBeanType(Class<?> type)
+         if (ClassUtil.isProxyType(type)) {
+             throw new IllegalArgumentException("Cannot deserialize Proxy class "+type.getName()+" as a Bean");
+         }
+-        // also: can't deserialize some local classes: static are ok; in-method not;
+-        // other non-static inner classes are ok
+-        typeStr = ClassUtil.isLocalType(type, true);
+-        if (typeStr != null) {
+-            throw new IllegalArgumentException("Cannot deserialize Class "+type.getName()+" (of type "+typeStr+") as a Bean");
+-        }
++        // [databind#3229]: Local/anonymous classes cannot be instantiated but
++        //   can still be updated via `readerForUpdating()`. So let them through
++        //   here; if actual instantiation is attempted, `ValueInstantiator` will
++        //   fail with a clear error.
+         return true;
+     }
+ 
+diff --git a/src/main/java/tools/jackson/databind/deser/bean/BeanDeserializerBase.java b/src/main/java/tools/jackson/databind/deser/bean/BeanDeserializerBase.java
+index 98a4aad416..8953518369 100644
+--- a/src/main/java/tools/jackson/databind/deser/bean/BeanDeserializerBase.java
++++ b/src/main/java/tools/jackson/databind/deser/bean/BeanDeserializerBase.java
+@@ -1608,6 +1608,11 @@ protected Object deserializeFromObjectUsingNonDefault(JsonParser p,
+         //   inner classes -- with one and only one exception; that of default constructor!
+         //   -- so let's indicate it
+         Class<?> raw = _beanType.getRawClass();
++        // [databind#3229]: Give a more specific message for local/anonymous classes
++        if (ClassUtil.isLocalType(raw, true) != null) {
++            return ctxt.handleMissingInstantiator(raw, null, p,
++"cannot construct instance of local/anonymous class (consider using `readerForUpdating()` to update an existing instance instead)");
++        }
+         if (ClassUtil.isNonStaticInnerClass(raw)) {
+             return ctxt.handleMissingInstantiator(raw, null, p,
+ "non-static inner classes like this can only by instantiated using default, no-argument constructor");
+diff --git a/src/test/java/tools/jackson/databind/convert/UpdateViaObjectReaderTest.java b/src/test/java/tools/jackson/databind/convert/UpdateViaObjectReaderTest.java
+index d9c942a627..180ff62457 100644
+--- a/src/test/java/tools/jackson/databind/convert/UpdateViaObjectReaderTest.java
++++ b/src/test/java/tools/jackson/databind/convert/UpdateViaObjectReaderTest.java
+@@ -13,6 +13,7 @@
+ import tools.jackson.databind.deser.std.StdDeserializer;
+ import tools.jackson.databind.deser.std.StdNodeBasedDeserializer;
+ import tools.jackson.databind.module.SimpleModule;
++import tools.jackson.databind.testutil.DatabindTestUtil;
+ 
+ import static org.junit.jupiter.api.Assertions.*;
+ 
+@@ -25,6 +26,7 @@
+  * expected.
+  */
+ public class UpdateViaObjectReaderTest
++    extends DatabindTestUtil
+ {
+     static class Bean {
+         public String a = "a";
+@@ -378,6 +380,65 @@ public void testReaderForUpdating3814() throws Exception {
+         assertEquals(30, newObj.age);
+     }
+ 
++    // [databind#3229]: readerForUpdating should work with anonymous/local classes
++    @Test
++    public void testReaderForUpdatingAnonymousClass3229() throws Exception {
++        Object anonBean = new Object() {
++            @SuppressWarnings("unused")
++            public int value = 1;
++        };
++        Object result = MAPPER.readerForUpdating(anonBean).readValue(a2q("{'value':42}"));
++        assertSame(anonBean, result);
++        // Verify the field was updated
++        assertEquals(42, anonBean.getClass().getField("value").getInt(anonBean));
++    }
++
++    // [databind#3229]: readerForUpdating should work with local classes
++    @Test
++    public void testReaderForUpdatingLocalClass3229() throws Exception {
++        class LocalBean {
++            public int x = 1;
++            public String y = "original";
++        }
++        LocalBean localBean = new LocalBean();
++        Object result = MAPPER.readerForUpdating(localBean).readValue(a2q("{'x':99,'y':'updated'}"));
++        assertSame(localBean, result);
++        assertEquals(99, localBean.x);
++        assertEquals("updated", localBean.y);
++    }
++
++    // [databind#3229]: direct deserialization (not updating) of anonymous class should still fail
++    @Test
++    public void testDeserializeAnonymousClassFails3229() throws Exception {
++        Object anonBean = new Object() {
++            @SuppressWarnings("unused")
++            public int value = 1;
++        };
++        try {
++            MAPPER.readValue(a2q("{'value':42}"), anonBean.getClass());
++            fail("Should not pass");
++        } catch (DatabindException e) {
++            verifyException(e, "Cannot construct instance of");
++            verifyException(e, "local/anonymous class");
++        }
++    }
++
++    // [databind#3229]: direct deserialization (not updating) of local class should still fail
++    @Test
++    public void testDeserializeLocalClassFails3229() throws Exception {
++        class LocalBean {
++            @SuppressWarnings("unused")
++            public int x = 1;
++        }
++        try {
++            MAPPER.readValue(a2q("{'x':42}"), LocalBean.class);
++            fail("Should not pass");
++        } catch (DatabindException e) {
++            verifyException(e, "Cannot construct instance of");
++            verifyException(e, "local/anonymous class");
++        }
++    }
++
+     // [databind#3814]
+     @Test
+     public void testReaderForUpdating3814DoesNotOverride() throws Exception {

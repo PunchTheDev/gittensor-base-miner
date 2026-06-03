@@ -1,0 +1,1530 @@
+diff --git a/release-notes/CREDITS b/release-notes/CREDITS
+index a6b23c2bbe..08e5800bf1 100644
+--- a/release-notes/CREDITS
++++ b/release-notes/CREDITS
+@@ -500,3 +500,8 @@ David Nelson (@eatdrinksleepcode)
+  * Reported #5814: Enum deserialization does not respect
+    `JsonFormat.Feature.ACCEPT_CASE_INSENSITIVE_VALUES` override
+   [3.2.0]
++
++Daniel Purnomo (@kyooosukedn)
++ * Fixed #5909: Forward Object Id references inside Collection properties
++   leak Builder instance (follow-up to #1496)
++  [3.2.0]
+diff --git a/release-notes/VERSION b/release-notes/VERSION
+index 3c36eeeeef..b53b823991 100644
+--- a/release-notes/VERSION
++++ b/release-notes/VERSION
+@@ -197,6 +197,9 @@ Versions: 3.x (for earlier see VERSION-2.x)
+  (fix by @cowtowncoder, w/ Claude code)
+ #5897: Excessive `TokenBuffer` allocations when deserializing records
+  (fix by Viktor S, w/ Claude code)
++#5909: Forward Object Id references inside Collection properties
++  leak Builder instance (follow-up to #1496)
++ (fix by Daniel P)
+ #5937: Add `SerializationContext.withActiveView()`
+  (implemented by @cowtowncoder)
+ - Remove project-specific Android SDK compatibility level, use shared;
+diff --git a/src/main/java/tools/jackson/databind/DeserializationContext.java b/src/main/java/tools/jackson/databind/DeserializationContext.java
+index 950a0d774a..0b6660cf5f 100644
+--- a/src/main/java/tools/jackson/databind/DeserializationContext.java
++++ b/src/main/java/tools/jackson/databind/DeserializationContext.java
+@@ -135,13 +135,27 @@ public abstract class DeserializationContext
+      * Type of {@link ValueDeserializer} on which {@link ValueDeserializer#createContextual}
+      * is being called currently.
+      */
+-    protected LinkedNode<JavaType> _currentType;
++    protected transient LinkedNode<JavaType> _currentType;
+ 
+     /**
+      * Lazily constructed {@link ClassIntrospector} instance: created from "blueprint"
+      */
+     protected transient ClassIntrospector _classIntrospector;
+ 
++    /**
++     * Re-entrant counter tracking nested {@code @JsonCreator(mode=DELEGATING)}
++     * deserializations that will trigger {@link #updateObjectId} after the
++     * delegate is built. Bracketed by
++     * {@link #enterDelegateBindPending}/{@link #exitDelegateBindPending}.
++     * While positive, any {@code ReadableObjectId.bindItem} call must retain
++     * resolved Referrings so the eventual delegate→bean rebind can replay them
++     * (e.g. for forward Object Id refs inside Collection/Map properties).
++     * See [databind#5909].
++     *
++     * @since 3.2
++     */
++    protected transient int _delegateBindDepth;
++
+     /*
+     /**********************************************************************
+     /* Life-cycle
+@@ -964,6 +978,40 @@ public abstract void checkUnresolvedObjectId()
+      */
+     public abstract boolean hasPendingForwardRefsFor(Object builder);
+ 
++    /**
++     * Mark entry into a {@code @JsonCreator(mode=DELEGATING)} deserialization
++     * that will subsequently call {@link #updateObjectId} to swap delegate→bean.
++     * While the depth counter is positive, any {@code bindItem} call retains
++     * resolved Referrings so the eventual rebind can replay them (e.g. for
++     * forward Object Id refs inside Collection/Map properties).
++     * Re-entrant; must be paired with {@link #exitDelegateBindPending} in a
++     * try/finally.
++     *
++     * @since 3.2
++     */
++    public void enterDelegateBindPending() {
++        _delegateBindDepth++;
++    }
++
++    /**
++     * Pair to {@link #enterDelegateBindPending}; decrements the depth counter.
++     *
++     * @since 3.2
++     */
++    public void exitDelegateBindPending() {
++        _delegateBindDepth--;
++    }
++
++    /**
++     * @return {@code true} when currently inside a delegate-bind window
++     *   established by {@link #enterDelegateBindPending}.
++     *
++     * @since 3.2
++     */
++    public boolean isDelegateBindPending() {
++        return _delegateBindDepth > 0;
++    }
++
+     /*
+     /**********************************************************************
+     /* Public API, type handling
+diff --git a/src/main/java/tools/jackson/databind/deser/BeanDeserializerBuilder.java b/src/main/java/tools/jackson/databind/deser/BeanDeserializerBuilder.java
+index 0ea6bcc7f5..ce9805983e 100644
+--- a/src/main/java/tools/jackson/databind/deser/BeanDeserializerBuilder.java
++++ b/src/main/java/tools/jackson/databind/deser/BeanDeserializerBuilder.java
+@@ -400,7 +400,8 @@ public ValueDeserializer<?> build()
+             //   but no easy access. But hard to see id property being optional,
+             //   so let's consider required at this point.
+             props = _addIdProp(_properties,
+-                    new ObjectIdValueProperty(_objectIdReader, PropertyMetadata.STD_REQUIRED));
++                    new ObjectIdValueProperty(_objectIdReader,
++                            PropertyMetadata.STD_REQUIRED, false));
+         }
+         return new BeanDeserializer(this,
+                 _beanDescRef, _constructPropMap(props), _backRefProperties, _ignorableProps, _ignoreAllUnknown, _includableProps,
+@@ -451,8 +452,11 @@ public ValueDeserializer<?> buildBuilderBased(JavaType valueType, String expBuil
+         if (_objectIdReader != null) {
+             // May or may not have annotations for id property; but no easy access.
+             // But hard to see id property being optional, so let's consider required at this point.
++            // [databind#5909]: builder-based deser will rebind id'd instance from
++            // Builder to built object via finishBuild's updateObjectId — flag it.
+             props = _addIdProp(_properties,
+-                    new ObjectIdValueProperty(_objectIdReader, PropertyMetadata.STD_REQUIRED));
++                    new ObjectIdValueProperty(_objectIdReader,
++                            PropertyMetadata.STD_REQUIRED, true));
+         } else {
+             props = _properties.values();
+         }
+diff --git a/src/main/java/tools/jackson/databind/deser/DeserializationContextExt.java b/src/main/java/tools/jackson/databind/deser/DeserializationContextExt.java
+index ffba980dd8..3f7c6d18e1 100644
+--- a/src/main/java/tools/jackson/databind/deser/DeserializationContextExt.java
++++ b/src/main/java/tools/jackson/databind/deser/DeserializationContextExt.java
+@@ -134,6 +134,9 @@ public void updateObjectId(Object delegate, Object newItem) throws JacksonExcept
+         if (_objectIds != null) {
+             for (ReadableObjectId roid : _objectIds.values()) {
+                 if (roid.tryReplaceBoundItem(delegate, newItem)) {
++                    // [databind#5909]: forward refs already resolved to the
++                    // delegate (e.g. Builder) need to be swapped to newItem too.
++                    roid.notifyReferringsOfRebind(delegate, newItem);
+                     return;
+                 }
+             }
+diff --git a/src/main/java/tools/jackson/databind/deser/ReadableObjectId.java b/src/main/java/tools/jackson/databind/deser/ReadableObjectId.java
+index 9c0a2bac99..b853090dda 100644
+--- a/src/main/java/tools/jackson/databind/deser/ReadableObjectId.java
++++ b/src/main/java/tools/jackson/databind/deser/ReadableObjectId.java
+@@ -1,8 +1,10 @@
+ package tools.jackson.databind.deser;
+ 
++import java.util.ArrayList;
+ import java.util.Collections;
+ import java.util.Iterator;
+ import java.util.LinkedList;
++import java.util.List;
+ 
+ import com.fasterxml.jackson.annotation.ObjectIdGenerator;
+ import com.fasterxml.jackson.annotation.ObjectIdResolver;
+@@ -35,6 +37,28 @@ public class ReadableObjectId
+ 
+     protected LinkedList<Referring> _referringProperties;
+ 
++    /**
++     * Referring properties that have already been resolved via {@link #bindItem}.
++     * Kept alive so that {@link #notifyReferringsOfRebind} can propagate
++     * builder-to-built-object replacements (e.g., after {@code finishBuild}).
++     * Only populated when {@link #_mayRebind} is set, since plain (non-Builder)
++     * deserialization never calls {@code updateObjectId} and would otherwise
++     * retain Referrings as dead memory.
++     *
++     * @since 3.2
++     */
++    protected List<Referring> _resolvedReferringProperties;
++
++    /**
++     * Flag set by callers (e.g., builder-based id property) to indicate that
++     * the bound item is a transient delegate that may later be rebuilt via
++     * {@link DeserializationContext#updateObjectId}; only then is it worth
++     * retaining resolved Referrings for {@link #notifyReferringsOfRebind}.
++     *
++     * @since 3.2
++     */
++    protected boolean _mayRebind;
++
+     protected ObjectIdResolver _resolver;
+ 
+     public ReadableObjectId(ObjectIdGenerator.IdKey key) {
+@@ -56,20 +80,50 @@ public void appendReferring(Referring currentReferring) {
+         _referringProperties.add(currentReferring);
+     }
+ 
++    /**
++     * Mark this entry as potentially rebindable (e.g., bound to a Builder
++     * instance whose {@code finishBuild} will later trigger
++     * {@link DeserializationContext#updateObjectId}). Enables retention of
++     * resolved Referrings so {@link #notifyReferringsOfRebind} can fire.
++     *
++     * @since 3.2
++     */
++    public void markMayRebind() {
++        _mayRebind = true;
++    }
++
+     /**
+      * Method called to assign actual POJO to which ObjectId refers to: will
+      * also handle referring properties, if any, by assigning POJO.
+      */
+     public void bindItem(DeserializationContext ctxt, Object ob) throws JacksonException
+     {
++        // [databind#5909]: bound item may also be a delegate that the outer
++        // deserializer (with @JsonCreator(mode=DELEGATING)) is about to replace
++        // via updateObjectId. The delegate's own deserializer doesn't know it
++        // is being used as a delegate, so the outer signals via context.
++        if (!_mayRebind && ctxt.isDelegateBindPending()) {
++            _mayRebind = true;
++        }
+         _resolver.bindItem(_key, ob);
+         _item = ob;
+         Object id = _key.key;
+         if (_referringProperties != null) {
+             Iterator<Referring> it = _referringProperties.iterator();
+             _referringProperties = null;
++            // [databind#5909]: only retain Referrings when the bound item may
++            // later be rebound (e.g., Builder -> built object). For plain
++            // POJO deserialization no rebind ever fires, so retention would
++            // be pure dead memory.
++            if (_mayRebind && _resolvedReferringProperties == null) {
++                _resolvedReferringProperties = new ArrayList<>();
++            }
+             while (it.hasNext()) {
+-                it.next().handleResolvedForwardReference(ctxt, id, ob);
++                Referring ref = it.next();
++                ref.handleResolvedForwardReference(ctxt, id, ob);
++                if (_mayRebind) {
++                    _resolvedReferringProperties.add(ref);
++                }
+             }
+         }
+     }
+@@ -99,6 +153,27 @@ public boolean tryReplaceBoundItem(Object delegate, Object newItem) {
+         return false;
+     }
+ 
++    /**
++     * Method called after {@link #tryReplaceBoundItem} to notify previously-resolved
++     * {@link Referring} instances that the bound item has been replaced (e.g.,
++     * builder → built object). Collection-like Referring implementations should
++     * override {@link Referring#handleItemRebind} to swap the old item for the new one.
++     *
++     * @since 3.2
++     */
++    public void notifyReferringsOfRebind(Object oldItem, Object newItem)
++            throws JacksonException
++    {
++        if (_resolvedReferringProperties != null) {
++            for (Referring ref : _resolvedReferringProperties) {
++                ref.handleItemRebind(oldItem, newItem);
++            }
++            // Referrings have served their purpose; release for GC. A given
++            // ROID's bound item is rebuilt at most once.
++            _resolvedReferringProperties = null;
++        }
++    }
++
+     public Object resolve(){
+         // [databind#1706] If item was replaced (e.g., after delegating creator),
+         // return the replacement instead of refreshing from resolver
+@@ -190,18 +265,21 @@ public boolean hasId(Object id) {
+         }
+ 
+         /**
+-         * Method for checking if this forward reference was registered against
+-         * the given container instance (the object that will receive the resolved
+-         * value). Used for detecting issues with Builder-based deserialization
+-         * where the container (builder) is discarded after building.
++         * Called when the resolved item has been rebound (e.g., builder → built object).
++         * Implementations that hold resolved values in mutable containers (collections,
++         * arrays, maps) should replace the old item with the new one. Default no-op
++         * since scalar property references are set on the POJO directly and captured
++         * via constructor before build.
+          *
+-         * @param obj The object to check against
+-         * @return {@code true} if this referring was registered against {@code obj}
++         * @param oldItem The previous item (e.g., the builder)
++         * @param newItem The replacement item (e.g., the built object)
+          *
+          * @since 3.2
+          */
+-        public boolean refersTo(Object obj) {
+-            return false;
++        public void handleItemRebind(Object oldItem, Object newItem)
++                throws JacksonException
++        {
++            // no-op by default
+         }
+     }
+ }
+diff --git a/src/main/java/tools/jackson/databind/deser/SettableAnyProperty.java b/src/main/java/tools/jackson/databind/deser/SettableAnyProperty.java
+index c28890947c..e8e3ab2f53 100644
+--- a/src/main/java/tools/jackson/databind/deser/SettableAnyProperty.java
++++ b/src/main/java/tools/jackson/databind/deser/SettableAnyProperty.java
+@@ -300,11 +300,6 @@ public void handleResolvedForwardReference(DeserializationContext ctxt, Object i
+             }
+             _parent.set(ctxt, _pojo, _propName, value);
+         }
+-
+-        @Override
+-        public boolean refersTo(Object obj) {
+-            return _pojo == obj;
+-        }
+     }
+ 
+     /*
+diff --git a/src/main/java/tools/jackson/databind/deser/bean/BeanAsArrayBuilderDeserializer.java b/src/main/java/tools/jackson/databind/deser/bean/BeanAsArrayBuilderDeserializer.java
+index bf19b1cf97..207207207c 100644
+--- a/src/main/java/tools/jackson/databind/deser/bean/BeanAsArrayBuilderDeserializer.java
++++ b/src/main/java/tools/jackson/databind/deser/bean/BeanAsArrayBuilderDeserializer.java
+@@ -265,7 +265,8 @@ protected final Object _deserializeUsingPropertyBased(final JsonParser p,
+         throws JacksonException
+     {
+         final PropertyBasedCreator creator = _propertyBasedCreator;
+-        PropertyValueBuffer buffer = creator.startBuilding(p, ctxt, _objectIdReader);
++        // [databind#5909]: builder will be rebuilt via finishBuild
++        PropertyValueBuffer buffer = creator.startBuilding(p, ctxt, _objectIdReader, true);
+ 
+         final SettableBeanProperty[] props = _orderedProperties;
+         final int propCount = props.length;
+diff --git a/src/main/java/tools/jackson/databind/deser/bean/BeanAsArrayDeserializer.java b/src/main/java/tools/jackson/databind/deser/bean/BeanAsArrayDeserializer.java
+index 0f105c80ef..9efaa25412 100644
+--- a/src/main/java/tools/jackson/databind/deser/bean/BeanAsArrayDeserializer.java
++++ b/src/main/java/tools/jackson/databind/deser/bean/BeanAsArrayDeserializer.java
+@@ -379,7 +379,7 @@ protected final Object _deserializeUsingPropertyBased(final JsonParser p, final
+         throws JacksonException
+     {
+         final PropertyBasedCreator creator = _propertyBasedCreator;
+-        PropertyValueBuffer buffer = creator.startBuilding(p, ctxt, _objectIdReader);
++        PropertyValueBuffer buffer = creator.startBuilding(p, ctxt, _objectIdReader, false);
+ 
+         final SettableBeanProperty[] props = _orderedProperties;
+         final int propCount = props.length;
+diff --git a/src/main/java/tools/jackson/databind/deser/bean/BeanDeserializer.java b/src/main/java/tools/jackson/databind/deser/bean/BeanDeserializer.java
+index 84551bc6a6..cf721c6c53 100644
+--- a/src/main/java/tools/jackson/databind/deser/bean/BeanDeserializer.java
++++ b/src/main/java/tools/jackson/databind/deser/bean/BeanDeserializer.java
+@@ -327,8 +327,8 @@ protected Object _deserializeRecordForUpdate(JsonParser p,
+     {
+         final PropertyBasedCreator creator = _propertyBasedCreator;
+         PropertyValueBuffer buffer = (_anySetter != null)
+-            ? creator.startBuildingWithAnySetter(p, ctxt, _objectIdReader, _anySetter)
+-            : creator.startBuilding(p, ctxt, _objectIdReader);
++            ? creator.startBuildingWithAnySetter(p, ctxt, _objectIdReader, _anySetter, false)
++            : creator.startBuilding(p, ctxt, _objectIdReader, false);
+ 
+         // Step 1: Pre-populate buffer from existing Record values
+         final Class<?> recordClass = _beanType.getRawClass();
+@@ -689,8 +689,8 @@ protected Object _deserializeUsingPropertyBased(final JsonParser p, final Deseri
+     {
+         final PropertyBasedCreator creator = _propertyBasedCreator;
+         PropertyValueBuffer buffer = (_anySetter != null)
+-            ? creator.startBuildingWithAnySetter(p, ctxt, _objectIdReader, _anySetter)
+-            : creator.startBuilding(p, ctxt, _objectIdReader);
++            ? creator.startBuildingWithAnySetter(p, ctxt, _objectIdReader, _anySetter, false)
++            : creator.startBuilding(p, ctxt, _objectIdReader, false);
+ 
+         // [dataformats-text#22]: Handle native Object Ids (e.g. YAML anchors) that
+         // are exposed via parser.getObjectId() rather than as a JSON property.
+@@ -1201,7 +1201,7 @@ protected Object deserializeUsingPropertyBasedWithUnwrapped(JsonParser p, Deseri
+         //    Ok however to pass via setter or field.
+ 
+         final PropertyBasedCreator creator = _propertyBasedCreator;
+-        PropertyValueBuffer buffer = creator.startBuilding(p, ctxt, _objectIdReader);
++        PropertyValueBuffer buffer = creator.startBuilding(p, ctxt, _objectIdReader, false);
+ 
+         TokenBuffer tokens = ctxt.bufferForInputBuffering(p);
+         tokens.writeStartObject();
+@@ -1409,7 +1409,7 @@ protected Object deserializeUsingPropertyBasedWithExternalTypeId(JsonParser p, D
+     {
+         final ExternalTypeHandler ext = _externalTypeIdHandler.start();
+         final PropertyBasedCreator creator = _propertyBasedCreator;
+-        PropertyValueBuffer buffer = creator.startBuilding(p, ctxt, _objectIdReader);
++        PropertyValueBuffer buffer = creator.startBuilding(p, ctxt, _objectIdReader, false);
+ 
+         for (JsonToken t = p.currentToken(); t == JsonToken.PROPERTY_NAME; t = p.nextToken()) {
+             String propName = p.currentName();
+@@ -1549,10 +1549,5 @@ public void handleResolvedForwardReference(DeserializationContext ctxt,
+                 _prop.set(ctxt, _bean, value);
+             }
+         }
+-
+-        @Override
+-        public boolean refersTo(Object obj) {
+-            return _bean == obj;
+-        }
+     }
+ }
+diff --git a/src/main/java/tools/jackson/databind/deser/bean/BeanDeserializerBase.java b/src/main/java/tools/jackson/databind/deser/bean/BeanDeserializerBase.java
+index 91603c00b5..ac2e4a589c 100644
+--- a/src/main/java/tools/jackson/databind/deser/bean/BeanDeserializerBase.java
++++ b/src/main/java/tools/jackson/databind/deser/bean/BeanDeserializerBase.java
+@@ -401,7 +401,10 @@ protected BeanDeserializerBase(BeanDeserializerBase src, ObjectIdReader oir)
+             // 18-Nov-2012, tatu: May or may not have annotations for id property;
+             //   but no easy access. But hard to see id property being optional,
+             //   so let's consider required at this point.
+-            ObjectIdValueProperty idProp = new ObjectIdValueProperty(oir, PropertyMetadata.STD_REQUIRED);
++            // [databind#5909]: builder-based subclasses rebind id'd instance
++            // from Builder to built object via finishBuild — flag accordingly.
++            ObjectIdValueProperty idProp = new ObjectIdValueProperty(oir,
++                    PropertyMetadata.STD_REQUIRED, this instanceof BuilderBasedDeserializer);
+             _beanProperties = src._beanProperties.withProperty(idProp);
+             _vanillaProcessing = false;
+         }
+@@ -1567,6 +1570,10 @@ protected Object _handleTypedObjectId(JsonParser p, DeserializationContext ctxt,
+         // (may happen with polymorphic builder deserialization where the subtype
+         // deserializer already handled ObjectId binding via finishBuild/updateObjectId)
+         if (roid.resolve() != pojo) {
++            // [databind#5909]: builder-based path will rebuild via finishBuild
++            if (this instanceof BuilderBasedDeserializer) {
++                roid.markMayRebind();
++            }
+             roid.bindItem(ctxt, pojo);
+         }
+         // also: may need to set a property value as well
+@@ -1656,7 +1663,22 @@ protected Object deserializeFromObjectUsingNonDefault(JsonParser p,
+         //   Creator handling
+         final ValueDeserializer<Object> delegateDeser = _delegateDeserializer(p);
+         if (delegateDeser != null) {
+-            final Object delegate = delegateDeser.deserialize(p, ctxt);
++            // [databind#5909]: signal delegate-bind-pending so that any ROID
++            // bound during delegate deserialization retains resolved Referrings
++            // — needed for collection-property forward refs to be rebound after
++            // updateObjectId(delegate, bean) below.
++            final boolean track = _objectIdReader != null;
++            if (track) {
++                ctxt.enterDelegateBindPending();
++            }
++            final Object delegate;
++            try {
++                delegate = delegateDeser.deserialize(p, ctxt);
++            } finally {
++                if (track) {
++                    ctxt.exitDelegateBindPending();
++                }
++            }
+             final Object bean = _valueInstantiator.createUsingDelegate(ctxt, delegate);
+             if (_injectables != null) {
+                 injectValues(ctxt, bean);
+diff --git a/src/main/java/tools/jackson/databind/deser/bean/BuilderBasedDeserializer.java b/src/main/java/tools/jackson/databind/deser/bean/BuilderBasedDeserializer.java
+index b51394efd7..623a53cbcf 100644
+--- a/src/main/java/tools/jackson/databind/deser/bean/BuilderBasedDeserializer.java
++++ b/src/main/java/tools/jackson/databind/deser/bean/BuilderBasedDeserializer.java
+@@ -443,7 +443,8 @@ protected Object _deserializeUsingPropertyBased(final JsonParser p,
+         throws JacksonException
+     {
+         final PropertyBasedCreator creator = _propertyBasedCreator;
+-        PropertyValueBuffer buffer = creator.startBuilding(p, ctxt, _objectIdReader);
++        // [databind#5909]: builder will be rebuilt via finishBuild
++        PropertyValueBuffer buffer = creator.startBuilding(p, ctxt, _objectIdReader, true);
+ 
+         // [dataformats-text#22]: Handle native Object Ids (e.g. YAML anchors)
+         if (_objectIdReader != null && p.canReadObjectId()) {
+@@ -829,7 +830,8 @@ protected Object deserializeUsingPropertyBasedWithUnwrapped(JsonParser p,
+         throws JacksonException
+     {
+         final PropertyBasedCreator creator = _propertyBasedCreator;
+-        PropertyValueBuffer buffer = creator.startBuilding(p, ctxt, _objectIdReader);
++        // [databind#5909]: builder will be rebuilt via finishBuild
++        PropertyValueBuffer buffer = creator.startBuilding(p, ctxt, _objectIdReader, true);
+ 
+         TokenBuffer tokens = ctxt.bufferForInputBuffering(p);
+         tokens.writeStartObject();
+diff --git a/src/main/java/tools/jackson/databind/deser/bean/PropertyBasedCreator.java b/src/main/java/tools/jackson/databind/deser/bean/PropertyBasedCreator.java
+index 11028fff2b..a9922d6949 100644
+--- a/src/main/java/tools/jackson/databind/deser/bean/PropertyBasedCreator.java
++++ b/src/main/java/tools/jackson/databind/deser/bean/PropertyBasedCreator.java
+@@ -276,23 +276,56 @@ public boolean hasManagedReferenceProperties() {
+ 
+     /**
+      * Method called when starting to build a bean instance.
++     *
++     * @deprecated Since 3.2
+      */
++    @Deprecated
+     public PropertyValueBuffer startBuilding(JsonParser p, DeserializationContext ctxt,
+             ObjectIdReader oir) {
+-        return new PropertyValueBuffer(p, ctxt, _propertyCount, oir, null,
+-                _injectablePropIndexes);
++        return startBuilding(p, ctxt, oir, false);
+     }
+ 
+     /**
+      * Method called when starting to build a bean instance.
++     *<p>
++     * The {@code mayRebind} flag (added with [databind#5909]) signals that the
++     * constructed instance is a Builder that will be rebuilt via
++     * {@code finishBuild}, so resolved Object Id Referrings need to be retained
++     * for later replay.
+      *
+-     * @since 2.18 (added SettableAnyProperty parameter)
++     * @since 3.2
++     */
++    public PropertyValueBuffer startBuilding(JsonParser p, DeserializationContext ctxt,
++            ObjectIdReader oir, boolean mayRebind) {
++        return new PropertyValueBuffer(p, ctxt, _propertyCount, oir, null,
++                _injectablePropIndexes, mayRebind);
++    }
++
++    /**
++     * @deprecated Since 3.2
+      */
+-    public PropertyValueBuffer startBuildingWithAnySetter(JsonParser p, DeserializationContext ctxt,
++    @Deprecated
++    public PropertyValueBuffer startBuildingWithAnySetter(JsonParser p,
++            DeserializationContext ctxt,
+             ObjectIdReader oir, SettableAnyProperty anySetter
++    ) {
++        return startBuildingWithAnySetter(p, ctxt, oir, anySetter, false);
++    }
++
++    /**
++     * Method called when starting to build a bean instance.
++     *<p>
++     * See {@link #startBuilding(JsonParser, DeserializationContext, ObjectIdReader, boolean)}
++     * for the meaning of {@code mayRebind} ([databind#5909]).
++     *
++     * @since 3.2
++     */
++    public PropertyValueBuffer startBuildingWithAnySetter(JsonParser p,
++            DeserializationContext ctxt,
++            ObjectIdReader oir, SettableAnyProperty anySetter, boolean mayRebind
+     ) {
+         return new PropertyValueBuffer(p, ctxt, _propertyCount, oir, anySetter,
+-                _injectablePropIndexes);
++                _injectablePropIndexes, mayRebind);
+     }
+ 
+     public Object build(DeserializationContext ctxt, PropertyValueBuffer buffer)
+diff --git a/src/main/java/tools/jackson/databind/deser/bean/PropertyValueBuffer.java b/src/main/java/tools/jackson/databind/deser/bean/PropertyValueBuffer.java
+index 25657a006f..06212e5be9 100644
+--- a/src/main/java/tools/jackson/databind/deser/bean/PropertyValueBuffer.java
++++ b/src/main/java/tools/jackson/databind/deser/bean/PropertyValueBuffer.java
+@@ -111,6 +111,16 @@ public class PropertyValueBuffer
+      */
+     protected final BitSet _injectablePropIndexes;
+ 
++    /**
++     * Set when the owning deserializer is Builder-based, so the constructed
++     * bean is a transient Builder that will later be rebuilt via
++     * {@code finishBuild} and trigger {@code updateObjectId}. See
++     * [databind#5909].
++     *
++     * @since 3.2
++     */
++    protected final boolean _mayRebind;
++
+     /*
+     /**********************************************************************
+     /* Life-cycle
+@@ -119,10 +129,22 @@ public class PropertyValueBuffer
+ 
+     /**
+      * @since 3.1
++     * @deprecated Since 3.2
+      */
++    @Deprecated
+     public PropertyValueBuffer(JsonParser p, DeserializationContext ctxt, int paramCount,
+             ObjectIdReader oir, SettableAnyProperty anyParamSetter,
+             BitSet injectablePropIndexes)
++    {
++        this(p, ctxt, paramCount, oir, anyParamSetter, injectablePropIndexes, false);
++    }
++
++    /**
++     * @since 3.2
++     */
++    public PropertyValueBuffer(JsonParser p, DeserializationContext ctxt, int paramCount,
++            ObjectIdReader oir, SettableAnyProperty anyParamSetter,
++            BitSet injectablePropIndexes, boolean mayRebind)
+     {
+         _parser = p;
+         _context = ctxt;
+@@ -142,6 +164,7 @@ public PropertyValueBuffer(JsonParser p, DeserializationContext ctxt, int paramC
+         }
+         _injectablePropIndexes = (injectablePropIndexes == null)
+                 ? null : (BitSet) injectablePropIndexes.clone();
++        _mayRebind = mayRebind;
+     }
+ 
+     /**
+@@ -382,6 +405,9 @@ public Object handleIdValue(final DeserializationContext ctxt, Object bean) thro
+         if (_objectIdReader != null) {
+             if (_idValue != null) {
+                 ReadableObjectId roid = ctxt.findObjectId(_idValue, _objectIdReader.generator, _objectIdReader.resolver);
++                if (_mayRebind) {
++                    roid.markMayRebind();
++                }
+                 roid.bindItem(ctxt, bean);
+                 // also: may need to set a property value as well
+                 SettableBeanProperty idProp = _objectIdReader.idProperty;
+diff --git a/src/main/java/tools/jackson/databind/deser/impl/ObjectIdReferenceProperty.java b/src/main/java/tools/jackson/databind/deser/impl/ObjectIdReferenceProperty.java
+index fa946ab97f..dcab34441a 100644
+--- a/src/main/java/tools/jackson/databind/deser/impl/ObjectIdReferenceProperty.java
++++ b/src/main/java/tools/jackson/databind/deser/impl/ObjectIdReferenceProperty.java
+@@ -139,10 +139,5 @@ public void handleResolvedForwardReference(DeserializationContext ctxt,
+             ctxt.removePendingForwardRef(_pojo);
+             _parent.set(ctxt, _pojo, value);
+         }
+-
+-        @Override
+-        public boolean refersTo(Object obj) {
+-            return _pojo == obj;
+-        }
+     }
+ }
+diff --git a/src/main/java/tools/jackson/databind/deser/impl/ObjectIdValueProperty.java b/src/main/java/tools/jackson/databind/deser/impl/ObjectIdValueProperty.java
+index 18f2736143..212f150fb6 100644
+--- a/src/main/java/tools/jackson/databind/deser/impl/ObjectIdValueProperty.java
++++ b/src/main/java/tools/jackson/databind/deser/impl/ObjectIdValueProperty.java
+@@ -19,12 +19,35 @@ public final class ObjectIdValueProperty
+ {
+     protected final ObjectIdReader _objectIdReader;
+ 
++    /**
++     * Set when the owning deserializer is Builder-based, so the bound id'd
++     * instance is a transient Builder that will later be rebuilt via
++     * {@code finishBuild} and trigger {@code updateObjectId}.
++     *
++     * @since 3.2
++     */
++    protected final boolean _mayRebind;
++
++    /**
++     * @deprecated Since 3.2
++     */
++    @Deprecated
+     public ObjectIdValueProperty(ObjectIdReader objectIdReader,
+             PropertyMetadata metadata)
++    {
++        this(objectIdReader, metadata, false);
++    }
++
++    /**
++     * @since 3.2
++     */
++    public ObjectIdValueProperty(ObjectIdReader objectIdReader,
++            PropertyMetadata metadata, boolean mayRebind)
+     {
+         super(objectIdReader.propertyName, objectIdReader.getIdType(), metadata,
+                 objectIdReader.getDeserializer());
+         _objectIdReader = objectIdReader;
++        _mayRebind = mayRebind;
+     }
+ 
+     protected ObjectIdValueProperty(ObjectIdValueProperty src, ValueDeserializer<?> deser,
+@@ -32,11 +55,13 @@ protected ObjectIdValueProperty(ObjectIdValueProperty src, ValueDeserializer<?>
+     {
+         super(src, deser, nva);
+         _objectIdReader = src._objectIdReader;
++        _mayRebind = src._mayRebind;
+     }
+ 
+     protected ObjectIdValueProperty(ObjectIdValueProperty src, PropertyName newName) {
+         super(src, newName);
+         _objectIdReader = src._objectIdReader;
++        _mayRebind = src._mayRebind;
+     }
+ 
+     @Override
+@@ -96,6 +121,9 @@ public Object deserializeSetAndReturn(JsonParser p,
+         }
+         Object id = _valueDeserializer.deserialize(p, ctxt);
+         ReadableObjectId roid = ctxt.findObjectId(id, _objectIdReader.generator, _objectIdReader.resolver);
++        if (_mayRebind) {
++            roid.markMayRebind();
++        }
+         roid.bindItem(ctxt, instance);
+         // also: may need to set a property value as well
+         SettableBeanProperty idProp = _objectIdReader.idProperty;
+diff --git a/src/main/java/tools/jackson/databind/deser/jdk/CollectionDeserializer.java b/src/main/java/tools/jackson/databind/deser/jdk/CollectionDeserializer.java
+index 2ff155b0d0..5db454e973 100644
+--- a/src/main/java/tools/jackson/databind/deser/jdk/CollectionDeserializer.java
++++ b/src/main/java/tools/jackson/databind/deser/jdk/CollectionDeserializer.java
+@@ -659,6 +659,57 @@ public void resolveForwardReference(DeserializationContext ctxt, Object id, Obje
+             throw new IllegalArgumentException("Trying to resolve a forward reference with id [" + id
+                     + "] that wasn't previously seen as unresolved.");
+         }
++
++        /**
++         * Replace a resolved item in the result collection. Called when the bound
++         * item is rebound (e.g., builder → built object) via
++         * {@link Referring#handleItemRebind}.
++         *
++         * @param oldItem Item to replace (Builder)
++         * @param newItem Item to replace {@code oldItem} with (Built value)
++         *
++         * @since 3.2
++         */
++        public void replaceResolvedItem(Object oldItem, Object newItem) {
++            if (_result instanceof List<?>) {
++                @SuppressWarnings("unchecked")
++                List<Object> list = (List<Object>) _result;
++                for (int i = 0, len = list.size(); i < len; i++) {
++                    if (list.get(i) == oldItem) {
++                        list.set(i, newItem);
++                    }
++                }
++            } else if (_containsIdentity(_result, oldItem)) {
++                // Non-list collections (e.g. LinkedHashSet, TreeSet): snapshot,
++                // clear, and replay with substitution so insertion order /
++                // comparator-based ordering is preserved and counts stay correct
++                // for any Collection impl.
++                List<Object> snapshot = new ArrayList<>(_result);
++                _result.clear();
++                for (Object item : snapshot) {
++                    _result.add(item == oldItem ? newItem : item);
++                }
++            }
++            // Same item may also live in a still-pending accumulator slot
++            // if a later forward ref hasn't yet been resolved.
++            for (CollectionReferring ref : _accumulator) {
++                for (int i = 0, len = ref.next.size(); i < len; i++) {
++                    if (ref.next.get(i) == oldItem) {
++                        ref.next.set(i, newItem);
++                    }
++                }
++            }
++        }
++
++        // @since 3.2
++        private static boolean _containsIdentity(Collection<?> coll, Object target) {
++            for (Object item : coll) {
++                if (item == target) {
++                    return true;
++                }
++            }
++            return false;
++        }
+     }
+ 
+     /**
+@@ -681,6 +732,11 @@ private final static class CollectionReferring extends Referring {
+         public void handleResolvedForwardReference(DeserializationContext ctxt, Object id, Object value) throws JacksonException {
+             _parent.resolveForwardReference(ctxt, id, value);
+         }
++
++        @Override
++        public void handleItemRebind(Object oldItem, Object newItem) {
++            _parent.replaceResolvedItem(oldItem, newItem);
++        }
+     }
+ 
+ }
+diff --git a/src/main/java/tools/jackson/databind/deser/jdk/EnumMapDeserializer.java b/src/main/java/tools/jackson/databind/deser/jdk/EnumMapDeserializer.java
+index 6f2d988681..69a7c69da6 100644
+--- a/src/main/java/tools/jackson/databind/deser/jdk/EnumMapDeserializer.java
++++ b/src/main/java/tools/jackson/databind/deser/jdk/EnumMapDeserializer.java
+@@ -348,7 +348,7 @@ public EnumMap<?,?> _deserializeUsingProperties(JsonParser p, DeserializationCon
+     {
+         final PropertyBasedCreator creator = _propertyBasedCreator;
+         // null -> no ObjectIdReader for EnumMaps
+-        PropertyValueBuffer buffer = creator.startBuilding(p, ctxt, null);
++        PropertyValueBuffer buffer = creator.startBuilding(p, ctxt, null, false);
+ 
+         String keyName;
+         if (p.isExpectedStartObjectToken()) {
+diff --git a/src/main/java/tools/jackson/databind/deser/jdk/FactoryBasedEnumDeserializer.java b/src/main/java/tools/jackson/databind/deser/jdk/FactoryBasedEnumDeserializer.java
+index 520eab001d..63c339071c 100644
+--- a/src/main/java/tools/jackson/databind/deser/jdk/FactoryBasedEnumDeserializer.java
++++ b/src/main/java/tools/jackson/databind/deser/jdk/FactoryBasedEnumDeserializer.java
+@@ -231,7 +231,7 @@ public Object deserializeWithType(JsonParser p, DeserializationContext ctxt, Typ
+     protected Object deserializeEnumUsingPropertyBased(final JsonParser p, final DeserializationContext ctxt,
+     		final PropertyBasedCreator creator) throws JacksonException
+     {
+-        PropertyValueBuffer buffer = creator.startBuilding(p, ctxt, null);
++        PropertyValueBuffer buffer = creator.startBuilding(p, ctxt, null, false);
+ 
+         JsonToken t = p.currentToken();
+         for (; t == JsonToken.PROPERTY_NAME; t = p.nextToken()) {
+diff --git a/src/main/java/tools/jackson/databind/deser/jdk/MapDeserializer.java b/src/main/java/tools/jackson/databind/deser/jdk/MapDeserializer.java
+index eeb6cd30a0..ced9b092e9 100644
+--- a/src/main/java/tools/jackson/databind/deser/jdk/MapDeserializer.java
++++ b/src/main/java/tools/jackson/databind/deser/jdk/MapDeserializer.java
+@@ -690,7 +690,7 @@ public Map<Object,Object> _deserializeUsingCreator(JsonParser p, Deserialization
+     {
+         final PropertyBasedCreator creator = _propertyBasedCreator;
+         // null -> no ObjectIdReader for Maps (yet?)
+-        PropertyValueBuffer buffer = creator.startBuilding(p, ctxt, null);
++        PropertyValueBuffer buffer = creator.startBuilding(p, ctxt, null, false);
+ 
+         String key;
+         if (p.isExpectedStartObjectToken()) {
+@@ -1036,6 +1036,33 @@ public void resolveForwardReference(DeserializationContext ctxt, Object id, Obje
+             throw new IllegalArgumentException("Trying to resolve a forward reference with id [" + id
+                     + "] that wasn't previously seen as unresolved.");
+         }
++
++        /**
++         * Replace a resolved item in the result map. Called when the bound item
++         * is rebound (e.g., builder → built object).
++         *
++         * @param oldItem Item to replace (Builder)
++         * @param newItem Item to replace {@code oldItem} with (Built value)
++         *
++         * @since 3.2
++         */
++        public void replaceResolvedItem(Object oldItem, Object newItem) {
++            replaceInMap(_result, oldItem, newItem);
++            // Pending accumulator entries may also hold the old item if a later
++            // forward ref hasn't yet resolved.
++            for (MapReferring ref : _accumulator) {
++                replaceInMap(ref.next, oldItem, newItem);
++            }
++        }
++
++        private static void replaceInMap(Map<Object, Object> map, Object oldItem, Object newItem) {
++            // Identity match: oldItem is the exact bound delegate (e.g. Builder).
++            for (Map.Entry<Object, Object> entry : map.entrySet()) {
++                if (entry.getValue() == oldItem) {
++                    entry.setValue(newItem);
++                }
++            }
++        }
+     }
+ 
+     /**
+@@ -1046,7 +1073,7 @@ public void resolveForwardReference(DeserializationContext ctxt, Object id, Obje
+     static class MapReferring extends Referring {
+         private final MapReferringAccumulator _parent;
+ 
+-        public final Map<Object, Object> next = new LinkedHashMap<Object, Object>();
++        public final Map<Object, Object> next = new LinkedHashMap<>();
+         public final Object key;
+ 
+         MapReferring(MapReferringAccumulator parent, UnresolvedForwardReference ref,
+@@ -1063,5 +1090,10 @@ public void handleResolvedForwardReference(DeserializationContext ctxt, Object i
+         {
+             _parent.resolveForwardReference(ctxt, id, value);
+         }
++
++        @Override
++        public void handleItemRebind(Object oldItem, Object newItem) {
++            _parent.replaceResolvedItem(oldItem, newItem);
++        }
+     }
+ }
+diff --git a/src/main/java/tools/jackson/databind/deser/jdk/ObjectArrayDeserializer.java b/src/main/java/tools/jackson/databind/deser/jdk/ObjectArrayDeserializer.java
+index 6301ef4a11..d94a7e2275 100644
+--- a/src/main/java/tools/jackson/databind/deser/jdk/ObjectArrayDeserializer.java
++++ b/src/main/java/tools/jackson/databind/deser/jdk/ObjectArrayDeserializer.java
+@@ -540,6 +540,17 @@ void resolveForwardReference(Object id, Object value) {
+                     + "] that wasn't previously seen as unresolved.");
+         }
+ 
++        // [databind#5909]: no `replaceResolvedItem` here, unlike Collection/Map
++        // accumulators. The Builder→built rebind path is unreachable for arrays:
++        //  - Typed arrays (e.g. `Entity[]`) cannot store the Builder instance,
++        //    so `resolveForwardReference` throws `ArrayStoreException` before
++        //    any rebind could fire.
++        //  - Untyped `Object[]` arrays don't trigger the forward-ref accumulator
++        //    at all because the default element deserializer
++        //    ({@code UntypedObjectDeserializer}) has no `ObjectIdReader`.
++        // Regression covered by
++        // {@code ObjectIdWithBuilder5909Test#forwardReferenceInTypedArrayFailsArrayStoreException}.
++
+         Object[] buildArray() {
+             final int size = _accumulator.size();
+             if (_untyped) {
+@@ -571,5 +582,8 @@ public void handleResolvedForwardReference(DeserializationContext ctxt,
+                 Object id, Object value) {
+             _parent.resolveForwardReference(id, value);
+         }
++
++        // [databind#5909]: no `handleItemRebind` override. The default no-op is
++        // correct for arrays — see comment in ObjectArrayReferringAccumulator.
+     }
+ }
+diff --git a/src/test/java/tools/jackson/databind/deser/bean/BeanPropertyMapTest.java b/src/test/java/tools/jackson/databind/deser/bean/BeanPropertyMapTest.java
+index 6bebcf03df..2a5bd3dd7a 100644
+--- a/src/test/java/tools/jackson/databind/deser/bean/BeanPropertyMapTest.java
++++ b/src/test/java/tools/jackson/databind/deser/bean/BeanPropertyMapTest.java
+@@ -33,11 +33,12 @@ public void testArrayOutOfBounds884() throws Exception
+     {
+         List<SettableBeanProperty> props = new ArrayList<SettableBeanProperty>();
+         PropertyMetadata md = PropertyMetadata.STD_REQUIRED;
+-        props.add(new ObjectIdValueProperty(new MyObjectIdReader("pk"), md));
+-        props.add(new ObjectIdValueProperty(new MyObjectIdReader("firstName"), md));
++        props.add(new ObjectIdValueProperty(new MyObjectIdReader("pk"), md, false));
++        props.add(new ObjectIdValueProperty(new MyObjectIdReader("firstName"), md, false));
+         BeanPropertyMap propMap = new BeanPropertyMap(props,
+                 null, Locale.getDefault(), false, true);
+-        propMap = propMap.withProperty(new ObjectIdValueProperty(new MyObjectIdReader("@id"), md));
++        propMap = propMap.withProperty(new ObjectIdValueProperty(new MyObjectIdReader("@id"),
++                md, false));
+         assertNotNull(propMap);
+     }
+ }
+diff --git a/src/test/java/tools/jackson/databind/objectid/ObjectIdWithBuilder1496Test.java b/src/test/java/tools/jackson/databind/objectid/ObjectIdWithBuilder1496Test.java
+index 55199ef156..d414653145 100644
+--- a/src/test/java/tools/jackson/databind/objectid/ObjectIdWithBuilder1496Test.java
++++ b/src/test/java/tools/jackson/databind/objectid/ObjectIdWithBuilder1496Test.java
+@@ -19,9 +19,9 @@
+ /**
+  * [databind#1496]: Object Ids with builder-based deserialization.
+  *<p>
+- * NOTE: this test class contains passing tests; there is separate class,
+- * {@link tools.jackson.databind.tofix.ObjectIdWithBuilder5909Test}, for
+- * remaining failing cases.
++ * NOTE: this test class contains passing tests; collection-item forward
++ * references are tested in
++ * {@link tools.jackson.databind.objectid.ObjectIdWithBuilder5909Test}.
+  */
+ class ObjectIdWithBuilder1496Test extends DatabindTestUtil
+ {
+diff --git a/src/test/java/tools/jackson/databind/objectid/ObjectIdWithBuilder5909Test.java b/src/test/java/tools/jackson/databind/objectid/ObjectIdWithBuilder5909Test.java
+new file mode 100644
+index 0000000000..bba19a0e28
+--- /dev/null
++++ b/src/test/java/tools/jackson/databind/objectid/ObjectIdWithBuilder5909Test.java
+@@ -0,0 +1,502 @@
++package tools.jackson.databind.objectid;
++
++import java.util.LinkedHashMap;
++import java.util.LinkedHashSet;
++import java.util.List;
++import java.util.Map;
++import java.util.Set;
++
++import org.junit.jupiter.api.Test;
++
++import com.fasterxml.jackson.annotation.JsonAutoDetect;
++import com.fasterxml.jackson.annotation.JsonCreator;
++import com.fasterxml.jackson.annotation.JsonIdentityInfo;
++import com.fasterxml.jackson.annotation.JsonProperty;
++import com.fasterxml.jackson.annotation.ObjectIdGenerators;
++
++import tools.jackson.databind.*;
++import tools.jackson.databind.annotation.JsonDeserialize;
++import tools.jackson.databind.annotation.JsonPOJOBuilder;
++import tools.jackson.databind.annotation.JsonSerialize;
++import tools.jackson.databind.testutil.DatabindTestUtil;
++
++import static org.junit.jupiter.api.Assertions.*;
++
++/**
++ * Tests for [databind#5909] (follow-up to [databind#1496]): Forward Object Id
++ * references that appear inside a {@link java.util.Collection}, or
++ * {@link java.util.Map}-typed property of a Builder-based type must be
++ * correctly resolved to the built target object, not the Builder instance.
++ * Also covers builder-with-property-creator ({@code @JsonCreator}),                                    
++ * delegating-creator ({@code [databind#1706]}), and documents the   
++ * typed-array limitation. 
++ */
++class ObjectIdWithBuilder5909Test extends DatabindTestUtil
++{
++    @JsonIdentityInfo(generator = ObjectIdGenerators.PropertyGenerator.class, property = "id")
++    @JsonDeserialize(builder = EntityBuilder.class)
++    static class Entity
++    {
++        private long id;
++        private Entity ref;
++        private List<Entity> refs;
++
++        Entity(long id, Entity ref, List<Entity> refs) {
++            this.id = id;
++            this.ref = ref;
++            this.refs = refs;
++        }
++
++        public long getId() { return id; }
++        public Entity getRef() { return ref; }
++        public List<Entity> getRefs() { return refs; }
++    }
++
++    @JsonIdentityInfo(generator = ObjectIdGenerators.PropertyGenerator.class, property = "id")
++    @JsonPOJOBuilder(withPrefix = "")
++    static class EntityBuilder
++    {
++        private long id;
++        private Entity ref;
++        private List<Entity> refs;
++
++        public EntityBuilder id(long id) { this.id = id; return this; }
++        public EntityBuilder ref(Entity ref) { this.ref = ref; return this; }
++        public EntityBuilder refs(List<Entity> refs) { this.refs = refs; return this; }
++
++        public Entity build() {
++            return new Entity(id, ref, refs);
++        }
++    }
++
++    static class EntityContainer
++    {
++        public List<Entity> entities;
++    }
++
++    // ---- Set variant: exercises CollectionReferring non-List branch ----
++
++    @JsonIdentityInfo(generator = ObjectIdGenerators.PropertyGenerator.class, property = "id")
++    @JsonDeserialize(builder = EntitySetBuilder.class)
++    static class EntitySet
++    {
++        private final long id;
++        private final Set<EntitySet> refs;
++
++        EntitySet(long id, Set<EntitySet> refs) {
++            this.id = id;
++            this.refs = refs;
++        }
++        public long getId() { return id; }
++        public Set<EntitySet> getRefs() { return refs; }
++    }
++
++    @JsonIdentityInfo(generator = ObjectIdGenerators.PropertyGenerator.class, property = "id")
++    @JsonPOJOBuilder(withPrefix = "")
++    static class EntitySetBuilder
++    {
++        private long id;
++        private Set<EntitySet> refs;
++
++        public EntitySetBuilder id(long id) { this.id = id; return this; }
++        public EntitySetBuilder refs(Set<EntitySet> refs) { this.refs = refs; return this; }
++
++        public EntitySet build() {
++            return new EntitySet(id, refs == null ? new LinkedHashSet<>() : refs);
++        }
++    }
++
++    static class EntitySetContainer
++    {
++        public List<EntitySet> entities;
++    }
++
++    // ---- Map variant: exercises MapReferring rebind path ----
++
++    @JsonIdentityInfo(generator = ObjectIdGenerators.PropertyGenerator.class, property = "id")
++    @JsonDeserialize(builder = EntityMapBuilder.class)
++    static class EntityMap
++    {
++        private final long id;
++        private final Map<String, EntityMap> refs;
++
++        EntityMap(long id, Map<String, EntityMap> refs) {
++            this.id = id;
++            this.refs = refs;
++        }
++        public long getId() { return id; }
++        public Map<String, EntityMap> getRefs() { return refs; }
++    }
++
++    @JsonIdentityInfo(generator = ObjectIdGenerators.PropertyGenerator.class, property = "id")
++    @JsonPOJOBuilder(withPrefix = "")
++    static class EntityMapBuilder
++    {
++        private long id;
++        private Map<String, EntityMap> refs;
++
++        public EntityMapBuilder id(long id) { this.id = id; return this; }
++        public EntityMapBuilder refs(Map<String, EntityMap> refs) { this.refs = refs; return this; }
++
++        public EntityMap build() {
++            return new EntityMap(id, refs == null ? new LinkedHashMap<>() : refs);
++        }
++    }
++
++    static class EntityMapContainer
++    {
++        public List<EntityMap> entities;
++    }
++
++    // ---- Property-based-creator builder variant: exercises the
++    // PropertyValueBuffer.handleIdValue rebind path, distinct from
++    // setter-based builders which go via ObjectIdValueProperty.
++
++    @JsonIdentityInfo(generator = ObjectIdGenerators.PropertyGenerator.class, property = "id")
++    @JsonDeserialize(builder = EntityCreatorBuilder.class)
++    static class EntityCreator
++    {
++        public final long id;
++        public final List<EntityCreator> refs;
++
++        EntityCreator(long id, List<EntityCreator> refs) {
++            this.id = id;
++            this.refs = refs;
++        }
++    }
++
++    @JsonIdentityInfo(generator = ObjectIdGenerators.PropertyGenerator.class, property = "id")
++    @JsonPOJOBuilder(withPrefix = "")
++    static class EntityCreatorBuilder
++    {
++        private final long id;
++        private final List<EntityCreator> refs;
++
++        @JsonCreator
++        EntityCreatorBuilder(@JsonProperty("id") long id,
++                @JsonProperty("refs") List<EntityCreator> refs) {
++            this.id = id;
++            this.refs = refs;
++        }
++
++        public EntityCreator build() {
++            return new EntityCreator(id, refs);
++        }
++    }
++
++    static class EntityCreatorContainer
++    {
++        public List<EntityCreator> entities;
++    }
++    
++    // NOTE: An equivalent test for `Entity[]`-typed properties is intentionally
++    // omitted: typed arrays of the built type fail earlier with ArrayStoreException
++    // when the Builder is stored into `_array` during bindItem, well before the
++    // rebind path added here can run. That gap is out of scope for #5909.
++
++    private final ObjectMapper MAPPER = newJsonMapper();
++
++    @Test
++    public void forwardReferenceInCollection() throws Exception
++    {
++        String json = a2q("{'entities':["
++                + "{'id':1,'refs':[2]},"
++                + "{'id':2,'ref':1,'refs':[]}"
++                + "]}");
++
++        EntityContainer container = MAPPER.readValue(json, EntityContainer.class);
++        assertNotNull(container);
++        assertEquals(2, container.entities.size());
++
++        Entity first = container.entities.get(0);
++        Entity second = container.entities.get(1);
++
++        assertEquals(1, first.getId());
++        assertEquals(2, second.getId());
++
++        assertSame(first, second.getRef());
++        assertEquals(1, first.getRefs().size());
++        assertSame(second, first.getRefs().get(0));
++    }
++
++    @Test
++    public void forwardReferenceInSet() throws Exception
++    {
++        String json = a2q("{'entities':["
++                + "{'id':1,'refs':[2]},"
++                + "{'id':2,'refs':[]}"
++                + "]}");
++
++        EntitySetContainer container = MAPPER.readValue(json, EntitySetContainer.class);
++        assertEquals(2, container.entities.size());
++
++        EntitySet first = container.entities.get(0);
++        EntitySet second = container.entities.get(1);
++
++        assertEquals(1, first.getRefs().size());
++        assertSame(second, first.getRefs().iterator().next());
++    }
++
++    @Test
++    public void forwardReferenceInMap() throws Exception
++    {
++        String json = a2q("{'entities':["
++                + "{'id':1,'refs':{'k':2}},"
++                + "{'id':2,'refs':{}}"
++                + "]}");
++
++        EntityMapContainer container = MAPPER.readValue(json, EntityMapContainer.class);
++        assertEquals(2, container.entities.size());
++
++        EntityMap first = container.entities.get(0);
++        EntityMap second = container.entities.get(1);
++
++        assertEquals(1, first.getRefs().size());
++        assertSame(second, first.getRefs().get("k"));
++    }
++
++    // Same forward id appearing multiple times in one List: every slot must be
++    // rebound, not just the first.
++    @Test
++    public void duplicateForwardReferenceInList() throws Exception
++    {
++        String json = a2q("{'entities':["
++                + "{'id':1,'refs':[2,2,2]},"
++                + "{'id':2,'refs':[]}"
++                + "]}");
++
++        EntityContainer container = MAPPER.readValue(json, EntityContainer.class);
++        Entity first = container.entities.get(0);
++        Entity second = container.entities.get(1);
++
++        assertEquals(3, first.getRefs().size());
++        assertSame(second, first.getRefs().get(0));
++        assertSame(second, first.getRefs().get(1));
++        assertSame(second, first.getRefs().get(2));
++    }
++
++    // Multiple distinct forward ids in one List, all needing rebind.
++    @Test
++    public void multipleForwardReferencesInList() throws Exception
++    {
++        String json = a2q("{'entities':["
++                + "{'id':1,'refs':[2,3]},"
++                + "{'id':2,'refs':[]},"
++                + "{'id':3,'refs':[]}"
++                + "]}");
++
++        EntityContainer container = MAPPER.readValue(json, EntityContainer.class);
++        assertEquals(3, container.entities.size());
++
++        Entity first = container.entities.get(0);
++        Entity second = container.entities.get(1);
++        Entity third = container.entities.get(2);
++
++        assertEquals(2, first.getRefs().size());
++        assertSame(second, first.getRefs().get(0));
++        assertSame(third, first.getRefs().get(1));
++    }
++
++    // Multi-element Set with two forward refs to distinct ids: every entry
++    // must end up rebound to its built object (none left as Builder), and the
++    // snapshot/clear/replay path must not drop or duplicate entries.
++    @Test
++    public void multipleForwardReferencesInSet() throws Exception
++    {
++        String json = a2q("{'entities':["
++                + "{'id':1,'refs':[2,3]},"
++                + "{'id':2,'refs':[]},"
++                + "{'id':3,'refs':[]}"
++                + "]}");
++
++        EntitySetContainer container = MAPPER.readValue(json, EntitySetContainer.class);
++        EntitySet first = container.entities.get(0);
++        EntitySet second = container.entities.get(1);
++        EntitySet third = container.entities.get(2);
++
++        Set<EntitySet> refs = first.getRefs();
++        assertEquals(2, refs.size());
++        // Every entry must be a built EntitySet, not a leftover Builder.
++        for (EntitySet item : refs) {
++            assertEquals(EntitySet.class, item.getClass(),
++                    "entry should have been rebound from Builder to built object");
++        }
++        assertTrue(refs.contains(second));
++        assertTrue(refs.contains(third));
++    }
++
++    // Multi-entry Map: forward and resolved refs in the same Map, distinct keys.
++    @Test
++    public void multipleForwardReferencesInMap() throws Exception
++    {
++        String json = a2q("{'entities':["
++                + "{'id':1,'refs':{'a':2,'b':3,'c':2}},"
++                + "{'id':2,'refs':{}},"
++                + "{'id':3,'refs':{}}"
++                + "]}");
++
++        EntityMapContainer container = MAPPER.readValue(json, EntityMapContainer.class);
++        EntityMap first = container.entities.get(0);
++        EntityMap second = container.entities.get(1);
++        EntityMap third = container.entities.get(2);
++
++        assertEquals(3, first.getRefs().size());
++        assertSame(second, first.getRefs().get("a"));
++        assertSame(third, first.getRefs().get("b"));
++        assertSame(second, first.getRefs().get("c"));
++    }
++
++    @Test
++    public void forwardReferenceInCollectionWithPropertyCreatorBuilder() throws Exception
++    {
++        String json = a2q("{'entities':["
++                + "{'id':1,'refs':[2]},"
++                + "{'id':2,'refs':[]}"
++                + "]}");
++
++        EntityCreatorContainer container = MAPPER.readValue(json, EntityCreatorContainer.class);
++        EntityCreator first = container.entities.get(0);
++        EntityCreator second = container.entities.get(1);
++
++        assertEquals(1, first.refs.size());
++        assertSame(second, first.refs.get(0),
++                "forward ref must be rebound from Builder to built object via PropertyValueBuffer path");
++    }
++
++    // ---- Array variant: documents the current limitation for typed arrays.
++    // A forward Object Id reference inside a typed `Entity[]` property of a
++    // Builder-based type cannot resolve to the Builder (different runtime type
++    // than the array's component) — the JVM rejects the store with
++    // `ArrayStoreException` during `resolveForwardReference`, well before the
++    // builder→built rebind path added by [databind#5909] could run.
++    //
++    // This is a regression test for the documented behavior referenced by
++    // {@link tools.jackson.databind.deser.jdk.ObjectArrayDeserializer.ObjectArrayReferringAccumulator#replaceResolvedItem(Object, Object)}.
++    // Untyped `Object[]` arrays don't reach the same path because the default
++    // element deserializer (UntypedObjectDeserializer) has no ObjectIdReader,
++    // so the accumulator/forward-ref path isn't taken at all.
++
++    @JsonIdentityInfo(generator = ObjectIdGenerators.PropertyGenerator.class, property = "id")
++    @JsonDeserialize(builder = EntityArrayBuilder.class)
++    static class EntityArray
++    {
++        public final long id;
++        public final EntityArray[] refs;
++
++        EntityArray(long id, EntityArray[] refs) {
++            this.id = id;
++            this.refs = refs;
++        }
++    }
++
++    @JsonIdentityInfo(generator = ObjectIdGenerators.PropertyGenerator.class, property = "id")
++    @JsonPOJOBuilder(withPrefix = "")
++    static class EntityArrayBuilder
++    {
++        private long id;
++        private EntityArray[] refs;
++
++        public EntityArrayBuilder id(long id) { this.id = id; return this; }
++        public EntityArrayBuilder refs(EntityArray[] refs) { this.refs = refs; return this; }
++
++        public EntityArray build() { return new EntityArray(id, refs); }
++    }
++
++    static class EntityArrayContainer
++    {
++        public List<EntityArray> entities;
++    }
++
++    @Test
++    public void forwardReferenceInTypedArrayFailsArrayStoreException() throws Exception
++    {
++        String json = a2q("{'entities':["
++                + "{'id':1,'refs':[2]},"
++                + "{'id':2,'refs':[]}"
++                + "]}");
++
++        // Typed `EntityArray[]` cannot hold an `EntityArrayBuilder` instance.
++        // The forward-ref resolution writes the builder into the array slot
++        // (in resolveForwardReference) and the JVM throws ArrayStoreException.
++        Throwable thrown = assertThrows(Throwable.class,
++                () -> MAPPER.readValue(json, EntityArrayContainer.class));
++        Throwable root = thrown;
++        while (root.getCause() != null && root != root.getCause()) {
++            root = root.getCause();
++        }
++        assertEquals(ArrayStoreException.class, root.getClass(),
++                "expected ArrayStoreException, got: " + root);
++    }
++
++    // ---- Delegating-creator variant ([databind#1706] + collection forward
++    // refs): the bound id'd instance is a transient delegate (Mutable*) which
++    // is replaced via updateObjectId after createUsingDelegate. Forward refs
++    // inside a Collection-typed property must be rebound to the final bean,
++    // not left pointing at the discarded delegate.
++
++    @JsonIdentityInfo(generator = ObjectIdGenerators.IntSequenceGenerator.class, property = "@id")
++    @JsonSerialize(as = ImmutableEntity1706.class)
++    @JsonDeserialize(as = ImmutableEntity1706.class)
++    interface Entity1706 {
++        long getId();
++        List<Entity1706> getRefs();
++    }
++
++    static class ImmutableEntity1706 implements Entity1706 {
++        private final long id;
++        private final List<Entity1706> refs;
++
++        ImmutableEntity1706(long id, List<Entity1706> refs) {
++            this.id = id;
++            this.refs = refs;
++        }
++
++        @Override public long getId() { return id; }
++        @Override public List<Entity1706> getRefs() { return refs; }
++
++        @JsonCreator(mode = JsonCreator.Mode.DELEGATING)
++        static ImmutableEntity1706 fromJson(MutableEntity1706 m) {
++            return new ImmutableEntity1706(m.id, m.refs);
++        }
++    }
++
++    // @JsonDeserialize (no `as`) override on MutableEntity1706 cancels the
++    // `as=ImmutableEntity1706` inherited from Entity1706 — needed so the
++    // delegate type isn't (mis)narrowed during delegate-deserializer lookup.
++    @JsonDeserialize
++    @JsonAutoDetect(fieldVisibility = JsonAutoDetect.Visibility.ANY)
++    static class MutableEntity1706 implements Entity1706 {
++        public long id;
++        public List<Entity1706> refs;
++
++        @Override public long getId() { throw new UnsupportedOperationException(); }
++        @Override public List<Entity1706> getRefs() { throw new UnsupportedOperationException(); }
++    }
++
++    static class Entity1706Container {
++        public List<Entity1706> entities;
++    }
++
++    @Test
++    public void forwardReferenceInCollectionWithDelegatingCreator() throws Exception
++    {
++        // First entity refs the second by @id forward; second is materialized later.
++        String json = a2q("{'entities':["
++                + "{'@id':1,'id':10,'refs':[2]},"
++                + "{'@id':2,'id':20,'refs':[]}"
++                + "]}");
++
++        Entity1706Container container = MAPPER.readValue(json, Entity1706Container.class);
++        Entity1706 first = container.entities.get(0);
++        Entity1706 second = container.entities.get(1);
++
++        // Both must be the *built* immutable bean, not the leftover Mutable delegate
++        assertEquals(ImmutableEntity1706.class, first.getClass());
++        assertEquals(ImmutableEntity1706.class, second.getClass());
++
++        assertEquals(1, first.getRefs().size());
++        assertSame(second, first.getRefs().get(0),
++                "forward ref must be rebound from delegate to built bean");
++    }
++
++}
+diff --git a/src/test/java/tools/jackson/databind/tofix/ObjectIdWithBuilder5909Test.java b/src/test/java/tools/jackson/databind/tofix/ObjectIdWithBuilder5909Test.java
+deleted file mode 100644
+index 7e9c0e35de..0000000000
+--- a/src/test/java/tools/jackson/databind/tofix/ObjectIdWithBuilder5909Test.java
++++ /dev/null
+@@ -1,105 +0,0 @@
+-package tools.jackson.databind.tofix;
+-
+-import java.util.List;
+-
+-import org.junit.jupiter.api.Test;
+-
+-import com.fasterxml.jackson.annotation.JsonIdentityInfo;
+-import com.fasterxml.jackson.annotation.ObjectIdGenerators;
+-
+-import tools.jackson.databind.*;
+-import tools.jackson.databind.annotation.JsonDeserialize;
+-import tools.jackson.databind.annotation.JsonPOJOBuilder;
+-import tools.jackson.databind.testutil.DatabindTestUtil;
+-import tools.jackson.databind.testutil.failure.JacksonTestFailureExpected;
+-
+-import static org.junit.jupiter.api.Assertions.*;
+-
+-/**
+- * [databind#5909] (follow-up to [databind#1496]: Forward Object Id references
+- * that appear inside a
+- * {@link java.util.Collection}-typed property of a Builder-based type are
+- * silently resolved to the Builder instance instead of the built target.
+- * <p>
+- * Unlike direct forward references on scalar properties -- which now fail with
+- * a clear {@code InvalidDefinitionException} (see
+- * {@link tools.jackson.databind.objectid.ObjectIdWithBuilder1496Test}) -- the
+- * collection-item path does not go through
+- * {@code ObjectIdReferenceProperty.deserializeSetAndReturn}, so
+- * {@code addPendingForwardRef} is never called and the guard in
+- * {@code BuilderBasedDeserializer.finishBuild} does not trip. Fixing this
+- * requires a separate mechanism to re-bind collection-item references from the
+- * builder to the built object.
+- */
+-class ObjectIdWithBuilder5909Test extends DatabindTestUtil
+-{
+-    @JsonIdentityInfo(generator = ObjectIdGenerators.PropertyGenerator.class, property = "id")
+-    @JsonDeserialize(builder = EntityBuilder.class)
+-    static class Entity
+-    {
+-        private long id;
+-        private Entity ref;
+-        private List<Entity> refs;
+-
+-        Entity(long id, Entity ref, List<Entity> refs) {
+-            this.id = id;
+-            this.ref = ref;
+-            this.refs = refs;
+-        }
+-
+-        public long getId() { return id; }
+-        public Entity getRef() { return ref; }
+-        public List<Entity> getRefs() { return refs; }
+-    }
+-
+-    @JsonIdentityInfo(generator = ObjectIdGenerators.PropertyGenerator.class, property = "id")
+-    @JsonPOJOBuilder(withPrefix = "")
+-    static class EntityBuilder
+-    {
+-        private long id;
+-        private Entity ref;
+-        private List<Entity> refs;
+-
+-        public EntityBuilder id(long id) { this.id = id; return this; }
+-        public EntityBuilder ref(Entity ref) { this.ref = ref; return this; }
+-        public EntityBuilder refs(List<Entity> refs) { this.refs = refs; return this; }
+-
+-        public Entity build() {
+-            return new Entity(id, ref, refs);
+-        }
+-    }
+-
+-    static class EntityContainer
+-    {
+-        public List<Entity> entities;
+-    }
+-
+-    private final ObjectMapper MAPPER = newJsonMapper();
+-
+-    // First entity's `refs` list holds a forward reference (id 2) resolved only
+-    // after entity 2 has been deserialized; the slot currently ends up holding
+-    // the EntityBuilder instance instead of the built Entity.
+-    @JacksonTestFailureExpected
+-    @Test
+-    public void forwardReferenceInCollection() throws Exception
+-    {
+-        String json = a2q("{'entities':["
+-                + "{'id':1,'refs':[2]},"
+-                + "{'id':2,'ref':1,'refs':[]}"
+-                + "]}");
+-
+-        EntityContainer container = MAPPER.readValue(json, EntityContainer.class);
+-        assertNotNull(container);
+-        assertEquals(2, container.entities.size());
+-
+-        Entity first = container.entities.get(0);
+-        Entity second = container.entities.get(1);
+-
+-        assertEquals(1, first.getId());
+-        assertEquals(2, second.getId());
+-
+-        assertSame(first, second.getRef());
+-        assertEquals(1, first.getRefs().size());
+-        assertSame(second, first.getRefs().get(0));
+-    }
+-}

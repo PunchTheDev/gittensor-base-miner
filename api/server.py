@@ -77,6 +77,8 @@ REPO_CATEGORY: dict[str, str] = {
     "clap-rs/clap": "rust",
     "hyperium/hyper": "rust",
     "tokio-rs/axum": "rust",
+    "fasterxml/jackson-databind": "jvm",
+    "square/okhttp": "jvm",
 }
 
 

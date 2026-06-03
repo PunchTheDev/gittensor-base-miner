@@ -1,0 +1,465 @@
+package tools.jackson.databind.deser.bean;
+
+import java.util.BitSet;
+
+import com.fasterxml.jackson.annotation.JacksonInject;
+
+import tools.jackson.core.JacksonException;
+import tools.jackson.core.JsonParser;
+
+import tools.jackson.databind.*;
+import tools.jackson.databind.deser.ReadableObjectId;
+import tools.jackson.databind.deser.SettableAnyProperty;
+import tools.jackson.databind.deser.SettableBeanProperty;
+import tools.jackson.databind.deser.impl.ObjectIdReader;
+import tools.jackson.databind.introspect.AnnotatedMember;
+import tools.jackson.databind.util.TokenBuffer;
+
+/**
+ * Simple container used for temporarily buffering a set of
+ * <code>PropertyValue</code>s.
+ * Using during construction of beans (and Maps) that use Creators,
+ * and hence need buffering before instance (that will have properties
+ * to assign values to) is constructed.
+ */
+public class PropertyValueBuffer
+{
+    /*
+    /**********************************************************************
+    /* Configuration
+    /**********************************************************************
+     */
+
+    protected final JsonParser _parser;
+    protected final DeserializationContext _context;
+
+    protected final ObjectIdReader _objectIdReader;
+
+    /*
+    /**********************************************************************
+    /* Accumulated properties, other stuff
+    /**********************************************************************
+     */
+
+    /**
+     * Buffer used for storing creator parameters for constructing
+     * instance.
+     */
+    protected final Object[] _creatorParameters;
+
+    /**
+     * Number of creator parameters for which we have not yet received
+     * values.
+     */
+    protected int _paramsNeeded;
+
+    /**
+     * Bitflag used to track parameters found from incoming data
+     * when number of parameters is
+     * less than 32 (fits in int).
+     */
+    protected int _paramsSeen;
+
+    /**
+     * Bitflag used to track parameters found from incoming data
+     * when number of parameters is
+     * 32 or higher.
+     */
+    protected final BitSet _paramsSeenBig;
+
+    /**
+     * If we get non-creator parameters before or between
+     * creator parameters, those need to be buffered. Buffer
+     * is just a simple linked list.
+     */
+    protected PropertyValue _buffered;
+
+    /**
+     * In case there is an Object Id property to handle, this is the value
+     * we have for it.
+     */
+    protected Object _idValue;
+
+    /**
+     * "Any setter" property bound to a Creator parameter (via {@code @JsonAnySetter}).
+     *
+     * @since 2.18
+     */
+    protected final SettableAnyProperty _anyParamSetter;
+
+    /**
+     * If "Any-setter-via-Creator" exists, we will need to buffer values to feed it,
+     * separate from regular, non-creator properties (see {@code _buffered}).
+     *
+     * @since 2.18
+     */
+    protected PropertyValue _anyParamBuffered;
+
+    /**
+     * Tail pointer for {@code _anyParamBuffered} linked list, so that we can
+     * append (instead of prepend) to preserve JSON property order.
+     *
+     * @since 3.1
+     */
+    protected PropertyValue _anyParamBufferedTail;
+
+    /**
+     * Indexes properties that are injectable, if any; {@code null} if none,
+     * cleared as they are injected.
+     *
+     * @since 2.21
+     */
+    protected final BitSet _injectablePropIndexes;
+
+    /*
+    /**********************************************************************
+    /* Life-cycle
+    /**********************************************************************
+     */
+
+    /**
+     * @since 3.1
+     */
+    public PropertyValueBuffer(JsonParser p, DeserializationContext ctxt, int paramCount,
+            ObjectIdReader oir, SettableAnyProperty anyParamSetter,
+            BitSet injectablePropIndexes)
+    {
+        _parser = p;
+        _context = ctxt;
+        _paramsNeeded = paramCount;
+        _objectIdReader = oir;
+        _creatorParameters = new Object[paramCount];
+        if (paramCount < 32) {
+            _paramsSeenBig = null;
+        } else {
+            _paramsSeenBig = new BitSet();
+        }
+        // Only care about Creator-bound Any setters:
+        if ((anyParamSetter == null) || (anyParamSetter.getParameterIndex() < 0)) {
+            _anyParamSetter = null;
+        } else {
+            _anyParamSetter = anyParamSetter;
+        }
+        _injectablePropIndexes = (injectablePropIndexes == null)
+                ? null : (BitSet) injectablePropIndexes.clone();
+    }
+
+    /**
+     * Returns {@code true} if the given property was seen in the JSON source by
+     * this buffer.
+     */
+    public final boolean hasParameter(SettableBeanProperty prop)
+    {
+        final int ix = prop.getCreatorIndex();
+
+        if (_paramsSeenBig == null) {
+            if (((_paramsSeen >> ix) & 1) == 1) {
+                return true;
+            }
+        } else {
+            if (_paramsSeenBig.get(ix)) {
+                return true;
+            }
+        }
+        // 28-Sep-2024 : [databind#4508] Support any-setter flowing through creator
+        if (_anyParamSetter != null) {
+            if (ix == _anyParamSetter.getParameterIndex()) {
+                return true;
+            }
+        }
+        return false;
+    }
+
+    /**
+     * A variation of {@link #getParameters} that
+     * accepts a single property.  Whereas the plural form eagerly fetches and
+     * validates all properties, this method may be used (along with
+     * {@link #hasParameter(SettableBeanProperty)}) to let applications only
+     * fetch the properties defined in the JSON source itself, and to have some
+     * other customized behavior for missing properties.
+     */
+    public Object getParameter(DeserializationContext ctxt, SettableBeanProperty prop)
+        throws JacksonException
+    {
+        Object value;
+        if (hasParameter(prop)) {
+            value = _creatorParameters[prop.getCreatorIndex()];
+        } else {
+            value = _creatorParameters[prop.getCreatorIndex()] = _findMissing(prop);
+        }
+        // 28-Sep-2024 : [databind#4508] Support any-setter flowing through creator
+        if ((value == null) && (_anyParamSetter != null )
+                && (prop.getCreatorIndex() == _anyParamSetter.getParameterIndex())) {
+            value = _createAndSetAnySetterValue(ctxt);
+        }
+        if (value == null && _context.isEnabled(DeserializationFeature.FAIL_ON_NULL_CREATOR_PROPERTIES)) {
+            return _context.reportInputMismatch(prop,
+                "Null value for creator property '%s' (index %d); `DeserializationFeature.FAIL_ON_NULL_CREATOR_PROPERTIES` enabled",
+                prop.getName(), prop.getCreatorIndex());
+        }
+        return value;
+    }
+
+    /**
+     * Method called to do necessary post-processing such as injection of values
+     * and verification of values for required properties,
+     * after either {@link #assignParameter(SettableBeanProperty, Object)}
+     * returns <code>true</code> (to indicate all creator properties are found), or when
+     * the whole JSON Object has been processed,
+     */
+    public Object[] getParameters(DeserializationContext ctxt, SettableBeanProperty[] props)
+        throws JacksonException
+    {
+        // quick check to see if anything else is needed
+        if (_paramsNeeded > 0) {
+            if (_paramsSeenBig == null) {
+                int mask = _paramsSeen;
+                // not optimal, could use `Integer.trailingZeroes()`, but for now should not
+                // really matter for common cases
+                for (int ix = 0, len = _creatorParameters.length; ix < len; ++ix, mask >>= 1) {
+                    if ((mask & 1) == 0) {
+                        _creatorParameters[ix] = _findMissing(props[ix]);
+                    }
+                }
+            } else {
+                final int len = _creatorParameters.length;
+                for (int ix = 0; (ix = _paramsSeenBig.nextClearBit(ix)) < len; ++ix) {
+                    _creatorParameters[ix] = _findMissing(props[ix]);
+                }
+            }
+        }
+        // [databind#562] since 2.18 : Respect @JsonAnySetter in @JsonCreator
+        if (_anyParamSetter != null) {
+            _creatorParameters[_anyParamSetter.getParameterIndex()] = _createAndSetAnySetterValue(ctxt);
+        }
+
+        // [databind#1381] handle inject-only (useInput = false) properties
+        if (_injectablePropIndexes != null) {
+            int ix = _injectablePropIndexes.nextSetBit(0);
+            while (ix >= 0) {
+                _inject(props[ix]);
+                ix = _injectablePropIndexes.nextSetBit(ix + 1);
+            }
+        }
+
+        if (_context.isEnabled(DeserializationFeature.FAIL_ON_NULL_CREATOR_PROPERTIES)) {
+            final int len = _creatorParameters.length;
+            for (int ix = 0; ix < len; ++ix) {
+                if (_creatorParameters[ix] == null) {
+                    SettableBeanProperty prop = props[ix];
+                    _context.reportInputMismatch(prop,
+                            "Null value for creator property '%s' (index %d); `DeserializationFeature.FAIL_ON_NULL_CREATOR_PROPERTIES` enabled",
+                            prop.getName(), props[ix].getCreatorIndex());
+                }
+            }
+        }
+
+        return _creatorParameters;
+    }
+
+    /**
+     * Helper method called to create and set any values buffered for "any setter"
+     */
+    private Object _createAndSetAnySetterValue(DeserializationContext ctxt) throws JacksonException
+    {
+        Object anySetterParameterObject = _anyParamSetter.createParameterObject();
+        for (PropertyValue pv = _anyParamBuffered; pv != null; pv = pv.next) {
+            pv.setValue(ctxt, anySetterParameterObject);
+        }
+        return anySetterParameterObject;
+    }
+
+    protected Object _findMissing(SettableBeanProperty prop) throws JacksonException
+    {
+        // 08-Jun-2024: [databind#562] AnySetters are bit special
+        if (_anyParamSetter != null) {
+            if (prop.getCreatorIndex() == _anyParamSetter.getParameterIndex()) {
+                // Ok if anything buffered
+                if (_anyParamBuffered != null) {
+                    // ... will be assigned by caller later on, for now return null
+                    return null;
+                }
+            }
+        }
+
+        // First: do we have injectable value?
+        final JacksonInject.Value injection = prop.getInjectionDefinition();
+        if (injection != null) {
+            // 10-Nov-2025: [databind#1381] Is this needed?
+            _injectablePropIndexes.clear(prop.getCreatorIndex());
+            return _context.findInjectableValue(prop.getInjectableValueId(),
+                    prop, null, injection.getOptional(), injection.getUseInput());
+        }
+        // Second: required?
+        if (prop.isRequired()) {
+            _context.reportInputMismatch(prop, "Missing required creator property '%s' (index %d)",
+                    prop.getName(), prop.getCreatorIndex());
+        }
+        if (_context.isEnabled(DeserializationFeature.FAIL_ON_MISSING_CREATOR_PROPERTIES)) {
+            _context.reportInputMismatch(prop,
+                    "Missing creator property '%s' (index %d); `DeserializationFeature.FAIL_ON_MISSING_CREATOR_PROPERTIES` enabled",
+                    prop.getName(), prop.getCreatorIndex());
+        }
+        try {
+            // Third: NullValueProvider? (22-Sep-2019, [databind#2458])
+            // 08-Aug-2021, tatu: consider [databind#3214]; not null but "absent" value...
+            Object absentValue = prop.getNullValueProvider().getAbsentValue(_context);
+            if (absentValue != null) {
+                return absentValue;
+            }
+
+            // Fourth: default value
+            ValueDeserializer<Object> deser = prop.getValueDeserializer();
+            return deser.getAbsentValue(_context);
+        } catch (JacksonException e) {
+            // [databind#2101]: Include property name, if we have it
+            AnnotatedMember member = prop.getMember();
+            if (member != null) {
+                e.prependPath(member.getDeclaringClass(), prop.getName());
+            }
+            throw e;
+        }
+    }
+
+    /**
+     * Method called to inject value for given property, possibly overriding
+     * assigned (from input) value.
+     *
+     * @since 2.21
+     */
+    private void _inject(final SettableBeanProperty prop) throws JacksonException {
+        final JacksonInject.Value injection = prop.getInjectionDefinition();
+
+        if (injection != null) {
+            final Boolean useInput = injection.getUseInput();
+
+            if (!Boolean.TRUE.equals(useInput)) {
+                final Object value = _context.findInjectableValue(injection.getId(),
+                        prop, prop.getMember(), injection.getOptional(), useInput);
+
+                if (value != null) {
+                    int ix = prop.getCreatorIndex();
+                    _creatorParameters[ix] = value;
+                }
+            }
+        }
+    }
+
+    /*
+    /**********************************************************************
+    /* Other methods
+    /**********************************************************************
+     */
+
+    /**
+     * Helper method called to see if given non-creator property is the "id property";
+     * and if so, handle appropriately.
+     */
+    public boolean readIdProperty(String propName) throws JacksonException
+    {
+        if ((_objectIdReader != null) && propName.equals(_objectIdReader.propertyName.getSimpleName())) {
+            _idValue = _objectIdReader.readObjectReference(_parser, _context);
+            return true;
+        }
+        return false;
+    }
+
+    /**
+     * Method called to assign a "native" Object Id value (such as YAML anchor)
+     * that has already been converted to the expected type.
+     *
+     * @since 3.2
+     */
+    public void assignNativeObjectId(Object id) {
+        _idValue = id;
+    }
+
+    /**
+     * Helper method called to handle Object Id value collected earlier, if any
+     */
+    public Object handleIdValue(final DeserializationContext ctxt, Object bean) throws JacksonException
+    {
+        if (_objectIdReader != null) {
+            if (_idValue != null) {
+                ReadableObjectId roid = ctxt.findObjectId(_idValue, _objectIdReader.generator, _objectIdReader.resolver);
+                roid.bindItem(ctxt, bean);
+                // also: may need to set a property value as well
+                SettableBeanProperty idProp = _objectIdReader.idProperty;
+                if (idProp != null) {
+                    // [databind#5328] Records/Creators do not have setters, skip
+                    if (idProp.isCreatorProperty()) {
+                        return bean;
+                    }
+                    return idProp.setAndReturn(ctxt, bean, _idValue);
+                }
+            } else {
+                // 07-Jun-2016, tatu: Trying to improve error messaging here...
+                ctxt.reportUnresolvedObjectId(_objectIdReader, bean);
+            }
+        }
+        return bean;
+    }
+
+    protected PropertyValue buffered() { return _buffered; }
+
+    public boolean isComplete() { return _paramsNeeded <= 0; }
+
+    /**
+     * Method called to buffer value for given property, as well as check whether
+     * we now have values for all (creator) properties that we expect to get values for.
+     *
+     * @return True if we have received all creator parameters
+     */
+    public boolean assignParameter(SettableBeanProperty prop, Object value)
+    {
+        final int ix = prop.getCreatorIndex();
+        _creatorParameters[ix] = value;
+        if (_paramsSeenBig == null) {
+            int old = _paramsSeen;
+            int newValue = (old | (1 << ix));
+            if (old != newValue) {
+                _paramsSeen = newValue;
+                if (--_paramsNeeded <= 0) {
+                    // 29-Nov-2016, tatu: But! May still require Object Id value
+                    return (_objectIdReader == null) || (_idValue != null);
+                }
+            }
+        } else {
+            if (!_paramsSeenBig.get(ix)) {
+                _paramsSeenBig.set(ix);
+                if (--_paramsNeeded <= 0) {
+                    // 29-Nov-2016, tatu: But! May still require Object Id value
+                    return (_objectIdReader == null) || (_idValue != null);
+                }
+            }
+        }
+        return false;
+    }
+
+    public void bufferProperty(SettableBeanProperty prop, Object value) {
+        _buffered = new PropertyValue.Regular(_buffered, value, prop);
+    }
+
+    public void bufferAnyProperty(SettableAnyProperty prop, String propName, Object value) {
+        _buffered = new PropertyValue.Any(_buffered, value, prop, propName);
+    }
+
+    public void bufferMapProperty(Object key, Object value) {
+        _buffered = new PropertyValue.Map(_buffered, value, key);
+    }
+
+    // [databind#5353]: append (not prepend) to preserve JSON property order
+    public void bufferAnyParameterProperty(SettableAnyProperty prop, String propName, Object value) {
+        PropertyValue newEntry = new PropertyValue.AnyParameter(null, value, prop, propName);
+        if (_anyParamBufferedTail == null) {
+            _anyParamBuffered = newEntry;
+        } else {
+            _anyParamBufferedTail.next = newEntry;
+        }
+        _anyParamBufferedTail = newEntry;
+    }
+
+    public void bufferMergingProperty(SettableBeanProperty prop, TokenBuffer buffered) {
+        _buffered = new PropertyValue.Merging(_buffered, buffered, prop);
+    }
+}

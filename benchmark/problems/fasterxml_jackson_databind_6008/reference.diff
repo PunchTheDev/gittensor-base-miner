@@ -1,0 +1,239 @@
+diff --git a/src/main/java/tools/jackson/databind/deser/impl/UnwrappedPropertyHandler.java b/src/main/java/tools/jackson/databind/deser/impl/UnwrappedPropertyHandler.java
+index 070c2df39f..9249d5caf9 100644
+--- a/src/main/java/tools/jackson/databind/deser/impl/UnwrappedPropertyHandler.java
++++ b/src/main/java/tools/jackson/databind/deser/impl/UnwrappedPropertyHandler.java
+@@ -38,29 +38,35 @@ public class UnwrappedPropertyHandler
+     protected final Set<String> _unwrappedPropertyNames;
+ 
+     /**
+-     * Flag that indicates if any of the unwrapped value deserializers
+-     * has an "any setter" (see {@link com.fasterxml.jackson.annotation.JsonAnySetter})
++     * Flag that indicates that we cannot tell from property names alone whether an
++     * incoming property is "unwrapped": either some unwrapped deserializer has an
++     * "any setter" (see {@link com.fasterxml.jackson.annotation.JsonAnySetter}), or
++     * is "opaque" -- declares no property names (via
++     * {@link ValueDeserializer#collectAllPropertyNamesTo}), as is the case for custom
++     * unwrapping deserializers that capture arbitrary fields. When set, all
++     * otherwise-unrecognized properties are routed to the unwrapped deserializers --
++     * as was the case before [databind#650].
+      *
+      * @since 3.1
+      */
+-    protected final boolean _hasUnwrappedAnySetter;
++    protected final boolean _acceptsAllUnwrapped;
+ 
+     public UnwrappedPropertyHandler() {
+         _creatorProperties = new ArrayList<>();
+         _properties = new ArrayList<>();
+         // placeholder: won't be modified in-place
+         _unwrappedPropertyNames = Collections.emptySet();
+-        _hasUnwrappedAnySetter = false;
++        _acceptsAllUnwrapped = false;
+     }
+ 
+     protected UnwrappedPropertyHandler(List<SettableBeanProperty> creatorProps,
+             List<SettableBeanProperty> props,
+             Set<String> unwrappedPropertyNames,
+-            boolean hasUnwrappedAnySetter) {
++            boolean acceptsAllUnwrapped) {
+         _creatorProperties = creatorProps;
+         _properties = props;
+         _unwrappedPropertyNames = unwrappedPropertyNames;
+-        _hasUnwrappedAnySetter = hasUnwrappedAnySetter;
++        _acceptsAllUnwrapped = acceptsAllUnwrapped;
+     }
+ 
+     /**
+@@ -70,8 +76,8 @@ protected UnwrappedPropertyHandler(List<SettableBeanProperty> creatorProps,
+      */
+     public UnwrappedPropertyHandler initializeUnwrappedPropertyNames() {
+         Set<String> unwrappedNames = new HashSet<>();
+-        boolean hasAnySetter = _collectUnwrappedPropertyNames(_properties, _creatorProperties, unwrappedNames);
+-        return new UnwrappedPropertyHandler(_creatorProperties, _properties, unwrappedNames, hasAnySetter);
++        boolean acceptsAll = _collectUnwrappedPropertyNames(_properties, _creatorProperties, unwrappedNames);
++        return new UnwrappedPropertyHandler(_creatorProperties, _properties, unwrappedNames, acceptsAll);
+     }
+ 
+     /**
+@@ -91,11 +97,11 @@ public UnwrappedPropertyHandler renameAll(DeserializationContext ctxt,
+         List<SettableBeanProperty> renamedCreatorProps = renameProperties(ctxt, _creatorProperties, transformer);
+         List<SettableBeanProperty> renamedProps = renameProperties(ctxt, _properties, transformer);
+ 
+-        // Collect unwrapped property names and check for AnySetter
++        // Collect unwrapped property names and check whether we must accept all unknowns
+         Set<String> names = new HashSet<>();
+-        boolean hasAnySetter = _collectUnwrappedPropertyNames(renamedProps, renamedCreatorProps, names);
++        boolean acceptsAll = _collectUnwrappedPropertyNames(renamedProps, renamedCreatorProps, names);
+ 
+-        return new UnwrappedPropertyHandler(renamedCreatorProps, renamedProps, names, hasAnySetter);
++        return new UnwrappedPropertyHandler(renamedCreatorProps, renamedProps, names, acceptsAll);
+     }
+ 
+     private List<SettableBeanProperty> renameProperties(DeserializationContext ctxt,
+@@ -192,7 +198,9 @@ public static PropertyName creatorParamName(int index) {
+      * @since 3.1
+      */
+     public boolean hasUnwrappedProperty(String propName) {
+-        if (_hasUnwrappedAnySetter) {
++        // [databind#6001]: an "any setter" or opaque (non-introspectable) unwrapper
++        //   means we cannot tell which properties are unwrapped, so accept all.
++        if (_acceptsAllUnwrapped) {
+             return true;
+         }
+         return _unwrappedPropertyNames.contains(propName);
+@@ -210,45 +218,52 @@ public void collectUnwrappedPropertyNamesTo(Set<String> names) {
+     /**
+      * Helper method to collect unwrapped property names.
+      *
+-     * @return {@code true} if any property deserializer has AnySetter.
++     * @return {@code true} if all otherwise-unrecognized properties must be accepted
++     *    as unwrapped (some deserializer has an "any setter" or is "opaque").
+      *
+      * @since 3.1
+      */
+     private boolean _collectUnwrappedPropertyNames(List<SettableBeanProperty> properties,
+             List<SettableBeanProperty> creatorProperties,
+             Set<String> names) {
+-        boolean hasAnySetter = false;
++        boolean acceptsAll = false;
+         for (SettableBeanProperty prop : properties) {
+-            if (_collectDeserializerPropertyNames(prop, names)) {
+-                hasAnySetter = true;
+-            }
++            acceptsAll |= _collectDeserializerPropertyNames(prop, names);
+         }
+         for (SettableBeanProperty prop : creatorProperties) {
+-            if (_collectDeserializerPropertyNames(prop, names)) {
+-                hasAnySetter = true;
+-            }
++            acceptsAll |= _collectDeserializerPropertyNames(prop, names);
+         }
+-        return hasAnySetter;
++        return acceptsAll;
+     }
+ 
+     /**
+      * Helper method to collect property names from a property's deserializer.
+      *
+-     * @return {@code true} if the property deserializer has AnySetter.
++     * @return {@code true} if the deserializer has an "any setter" or is "opaque"
++     *    (declares no property names), in which case all otherwise-unrecognized
++     *    properties must be routed to it (pre-#650 behavior).
+      *
+      * @since 3.1
+      */
+     private boolean _collectDeserializerPropertyNames(SettableBeanProperty prop,
+             Set<String> names)
+     {
+-        if (prop != null) {
+-            ValueDeserializer<?> deser = prop.getValueDeserializer();
+-            if (deser != null) {
+-                // Recursively collect property names
+-            	deser.collectAllPropertyNamesTo(names);
+-                return deser.hasAnySetter();
+-            }
++        if (prop == null) {
++            return false;
++        }
++        ValueDeserializer<?> deser = prop.getValueDeserializer();
++        if (deser == null) {
++            return false;
++        }
++        if (deser.hasAnySetter()) {
++            return true;
+         }
+-        return false;
++        // [databind#6001]: collect into a temp set so we can tell whether this
++        //   deserializer contributed any names of its own; if not, it is "opaque"
++        //   (typically a custom unwrapping deserializer capturing arbitrary fields).
++        Set<String> propNames = new HashSet<>();
++        deser.collectAllPropertyNamesTo(propNames);
++        names.addAll(propNames);
++        return propNames.isEmpty();
+     }
+ }
+diff --git a/src/test/java/tools/jackson/databind/tofix/UnwrappedCustomDeserCreator6001Test.java b/src/test/java/tools/jackson/databind/deser/UnwrappedCustomDeserCreator6001Test.java
+similarity index 71%
+rename from src/test/java/tools/jackson/databind/tofix/UnwrappedCustomDeserCreator6001Test.java
+rename to src/test/java/tools/jackson/databind/deser/UnwrappedCustomDeserCreator6001Test.java
+index c9e57e142b..38d6b1dc04 100644
+--- a/src/test/java/tools/jackson/databind/tofix/UnwrappedCustomDeserCreator6001Test.java
++++ b/src/test/java/tools/jackson/databind/deser/UnwrappedCustomDeserCreator6001Test.java
+@@ -1,4 +1,4 @@
+-package tools.jackson.databind.tofix;
++package tools.jackson.databind.deser;
+ 
+ import java.io.Serializable;
+ import java.util.LinkedHashMap;
+@@ -12,28 +12,21 @@
+ import tools.jackson.core.JsonParser;
+ import tools.jackson.databind.BeanProperty;
+ import tools.jackson.databind.DeserializationContext;
++import tools.jackson.databind.DeserializationFeature;
+ import tools.jackson.databind.ObjectMapper;
+ import tools.jackson.databind.ValueDeserializer;
+ import tools.jackson.databind.annotation.JsonDeserialize;
+ import tools.jackson.databind.node.ObjectNode;
+ import tools.jackson.databind.testutil.DatabindTestUtil;
+-import tools.jackson.databind.testutil.failure.JacksonTestFailureExpected;
+ import tools.jackson.databind.util.NameTransformer;
+ 
+ import static org.junit.jupiter.api.Assertions.assertEquals;
+ import static org.junit.jupiter.api.Assertions.assertTrue;
+ 
+-// [databind#6001]: Regression 3.0 -> 3.1 with `@JsonUnwrapped` on a record
+-// (property-based-creator) component whose custom `ValueDeserializer` implements
+-// `unwrappingDeserializer(...)` but does NOT declare property names via
+-// `collectAllPropertyNamesTo(...)`.
+-//
+-// Root cause: #650 made `BeanDeserializer` buffer only properties recognized by
+-// `UnwrappedPropertyHandler.hasUnwrappedProperty(...)` (i.e. names contributed via
+-// `collectAllPropertyNamesTo`). A custom unwrapper that captures arbitrary fields
+-// contributes no names, so the prefixed field ("titleEn") is treated as unknown and
+-// skipped -- the custom deserializer is invoked with an empty `{}` instead of the
+-// flattened fields it received in 3.0.x.
++// [databind#6001]: `@JsonUnwrapped` on a record (property-based-creator) component whose
++// custom `ValueDeserializer` implements `unwrappingDeserializer(...)` but declares no
++// property names. Before the fix, #650 buffered only properties recognized via
++// `collectAllPropertyNamesTo(...)`, so such a custom unwrapper received an empty `{}`.
+ class UnwrappedCustomDeserCreator6001Test extends DatabindTestUtil
+ {
+     record ConsentVersion(
+@@ -93,7 +86,6 @@ public ValueDeserializer<CapturingUnwrappedValue> unwrappingDeserializer(
+ 
+     private final ObjectMapper MAPPER = newJsonMapper();
+ 
+-    @JacksonTestFailureExpected
+     @Test
+     void unwrappedRecordCreatorPropertiesShouldReceiveFlattenedFields()
+     {
+@@ -112,5 +104,29 @@ void unwrappedRecordCreatorPropertiesShouldReceiveFlattenedFields()
+                 () -> "Expected title.rawFields() to contain key 'En', but got "
+                         + result.title().rawFields());
+         assertEquals("title en", result.title().rawFields().get("En"));
++        assertEquals("version-id", result.versionId());
++        assertEquals("scope-class-id", result.scopeClassId());
++    }
++
++    // Guard for [databind#650]: an opaque unwrapper routes all leftover unknowns to itself,
++    // so FAIL_ON_UNKNOWN_PROPERTIES does NOT fire here (the unwrapper "owns" them) -- this is
++    // the pre-#650 (3.0.x) behavior we are deliberately restoring for opaque unwrappers.
++    @Test
++    void opaqueUnwrapperAbsorbsUnknownsEvenWithFailOnUnknown()
++    {
++        ObjectMapper mapper = jsonMapperBuilder()
++                .enable(DeserializationFeature.FAIL_ON_UNKNOWN_PROPERTIES)
++                .build();
++        String json = """
++                {
++                  "versionId": "version-id",
++                  "version": "1",
++                  "titleEn": "title en",
++                  "totallyUnknown": "x"
++                }
++                """;
++
++        ConsentVersion result = mapper.readValue(json, ConsentVersion.class);
++        assertEquals("title en", result.title().rawFields().get("En"));
+     }
+ }

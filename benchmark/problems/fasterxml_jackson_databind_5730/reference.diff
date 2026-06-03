@@ -1,0 +1,157 @@
+diff --git a/release-notes/CREDITS-2.x b/release-notes/CREDITS-2.x
+index 54e7cd3fb0..dafbd45bc9 100644
+--- a/release-notes/CREDITS-2.x
++++ b/release-notes/CREDITS-2.x
+@@ -431,6 +431,9 @@ Jonas Konrad (yawkat@github)
+    (2.14.1)
+   * Contributed fix for #4848: Avoid type pollution in `StringCollectionDeserializer`
+    (2.18.3)
++  * Fixed #5729: (regression due to #5429) ISO-8601 change prevents parsing
++    negative timestamps (dates before 1970)
++   (2.21.2)
+ 
+ Jirka Kremser (Jiri-Kremser@github)
+   * Suggested #924: SequenceWriter.writeAll() could accept Iterable
+@@ -2003,3 +2006,8 @@ Kyrylo Merzlikin (@kirmerzlikin)
+  * Reported #5706: `TokenBuffer` serialization fails when buffer contains integer
+    encoded as String
+   [2.21.1]
++
++Thomas Wöckinger (@thomaswoeckinger)
++ * Reported #5729: (regression due to #5429) ISO-8601 change prevents parsing
++   negative timestamps (dates before 1970)
++  [2.21.2]
+diff --git a/release-notes/VERSION-2.x b/release-notes/VERSION-2.x
+index 82bf1fcebc..068923908b 100644
+--- a/release-notes/VERSION-2.x
++++ b/release-notes/VERSION-2.x
+@@ -4,6 +4,13 @@ Project: jackson-databind
+ === Releases === 
+ ------------------------------------------------------------------------
+ 
++2.21.2 (not yet released)
++
++#5729: (regression due to #5429) ISO-8601 change prevents parsing
++  negative timestamps (dates before 1970)
++ (reported by Thomas W)
++ (fixed by by Jonas K)
++
+ 2.21.1 (22-Feb-2026)
+ 
+ #5184: `@JsonIgnore` on record method applied to record matching
+diff --git a/src/main/java/com/fasterxml/jackson/databind/util/StdDateFormat.java b/src/main/java/com/fasterxml/jackson/databind/util/StdDateFormat.java
+index cf0452345b..694227e363 100644
+--- a/src/main/java/com/fasterxml/jackson/databind/util/StdDateFormat.java
++++ b/src/main/java/com/fasterxml/jackson/databind/util/StdDateFormat.java
+@@ -614,6 +614,10 @@ protected boolean looksLikeISO8601(String dateStr)
+             final char c = dateStr.charAt(0);
+             // [databind#5429]: extended year may have +/- prefix
+             if (c == '+' || c == '-') {
++                // [databind#5729] avoid stringified timestamps
++                if (_isAllDigits(dateStr, 1)) {
++                    return false;
++                }
+                 return (dateStr.length() >= 11)
+                     && Character.isDigit(dateStr.charAt(1));
+             }
+@@ -625,6 +629,19 @@ protected boolean looksLikeISO8601(String dateStr)
+         return false;
+     }
+ 
++    // @since 2.21.2 (for [databind#5729])
++    private static boolean _isAllDigits(String str, int offset)
++    {
++        final int len = str.length();
++        for (int i = offset; i < len; ++i) {
++            if (!Character.isDigit(str.charAt(i))) {
++                return false;
++            }
++        }
++        // return false if no digits past leading sign
++        return (offset < len);
++    }
++
+     private Date _parseDateFromLong(String longStr, ParsePosition pos) throws ParseException
+     {
+         long ts;
+diff --git a/src/test/java/com/fasterxml/jackson/databind/deser/jdk/DateDeserializationTest.java b/src/test/java/com/fasterxml/jackson/databind/deser/jdk/DateDeserializationTest.java
+index b20d7728c9..632ec1cad6 100644
+--- a/src/test/java/com/fasterxml/jackson/databind/deser/jdk/DateDeserializationTest.java
++++ b/src/test/java/com/fasterxml/jackson/databind/deser/jdk/DateDeserializationTest.java
+@@ -133,6 +133,24 @@ public void testDateUtilWithStringTimestamp() throws Exception
+         assertEquals(before, value.getTime());
+     }
+ 
++    @Test
++    public void testSignedStringTimestampViaObjectMapper() throws Exception
++    {
++        long before = -1383043669935L;
++        String json = q(String.valueOf(before));
++
++        Date date = MAPPER.readValue(json, Date.class);
++        assertEquals(before, date.getTime());
++
++        Calendar calendar = MAPPER.readValue(json, Calendar.class);
++        assertEquals(before, calendar.getTimeInMillis());
++
++        assertThrows(InvalidFormatException.class,
++                () -> MAPPER.readValue(q("+1383043669935"), Date.class));
++        assertThrows(InvalidFormatException.class,
++                () -> MAPPER.readValue(q("+1383043669935"), Calendar.class));
++    }
++
+     @Test
+     public void testDateUtilRFC1123() throws Exception
+     {
+diff --git a/src/test/java/com/fasterxml/jackson/databind/util/StdDateFormatTest.java b/src/test/java/com/fasterxml/jackson/databind/util/StdDateFormatTest.java
+index 0433a6eb45..346cfc2345 100644
+--- a/src/test/java/com/fasterxml/jackson/databind/util/StdDateFormatTest.java
++++ b/src/test/java/com/fasterxml/jackson/databind/util/StdDateFormatTest.java
+@@ -13,6 +13,12 @@
+ 
+ public class StdDateFormatTest extends DatabindTestUtil
+ {
++    static class TestStdDateFormat extends StdDateFormat {
++        boolean testLooksLikeISO8601(String input) {
++            return looksLikeISO8601(input);
++        }
++    }
++
+     @SuppressWarnings("deprecation")
+     @Test
+     public void testFactories() {
+@@ -147,4 +153,34 @@ public void testInvalid() {
+             verifyException(e, "Cannot parse");
+         }
+     }
++
++    @Test
++    public void testNegativeTimestampParsing() throws Exception
++    {
++        StdDateFormat f = StdDateFormat.instance.clone();
++        f.setLenient(false);
++
++        Date dt = f.parse("-1383043669935");
++        assertEquals(-1383043669935L, dt.getTime());
++    }
++
++    @Test
++    public void testShortNegativeTimestampParsing() throws Exception
++    {
++        StdDateFormat f = StdDateFormat.instance.clone();
++        f.setLenient(false);
++
++        assertEquals(-1L, f.parse("-1").getTime());
++        assertEquals(-1234567890L, f.parse("-1234567890").getTime());
++    }
++
++    @Test
++    public void testCompactNumericDateInputStillHandledAsTimestamp() throws Exception
++    {
++        TestStdDateFormat f = new TestStdDateFormat();
++        f.setLenient(false);
++
++        assertFalse(f.testLooksLikeISO8601("20250305"));
++        assertEquals(20250305L, f.parse("20250305").getTime());
++    }
+ }
