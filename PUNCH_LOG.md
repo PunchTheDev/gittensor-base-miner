@@ -4,6 +4,14 @@ Milestone trail for the base-miner benchmark. Discord is the primary channel; th
 
 ---
 
+## 2026-06-03 — Dashboard stale placeholder fix (dashboard commit 8f886f0)
+
+Static hero pool-count placeholders (`430`) in `index.html` were never reached by JS on slow connections — showed stale count briefly before the dynamic `d.pool_size = 441` update fired. Fixed both inline occurrences to `441`.
+
+All systems healthy: API pool=441, oracle=13.03, 0 submissions, 13 active repos.
+
+---
+
 ## 2026-06-03 — Fix SOTA comparison: weighted_score throughout (commit 450180f)
 
 Found and fixed two interrelated ranking bugs:
