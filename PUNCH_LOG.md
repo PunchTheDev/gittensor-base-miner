@@ -4,6 +4,48 @@ Milestone trail for the base-miner benchmark. Discord is the primary channel; th
 
 ---
 
+## 2026-06-03 — Three latent bugs fixed (commits 2149015, 50d5622, 146d9f4)
+
+Pre-submission audit of CI workflows and API found three bugs that would have caused silent failures or crashes once miners start submitting.
+
+**Bug 1 — `record_submission.yml`: NameError on first champion (commit 2149015)**
+
+```python
+# BEFORE (crashes with NameError: name 'score' is not defined)
+print(f"Champion updated: {handle} (score={score})")
+
+# AFTER
+print(f"Champion updated: {handle} (weighted={weighted:.4f})")
+```
+
+Root cause: `score` was never defined in that scope — the variable was `weighted`. This would have crashed the champion-promotion step on the very first miner PR that beats the SOTA, leaving the champion directory un-updated.
+
+**Bug 2 — `record_result.py`: misleading SOTA comparison message (commit 50d5622)**
+
+```python
+# BEFORE (prints arithmetic mean but compares against weighted SOTA)
+print(f"Score {mean_score:.4f} below current SOTA {prev_sota:.4f} ...")
+
+# AFTER
+print(f"Weighted score {weighted_mean:.4f} below current SOTA {prev_sota:.4f} ...")
+```
+
+Root cause: `mean_score` (arithmetic mean) was printed in a message about failing to beat SOTA, while SOTA is a weighted mean. Misleading for any submission with high weighted but lower arithmetic score.
+
+**Bug 3 — `api/server.py`: month-overflow crash in `/api/shard` (commit 146d9f4)**
+
+```python
+# BEFORE (crashes with ValueError: day is out of range near month-end)
+next_rotation = str(today.replace(day=today.day + days_to_monday) if days_to_monday else today)
+
+# AFTER
+next_rotation = str(today + timedelta(days=days_to_monday))
+```
+
+Root cause: `date.replace(day=N)` raises ValueError when N exceeds the days in the month (e.g. July 28 + 7 days = Aug 4, but `today.replace(day=35)` throws). Affects any `/api/shard` call during the last ~7 days of most months. API restarted, verified.
+
+---
+
 ## 2026-06-03 — scorer image build fixed (commits cc21881, e2ddd16)
 
 **Critical bug found and fixed: Docker scorer image had never successfully built.**
