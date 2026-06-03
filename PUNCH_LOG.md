@@ -4140,3 +4140,24 @@ Stale dashboard data fixed. Trigger gap fixed in pending node24 branch.
 
 ### Status
 Pool 1123, oracle 12.64, whitelist 65 models. Agent history tracking live in storage + API + dashboard.
+
+---
+
+## Step 225 — 2026-06-03
+
+### gitminer init command + DAS check
+
+- **PR #98**: Add `gitminer init <handle>` command (merged abce6450)
+  - `cmd_init()`: copies example agent.py to `agent/submissions/{handle}/`, writes meta.json with
+    pre-computed sha256 — eliminates 4-step manual scaffold
+  - Validates handle (no slashes/spaces), warns on non-whitelisted model
+  - Updated: `CONTRIBUTING.md` leads "Write your agent" with `gitminer init`, module docstring,
+    `api/server.py` quickstart adds `scaffold` step
+- **Dashboard PR #12**: Update quick start to show `gitminer init` (merged a9e5128)
+  - 4-step flow: init → run → eval → submit; replaced old mine --loop as primary path
+- **DAS check**: 19 repos (one added since step 213), all in registered_repos; `allways-ui` in
+  pool_config but not in DAS and has no problems in pool (harmless)
+- **Whitelist verification**: all 65 models confirmed live on OpenRouter (0 missing)
+
+### Status
+Pool 1123, oracle 12.64, 65 models. `gitminer init` reduces onboarding friction.
