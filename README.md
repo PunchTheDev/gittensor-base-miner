@@ -122,7 +122,7 @@ python3 gitminer.py serve-api
 # Example: fetch this week's shard in a shell script
 curl http://localhost:8083/api/shard
 curl http://localhost:8083/api/problems/0463
-curl "http://localhost:8083/api/problems?lang=py&difficulty=hard&limit=10"
+curl "http://localhost:8083/api/problems?cat=python&difficulty=hard&limit=10"
 curl http://localhost:8083/api/leaderboard
 ```
 

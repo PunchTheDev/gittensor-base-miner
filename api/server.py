@@ -37,7 +37,6 @@ POOL_DIR = REPO_ROOT / "benchmark" / "problems"
 POOL_CONFIG = REPO_ROOT / "benchmark" / "pool_config.json"
 BASELINES = REPO_ROOT / "results" / "baselines.json"
 LEADERBOARD = REPO_ROOT / "results" / "leaderboard.json"
-ALLOWED_MODELS = REPO_ROOT / "benchmark" / "allowed_models.txt"
 
 CORS_HEADERS = {
     "Access-Control-Allow-Origin": "*",
