@@ -1,0 +1,109 @@
+diff --git a/mypy/checkexpr.py b/mypy/checkexpr.py
+index 714ae12310094..9c1444ab96322 100644
+--- a/mypy/checkexpr.py
++++ b/mypy/checkexpr.py
+@@ -1948,12 +1948,7 @@ def analyze_type_type_callee(self, item: ProperType, context: Context) -> Type:
+             # but better than AnyType...), but replace the return type
+             # with typevar.
+             callee = self.analyze_type_type_callee(get_proper_type(item.upper_bound), context)
+-            callee = get_proper_type(callee)
+-            if isinstance(callee, CallableType):
+-                callee = callee.copy_modified(ret_type=item)
+-            elif isinstance(callee, Overloaded):
+-                callee = Overloaded([c.copy_modified(ret_type=item) for c in callee.items])
+-            return callee
++            return self.replace_type_type_callee_ret_type(callee, item)
+         # We support Type of namedtuples but not of tuples in general
+         if isinstance(item, TupleType) and tuple_fallback(item).type.fullname != "builtins.tuple":
+             return self.analyze_type_type_callee(tuple_fallback(item), context)
+@@ -1963,6 +1958,23 @@ def analyze_type_type_callee(self, item: ProperType, context: Context) -> Type:
+         self.msg.unsupported_type_type(item, context)
+         return AnyType(TypeOfAny.from_error)
+ 
++    def replace_type_type_callee_ret_type(self, callee: Type, ret_type: Type) -> Type:
++        callee = get_proper_type(callee)
++        if isinstance(callee, CallableType):
++            return callee.copy_modified(ret_type=ret_type)
++        if isinstance(callee, Overloaded):
++            return Overloaded([c.copy_modified(ret_type=ret_type) for c in callee.items])
++        if isinstance(callee, UnionType):
++            return UnionType(
++                [
++                    self.replace_type_type_callee_ret_type(item, ret_type)
++                    for item in callee.relevant_items()
++                ],
++                line=callee.line,
++                column=callee.column,
++            )
++        return callee
++
+     def infer_arg_types_in_empty_context(self, args: list[Expression]) -> list[Type]:
+         """Infer argument expression types in an empty context.
+ 
+diff --git a/test-data/unit/check-classes.test b/test-data/unit/check-classes.test
+index b830b99465e07..2cd43c74ebb5b 100644
+--- a/test-data/unit/check-classes.test
++++ b/test-data/unit/check-classes.test
+@@ -3889,6 +3889,24 @@ def process(cls: Type[U]):
+ [builtins fixtures/classmethod.pyi]
+ [out]
+ 
++[case testTypeUsingTypeCConstructorReturnFromTypeVarUnionBound]
++from typing import Optional, Type, TypeVar, Union
++
++class A:
++    def __init__(self, value: str = "") -> None: pass
++class B:
++    def __init__(self, value: str = "") -> None: pass
++
++T = TypeVar("T", bound=Union[A, B])
++
++def make(ftype: Type[T], value: Optional[str]) -> T:
++    if value is None:
++        return ftype()
++    return ftype(value)
++
++reveal_type(make(A, "a"))  # N: Revealed type is "__main__.A"
++reveal_type(make(B, None))  # N: Revealed type is "__main__.B"
++
+ [case testTypeUsingTypeCErrorUnsupportedType]
+ from typing import Type, Tuple
+ def foo(arg: Type[Tuple[int]]):
+diff --git a/test-data/unit/check-python310.test b/test-data/unit/check-python310.test
+index 03a0934b662c6..2f5b2d7ce8e86 100644
+--- a/test-data/unit/check-python310.test
++++ b/test-data/unit/check-python310.test
+@@ -3531,7 +3531,7 @@ def switch(choice: type[T_Choice]) -> None:
+             reveal_type(choice())  # N: Revealed type is "b.Two"
+         case _:
+             reveal_type(choice)  # N: Revealed type is "type[T_Choice`-1]"
+-            reveal_type(choice())  # N: Revealed type is "b.One | b.Two"
++            reveal_type(choice())  # N: Revealed type is "T_Choice`-1"
+ 
+ [file b.py]
+ class One: ...
+diff --git a/test-data/unit/check-python312.test b/test-data/unit/check-python312.test
+index c4a2320797464..ea5380466478c 100644
+--- a/test-data/unit/check-python312.test
++++ b/test-data/unit/check-python312.test
+@@ -824,6 +824,20 @@ f(1, u)
+ f('x', None)  # E: Value of type variable "T" of "f" cannot be "str" \
+               # E: Value of type variable "S" of "f" cannot be "None"
+ 
++[case testPEP695UpperBoundTypeTypeConstructorReturnType]
++class A:
++    def __init__(self, value: str = "") -> None: pass
++class B:
++    def __init__(self, value: str = "") -> None: pass
++
++def make[T: A | B](ftype: type[T], value: str | None) -> T:
++    if value is None:
++        return ftype()
++    return ftype(value)
++
++reveal_type(make(A, "a"))  # N: Revealed type is "__main__.A"
++reveal_type(make(B, None))  # N: Revealed type is "__main__.B"
++
+ [case testPEP695InferVarianceOfTupleType]
+ class Cov[T](tuple[int, str]):
+     def f(self) -> T: pass

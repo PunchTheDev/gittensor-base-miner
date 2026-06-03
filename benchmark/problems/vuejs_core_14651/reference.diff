@@ -1,0 +1,240 @@
+diff --git a/packages/runtime-vapor/__tests__/vdomInterop.spec.ts b/packages/runtime-vapor/__tests__/vdomInterop.spec.ts
+index dff1504d7d2..2b8945a9f16 100644
+--- a/packages/runtime-vapor/__tests__/vdomInterop.spec.ts
++++ b/packages/runtime-vapor/__tests__/vdomInterop.spec.ts
+@@ -34,6 +34,7 @@ import {
+   child,
+   createComponent,
+   createDynamicComponent,
++  createForSlots,
+   createIf,
+   createSlot,
+   createTemplateRefSetter,
+@@ -43,6 +44,7 @@ import {
+   renderEffect,
+   setText,
+   template,
++  txt,
+   vaporInteropPlugin,
+   withVaporCtx,
+ } from '../src'
+@@ -915,6 +917,103 @@ describe('vdomInterop', () => {
+ 
+       expect(html()).toBe('<div>forwarded slot</div>')
+     })
++
++    test('dynamic slots via createForSlots should update in vdom child', async () => {
++      const list = ref([0, 1, 2])
++
++      const VDomChild = defineComponent({
++        setup(_, { slots }) {
++          return () => h('div', null, [renderSlot(slots, 'default')])
++        },
++      })
++
++      const VaporParent = defineVaporComponent({
++        setup() {
++          return createComponent(VDomChild as any, null, {
++            $: [
++              () =>
++                createForSlots(list.value, value => ({
++                  name: 'default',
++                  fn: () => {
++                    const n = template('<span> </span>')() as Element
++                    const t = txt(n) as Text
++                    renderEffect(() => setText(t, toDisplayString(value)))
++                    return n
++                  },
++                })),
++            ],
++          })
++        },
++      })
++
++      const { html } = define({
++        setup() {
++          return () => h(VaporParent as any)
++        },
++      }).render()
++
++      // last-wins: shows last item
++      expect(html()).toBe('<div><span>2</span></div>')
++
++      list.value.push(3)
++      await nextTick()
++      expect(html()).toBe('<div><span>3</span></div>')
++
++      list.value.pop()
++      list.value.pop()
++      await nextTick()
++      expect(html()).toBe('<div><span>1</span></div>')
++    })
++
++    test('dynamic slots via createForSlots should re-mount fragment slot in vdom child', async () => {
++      const list = ref([0, 1, 2])
++
++      const VDomChild = defineComponent({
++        setup(_, { slots }) {
++          return () => h('div', null, [renderSlot(slots, 'default')])
++        },
++      })
++
++      const VaporParent = defineVaporComponent({
++        setup() {
++          return createComponent(VDomChild as any, null, {
++            $: [
++              () =>
++                createForSlots(list.value, value => ({
++                  name: 'default',
++                  fn: () =>
++                    createIf(
++                      () => true,
++                      () => {
++                        const n = template('<span> </span>')() as Element
++                        const t = txt(n) as Text
++                        renderEffect(() => setText(t, toDisplayString(value)))
++                        return n
++                      },
++                    ),
++                })),
++            ],
++          })
++        },
++      })
++
++      const { html } = define({
++        setup() {
++          return () => h(VaporParent as any)
++        },
++      }).render()
++
++      expect(html()).toBe('<div><span>2</span><!--if--></div>')
++
++      list.value.push(3)
++      await nextTick()
++      expect(html()).toBe('<div><span>3</span><!--if--></div>')
++
++      list.value.pop()
++      list.value.pop()
++      await nextTick()
++      expect(html()).toBe('<div><span>1</span><!--if--></div>')
++    })
+   })
+ 
+   describe('provide / inject', () => {
+diff --git a/packages/runtime-vapor/src/vdomInterop.ts b/packages/runtime-vapor/src/vdomInterop.ts
+index 90c86bb056a..f7f40cef688 100644
+--- a/packages/runtime-vapor/src/vdomInterop.ts
++++ b/packages/runtime-vapor/src/vdomInterop.ts
+@@ -309,40 +309,46 @@ const vaporInteropImpl: Omit<
+     parentSuspense,
+   ) {
+     if (!n1) {
+-      const prev = currentInstance
+-      let prevSuspense: SuspenseBoundary | null = null
+-      simpleSetCurrentInstance(parentComponent)
+-      if (__FEATURE_SUSPENSE__ && parentSuspense) {
+-        prevSuspense = setParentSuspense(parentSuspense)
+-      }
+       // mount
+-      let selfAnchor: Node | undefined
+-      const { slot, fallback } = n2.vs!
+-      const propsRef = (n2.vs!.ref = shallowRef(n2.props))
+-      let slotBlock = slot(new Proxy(propsRef, vaporSlotPropsProxyHandler))
+-      if (fallback) {
+-        const vaporFallback = createVaporFallback(fallback, parentComponent)
+-        const emptyFrag = attachSlotFallback(slotBlock, vaporFallback)
+-        if (!isValidBlock(slotBlock)) {
+-          slotBlock = renderSlotFallback(slotBlock, vaporFallback, emptyFrag)
+-        }
+-      }
+-      if (isFragment(slotBlock)) {
++      const slotBlock = renderVaporSlot(n2, parentComponent, parentSuspense)
++      const selfAnchor =
+         // use fragment's anchor when possible
+-        selfAnchor = slotBlock.anchor
+-      }
+-      if (__FEATURE_SUSPENSE__ && parentSuspense) {
+-        setParentSuspense(prevSuspense)
+-      }
+-      simpleSetCurrentInstance(prev)
+-      if (!selfAnchor) selfAnchor = createTextNode()
++        (isFragment(slotBlock) ? slotBlock.anchor : undefined) ||
++        createTextNode()
+       insert((n2.el = n2.anchor = selfAnchor), container, anchor)
+       insert((n2.vb = slotBlock), container, selfAnchor)
+     } else {
+       // update
+-      n2.el = n2.anchor = n1.anchor
+-      n2.vb = n1.vb
+-      ;(n2.vs!.ref = n1.vs!.ref)!.value = n2.props
++      // slot function changed (e.g. dynamic slots from _createForSlots),
++      // need to re-mount the vapor block
++      if (n2.vs!.slot !== n1.vs!.slot) {
++        const selfAnchor = n1.anchor as Node
++        const parent = selfAnchor.parentNode as ParentNode
++        const nextSibling = selfAnchor.nextSibling
++        const oldBlockOwnsAnchor =
++          isFragment(n1.vb!) && n1.vb!.anchor === selfAnchor
++        // remove old vapor block
++        remove(n1.vb!, parent)
++        const slotBlock = renderVaporSlot(n2, parentComponent, parentSuspense)
++        let newAnchor = isFragment(slotBlock) ? slotBlock.anchor : undefined
++        let insertAnchor = nextSibling as Node
++        if (newAnchor) {
++          if (!oldBlockOwnsAnchor) {
++            remove(selfAnchor, parent)
++          }
++        } else if (oldBlockOwnsAnchor) {
++          newAnchor = createTextNode()
++        } else {
++          newAnchor = selfAnchor
++          insertAnchor = selfAnchor
++        }
++        insert((n2.el = n2.anchor = newAnchor), parent, insertAnchor)
++        insert((n2.vb = slotBlock), parent, newAnchor)
++      } else {
++        n2.el = n2.anchor = n1.anchor
++        n2.vb = n1.vb
++        ;(n2.vs!.ref = n1.vs!.ref)!.value = n2.props
++      }
+     }
+   },
+ 
+@@ -1194,3 +1200,36 @@ const createFallback =
+     // vapor block
+     return fallbackNodes as Block
+   }
++
++function renderVaporSlot(
++  vnode: VNode,
++  parentComponent: ComponentInternalInstance | null,
++  parentSuspense: SuspenseBoundary | null,
++): Block {
++  const prev = currentInstance
++  let prevSuspense: SuspenseBoundary | null = null
++  simpleSetCurrentInstance(parentComponent)
++  if (__FEATURE_SUSPENSE__ && parentSuspense) {
++    prevSuspense = setParentSuspense(parentSuspense)
++  }
++  try {
++    const { slot, fallback } = vnode.vs!
++    const propsRef = (vnode.vs!.ref = shallowRef(vnode.props))
++    let slotBlock = slot(new Proxy(propsRef, vaporSlotPropsProxyHandler))
++    if (!fallback) {
++      return slotBlock
++    }
++
++    const vaporFallback = createVaporFallback(fallback, parentComponent)
++    const emptyFrag = attachSlotFallback(slotBlock, vaporFallback)
++    if (!isValidBlock(slotBlock)) {
++      slotBlock = renderSlotFallback(slotBlock, vaporFallback, emptyFrag)
++    }
++    return slotBlock
++  } finally {
++    if (__FEATURE_SUSPENSE__ && parentSuspense) {
++      setParentSuspense(prevSuspense)
++    }
++    simpleSetCurrentInstance(prev)
++  }
++}

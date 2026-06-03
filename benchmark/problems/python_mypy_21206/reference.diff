@@ -1,0 +1,111 @@
+diff --git a/mypy/checker.py b/mypy/checker.py
+index 6a0e8f3718d35..7ac16053c217a 100644
+--- a/mypy/checker.py
++++ b/mypy/checker.py
+@@ -6957,10 +6957,6 @@ def narrow_type_by_identity_equality(
+     def propagate_up_typemap_info(self, new_types: TypeMap) -> TypeMap:
+         """Attempts refining parent expressions of any MemberExpr or IndexExprs in new_types.
+ 
+-        Specifically, this function accepts two mappings of expression to original types:
+-        the original mapping (existing_types), and a new mapping (new_types) intended to
+-        update the original.
+-
+         This function iterates through new_types and attempts to use the information to try
+         refining any parent types that happen to be unions.
+ 
+@@ -6979,23 +6975,12 @@ def propagate_up_typemap_info(self, new_types: TypeMap) -> TypeMap:
+ 
+         We return the newly refined map. This map is guaranteed to be a superset of 'new_types'.
+         """
+-        output_map = {}
++        all_mappings = [new_types]
+         for expr, expr_type in new_types.items():
+-            # The original inferred type should always be present in the output map, of course
+-            output_map[expr] = expr_type
+-
+-            # Next, try using this information to refine the parent types, if applicable.
+-            new_mapping = self.refine_parent_types(expr, expr_type)
+-            for parent_expr, proposed_parent_type in new_mapping.items():
+-                # We don't try inferring anything if we've already inferred something for
+-                # the parent expression.
+-                # TODO: Consider picking the narrower type instead of always discarding this?
+-                if parent_expr in new_types:
+-                    continue
+-                output_map[parent_expr] = proposed_parent_type
+-        return output_map
++            all_mappings.append(self.refine_parent_types(expr, expr_type))
++        return reduce_and_conditional_type_maps(all_mappings, use_meet=True)
+ 
+-    def refine_parent_types(self, expr: Expression, expr_type: Type) -> Mapping[Expression, Type]:
++    def refine_parent_types(self, expr: Expression, expr_type: Type) -> TypeMap:
+         """Checks if the given expr is a 'lookup operation' into a union and iteratively refines
+         the parent types based on the 'expr_type'.
+ 
+@@ -8744,6 +8729,8 @@ def reduce_and_conditional_type_maps(ms: list[TypeMap], *, use_meet: bool) -> Ty
+         return ms[0]
+     result = ms[0]
+     for m in ms[1:]:
++        if not m:
++            continue  # this is a micro-optimisation
+         result = and_conditional_maps(result, m, use_meet=use_meet)
+     return result
+ 
+diff --git a/test-data/unit/check-isinstance.test b/test-data/unit/check-isinstance.test
+index 3fbea4aa1e81a..d98c5424156da 100644
+--- a/test-data/unit/check-isinstance.test
++++ b/test-data/unit/check-isinstance.test
+@@ -3070,7 +3070,7 @@ if hasattr(mod, "y"):
+ def __getattr__(attr: str) -> str: ...
+ [builtins fixtures/module.pyi]
+ 
+-[case testMultipleHasAttr-xfail]
++[case testMultipleHasAttr]
+ # flags: --warn-unreachable
+ # https://github.com/python/mypy/issues/20596
+ from __future__ import annotations
+diff --git a/test-data/unit/check-narrowing.test b/test-data/unit/check-narrowing.test
+index 6e3bba6921bff..648a4b001da5c 100644
+--- a/test-data/unit/check-narrowing.test
++++ b/test-data/unit/check-narrowing.test
+@@ -3993,3 +3993,25 @@ def f2(func: Callable[..., T], arg: str) -> T:
+         return func(arg)
+     return func(arg)
+ [builtins fixtures/primitives.pyi]
++
++
++[case testPropagatedParentNarrowingMeet]
++# flags: --strict-equality --warn-unreachable
++from __future__ import annotations
++
++class A:
++    tag: int
++
++class B:
++    tag: int
++    name = "b"
++
++class C:
++    tag: str
++
++def stringify(value: A | B | C) -> str:
++    if isinstance(value.tag, int) and isinstance(value, B):
++        reveal_type(value)  # N: Revealed type is "__main__.B"
++        return value.name
++    return ""
++[builtins fixtures/tuple.pyi]
+diff --git a/test-data/unit/check-python310.test b/test-data/unit/check-python310.test
+index 4b8286ce5cc9c..b9dc59fd1ebf7 100644
+--- a/test-data/unit/check-python310.test
++++ b/test-data/unit/check-python310.test
+@@ -3699,9 +3699,9 @@ class B(TypedDict):
+     num: int
+ 
+ d: A | B
+-match d["tag"]: # E: Match statement has unhandled case for values of type "Literal['b']" \
++match d["tag"]: # E: Match statement has unhandled case for values of type "B" \
+                 # N: If match statement is intended to be non-exhaustive, add `case _: pass` \
+-                # E: Match statement has unhandled case for values of type "B"
++                # E: Match statement has unhandled case for values of type "Literal['b']"
+     case "a":
+         reveal_type(d)  # N: Revealed type is "TypedDict('__main__.A', {'tag': Literal['a'], 'name': builtins.str})"
+         reveal_type(d["name"])  # N: Revealed type is "builtins.str"

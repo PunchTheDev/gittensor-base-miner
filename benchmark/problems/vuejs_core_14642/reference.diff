@@ -1,0 +1,674 @@
+diff --git a/packages/runtime-core/__tests__/components/Suspense.spec.ts b/packages/runtime-core/__tests__/components/Suspense.spec.ts
+index 4abab7c56db..319575b3bc1 100644
+--- a/packages/runtime-core/__tests__/components/Suspense.spec.ts
++++ b/packages/runtime-core/__tests__/components/Suspense.spec.ts
+@@ -2476,6 +2476,100 @@ describe('Suspense', () => {
+     expect(serializeInner(target)).toBe(``)
+   })
+ 
++  test('should not mount discarded teleport after suspense is resolved', async () => {
++    const target = nodeOps.createElement('div')
++    const showTeleport = ref(true)
++
++    const Async = defineAsyncComponent({
++      render() {
++        return h('div', 'async')
++      },
++    })
++
++    const Comp = {
++      setup() {
++        return () => {
++          const children = [h(Async)]
++          if (showTeleport.value) {
++            children.push(h(Teleport, { to: target }, h('div', 'teleported')))
++          }
++          return h(Suspense, null, {
++            default: h('div', null, children),
++            fallback: h('div', 'fallback'),
++          })
++        }
++      },
++    }
++
++    const root = nodeOps.createElement('div')
++    render(h(Comp), root)
++    expect(serializeInner(root)).toBe(`<div>fallback</div>`)
++    expect(serializeInner(target)).toBe(``)
++
++    showTeleport.value = false
++    await nextTick()
++    expect(serializeInner(root)).toBe(`<div>fallback</div>`)
++    expect(serializeInner(target)).toBe(``)
++
++    await Promise.all(deps)
++    await nextTick()
++    expect(serializeInner(root)).toBe(`<div><div>async</div></div>`)
++    expect(serializeInner(target)).toBe(``)
++  })
++
++  test('should not process discarded disabled teleport update after suspense is resolved', async () => {
++    const target = nodeOps.createElement('div')
++    const showTeleport = ref(true)
++    const disabled = ref(false)
++
++    const Async = defineAsyncComponent({
++      render() {
++        return h('div', 'async')
++      },
++    })
++
++    const Comp = {
++      setup() {
++        return () => {
++          const children = [h(Async)]
++          if (showTeleport.value) {
++            children.push(
++              h(
++                Teleport,
++                { to: target, disabled: disabled.value },
++                h('div', 'teleported'),
++              ),
++            )
++          }
++          return h(Suspense, null, {
++            default: h('div', null, children),
++            fallback: h('div', 'fallback'),
++          })
++        }
++      },
++    }
++
++    const root = nodeOps.createElement('div')
++    render(h(Comp), root)
++    expect(serializeInner(root)).toBe(`<div>fallback</div>`)
++    expect(serializeInner(target)).toBe(``)
++
++    disabled.value = true
++    await nextTick()
++    expect(serializeInner(root)).toBe(`<div>fallback</div>`)
++    expect(serializeInner(target)).toBe(``)
++
++    showTeleport.value = false
++    await nextTick()
++    expect(serializeInner(root)).toBe(`<div>fallback</div>`)
++    expect(serializeInner(target)).toBe(``)
++
++    await Promise.all(deps)
++    await nextTick()
++    expect(serializeInner(root)).toBe(`<div><div>async</div></div>`)
++    expect(serializeInner(target)).toBe(``)
++  })
++
+   //#11617
+   test('update async component before resolve then update again', async () => {
+     const arr: boolean[] = []
+diff --git a/packages/runtime-core/__tests__/components/Teleport.spec.ts b/packages/runtime-core/__tests__/components/Teleport.spec.ts
+index 385b25660bc..d4953d8da4d 100644
+--- a/packages/runtime-core/__tests__/components/Teleport.spec.ts
++++ b/packages/runtime-core/__tests__/components/Teleport.spec.ts
+@@ -146,6 +146,200 @@ describe('renderer: teleport', () => {
+       )
+     })
+ 
++    test('should keep the mounted vnode as the patch base across deferred updates', async () => {
++      const root = document.createElement('div')
++      document.body.appendChild(root)
++
++      const show = ref(false)
++      const disabled = ref(false)
++      const text = ref('A')
++      const phase = ref(0)
++
++      const Step1 = {
++        setup() {
++          disabled.value = true
++          text.value = 'B'
++          phase.value = 1
++          return () => h('div', 'step1')
++        },
++      }
++
++      const Step2 = {
++        setup() {
++          disabled.value = false
++          text.value = 'C'
++          return () => h('div', 'step2')
++        },
++      }
++
++      createDOMApp({
++        render() {
++          return show.value
++            ? [
++                h(
++                  Teleport,
++                  { to: '#targetId2', defer: true, disabled: disabled.value },
++                  h('div', text.value),
++                ),
++                phase.value === 0 ? h(Step1) : h(Step2),
++                h('div', { id: 'targetId2' }),
++              ]
++            : [h('div')]
++        },
++      }).mount(root)
++
++      show.value = true
++      await nextTick()
++
++      expect(root.innerHTML).toMatchInlineSnapshot(
++        `"<!--teleport start--><!--teleport end--><div>step2</div><div id="targetId2"><div>C</div></div>"`,
++      )
++    })
++
++    test('should handle disabled teleport updates before deferred mount', async () => {
++      const root = document.createElement('div')
++      const target = document.createElement('div')
++      target.id = 'targetId3'
++      document.body.appendChild(root)
++      document.body.appendChild(target)
++
++      const showTeleport = ref(false)
++      const disabled = ref(false)
++
++      const Step = {
++        setup() {
++          disabled.value = true
++          return () => h('div', 'step')
++        },
++      }
++
++      createDOMApp({
++        render() {
++          return showTeleport.value
++            ? [
++                h(
++                  Teleport,
++                  { to: '#targetId3', defer: true, disabled: disabled.value },
++                  h('div', 'teleported'),
++                ),
++                h(Step),
++              ]
++            : [h('div')]
++        },
++      }).mount(root)
++
++      expect(root.innerHTML).toMatchInlineSnapshot(`"<div></div>"`)
++      expect(target.innerHTML).toBe(``)
++
++      showTeleport.value = true
++      await nextTick()
++
++      expect(root.innerHTML).toMatchInlineSnapshot(
++        `"<!--teleport start--><div>teleported</div><!--teleport end--><div>step</div>"`,
++      )
++      expect(target.innerHTML).toBe(``)
++    })
++
++    test('should not mount discarded teleport after deferred updates', async () => {
++      const root = document.createElement('div')
++      const target = document.createElement('div')
++      target.id = 'targetId4'
++      document.body.appendChild(root)
++      document.body.appendChild(target)
++
++      const showTeleport = ref(false)
++      const phase = ref(0)
++
++      const Step1 = {
++        setup() {
++          phase.value = 1
++          return () => h('div', 'step1')
++        },
++      }
++
++      const Step2 = {
++        setup() {
++          showTeleport.value = false
++          return () => h('div', 'step2')
++        },
++      }
++
++      createDOMApp({
++        render() {
++          return showTeleport.value
++            ? [
++                h(
++                  Teleport,
++                  { to: '#targetId4', defer: true },
++                  h('div', 'teleported'),
++                ),
++                phase.value === 0 ? h(Step1) : h(Step2),
++              ]
++            : [h('div', 'done')]
++        },
++      }).mount(root)
++
++      expect(root.innerHTML).toMatchInlineSnapshot(`"<div>done</div>"`)
++      expect(target.innerHTML).toBe(``)
++
++      showTeleport.value = true
++      await nextTick()
++
++      expect(root.innerHTML).toMatchInlineSnapshot(`"<div>done</div>"`)
++      expect(target.innerHTML).toBe(``)
++    })
++
++    test('should not mount discarded disabled teleport after deferred updates', async () => {
++      const root = document.createElement('div')
++      const target = document.createElement('div')
++      target.id = 'targetId5'
++      document.body.appendChild(root)
++      document.body.appendChild(target)
++
++      const showTeleport = ref(false)
++      const disabled = ref(false)
++      const phase = ref(0)
++
++      const Step1 = {
++        setup() {
++          disabled.value = true
++          phase.value = 1
++          return () => h('div', 'step1')
++        },
++      }
++
++      const Step2 = {
++        setup() {
++          showTeleport.value = false
++          return () => h('div', 'step2')
++        },
++      }
++
++      createDOMApp({
++        render() {
++          return showTeleport.value
++            ? [
++                h(
++                  Teleport,
++                  { to: '#targetId5', defer: true, disabled: disabled.value },
++                  h('div', 'teleported'),
++                ),
++                phase.value === 0 ? h(Step1) : h(Step2),
++              ]
++            : [h('div', 'done')]
++        },
++      }).mount(root)
++
++      expect(root.innerHTML).toMatchInlineSnapshot(`"<div>done</div>"`)
++      expect(target.innerHTML).toBe(``)
++
++      showTeleport.value = true
++      await nextTick()
++
++      expect(root.innerHTML).toMatchInlineSnapshot(`"<div>done</div>"`)
++      expect(target.innerHTML).toBe(``)
++    })
++
+     // #13349
+     test('handle deferred teleport updates before and after mount', async () => {
+       const root = document.createElement('div')
+diff --git a/packages/runtime-core/src/components/Teleport.ts b/packages/runtime-core/src/components/Teleport.ts
+index e339ad7003b..3c91923af42 100644
+--- a/packages/runtime-core/src/components/Teleport.ts
++++ b/packages/runtime-core/src/components/Teleport.ts
+@@ -14,6 +14,7 @@ import type { VNode, VNodeArrayChildren, VNodeProps } from '../vnode'
+ import { ShapeFlags, isString } from '@vue/shared'
+ import { warn } from '../warning'
+ import { isHmrUpdating } from '../hmr'
++import { type SchedulerJob, SchedulerJobFlags } from '../scheduler'
+ 
+ export type TeleportVNode = VNode<RendererNode, RendererElement, TeleportProps>
+ 
+@@ -23,6 +24,8 @@ export interface TeleportProps {
+   defer?: boolean
+ }
+ 
++const pendingMounts = new WeakMap<VNode, SchedulerJob>()
++
+ export const TeleportEndKey: unique symbol = Symbol('_vte')
+ 
+ export const isTeleport = (type: any): boolean => type.__isTeleport
+@@ -95,7 +98,7 @@ export const TeleportImpl = {
+     } = internals
+ 
+     const disabled = isTeleportDisabled(n2.props)
+-    let { shapeFlag, children, dynamicChildren } = n2
++    let { dynamicChildren } = n2
+ 
+     // #3302
+     // HMR updated, force full diff
+@@ -104,6 +107,70 @@ export const TeleportImpl = {
+       dynamicChildren = null
+     }
+ 
++    const mount = (
++      vnode: TeleportVNode,
++      container: RendererElement,
++      anchor: RendererNode,
++    ) => {
++      // Teleport *always* has Array children. This is enforced in both the
++      // compiler and vnode children normalization.
++      if (vnode.shapeFlag & ShapeFlags.ARRAY_CHILDREN) {
++        mountChildren(
++          vnode.children as VNodeArrayChildren,
++          container,
++          anchor,
++          parentComponent,
++          parentSuspense,
++          namespace,
++          slotScopeIds,
++          optimized,
++        )
++      }
++    }
++
++    const mountToTarget = (vnode: TeleportVNode = n2) => {
++      const disabled = isTeleportDisabled(vnode.props)
++      const target = (vnode.target = resolveTarget(vnode.props, querySelector))
++      const targetAnchor = prepareAnchor(target, vnode, createText, insert)
++      if (target) {
++        // #2652 we could be teleporting from a non-SVG tree into an SVG tree
++        if (namespace !== 'svg' && isTargetSVG(target)) {
++          namespace = 'svg'
++        } else if (namespace !== 'mathml' && isTargetMathML(target)) {
++          namespace = 'mathml'
++        }
++
++        // track CE teleport targets
++        if (parentComponent && parentComponent.isCE) {
++          ;(
++            parentComponent.ce!._teleportTargets ||
++            (parentComponent.ce!._teleportTargets = new Set())
++          ).add(target)
++        }
++
++        if (!disabled) {
++          mount(vnode, target, targetAnchor)
++          updateCssVars(vnode, false)
++        }
++      } else if (__DEV__ && !disabled) {
++        warn('Invalid Teleport target on mount:', target, `(${typeof target})`)
++      }
++    }
++
++    const queuePendingMount = (vnode: TeleportVNode) => {
++      const mountJob: SchedulerJob = () => {
++        if (pendingMounts.get(vnode) !== mountJob) return
++        pendingMounts.delete(vnode)
++        if (isTeleportDisabled(vnode.props)) {
++          mount(vnode, container, vnode.anchor!)
++          updateCssVars(vnode, true)
++        }
++        mountToTarget(vnode)
++      }
++      pendingMounts.set(vnode, mountJob)
++      queuePostRenderEffect(mountJob, parentSuspense)
++    }
++
+     if (n1 == null) {
+       // insert anchors in the main view
+       const placeholder = (n2.el = __DEV__
+@@ -115,101 +182,37 @@ export const TeleportImpl = {
+       insert(placeholder, container, anchor)
+       insert(mainAnchor, container, anchor)
+ 
+-      const mount = (container: RendererElement, anchor: RendererNode) => {
+-        // Teleport *always* has Array children. This is enforced in both the
+-        // compiler and vnode children normalization.
+-        if (shapeFlag & ShapeFlags.ARRAY_CHILDREN) {
+-          mountChildren(
+-            children as VNodeArrayChildren,
+-            container,
+-            anchor,
+-            parentComponent,
+-            parentSuspense,
+-            namespace,
+-            slotScopeIds,
+-            optimized,
+-          )
+-        }
+-      }
+-
+-      const mountToTarget = () => {
+-        const target = (n2.target = resolveTarget(n2.props, querySelector))
+-        const targetAnchor = prepareAnchor(target, n2, createText, insert)
+-        if (target) {
+-          // #2652 we could be teleporting from a non-SVG tree into an SVG tree
+-          if (namespace !== 'svg' && isTargetSVG(target)) {
+-            namespace = 'svg'
+-          } else if (namespace !== 'mathml' && isTargetMathML(target)) {
+-            namespace = 'mathml'
+-          }
+-
+-          // track CE teleport targets
+-          if (parentComponent && parentComponent.isCE) {
+-            ;(
+-              parentComponent.ce!._teleportTargets ||
+-              (parentComponent.ce!._teleportTargets = new Set())
+-            ).add(target)
+-          }
+-
+-          if (!disabled) {
+-            mount(target, targetAnchor)
+-            updateCssVars(n2, false)
+-          }
+-        } else if (__DEV__ && !disabled) {
+-          warn(
+-            'Invalid Teleport target on mount:',
+-            target,
+-            `(${typeof target})`,
+-          )
+-        }
++      if (
++        isTeleportDeferred(n2.props) ||
++        (__FEATURE_SUSPENSE__ && parentSuspense && parentSuspense.pendingBranch)
++      ) {
++        queuePendingMount(n2)
++        return
+       }
+ 
+       if (disabled) {
+-        mount(container, mainAnchor)
++        mount(n2, container, mainAnchor)
+         updateCssVars(n2, true)
+       }
+ 
+-      if (
+-        isTeleportDeferred(n2.props) ||
+-        (parentSuspense && parentSuspense.pendingBranch)
+-      ) {
+-        n2.el!.__isMounted = false
+-        queuePostRenderEffect(() => {
+-          if (n2.el!.__isMounted !== false) return
+-          mountToTarget()
+-          delete n2.el!.__isMounted
+-        }, parentSuspense)
+-      } else {
+-        mountToTarget()
+-      }
++      mountToTarget()
+     } else {
+       // update content
+       n2.el = n1.el
+-      n2.targetStart = n1.targetStart
+       const mainAnchor = (n2.anchor = n1.anchor)!
+-      const target = (n2.target = n1.target)!
+-      const targetAnchor = (n2.targetAnchor = n1.targetAnchor)!
+-
+       // Target mounting may still be pending because of deferred teleport or a
+-      // parent suspense buffering post-render effects. In that case, defer the
+-      // teleport patch itself until the pending mount effect has run.
+-      if (n1.el!.__isMounted === false) {
+-        queuePostRenderEffect(() => {
+-          TeleportImpl.process(
+-            n1,
+-            n2,
+-            container,
+-            anchor,
+-            parentComponent,
+-            parentSuspense,
+-            namespace,
+-            slotScopeIds,
+-            optimized,
+-            internals,
+-          )
+-        }, parentSuspense)
++      // parent suspense buffering post-render effects. In that case, replace
++      // the pending mount so the latest vnode goes through the mount flow.
++      const pendingMount = pendingMounts.get(n1)
++      if (pendingMount) {
++        pendingMount.flags! |= SchedulerJobFlags.DISPOSED
++        pendingMounts.delete(n1)
++        queuePendingMount(n2)
+         return
+       }
++      n2.targetStart = n1.targetStart
++      const target = (n2.target = n1.target)!
++      const targetAnchor = (n2.targetAnchor = n1.targetAnchor)!
+       const wasDisabled = isTeleportDisabled(n1.props)
+       const currentContainer = wasDisabled ? container : target
+       const currentAnchor = wasDisabled ? mainAnchor : targetAnchor
+@@ -324,6 +327,17 @@ export const TeleportImpl = {
+       props,
+     } = vnode
+ 
++    let shouldRemove = doRemove || !isTeleportDisabled(props)
++    // A deferred teleport inside a pending suspense may be unmounted before its
++    // content is ever mounted. Clear the queued mount effect and skip removing
++    // children because nothing has been mounted yet.
++    const pendingMount = pendingMounts.get(vnode)
++    if (pendingMount) {
++      pendingMount.flags! |= SchedulerJobFlags.DISPOSED
++      pendingMounts.delete(vnode)
++      shouldRemove = false
++    }
++
+     if (target) {
+       hostRemove(targetStart!)
+       hostRemove(targetAnchor!)
+@@ -332,7 +346,6 @@ export const TeleportImpl = {
+     // an unmounted teleport should always unmount its children whether it's disabled or not
+     doRemove && hostRemove(anchor!)
+     if (shapeFlag & ShapeFlags.ARRAY_CHILDREN) {
+-      const shouldRemove = doRemove || !isTeleportDisabled(props)
+       for (let i = 0; i < (children as VNode[]).length; i++) {
+         const child = (children as VNode[])[i]
+         unmount(
+diff --git a/packages/vue/__tests__/e2e/Transition.spec.ts b/packages/vue/__tests__/e2e/Transition.spec.ts
+index 81eb12de82e..c0e000af4f7 100644
+--- a/packages/vue/__tests__/e2e/Transition.spec.ts
++++ b/packages/vue/__tests__/e2e/Transition.spec.ts
+@@ -2114,6 +2114,112 @@ describe('e2e: Transition', () => {
+       E2E_TIMEOUT,
+     )
+ 
++    // #14640
++    test(
++      'switch suspense branches after teleport updates before pending mount finishes',
++      async () => {
++        await page().evaluate(() => {
++          const { createApp, defineComponent, nextTick, ref } = (window as any)
++            .Vue
++
++          const Comp = defineComponent({
++            props: {
++              mode: {
++                type: String,
++                required: true,
++              },
++              count: Number,
++            },
++            emits: ['go', 'back'],
++            async setup() {
++              await new Promise(resolve => setTimeout(resolve, 0))
++            },
++            template: `
++              <div v-if="mode === 'a'">
++                <button @click="$emit('go')">Go</button>
++                <div>{{ count }}</div>
++                <teleport to="body">
++                  <Transition name="fade">
++                    <div>
++                      A Teleport
++                    </div>
++                  </Transition>
++                </teleport>
++              </div>
++
++              <div v-else>
++                <button @click="$emit('back')">Back</button>
++                <teleport to="body">
++                  <div>
++                    B Teleport
++                  </div>
++                </teleport>
++              </div>
++            `,
++          })
++
++          createApp({
++            components: {
++              Comp,
++            },
++            setup() {
++              const count = ref(0)
++              const page = ref('a')
++
++              const switchTo = (key: string) => {
++                page.value = key
++              }
++
++              const handleResolve = async () => {
++                await nextTick()
++                count.value++
++              }
++
++              return {
++                count,
++                page,
++                switchTo,
++                handleResolve,
++              }
++            },
++            template: `
++              <div id="container">
++                <Transition mode="out-in">
++                  <Suspense @resolve="handleResolve">
++                    <Comp
++                      :key="page"
++                      :mode="page"
++                      :count="count"
++                      @go="switchTo('b')"
++                      @back="switchTo('a')"
++                    />
++                  </Suspense>
++                </Transition>
++              </div>
++            `,
++          }).mount('#app')
++        })
++
++        await transitionFinish(60)
++        expect(await html('#container')).toBe(
++          '<div class=""><button>Go</button><div>1</div><!--teleport start--><!--teleport end--></div>',
++        )
++
++        await click('button')
++        await transitionFinish(60)
++        expect(await html('#container')).toBe(
++          '<div class=""><button>Back</button><!--teleport start--><!--teleport end--></div>',
++        )
++
++        await click('button')
++        await transitionFinish(60)
++        expect(await html('#container')).toBe(
++          '<div class=""><button>Go</button><div>3</div><!--teleport start--><!--teleport end--></div>',
++        )
++      },
++      E2E_TIMEOUT,
++    )
++
+     // #3963
+     test(
+       'Suspense fallback should work with transition',

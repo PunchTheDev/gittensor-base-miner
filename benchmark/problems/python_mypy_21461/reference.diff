@@ -1,0 +1,178 @@
+diff --git a/mypy/checker.py b/mypy/checker.py
+index e7c546628bc5e..80402e71dce69 100644
+--- a/mypy/checker.py
++++ b/mypy/checker.py
+@@ -6772,14 +6772,34 @@ def comparison_type_narrowing_helper(self, node: ComparisonExpr) -> tuple[TypeMa
+ 
+                 if left_index in narrowable_operand_index_to_hash:
+                     p_iterable_type = get_proper_type(iterable_type)
++                    container_item_types = None
++
++                    # Can we statically determine container contents?
+                     if (
+                         isinstance(p_iterable_type, TupleType)
+                         and find_unpack_in_list(p_iterable_type.items) is None
+                     ):
+-                        # For some tuples, we can do negative narrowing, e.g. `x not in (None,)`
++                        container_item_types = p_iterable_type.items
++                    else:
++                        container_expr = collapse_walrus(operands[right_index])
++                        if isinstance(container_expr, (ListExpr, SetExpr)):
++                            if all(not isinstance(i, StarExpr) for i in container_expr.items):
++                                container_item_types = [
++                                    self.lookup_type(e) for e in container_expr.items
++                                ]
++                        elif isinstance(container_expr, DictExpr):
++                            if all(k is not None for k, v in container_expr.items):
++                                container_item_types = [
++                                    self.lookup_type(cast(Expression, k))
++                                    for k, v in container_expr.items
++                                ]
++
++                    if container_item_types is not None:
++                        # If we know the exact contents, we can potentially do negative narrowing,
++                        # e.g. `x not in (None,)`
+                         all_if_maps = []
+                         all_else_maps = []
+-                        for known_item in p_iterable_type.items:
++                        for known_item in container_item_types:
+                             # Match the should_coerce_literals logic from narrow_type_by_identity_equality
+                             p_known_item = get_proper_type(known_item)
+                             if is_literal_type_like(p_known_item) or (
+@@ -6799,7 +6819,7 @@ def comparison_type_narrowing_helper(self, node: ComparisonExpr) -> tuple[TypeMa
+                         if_map = reduce_or_conditional_type_maps(all_if_maps)
+                         else_map = reduce_and_conditional_type_maps(all_else_maps, use_meet=True)
+                     else:
+-                        collection_item_type = get_proper_type(builtin_item_type(iterable_type))
++                        collection_item_type = get_proper_type(builtin_item_type(p_iterable_type))
+                         if collection_item_type is not None:
+                             if_map, else_map = self.narrow_type_by_identity_equality(
+                                 "==",
+@@ -6813,6 +6833,7 @@ def comparison_type_narrowing_helper(self, node: ComparisonExpr) -> tuple[TypeMa
+                             else_map = {}
+ 
+                 if right_index in narrowable_operand_index_to_hash:
++                    # E.g. narrows the right operand in `if "key" in typed_dict`
+                     if_type, else_type = self.conditional_types_for_iterable(
+                         item_type, iterable_type
+                     )
+diff --git a/test-data/unit/check-isinstance.test b/test-data/unit/check-isinstance.test
+index fe093220aa9da..acd81839fcdc7 100644
+--- a/test-data/unit/check-isinstance.test
++++ b/test-data/unit/check-isinstance.test
+@@ -2254,7 +2254,6 @@ if y not in x:
+ else:
+     reveal_type(y)  # N: Revealed type is "builtins.int"
+ [builtins fixtures/list.pyi]
+-[out]
+ 
+ [case testNarrowTypeAfterInListOfOptional]
+ # flags: --warn-unreachable
+@@ -2268,7 +2267,6 @@ if y not in x:
+ else:
+     reveal_type(y)  # N: Revealed type is "builtins.int | None"
+ [builtins fixtures/list.pyi]
+-[out]
+ 
+ [case testNarrowTypeAfterInListNonOverlapping]
+ # flags: --warn-unreachable
+@@ -2319,7 +2317,6 @@ if y not in nt:
+ else:
+     reveal_type(y) # N: Revealed type is "builtins.int"
+ [builtins fixtures/tuple.pyi]
+-[out]
+ 
+ [case testNarrowTypeAfterInDict]
+ # flags: --warn-unreachable
+@@ -2336,7 +2333,6 @@ if y not in x:
+ else:
+     reveal_type(y) # N: Revealed type is "builtins.str"
+ [builtins fixtures/dict.pyi]
+-[out]
+ 
+ [case testNarrowTypeAfterInNoAnyOrObject]
+ # flags: --warn-unreachable
+@@ -2356,7 +2352,6 @@ else:
+     reveal_type(y) # N: Revealed type is "builtins.int | None"
+ [typing fixtures/typing-medium.pyi]
+ [builtins fixtures/list.pyi]
+-[out]
+ 
+ [case testNarrowTypeAfterInUserDefined]
+ # flags: --warn-unreachable
+@@ -2378,7 +2373,6 @@ else:
+     reveal_type(y) # N: Revealed type is "builtins.int | None"
+ [typing fixtures/typing-full.pyi]
+ [builtins fixtures/list.pyi]
+-[out]
+ 
+ [case testNarrowTypeAfterInSet]
+ # flags: --warn-unreachable
+@@ -2395,7 +2389,6 @@ if y not in s:
+ else:
+     reveal_type(y) # N: Revealed type is "builtins.str"
+ [builtins fixtures/set.pyi]
+-[out]
+ 
+ [case testNarrowTypeAfterInTypedDict]
+ # flags: --warn-unreachable
+@@ -2412,7 +2405,6 @@ def f() -> None:
+     reveal_type(x) # N: Revealed type is "builtins.str"
+ [builtins fixtures/dict.pyi]
+ [typing fixtures/typing-typeddict.pyi]
+-[out]
+ 
+ [case testIsinstanceWidensWithAnyArg]
+ # flags: --warn-unreachable
+diff --git a/test-data/unit/check-narrowing.test b/test-data/unit/check-narrowing.test
+index 944161810389b..7bab7baa6cebd 100644
+--- a/test-data/unit/check-narrowing.test
++++ b/test-data/unit/check-narrowing.test
+@@ -3291,11 +3291,47 @@ def narrow_list(x: Literal['a', 'b', 'c'], t: list[Literal['a', 'b']]):
+     else:
+         reveal_type(x)  # N: Revealed type is "Literal['a'] | Literal['b'] | Literal['c']"
+ 
++    if x in ['a', 'b']:
++        reveal_type(x)  # N: Revealed type is "Literal['a'] | Literal['b']"
++    else:
++        reveal_type(x)  # N: Revealed type is "Literal['a'] | Literal['b'] | Literal['c']"
++
++    if x in ['a', 'b', *[]]:
++        reveal_type(x)  # N: Revealed type is "Literal['a'] | Literal['b'] | Literal['c']"
++    else:
++        reveal_type(x)  # N: Revealed type is "Literal['a'] | Literal['b'] | Literal['c']"
++
+ def narrow_set(x: Literal['a', 'b', 'c'], t: set[Literal['a', 'b']]):
+     if x in t:
+         reveal_type(x)  # N: Revealed type is "Literal['a'] | Literal['b']"
+     else:
+         reveal_type(x)  # N: Revealed type is "Literal['a'] | Literal['b'] | Literal['c']"
++
++    if x in {'a', 'b'}:
++        reveal_type(x)  # N: Revealed type is "Literal['a'] | Literal['b']"
++    else:
++        reveal_type(x)  # N: Revealed type is "Literal['a'] | Literal['b'] | Literal['c']"
++
++    if x in {'a', 'b', *[]}:
++        reveal_type(x)  # N: Revealed type is "Literal['a'] | Literal['b'] | Literal['c']"
++    else:
++        reveal_type(x)  # N: Revealed type is "Literal['a'] | Literal['b'] | Literal['c']"
++
++def narrow_dict(x: Literal['a', 'b', 'c'], t: dict[Literal['a', 'b'], int]):
++    if x in t:  # E: Unsupported operand types for in ("Literal['a', 'b', 'c']" and "dict[Literal['a', 'b'], int]")
++        reveal_type(x)  # N: Revealed type is "Literal['a'] | Literal['b']"
++    else:
++        reveal_type(x)  # N: Revealed type is "Literal['a'] | Literal['b'] | Literal['c']"
++
++    if x in {'a': 0, 'b': 1}:
++        reveal_type(x)  # N: Revealed type is "Literal['a'] | Literal['b']"
++    else:
++        reveal_type(x)  # N: Revealed type is "Literal['a'] | Literal['b'] | Literal['c']"
++
++    if x in {'a': 0, 'b': 1, **{}}:
++        reveal_type(x)  # N: Revealed type is "Literal['a'] | Literal['b'] | Literal['c']"
++    else:
++        reveal_type(x)  # N: Revealed type is "Literal['a'] | Literal['b'] | Literal['c']"
+ [builtins fixtures/primitives.pyi]
+ 
+ 

@@ -1,0 +1,120 @@
+diff --git a/packages/compiler-sfc/__tests__/compileScript/resolveType.spec.ts b/packages/compiler-sfc/__tests__/compileScript/resolveType.spec.ts
+index dd03cb973b8..83fd5634840 100644
+--- a/packages/compiler-sfc/__tests__/compileScript/resolveType.spec.ts
++++ b/packages/compiler-sfc/__tests__/compileScript/resolveType.spec.ts
+@@ -803,6 +803,61 @@ describe('resolveType', () => {
+         foo: ['Boolean', 'Symbol', 'Number'],
+       })
+     })
++
++    // #14729 — original user repro shape
++    test('MaybeRef wrapped array type in interface inheritance chain', () => {
++      expect(
++        resolve(`
++        import type { MaybeRef } from 'unresolvable-pkg-xyz'
++        type OptionItem = { label: string; value: string | number }
++        type FormItemOptions<T = any, C = any> =
++          | MaybeRef<OptionItem[]>
++          | Promise<OptionItem[]>
++          | ((row: T, context: C) => OptionItem[] | Promise<OptionItem[]>)
++        interface ISelectable<T = any, C = any> {
++          options?: FormItemOptions<T, C>
++        }
++        interface XSelectProps<T = any, C = any> extends ISelectable<T, C> {
++          modelValue?: unknown
++        }
++        defineProps<XSelectProps>()
++      `).props,
++      ).toMatchObject({
++        // 'Array' must be present so that array values pass runtime type check
++        options: expect.arrayContaining(['Array', 'Promise', 'Function']),
++      })
++    })
++
++    // #14729
++    test('Vue ref wrapper types in union are inferred when source is unresolvable', () => {
++      expect(
++        resolve(`
++        import type {
++          MaybeRef,
++          Ref,
++          ShallowRef,
++          ComputedRef,
++          WritableComputedRef,
++          MaybeRefOrGetter,
++        } from 'unresolvable-pkg-xyz'
++        defineProps<{
++          a?: MaybeRef<string[]> | Promise<string[]> | (() => string[])
++          b?: Ref<number>
++          c?: ShallowRef<number>
++          d?: ComputedRef<number>
++          e?: WritableComputedRef<number>
++          f?: MaybeRefOrGetter<boolean>
++        }>()
++      `).props,
++      ).toStrictEqual({
++        a: ['Object', 'Array', 'Promise', 'Function'],
++        b: ['Object'],
++        c: ['Object'],
++        d: ['Object'],
++        e: ['Object'],
++        f: ['Object', 'Function', 'Boolean'],
++      })
++    })
+   })
+ 
+   describe('generics', () => {
+diff --git a/packages/compiler-sfc/src/script/resolveType.ts b/packages/compiler-sfc/src/script/resolveType.ts
+index 14e5fabe5eb..5896a456137 100644
+--- a/packages/compiler-sfc/src/script/resolveType.ts
++++ b/packages/compiler-sfc/src/script/resolveType.ts
+@@ -1656,7 +1656,13 @@ export function inferRuntimeType(
+         }
+ 
+       case 'TSTypeReference': {
+-        const resolved = resolveTypeReference(ctx, node, scope)
++        // #14729 — if resolution fails (e.g. an unresolvable import), still
++        // fall through to the built-in name handling below so that well-known
++        // types like Ref/MaybeRef/Promise can be inferred from the name alone.
++        let resolved: ScopeTypeNode | undefined
++        try {
++          resolved = resolveTypeReference(ctx, node, scope)
++        } catch {}
+         if (resolved) {
+           if (resolved.type === 'TSTypeAliasDeclaration') {
+             // #13240
+@@ -1788,6 +1794,34 @@ export function inferRuntimeType(
+               case 'ReadonlySet':
+                 return ['Set']
+ 
++              // Vue ref wrapper types — handled here so that runtime type
++              // inference still works when `vue` types cannot be resolved
++              // (e.g. consumed as built artifacts in another package). #14729
++              case 'Ref':
++              case 'ShallowRef':
++              case 'ComputedRef':
++              case 'WritableComputedRef':
++                return ['Object']
++              case 'MaybeRef':
++              case 'MaybeRefOrGetter': {
++                const types = new Set<string>(['Object'])
++                if (node.typeName.name === 'MaybeRefOrGetter') {
++                  types.add('Function')
++                }
++                if (node.typeParameters && node.typeParameters.params[0]) {
++                  for (const t of inferRuntimeType(
++                    ctx,
++                    node.typeParameters.params[0],
++                    scope,
++                    false,
++                    typeParameters,
++                  )) {
++                    types.add(t)
++                  }
++                }
++                return Array.from(types)
++              }
++
+               case 'NonNullable':
+                 if (node.typeParameters && node.typeParameters.params[0]) {
+                   return inferRuntimeType(

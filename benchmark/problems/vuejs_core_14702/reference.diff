@@ -1,0 +1,85 @@
+diff --git a/packages/runtime-core/__tests__/components/Suspense.spec.ts b/packages/runtime-core/__tests__/components/Suspense.spec.ts
+index 319575b3bc1..d56f5315d88 100644
+--- a/packages/runtime-core/__tests__/components/Suspense.spec.ts
++++ b/packages/runtime-core/__tests__/components/Suspense.spec.ts
+@@ -2570,6 +2570,44 @@ describe('Suspense', () => {
+     expect(serializeInner(target)).toBe(``)
+   })
+ 
++  // #14701
++  test('should not crash when moving disabled teleport with component children inside suspense', async () => {
++    const target = nodeOps.createElement('div')
++
++    const Comp = {
++      render() {
++        return h('div', 'comp')
++      },
++    }
++
++    const Async = defineAsyncComponent({
++      render() {
++        // Multi-root fragment: element + disabled teleport with component child
++        return [
++          h('div', 'content'),
++          h(Teleport, { to: target, disabled: true }, h(Comp)),
++        ]
++      },
++    })
++
++    const root = nodeOps.createElement('div')
++    render(
++      h(Suspense, null, {
++        default: h(Async),
++        fallback: h('div', 'fallback'),
++      }),
++      root,
++    )
++    expect(serializeInner(root)).toBe(`<div>fallback</div>`)
++
++    await Promise.all(deps)
++    await nextTick()
++    await nextTick()
++    expect(serializeInner(root)).toBe(
++      `<div>content</div><!--teleport start--><div>comp</div><!--teleport end-->`,
++    )
++  })
++
+   //#11617
+   test('update async component before resolve then update again', async () => {
+     const arr: boolean[] = []
+diff --git a/packages/runtime-core/src/components/Teleport.ts b/packages/runtime-core/src/components/Teleport.ts
+index 3c91923af42..8e251bb70a4 100644
+--- a/packages/runtime-core/src/components/Teleport.ts
++++ b/packages/runtime-core/src/components/Teleport.ts
+@@ -94,7 +94,7 @@ export const TeleportImpl = {
+       mc: mountChildren,
+       pc: patchChildren,
+       pbc: patchBlockChildren,
+-      o: { insert, querySelector, createText, createComment },
++      o: { insert, querySelector, createText, createComment, parentNode },
+     } = internals
+ 
+     const disabled = isTeleportDisabled(n2.props)
+@@ -162,7 +162,11 @@ export const TeleportImpl = {
+         if (pendingMounts.get(vnode) !== mountJob) return
+         pendingMounts.delete(vnode)
+         if (isTeleportDisabled(vnode.props)) {
+-          mount(vnode, container, vnode.anchor!)
++          // Use the current parent of the placeholder instead of the
++          // captured `container`, which may be stale if Suspense has moved
++          // the branch to a different container during resolve.
++          const mountContainer = parentNode(vnode.el!) || container
++          mount(vnode, mountContainer, vnode.anchor!)
+           updateCssVars(vnode, true)
+         }
+         mountToTarget(vnode)
+@@ -389,7 +393,8 @@ function moveTeleport(
+   // if this is a re-order and teleport is enabled (content is in target)
+   // do not move children. So the opposite is: only move children if this
+   // is not a reorder, or the teleport is disabled
+-  if (!isReorder || isTeleportDisabled(props)) {
++  // #14701 don't move children if in pending mount
++  if (!pendingMounts.has(vnode) && (!isReorder || isTeleportDisabled(props))) {
+     // Teleport has either Array children or no children.
+     if (shapeFlag & ShapeFlags.ARRAY_CHILDREN) {
+       for (let i = 0; i < (children as VNode[]).length; i++) {

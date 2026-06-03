@@ -1,0 +1,318 @@
+diff --git a/packages/reactivity/src/effect.ts b/packages/reactivity/src/effect.ts
+index 978d3b05687..c212e7d8314 100644
+--- a/packages/reactivity/src/effect.ts
++++ b/packages/reactivity/src/effect.ts
+@@ -114,8 +114,19 @@ export class ReactiveEffect<T = any>
+   onTrigger?: (event: DebuggerEvent) => void
+ 
+   constructor(public fn: () => T) {
+-    if (activeEffectScope && activeEffectScope.active) {
+-      activeEffectScope.effects.push(this)
++    if (activeEffectScope) {
++      if (activeEffectScope.active) {
++        activeEffectScope.effects.push(this)
++      } else {
++        // The active scope has already been stopped. This happens when a
++        // component's setup is resumed after a top-level `await` (via the
++        // compiler-emitted `__restore()` from `withAsyncContext`) but the
++        // component was unmounted while pending under <Suspense>. Without
++        // this guard the effect would become an orphan: not held by any
++        // scope (so it cannot be stopped via the scope chain) yet still
++        // able to subscribe to reactive deps and fire forever.
++        this.flags &= ~EffectFlags.ACTIVE
++      }
+     }
+   }
+ 
+diff --git a/packages/reactivity/src/effectScope.ts b/packages/reactivity/src/effectScope.ts
+index 7b93c000271..03c15ed2f12 100644
+--- a/packages/reactivity/src/effectScope.ts
++++ b/packages/reactivity/src/effectScope.ts
+@@ -22,6 +22,7 @@ export class EffectScope {
+   cleanups: (() => void)[] = []
+ 
+   private _isPaused = false
++  private _warnOnRun = true
+ 
+   /**
+    * only assigned by undetached scope
+@@ -44,12 +45,19 @@ export class EffectScope {
+   // TODO isolatedDeclarations ReactiveFlags.SKIP
+ 
+   constructor(public detached = false) {
+-    this.parent = activeEffectScope
+     if (!detached && activeEffectScope) {
+-      this.index =
+-        (activeEffectScope.scopes || (activeEffectScope.scopes = [])).push(
+-          this,
+-        ) - 1
++      if (activeEffectScope.active) {
++        this.parent = activeEffectScope
++        this.index =
++          (activeEffectScope.scopes || (activeEffectScope.scopes = [])).push(
++            this,
++          ) - 1
++      } else {
++        // The parent scope has already stopped, so this child must not become
++        // a detached live scope.
++        this._active = false
++        this._warnOnRun = false
++      }
+     }
+   }
+ 
+@@ -101,7 +109,7 @@ export class EffectScope {
+       } finally {
+         activeEffectScope = currentEffectScope
+       }
+-    } else if (__DEV__) {
++    } else if (__DEV__ && this._warnOnRun) {
+       warn(`cannot run an inactive effect scope.`)
+     }
+   }
+diff --git a/packages/runtime-core/__tests__/components/Suspense.spec.ts b/packages/runtime-core/__tests__/components/Suspense.spec.ts
+index d56f5315d88..24954baca33 100644
+--- a/packages/runtime-core/__tests__/components/Suspense.spec.ts
++++ b/packages/runtime-core/__tests__/components/Suspense.spec.ts
+@@ -12,6 +12,7 @@ import {
+   createBlock,
+   createCommentVNode,
+   createElementBlock,
++  getCurrentInstance,
+   h,
+   nextTick,
+   nodeOps,
+@@ -29,6 +30,7 @@ import {
+   shallowRef,
+   watch,
+   watchEffect,
++  withAsyncContext,
+   withDirectives,
+ } from '@vue/runtime-test'
+ import {
+@@ -36,6 +38,7 @@ import {
+   createApp,
+   defineAsyncComponent as defineAsyncComp,
+   defineComponent,
++  effectScope,
+   inject,
+   provide,
+ } from 'vue'
+@@ -3009,4 +3012,217 @@ describe('Suspense', () => {
+       expect(unmounted).toHaveBeenCalledTimes(1)
+     })
+   })
++
++  describe('async setup with top-level await', () => {
++    test('pending branch replaced before async setup resolves', async () => {
++      const updateSpy = vi.fn()
++      const stateRef = ref(0)
++      let resolvePending!: (v?: unknown) => void
++
++      const SlowComp = defineComponent({
++        async setup() {
++          let __temp: any, __restore: any
++          ;[__temp, __restore] = withAsyncContext(
++            () =>
++              new Promise(r => {
++                resolvePending = r
++              }),
++          )
++          __temp = await __temp
++          __restore()
++
++          watch(stateRef, updateSpy)
++
++          return () => h('div', 'slow')
++        },
++      })
++
++      const FillerComp = defineComponent({
++        setup: () => () => h('div', 'filler'),
++      })
++
++      const view = shallowRef<any>(SlowComp)
++      const Comp = defineComponent({
++        setup: () => () =>
++          h(Suspense, null, {
++            default: h(view.value),
++            fallback: h('div', 'fallback'),
++          }),
++      })
++
++      const root = nodeOps.createElement('div')
++      render(h(Comp), root)
++      expect(serializeInner(root)).toBe(`<div>fallback</div>`)
++
++      view.value = FillerComp
++      await nextTick()
++      expect(serializeInner(root)).toBe(`<div>filler</div>`)
++
++      // wait a macro task tick for all micro ticks to resolve
++      resolvePending(undefined)
++      await new Promise(r => setTimeout(r))
++
++      stateRef.value++
++      await nextTick()
++      expect(updateSpy).not.toHaveBeenCalled()
++    })
++
++    test('boundary unmounted before async setup resolves', async () => {
++      const updateSpy = vi.fn()
++      const stateRef = ref(0)
++      let resolvePending!: (v?: unknown) => void
++
++      const SlowComp = defineComponent({
++        async setup() {
++          let __temp: any, __restore: any
++          ;[__temp, __restore] = withAsyncContext(
++            () =>
++              new Promise(r => {
++                resolvePending = r
++              }),
++          )
++          __temp = await __temp
++          __restore()
++
++          watch(stateRef, updateSpy)
++
++          return () => h('div', 'slow')
++        },
++      })
++
++      const root = nodeOps.createElement('div')
++      render(
++        h(() =>
++          h(Suspense, null, {
++            default: h(SlowComp),
++            fallback: h('div', 'fallback'),
++          }),
++        ),
++        root,
++      )
++      expect(serializeInner(root)).toBe(`<div>fallback</div>`)
++
++      render(null, root)
++
++      resolvePending(undefined)
++      await new Promise(r => setTimeout(r))
++
++      stateRef.value++
++      await nextTick()
++      expect(updateSpy).not.toHaveBeenCalled()
++    })
++
++    test('repeated branch replacement before async setup resolves', async () => {
++      const updateSpy = vi.fn()
++      const stateRef = ref(0)
++      const resolvers: Array<(v?: unknown) => void> = []
++
++      const SlowComp = defineComponent({
++        async setup() {
++          let __temp: any, __restore: any
++          ;[__temp, __restore] = withAsyncContext(
++            () =>
++              new Promise(r => {
++                resolvers.push(r)
++              }),
++          )
++          __temp = await __temp
++          __restore()
++
++          const uid = getCurrentInstance()!.uid
++          watch(stateRef, () => {
++            updateSpy(uid)
++          })
++
++          return () => h('div', 'slow')
++        },
++      })
++
++      const FillerComp = defineComponent({
++        setup: () => () => h('div', 'filler'),
++      })
++
++      const view = shallowRef<any>(FillerComp)
++      const Comp = defineComponent({
++        setup: () => () =>
++          h(Suspense, null, {
++            default: h(view.value),
++            fallback: h('div', 'fallback'),
++          }),
++      })
++
++      const root = nodeOps.createElement('div')
++      render(h(Comp), root)
++      expect(serializeInner(root)).toBe(`<div>filler</div>`)
++
++      for (let i = 0; i < 3; i++) {
++        view.value = SlowComp
++        await nextTick()
++        view.value = FillerComp
++        await nextTick()
++      }
++
++      expect(resolvers.length).toBe(3)
++      resolvers.forEach(r => r(undefined))
++      await new Promise(r => setTimeout(r))
++
++      stateRef.value++
++      await nextTick()
++      expect(updateSpy).not.toHaveBeenCalled()
++    })
++
++    test('nested scope created after pending branch is abandoned', async () => {
++      const updateSpy = vi.fn()
++      const stateRef = ref(0)
++      let resolvePending!: (v?: unknown) => void
++
++      const SlowComp = defineComponent({
++        async setup() {
++          let __temp: any, __restore: any
++          ;[__temp, __restore] = withAsyncContext(
++            () =>
++              new Promise(r => {
++                resolvePending = r
++              }),
++          )
++          __temp = await __temp
++          __restore()
++
++          effectScope().run(() => {
++            watch(stateRef, updateSpy)
++          })
++
++          return () => h('div', 'slow')
++        },
++      })
++
++      const FillerComp = defineComponent({
++        setup: () => () => h('div', 'filler'),
++      })
++
++      const view = shallowRef<any>(SlowComp)
++      const Comp = defineComponent({
++        setup: () => () =>
++          h(Suspense, null, {
++            default: h(view.value),
++            fallback: h('div', 'fallback'),
++          }),
++      })
++
++      const root = nodeOps.createElement('div')
++      render(h(Comp), root)
++      expect(serializeInner(root)).toBe(`<div>fallback</div>`)
++
++      view.value = FillerComp
++      await nextTick()
++      expect(serializeInner(root)).toBe(`<div>filler</div>`)
++
++      resolvePending(undefined)
++      await new Promise(r => setTimeout(r))
++
++      stateRef.value++
++      await nextTick()
++      expect(updateSpy).not.toHaveBeenCalled()
++    })
++  })
+ })

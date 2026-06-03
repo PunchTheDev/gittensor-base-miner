@@ -1,0 +1,258 @@
+diff --git a/packages/runtime-core/__tests__/components/Suspense.spec.ts b/packages/runtime-core/__tests__/components/Suspense.spec.ts
+index 83e18fc3c7e..4abab7c56db 100644
+--- a/packages/runtime-core/__tests__/components/Suspense.spec.ts
++++ b/packages/runtime-core/__tests__/components/Suspense.spec.ts
+@@ -9,7 +9,9 @@ import {
+   Suspense,
+   type SuspenseProps,
+   Teleport,
++  createBlock,
+   createCommentVNode,
++  createElementBlock,
+   h,
+   nextTick,
+   nodeOps,
+@@ -17,6 +19,7 @@ import {
+   onMounted,
+   onUnmounted,
+   onUpdated,
++  openBlock,
+   ref,
+   render,
+   renderList,
+@@ -28,9 +31,17 @@ import {
+   watchEffect,
+   withDirectives,
+ } from '@vue/runtime-test'
+-import { computed, createApp, defineComponent, inject, provide } from 'vue'
++import {
++  computed,
++  createApp,
++  defineAsyncComponent as defineAsyncComp,
++  defineComponent,
++  inject,
++  provide,
++} from 'vue'
+ import type { RawSlots } from 'packages/runtime-core/src/componentSlots'
+ import { resetSuspenseId } from '../../src/components/Suspense'
++import { PatchFlags } from '@vue/shared'
+ 
+ describe('Suspense', () => {
+   const deps: Promise<any>[] = []
+@@ -2166,6 +2177,184 @@ describe('Suspense', () => {
+     await Promise.all(deps)
+   })
+ 
++  // #12920
++  test('unmount Suspense after async child (with defineAsyncComponent) self-triggered update', async () => {
++    const Comp = defineComponent({
++      setup() {
++        const show = ref(true)
++        onMounted(() => {
++          // trigger update
++          show.value = !show.value
++        })
++        return () =>
++          show.value
++            ? (openBlock(), createElementBlock('div', { key: 0 }, 'show'))
++            : (openBlock(), createElementBlock('div', { key: 1 }, 'hidden'))
++      },
++    })
++
++    const AsyncComp = defineAsyncComp(() => {
++      const p = new Promise(resolve => {
++        resolve(Comp)
++      })
++      deps.push(p.then(() => Promise.resolve()))
++      return p as any
++    })
++
++    const toggle = ref(true)
++    const root = nodeOps.createElement('div')
++    const App = {
++      render() {
++        return (
++          openBlock(),
++          createElementBlock(
++            Fragment,
++            null,
++            [
++              h('h1', null, toggle.value),
++              toggle.value
++                ? (openBlock(),
++                  createBlock(
++                    Suspense,
++                    { key: 0 },
++                    {
++                      default: h(AsyncComp),
++                    },
++                  ))
++                : createCommentVNode('v-if', true),
++            ],
++            PatchFlags.STABLE_FRAGMENT,
++          )
++        )
++      },
++    }
++    render(h(App), root)
++    expect(serializeInner(root)).toBe(`<h1>true</h1><!---->`)
++
++    await Promise.all(deps)
++    await nextTick()
++    await nextTick()
++    expect(serializeInner(root)).toBe(`<h1>true</h1><div>show</div>`)
++
++    await nextTick()
++    expect(serializeInner(root)).toBe(`<h1>true</h1><div>hidden</div>`)
++
++    // unmount suspense
++    toggle.value = false
++    await Promise.all(deps)
++    await nextTick()
++    expect(serializeInner(root)).toBe(`<h1>true</h1><!--v-if-->`)
++  })
++
++  test('unmount Suspense after async child (with async setup) self-triggered update', async () => {
++    const AsyncComp = defineComponent({
++      async setup() {
++        const show = ref(true)
++        onMounted(() => {
++          // trigger update
++          show.value = !show.value
++        })
++        const p = new Promise(r => setTimeout(r, 1))
++        // extra tick needed for Node 12+
++        deps.push(p.then(() => Promise.resolve()))
++        return () =>
++          show.value
++            ? (openBlock(), createElementBlock('div', { key: 0 }, 'show'))
++            : (openBlock(), createElementBlock('div', { key: 1 }, 'hidden'))
++      },
++    })
++
++    const toggle = ref(true)
++    const root = nodeOps.createElement('div')
++    const App = {
++      render() {
++        return (
++          openBlock(),
++          createElementBlock(
++            Fragment,
++            null,
++            [
++              h('h1', null, toggle.value),
++              toggle.value
++                ? (openBlock(),
++                  createBlock(
++                    Suspense,
++                    { key: 0 },
++                    {
++                      default: h(AsyncComp),
++                    },
++                  ))
++                : createCommentVNode('v-if', true),
++            ],
++            PatchFlags.STABLE_FRAGMENT,
++          )
++        )
++      },
++    }
++    render(h(App), root)
++    expect(serializeInner(root)).toBe(`<h1>true</h1><!---->`)
++
++    await Promise.all(deps)
++    await nextTick()
++    expect(serializeInner(root)).toBe(`<h1>true</h1><div>hidden</div>`)
++
++    // unmount suspense
++    toggle.value = false
++    await Promise.all(deps)
++    await nextTick()
++    expect(serializeInner(root)).toBe(`<h1>true</h1><!--v-if-->`)
++  })
++
++  test('propagates host el through wrapper components above Suspense after async child self-triggered update', async () => {
++    const AsyncComp = defineComponent({
++      async setup() {
++        const show = ref(true)
++        onMounted(() => {
++          show.value = false
++        })
++        const p = new Promise(r => setTimeout(r, 1))
++        deps.push(p.then(() => Promise.resolve()))
++        return () =>
++          h(
++            'div',
++            { key: show.value ? 'show' : 'hidden' },
++            show.value ? 'show' : 'hidden',
++          )
++      },
++    })
++
++    const Inner = defineComponent({
++      render() {
++        return h(Suspense, null, {
++          default: () => h(AsyncComp),
++        })
++      },
++    })
++
++    const Outer = defineComponent({
++      render() {
++        return h(Inner)
++      },
++    })
++
++    const root = nodeOps.createElement('div')
++    const vnode = h(Outer)
++    render(vnode, root)
++    expect(serializeInner(root)).toBe(`<!---->`)
++
++    await Promise.all(deps)
++    await nextTick()
++    expect(serializeInner(root)).toBe(`<div>hidden</div>`)
++
++    const renderedEl = root.children[0]
++    const innerVNode = vnode.component!.subTree
++    const suspenseVNode = innerVNode.component!.subTree
++
++    expect(suspenseVNode.el).toBe(renderedEl)
++    expect(innerVNode.el).toBe(renderedEl)
++    expect(vnode.el).toBe(renderedEl)
++  })
++
+   test('should mount after suspense is resolved', async () => {
+     const target = nodeOps.createElement('div')
+ 
+diff --git a/packages/runtime-core/src/componentRenderUtils.ts b/packages/runtime-core/src/componentRenderUtils.ts
+index d8563835b5a..0b46130c06d 100644
+--- a/packages/runtime-core/src/componentRenderUtils.ts
++++ b/packages/runtime-core/src/componentRenderUtils.ts
+@@ -471,13 +471,16 @@ function hasPropValueChanged(
+ }
+ 
+ export function updateHOCHostEl(
+-  { vnode, parent }: ComponentInternalInstance,
++  { vnode, parent, suspense }: ComponentInternalInstance,
+   el: typeof vnode.el, // HostNode
+ ): void {
+   while (parent) {
+     const root = parent.subTree
+     if (root.suspense && root.suspense.activeBranch === vnode) {
+-      root.el = vnode.el
++      // Suspense proxies its active branch host node, so keep propagating from
++      // the boundary vnode to any wrapper components above it.
++      root.suspense.vnode.el = root.el = el
++      vnode = root
+     }
+     if (root === vnode) {
+       ;(vnode = parent.vnode).el = el
+@@ -486,4 +489,8 @@ export function updateHOCHostEl(
+       break
+     }
+   }
++  // also update suspense vnode el
++  if (suspense && suspense.activeBranch === vnode) {
++    suspense.vnode.el = el
++  }
+ }

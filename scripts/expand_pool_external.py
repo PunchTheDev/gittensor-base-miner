@@ -63,6 +63,9 @@ EXTERNAL_REPOS = [
     "colinhacks/zod",         # 38k stars — TypeScript schema validation, vitest tests, active bug-fixes
     "vitest-dev/vitest",      # 14k stars — TypeScript testing framework, self-testing, active bug-fixes
     "trpc/trpc",              # 36k stars — TypeScript RPC framework, vitest tests
+    "vuejs/core",             # 48k stars — Vue 3 reactivity/runtime, vitest tests, clean bug-fixes
+    # Python (continued)
+    "python/mypy",            # 18k stars — Python type checker, pytest suite, self-contained
 ]
 
 

@@ -1,0 +1,400 @@
+diff --git a/packages/compiler-core/__tests__/transforms/transformElement.spec.ts b/packages/compiler-core/__tests__/transforms/transformElement.spec.ts
+index bf3510a052d..4224d5c1933 100644
+--- a/packages/compiler-core/__tests__/transforms/transformElement.spec.ts
++++ b/packages/compiler-core/__tests__/transforms/transformElement.spec.ts
+@@ -121,6 +121,121 @@ describe('compiler: element transform', () => {
+     expect(node.tag).toBe(`Example`)
+   })
+ 
++  test('resolve component from scoped slot bindings and shadows setup bindings', () => {
++    const { code } = baseCompile(
++      `<Example v-slot="{ Foo }"><Foo /></Example>`,
++      {
++        prefixIdentifiers: true,
++        bindingMetadata: {
++          Example: BindingTypes.SETUP_CONST,
++          Foo: BindingTypes.SETUP_MAYBE_REF,
++        },
++      },
++    )
++
++    expect(code).toContain(`_createVNode(Foo)`)
++    expect(code).not.toContain(`_component_Foo`)
++    expect(code).not.toContain(`_resolveComponent("Foo")`)
++    expect(code).not.toContain(`$setup["Foo"]`)
++  })
++
++  test('resolve kebab-cased component from scoped slot bindings', () => {
++    const { code } = baseCompile(
++      `<Example v-slot="{ fooBar }"><foo-bar /></Example>`,
++      {
++        prefixIdentifiers: true,
++        isNativeTag: tag => tag !== 'foo-bar',
++        bindingMetadata: {
++          Example: BindingTypes.SETUP_CONST,
++        },
++      },
++    )
++
++    expect(code).toContain(`_createVNode(fooBar)`)
++    expect(code).not.toContain(`_component_foo_bar`)
++    expect(code).not.toContain(`_resolveComponent("foo-bar")`)
++  })
++
++  test('does not resolve component from inactive scoped slot bindings', () => {
++    const { code } = baseCompile(
++      `<Example v-slot="{ Foo }"><Foo /></Example><Foo />`,
++      {
++        prefixIdentifiers: true,
++        bindingMetadata: {
++          Example: BindingTypes.SETUP_CONST,
++        },
++      },
++    )
++
++    expect(code).toContain(`_createVNode(Foo)`)
++    expect(code).toContain(`const _component_Foo = _resolveComponent("Foo")`)
++    expect(code).toContain(`_createVNode(_component_Foo)`)
++  })
++
++  test('does not resolve component from v-for bindings', () => {
++    const { code } = baseCompile(
++      `<template v-for="Foo in list"><Foo :value="Foo" /></template>`,
++      {
++        prefixIdentifiers: true,
++      },
++    )
++
++    expect(code).toContain(`const _component_Foo = _resolveComponent("Foo")`)
++    expect(code).toContain(`_createBlock(_component_Foo`)
++    expect(code).toContain(`value: Foo`)
++    expect(code).not.toContain(`_createVNode(Foo`)
++    expect(code).not.toContain(`_createBlock(Foo`)
++  })
++
++  test('does not resolve component from scoped slot bindings shadowed by v-for', () => {
++    const { code } = baseCompile(
++      `<Example v-slot="{ Foo }"><template v-for="Foo in list"><Foo /></template></Example>`,
++      {
++        prefixIdentifiers: true,
++        bindingMetadata: {
++          Example: BindingTypes.SETUP_CONST,
++        },
++      },
++    )
++
++    expect(code).toContain(`const _component_Foo = _resolveComponent("Foo")`)
++    expect(code).toContain(`_createBlock(_component_Foo)`)
++    expect(code).not.toContain(`_createVNode(Foo)`)
++    expect(code).not.toContain(`_createBlock(Foo)`)
++  })
++
++  test('resolve component from scoped slot bindings shadowing v-for', () => {
++    const { code } = baseCompile(
++      `<div v-for="Foo in list"><Example v-slot="{ Foo }"><Foo /></Example></div>`,
++      {
++        prefixIdentifiers: true,
++        bindingMetadata: {
++          Example: BindingTypes.SETUP_CONST,
++        },
++      },
++    )
++
++    expect(code).toContain(`_createVNode(Foo)`)
++    expect(code).not.toContain(`_component_Foo`)
++    expect(code).not.toContain(`_resolveComponent("Foo")`)
++  })
++
++  test('resolve component from template scoped slot bindings', () => {
++    const { code } = baseCompile(
++      `<Example><template #default="{ Foo }"><Foo /></template></Example>`,
++      {
++        prefixIdentifiers: true,
++        bindingMetadata: {
++          Example: BindingTypes.SETUP_CONST,
++        },
++      },
++    )
++
++    expect(code).toContain(`_createVNode(Foo)`)
++    expect(code).not.toContain(`_component_Foo`)
++    expect(code).not.toContain(`_resolveComponent("Foo")`)
++  })
++
+   test('resolve namespaced component from setup bindings', () => {
+     const { root, node } = parseWithElementTransform(`<Foo.Example/>`, {
+       bindingMetadata: {
+@@ -175,6 +290,23 @@ describe('compiler: element transform', () => {
+     expect(node.tag).toBe('_unref($props["Foo"]).Example')
+   })
+ 
++  test('resolve namespaced component from scoped slot bindings', () => {
++    const { code } = baseCompile(
++      `<Example v-slot="slotProps"><slot-props.Foo /></Example>`,
++      {
++        prefixIdentifiers: true,
++        isNativeTag: tag => tag !== 'slot-props.Foo',
++        bindingMetadata: {
++          Example: BindingTypes.SETUP_CONST,
++        },
++      },
++    )
++
++    expect(code).toContain(`_createVNode(slotProps.Foo)`)
++    expect(code).not.toContain(`_component_slot_props`)
++    expect(code).not.toContain(`_resolveComponent("slot-props.Foo")`)
++  })
++
+   test('do not resolve component from non-script-setup bindings', () => {
+     const bindingMetadata = {
+       Example: BindingTypes.SETUP_MAYBE_REF,
+diff --git a/packages/compiler-core/src/transform.ts b/packages/compiler-core/src/transform.ts
+index 3ef6554e748..914148014d2 100644
+--- a/packages/compiler-core/src/transform.ts
++++ b/packages/compiler-core/src/transform.ts
+@@ -81,6 +81,8 @@ export interface ImportItem {
+   path: string
+ }
+ 
++type IdentifierScopeType = 'local' | 'slot'
++
+ export interface TransformContext
+   extends
+     Required<Omit<TransformOptions, keyof CompilerCompatOptions>>,
+@@ -95,6 +97,7 @@ export interface TransformContext
+   temps: number
+   cached: (CacheExpression | null)[]
+   identifiers: { [name: string]: number | undefined }
++  identifierScopes: { [name: string]: IdentifierScopeType[] | undefined }
+   scopes: {
+     vFor: number
+     vSlot: number
+@@ -114,8 +117,9 @@ export interface TransformContext
+   replaceNode(node: TemplateChildNode): void
+   removeNode(node?: TemplateChildNode): void
+   onNodeRemoved(): void
+-  addIdentifiers(exp: ExpressionNode | string): void
++  addIdentifiers(exp: ExpressionNode | string, type?: IdentifierScopeType): void
+   removeIdentifiers(exp: ExpressionNode | string): void
++  isSlotScopeIdentifier(name: string): boolean
+   hoist(exp: string | JSChildNode | ArrayExpression): SimpleExpressionNode
+   cache(exp: JSChildNode, isVNode?: boolean, inVOnce?: boolean): CacheExpression
+   constantCache: WeakMap<TemplateChildNode, ConstantTypes>
+@@ -193,6 +197,7 @@ export function createTransformContext(
+     constantCache: new WeakMap(),
+     temps: 0,
+     identifiers: Object.create(null),
++    identifierScopes: Object.create(null),
+     scopes: {
+       vFor: 0,
+       vSlot: 0,
+@@ -267,15 +272,15 @@ export function createTransformContext(
+       context.parent!.children.splice(removalIndex, 1)
+     },
+     onNodeRemoved: NOOP,
+-    addIdentifiers(exp) {
++    addIdentifiers(exp, type = 'local') {
+       // identifier tracking only happens in non-browser builds.
+       if (!__BROWSER__) {
+         if (isString(exp)) {
+-          addId(exp)
++          addId(exp, type)
+         } else if (exp.identifiers) {
+-          exp.identifiers.forEach(addId)
++          exp.identifiers.forEach(id => addId(id, type))
+         } else if (exp.type === NodeTypes.SIMPLE_EXPRESSION) {
+-          addId(exp.content)
++          addId(exp.content, type)
+         }
+       }
+     },
+@@ -290,6 +295,10 @@ export function createTransformContext(
+         }
+       }
+     },
++    isSlotScopeIdentifier(name) {
++      const scopes = context.identifierScopes[name]
++      return scopes ? scopes[scopes.length - 1] === 'slot' : false
++    },
+     hoist(exp) {
+       if (isString(exp)) exp = createSimpleExpression(exp)
+       context.hoists.push(exp)
+@@ -318,16 +327,21 @@ export function createTransformContext(
+     context.filters = new Set()
+   }
+ 
+-  function addId(id: string) {
+-    const { identifiers } = context
++  function addId(id: string, type: IdentifierScopeType) {
++    const { identifiers, identifierScopes } = context
+     if (identifiers[id] === undefined) {
+       identifiers[id] = 0
+     }
+     identifiers[id]!++
++    ;(identifierScopes[id] || (identifierScopes[id] = [])).push(type)
+   }
+ 
+   function removeId(id: string) {
+     context.identifiers[id]!--
++    const scopes = context.identifierScopes[id]
++    if (scopes) {
++      scopes.pop()
++    }
+   }
+ 
+   return context
+diff --git a/packages/compiler-core/src/transforms/transformElement.ts b/packages/compiler-core/src/transforms/transformElement.ts
+index 1dca0c514c1..2fa0a20fdd9 100644
+--- a/packages/compiler-core/src/transforms/transformElement.ts
++++ b/packages/compiler-core/src/transforms/transformElement.ts
+@@ -282,7 +282,21 @@ export function resolveComponentType(
+     return builtIn
+   }
+ 
+-  // 3. user component (from setup bindings)
++  // 3. component from slot props
++  // this is skipped in browser build since browser builds do not perform
++  // identifier tracking.
++  if (!__BROWSER__) {
++    const fromScope = resolveSlotScopeReference(tag, context)
++    if (fromScope) return fromScope
++
++    const dotIndex = tag.indexOf('.')
++    if (dotIndex > 0) {
++      const ns = resolveSlotScopeReference(tag.slice(0, dotIndex), context)
++      if (ns) return ns + tag.slice(dotIndex)
++    }
++  }
++
++  // 4. user component (from setup bindings)
+   // this is skipped in browser build since browser builds do not perform
+   // binding analysis.
+   if (!__BROWSER__) {
+@@ -299,7 +313,7 @@ export function resolveComponentType(
+     }
+   }
+ 
+-  // 4. Self referencing component (inferred from filename)
++  // 5. Self referencing component (inferred from filename)
+   if (
+     !__BROWSER__ &&
+     context.selfName &&
+@@ -313,12 +327,29 @@ export function resolveComponentType(
+     return toValidAssetId(tag, `component`)
+   }
+ 
+-  // 5. user component (resolve)
++  // 6. user component (resolve)
+   context.helper(RESOLVE_COMPONENT)
+   context.components.add(tag)
+   return toValidAssetId(tag, `component`)
+ }
+ 
++function resolveSlotScopeReference(name: string, context: TransformContext) {
++  const camelName = camelize(name)
++  const PascalName = capitalize(camelName)
++  const isInSlotScope = (reference: string) =>
++    context.isSlotScopeIdentifier(reference)
++
++  if (isInSlotScope(name)) {
++    return name
++  }
++  if (isInSlotScope(camelName)) {
++    return camelName
++  }
++  if (isInSlotScope(PascalName)) {
++    return PascalName
++  }
++}
++
+ function resolveSetupReference(name: string, context: TransformContext) {
+   const bindings = context.bindingMetadata
+   if (!bindings || bindings.__isScriptSetup === false) {
+diff --git a/packages/compiler-core/src/transforms/vSlot.ts b/packages/compiler-core/src/transforms/vSlot.ts
+index f9a1b72daad..ad2aeb130e2 100644
+--- a/packages/compiler-core/src/transforms/vSlot.ts
++++ b/packages/compiler-core/src/transforms/vSlot.ts
+@@ -57,7 +57,7 @@ export const trackSlotScopes: NodeTransform = (node, context) => {
+     if (vSlot) {
+       const slotProps = vSlot.exp
+       if (!__BROWSER__ && context.prefixIdentifiers) {
+-        slotProps && context.addIdentifiers(slotProps)
++        slotProps && context.addIdentifiers(slotProps, 'slot')
+       }
+       context.scopes.vSlot++
+       return () => {
+diff --git a/packages/compiler-ssr/__tests__/ssrComponent.spec.ts b/packages/compiler-ssr/__tests__/ssrComponent.spec.ts
+index 0a71eeefeed..89ee158d8ab 100644
+--- a/packages/compiler-ssr/__tests__/ssrComponent.spec.ts
++++ b/packages/compiler-ssr/__tests__/ssrComponent.spec.ts
+@@ -104,6 +104,54 @@ describe('ssr: components', () => {
+         `)
+     })
+ 
++    test('slot prop component', () => {
++      const { code } = compile(`<foo v-slot="{ Foo }"><Foo /></foo>`)
++
++      expect(code).toContain(
++        `_ssrRenderComponent(Foo, null, null, _parent, _scopeId)`,
++      )
++      expect(code).toContain(`_createVNode(Foo)`)
++      expect(code).not.toContain(`_component_Foo`)
++      expect(code).not.toContain(`_resolveComponent("Foo")`)
++    })
++
++    test('namespaced slot prop component', () => {
++      const { code } = compile(
++        `<foo v-slot="slotProps"><slot-props.Foo /></foo>`,
++      )
++
++      expect(code).toContain(
++        `_ssrRenderComponent(slotProps.Foo, null, null, _parent, _scopeId)`,
++      )
++      expect(code).toContain(`_createVNode(slotProps.Foo)`)
++      expect(code).not.toContain(`_component_slot_props`)
++      expect(code).not.toContain(`_resolveComponent("slot-props.Foo")`)
++    })
++
++    test('does not resolve v-for binding as slot prop component', () => {
++      const { code } = compile(
++        `<template v-for="Foo in list"><Foo :value="Foo" /></template>`,
++      )
++
++      expect(code).toContain(`const _component_Foo = _resolveComponent("Foo")`)
++      expect(code).toContain(`_ssrRenderComponent(_component_Foo`)
++      expect(code).toContain(`value: Foo`)
++      expect(code).not.toContain(`_ssrRenderComponent(Foo,`)
++    })
++
++    test('does not resolve slot prop component when shadowed by v-for', () => {
++      const { code } = compile(
++        `<foo v-slot="{ Foo }"><template v-for="Foo in list"><Foo /></template></foo>`,
++      )
++
++      expect(code).toContain(`const _component_Foo = _resolveComponent("Foo")`)
++      expect(code).toContain(`_ssrRenderComponent(_component_Foo`)
++      expect(code).toContain(`_createBlock(_component_Foo)`)
++      expect(code).not.toContain(`_ssrRenderComponent(Foo, null`)
++      expect(code).not.toContain(`_createVNode(Foo)`)
++      expect(code).not.toContain(`_createBlock(Foo)`)
++    })
++
+     test('empty attribute should not produce syntax error', () => {
+       // previously this would produce syntax error `default: _withCtx((, _push, ...)`
+       expect(compile(`<foo v-slot="">foo</foo>`).code).not.toMatch(`(,`)
+diff --git a/packages/compiler-ssr/src/transforms/ssrTransformComponent.ts b/packages/compiler-ssr/src/transforms/ssrTransformComponent.ts
+index 5cf9c736a84..c10db7802c0 100644
+--- a/packages/compiler-ssr/src/transforms/ssrTransformComponent.ts
++++ b/packages/compiler-ssr/src/transforms/ssrTransformComponent.ts
+@@ -353,6 +353,11 @@ function subTransform(
+   // inherit parent scope analysis state
+   childContext.scopes = { ...parentContext.scopes }
+   childContext.identifiers = { ...parentContext.identifiers }
++  childContext.identifierScopes = Object.create(null)
++  for (const name in parentContext.identifierScopes) {
++    childContext.identifierScopes[name] =
++      parentContext.identifierScopes[name]!.slice()
++  }
+   childContext.imports = parentContext.imports
+   // traverse
+   traverseNode(childRoot, childContext)

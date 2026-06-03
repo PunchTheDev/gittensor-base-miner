@@ -1,0 +1,144 @@
+diff --git a/packages/runtime-core/__tests__/components/BaseTransition.spec.ts b/packages/runtime-core/__tests__/components/BaseTransition.spec.ts
+index 18cd43b0001..c541d5fc4c2 100644
+--- a/packages/runtime-core/__tests__/components/BaseTransition.spec.ts
++++ b/packages/runtime-core/__tests__/components/BaseTransition.spec.ts
+@@ -254,6 +254,51 @@ describe('BaseTransition', () => {
+       cbs.doneEnter[`<div></div>`]()
+       expect(props.onAfterAppear).toHaveBeenCalledTimes(1)
+     })
++
++    // #14031
++    test('w/ KeepAlive activate/deactivate should not call enter/leave hooks', async () => {
++      const { props } = mockProps({ persisted: true })
++      const { hooks } = mockPersistedHooks()
++      const which = ref<'A' | 'B'>('A')
++      const CompA = {
++        name: 'CompA',
++        render: () => h('div', { id: 'A', ...hooks }),
++      }
++      const CompB = {
++        name: 'CompB',
++        render: () => h('span', { id: 'B' }),
++      }
++      const root = nodeOps.createElement('div')
++      const App = {
++        render() {
++          return h(BaseTransition, props, () =>
++            h(KeepAlive, null, which.value === 'A' ? h(CompA) : h(CompB)),
++          )
++        },
++      }
++      render(h(App), root)
++
++      // initial mount: persisted, so no auto enter hooks
++      expect(props.onBeforeEnter).not.toHaveBeenCalled()
++      expect(props.onEnter).not.toHaveBeenCalled()
++      expect(props.onAfterEnter).not.toHaveBeenCalled()
++
++      // switch to B → A is deactivated (moved to storage). Since the
++      // transition on A's <div> is persisted, no leave hooks should fire.
++      which.value = 'B'
++      await nextTick()
++      expect(props.onBeforeLeave).not.toHaveBeenCalled()
++      expect(props.onLeave).not.toHaveBeenCalled()
++      expect(props.onAfterLeave).not.toHaveBeenCalled()
++
++      // switch back to A → A is activated (moved back from storage). The
++      // persisted transition still shouldn't auto-fire enter hooks.
++      which.value = 'A'
++      await nextTick()
++      expect(props.onBeforeEnter).not.toHaveBeenCalled()
++      expect(props.onEnter).not.toHaveBeenCalled()
++      expect(props.onAfterEnter).not.toHaveBeenCalled()
++    })
+   })
+ 
+   describe('toggle on-off', () => {
+diff --git a/packages/runtime-core/src/renderer.ts b/packages/runtime-core/src/renderer.ts
+index f97ca24f143..cca3667d641 100644
+--- a/packages/runtime-core/src/renderer.ts
++++ b/packages/runtime-core/src/renderer.ts
+@@ -2082,9 +2082,16 @@ function baseCreateRenderer(
+       transition
+     if (needTransition) {
+       if (moveType === MoveType.ENTER) {
+-        transition!.beforeEnter(el!)
+-        hostInsert(el!, container, anchor)
+-        queuePostRenderEffect(() => transition!.enter(el!), parentSuspense)
++        // #14031 if there is no pending v-show leave, the persisted
++        // transition lifecycle is directive-owned, so activating a kept-alive
++        // node only relocates it.
++        if (transition!.persisted && !el![leaveCbKey]) {
++          hostInsert(el!, container, anchor)
++        } else {
++          transition!.beforeEnter(el!)
++          hostInsert(el!, container, anchor)
++          queuePostRenderEffect(() => transition!.enter(el!), parentSuspense)
++        }
+       } else {
+         const { leave, delayLeave, afterLeave } = transition!
+         const remove = () => {
+@@ -2098,13 +2105,20 @@ function baseCreateRenderer(
+           // #13153 move kept-alive node before v-show transition leave finishes
+           // it needs to call the leaving callback to ensure element's `display`
+           // is `none`
++          const wasLeaving = el!._isLeaving || !!el![leaveCbKey]
+           if (el!._isLeaving) {
+             el![leaveCbKey](true /* cancelled */)
+           }
+-          leave(el!, () => {
++          // #14031 without a pending leave, persisted transitions should skip
++          // directive-owned leave hooks and just relocate.
++          if (transition!.persisted && !wasLeaving) {
+             remove()
+-            afterLeave && afterLeave()
+-          })
++          } else {
++            leave(el!, () => {
++              remove()
++              afterLeave && afterLeave()
++            })
++          }
+         }
+         if (delayLeave) {
+           delayLeave(el!, remove, performLeave)
+diff --git a/packages/vue/__tests__/e2e/Transition.spec.ts b/packages/vue/__tests__/e2e/Transition.spec.ts
+index acaed284efa..fc331e8565c 100644
+--- a/packages/vue/__tests__/e2e/Transition.spec.ts
++++ b/packages/vue/__tests__/e2e/Transition.spec.ts
+@@ -1847,7 +1847,7 @@ describe('e2e: Transition', () => {
+     test(
+       'move kept-alive node before v-show transition leave finishes',
+       async () => {
+-        await page().evaluate(() => {
++        await page().evaluate(duration => {
+           const { createApp, ref } = (window as any).Vue
+           const show = ref(true)
+           createApp({
+@@ -1873,7 +1873,7 @@ describe('e2e: Transition', () => {
+                       return { show }
+                     },
+                     template: `
+-                      <Transition name="test">
++                      <Transition name="test" :duration="${duration * 4}">
+                         <div v-show="show" >
+                           <h2>{{ show ? "I should show" : "I shouldn't show " }}</h2>
+                         </div>
+@@ -1898,7 +1898,7 @@ describe('e2e: Transition', () => {
+               },
+             },
+           }).mount('#app')
+-        })
++        }, duration)
+ 
+         expect(await html('#container')).toBe(
+           `<div><h2>I should show</h2></div>` +
+@@ -1934,7 +1934,7 @@ describe('e2e: Transition', () => {
+             `<button id="changeShowBtn">false</button>`,
+         )
+ 
+-        await transitionFinish()
++        await transitionFinish(duration * 4)
+         expect(await html('#container')).toBe(
+           `<div class="" style="display: none;"><h2>I shouldn't show </h2></div>` +
+             `<h2>This is page1</h2>` +
