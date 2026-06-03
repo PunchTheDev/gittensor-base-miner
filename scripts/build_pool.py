@@ -162,10 +162,15 @@ def has_additions(diff: str) -> bool:
 
 
 def is_substantive(pr: dict) -> bool:
-    """True if the PR has meaningful scored code changes."""
+    """True if the PR has meaningful scored code changes.
+
+    Requires baseScore > 0.5 so problems with only test-file or cosmetic
+    source changes (which score ~0 even on a perfect solution) are excluded.
+    """
     return (
         pr.get("totalNodesScored", 0) > 0
         and float(pr.get("tokenScore", 0)) > 0
+        and float(pr.get("baseScore", 0)) > 0.5
     )
 
 
