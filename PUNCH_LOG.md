@@ -4294,3 +4294,33 @@ Pool 1123, oracle 12.64, 65 models. Next shard rotation: 2026-06-08 (5 days).
 
 ### Status
 Pool 1123, oracle 12.64, 65 models. API serves `test_files` for problem drawer. Node24 branch ready.
+
+## Step 242 — Token efficiency scoring
+**Date:** 2026-06-03
+**Commit:** e7f1f4cb (PR #107)
+
+### What shipped
+Token efficiency is now a first-class scoring dimension.
+
+**Formula updated:**
+```
+benchmark_score = test_pass_rate × relative_score × anti_gaming_multiplier
+                  × test_quality_factor × efficiency_factor
+```
+
+**`compute_efficiency_factor(tokens_used, budget)`:**
+- `tokens_used = 0` (not tracked) → `1.0` (no penalty, fully backward compat)
+- `tokens_used ≤ 10 000` → `1.0` (efficient region)
+- `tokens_used = 30 000` → `0.925`
+- `tokens_used = 50 000` → `0.85` (budget-exhausted; minimum)
+
+**Files changed:**
+- `agent/base.py`: `Patch.tokens_used: int = 0` — opt-in field
+- `benchmark/harness/score.py`: efficiency constants + `compute_efficiency_factor`, folded into `_score_in_worktree`
+- `benchmark/evaluate.py`: captures `patch.tokens_used`, passes to `score_patch`; sandbox path injects factor post-hoc; `total_tokens_used` aggregated + printed in eval summary
+- `agent/example/agent.py`: `_call` → `(str, int)`; `solve()` and `repair()` accumulate and set `Patch.tokens_used`
+- `scripts/record_result.py`: `efficiency_factor` + `tokens_used` in per-problem breakdown
+
+### Next
+- Dashboard: display efficiency_factor + tokens_used in leaderboard/agent drawer
+- Decaying margin for forks (anti-copy scoring engine)
