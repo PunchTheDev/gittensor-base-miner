@@ -11,7 +11,7 @@ Marginal-gain formula
     (score + max(0, score - sota) × 3.0) × label_multiplier × time_decay
     ↓
 Weighted emission for your PR
-    ↓ repo emission share (2%) × contributor cut (59.5%)
+    ↓ repo emission share (2%) × contributor cut (55%)
 Your share of block rewards
     ↓ converted at market rate
 TAO
