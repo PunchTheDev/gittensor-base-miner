@@ -4004,3 +4004,28 @@ Comprehensive model whitelist audit: 48 → 65 models. Full OpenRouter `/v1/mode
 ### Status
 Pool 1123, oracle 12.64, whitelist **65 models**, rotation Sunday 2026-06-08 (5 days).
 Node.js 24 upgrade: branch `punch/node24-workflow-upgrades` ready locally (operator needs `workflow` scope).
+
+## Step 216 — 2026-06-03
+
+### Action
+Pre-rotation health audit + dashboard sync to 65 models.
+
+### Health audit results (all green)
+- Pool: 1123 problems in dirs = 1123 in baselines.json = pool_config.json ✅
+- Oracle: weighted 12.64 computed = stored ✅; arithmetic 11.49 ✅
+- Leaderboard oracle row: score=11.49, weighted=12.64, benchmark_score=1.0 ✅
+- Zero empty test_cmd ✅; zero server-required problems ✅
+- refresh_pool.yml: `actions:write` ✅, `--incremental` ✅, external refresh ✅, oracle sync ✅
+- SERVER_TEST_PATTERNS filter: build_pool.py ✅ + expand_pool_external.py ✅
+- EXTERNAL_REPOS (34) matches pool_config.json ✅
+- example agent sha256 matches meta.json ✅
+- REPO_CATEGORY map: 54 entries, all major repos correctly categorized ✅
+- API localhost:8083: pool=1123, oracle=12.64, repos=47, models=65 ✅
+- Open PRs: none ✅
+
+### Also fixed
+- Dashboard data.json was still at 48 models (PR #93 expanded to 65 but dashboard wasn't synced)
+- Updated `allowed_models` array in data.json → 65 entries (commit 79392e8)
+
+### Status
+Pool 1123, oracle 12.64, whitelist **65 models**, rotation Sunday 2026-06-08 (all green).
