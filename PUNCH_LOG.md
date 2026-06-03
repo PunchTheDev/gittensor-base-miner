@@ -2753,3 +2753,27 @@ Updated: `results/baselines.json`, `results/leaderboard.json` (oracle row), `doc
 - 🚨 Daytona integration — model enforcement + static agent detection
 - 🚨 Per-miner OpenRouter key
 - Commit-reveal (private eval)
+
+---
+
+## Step 166 — Pool 644→681: starlette, werkzeug, requests
+
+**Date**: 2026-06-03
+
+### Changes
+- +9 problems from encode/starlette (ASGI middleware, staticfiles, testclient, CORS, templates, sessions)
+- +27 problems from pallets/werkzeug (HTTP headers, routing, formparser, datastructures, debug tools)
+- +1 problem from psf/requests (HTTP model fix)
+- Total: **681 problems** (was 644)
+- Oracle: weighted **14.81** / arithmetic **13.50** (count=681) — slight drop from 15.23 because external Python fixes are smaller diffs
+- Pool composition: python:297 (43.6%), rust:206 (30.2%), typescript:98 (14.4%), jvm:42 (6.2%), ruby:38 (5.6%)
+- Fixed stale oracle values in docs/rewards.md (was showing 13.03)
+- Fixed ORACLE_ROW note in scripts/record_result.py (no longer "DAS network only")
+
+### PR
+[PunchTheDev/gittensor-base-miner#16](https://github.com/PunchTheDev/gittensor-base-miner/pull/16) — merged
+
+### Critical gaps (unchanged, still need operator input)
+- 🚨 Daytona integration — model enforcement + static agent detection
+- 🚨 Per-miner OpenRouter key
+- Commit-reveal (private eval)
