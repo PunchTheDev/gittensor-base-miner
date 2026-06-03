@@ -3447,3 +3447,60 @@ Principal-engineer audit focused on scoring sophistication (operator asked expli
 - Scoring model v5: multi-factor difficulty (multi-file/new-file modifiers) + all v4 features
 - Distribution: easy 9.8%, medium 40.2%, hard 50.0%
 - Agent: plan-step assertion injection added (plan quality improvement)
+
+## Step 193 — test_quality_factor incorporated into benchmark_score (2026-06-03)
+
+### Summary
+
+`test_quality_factor` (TQF) is now part of the canonical `benchmark_score` formula. Previously it was observational-only.
+
+**Formula change:**
+```
+benchmark_score = test_pass_rate × relative_score × anti_gaming_multiplier × test_quality_factor
+```
+
+`test_quality_factor = 0.85 + 0.15 × min(test_coverage_ratio, 1.0)`
+
+Oracle invariant maintained: reference coverage_ratio=1.0 → tqf=1.0 → benchmark_score=1.0.
+
+### PRs
+
+- **PR #70**: test_quality_factor into benchmark_score (merged)
+
+---
+
+## Step 194 — CI cache, TQF breakdown column, PR cleanup (2026-06-03)
+
+### Summary
+
+Merged 4 open PRs and exposed `test_quality_factor` in the dashboard submission breakdown.
+
+### Changes
+
+**CI repo cache** (PRs #67, #68, both merged):
+- `score.py`: Per-repo threading lock in `cached_repo()` — prevents race conditions on initial clone
+- `runner.py`: Warm host clone mounted read-only into Phase 1 Docker container — local clone replaces network clone
+- `eval.yml` + `record_submission.yml`: `actions/cache` for `~/.cache/gitminer/repos` + `gitminer.py cache` pre-warm step
+- Expected: 30–60% reduction in Phase 1 wall-clock time per eval
+
+**TQF in per-problem breakdown** (PR #71):
+- `scripts/record_result.py`: `test_quality_factor` added to each problem's breakdown entry alongside `benchmark_score` and `test_pass_rate`
+
+**Dashboard TQF column** (dashboard PR #4):
+- New "TQF" column in submission breakdown table
+- Color-coded: green ≥0.99, yellow ≥0.90, red <0.90
+- Tooltip explains: `0.85 + 0.15×coverage_ratio`
+
+### PRs
+
+- **PR #67**: Docker cache mount (merged)
+- **PR #68**: CI cache setup (merged)
+- **PR #71**: TQF in per-problem breakdown (merged)
+- **Dashboard PR #4**: TQF column in submission table (merged)
+
+### System state after step 194
+
+- base-miner main: d28e31ab (post-PR#71 merge)
+- Dashboard: `test_quality_factor` column live in submission breakdown
+- Benchmark: 1154 problems, oracle 12.70 weighted, 47 repos, 6 languages
+- CI: repo cache active — Phase 1 eval 30–60% faster
