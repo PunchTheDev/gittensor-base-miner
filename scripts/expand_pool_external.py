@@ -410,6 +410,15 @@ def curate_github_pr(
         print(f"  Skip {repo}#{pr_number}: deletion-only diff")
         return False
 
+    SERVER_TEST_PATTERNS = ("test_http_api/", "test_web_api/", "test_sdk_api/")
+    diff_test_paths = re.findall(r"^diff --git a/(\S+)", diff, re.MULTILINE)
+    if any(
+        any(pat in p for pat in SERVER_TEST_PATTERNS)
+        for p in diff_test_paths
+    ):
+        print(f"  Skip {repo}#{pr_number}: server-required integration tests (test_http_api/web/sdk)")
+        return False
+
     if dry_run:
         print(f"  [DRY RUN] {repo}#{pr_number}: {issue_data['title'][:60]}")
         return True
