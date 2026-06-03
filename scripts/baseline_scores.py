@@ -105,6 +105,28 @@ def main() -> None:
             del existing[rid]
         if removed:
             print(f"Pruned {len(removed)} removed problems from existing scores")
+
+    # Re-apply current difficulty model to all carried-over entries.
+    # This is fast (reads only reference.diff size/content) and ensures
+    # that difficulty changes (e.g. the multi-factor model in PR #62) are
+    # reflected even for problems that weren't re-scored. The stale
+    # `difficulty_weight` field (added by a one-off backfill in PR #64) is
+    # dropped in favour of the authoritative `weight` field.
+    if existing:
+        fixed = 0
+        for entry in existing.values():
+            pid = entry["id"]
+            prob_dir = PROBLEMS_DIR / pid
+            if not prob_dir.exists():
+                continue
+            tier, weight = problem_difficulty(prob_dir)
+            if entry.get("difficulty") != tier or abs(entry.get("weight", 0) - weight) > 0.01:
+                entry["difficulty"] = tier
+                entry["weight"] = weight
+                fixed += 1
+            entry.pop("difficulty_weight", None)  # remove redundant legacy field
+        if fixed:
+            print(f"Re-applied current difficulty model to {fixed} carried-over entries")
     baselines = list(existing.values()) if existing else []
     existing_ids = set(existing.keys())
     skipped = 0
