@@ -25,10 +25,15 @@ DEFAULT_MAX_PER_WEEK = 5
 
 
 def count_recent_merges(handle: str, since: str = "7 days ago") -> int:
-    """Return number of commits in the last `since` period touching this handle's agent.py."""
+    """Return number of commits on main in the last `since` period touching this handle's agent.py.
+
+    Counts only commits reachable from origin/main so that iterative pushes to an open PR
+    don't prematurely count against the limit before a single submission is merged.
+    """
     agent_path = f"agent/submissions/{handle}/agent.py"
+    # Use origin/main (the upstream merged state) not HEAD (which includes PR branch commits).
     result = subprocess.run(
-        ["git", "log", f"--since={since}", "--oneline", "--", agent_path],
+        ["git", "log", "origin/main", f"--since={since}", "--oneline", "--", agent_path],
         capture_output=True,
         text=True,
         cwd=REPO_ROOT,
