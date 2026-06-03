@@ -100,7 +100,7 @@ python3 gitminer.py validate --problem 0463 --patch my_fix.diff
 python3 gitminer.py leaderboard
 
 # Generate commit-reveal hash for your agent before submitting
-python3 gitminer.py hash your_patch.diff
+python3 gitminer.py hash agent/submissions/yourhandle/agent.py
 
 # Validate agent and print PR submission steps
 python3 gitminer.py submit agent/submissions/yourhandle/agent.py

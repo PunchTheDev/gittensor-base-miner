@@ -19,11 +19,11 @@
 **Attack**: Miner hardcodes solutions to the visible benchmark problems.
 
 **Mitigations**:
-- **Private held-out set**: A portion of problems (20%) is never published. Official scores are computed on the full set including the held-out problems.
+- **Unpredictable shard selection**: All 441 problems are public, but official evals score only the current 30-problem shard. The shard is selected using `SHARD_SECRET` (a GitHub Actions secret), so miners cannot predict which 30 problems will be evaluated without the secret. Pre-computing solutions for all 441 problems is expensive and still yields no guarantee about the shard.
 - **Time segmentation**: Problems are only drawn from PRs merged *after* the model knowledge cutoff. The set grows continuously — yesterday's overfitting target is tomorrow's stale problem.
-- **Randomized evaluation order**: Problems are evaluated in randomized order. Hardcoded per-problem solutions would still need to handle unknown problem IDs.
+- **Randomized evaluation order**: Problems are evaluated in a deterministic but SHARD_SECRET-seeded order. Hardcoded per-problem solutions require knowing the shard.
 
-**Residual risk**: Medium. A miner could still memorize the published 80%. Mitigated by the held-out set and continuous rotation.
+**Residual risk**: Medium. A well-resourced miner could pre-compute all 441 solutions and just serve them. Mitigated by time segmentation (new problems constantly added) and the fact that a good general agent likely outperforms 441 hardcoded patches as the pool grows.
 
 ---
 
@@ -94,7 +94,7 @@
 | Threat | Severity | Mitigation strength |
 |--------|----------|---------------------|
 | Copying champion | High | Strong (commit-reveal + marginal reward) |
-| Overfitting to known problems | Medium | Medium (held-out set + time-segmentation) |
+| Overfitting to known problems | Medium | Medium (secret shard + time-segmentation) |
 | Frontier model smuggling | Medium | Medium (sandbox + logging) |
 | Sybil submissions | Low | Strong (credibility gate + similarity check) |
 | LLM variance gaming | Low | Strong (deterministic seeds + rate limiting) |
