@@ -2,23 +2,60 @@
 
 ## Overview
 
-Submissions are scored by replaying real Gittensor issues in an isolated sandbox using **Gittensor's native tree-sitter scoring engine** — the same AST-based scorer the DAS validator uses.
+Submissions are scored by replaying real Gittensor issues in an isolated sandbox. The scoring pipeline combines **Gittensor's native tree-sitter quality engine** (the same AST scorer the DAS validator uses) with our own benchmark-specific metrics that capture correctness depth and oracle-relative quality.
 
-**Correctness gates quality.** A patch that doesn't pass the test suite scores 0, regardless of code quality.
+## Scoring philosophy
+
+A good base miner does two things: it produces correct fixes, and it produces high-quality code. Raw Gittensor scoring only captures quality (via AST token analysis). Our benchmark adds:
+
+1. **Partial correctness** — A fix that passes 9/10 tests is better than one that passes 0/10. `test_pass_rate` captures this on a continuous 0–1 scale rather than a binary gate.
+2. **Oracle-relative quality** — A 2-line fix on a 2-line problem is worth as much as a 200-line fix on a 200-line problem. `relative_score` normalizes quality against what the accepted solution actually scored.
+3. **Composite benchmark score** — Combines both signals into a single leaderboard metric that rewards agents for being correct *and* high-quality, not just one or the other.
 
 ## Metrics
 
-Three complementary signals are reported for each evaluation:
+| Metric | Scale | Primary? | Meaning |
+|---|---|---|---|
+| `benchmark_score` | 0–2.0 | **YES** | `test_pass_rate × relative_score` — composite correctness + quality |
+| `relative_score` | 0–2.0 | secondary | Agent quality / oracle quality for this specific problem |
+| `test_pass_rate` | 0–1.0 | secondary | Fraction of tests that pass (granular correctness) |
+| `final_score` | 0–30 | compat | Gittensor native AST score (for on-chain emissions comparison) |
+| `file_coverage` | 0–1.0 | diagnostic | Fraction of reference-diff source files touched (observational) |
 
-| Metric | Scale | Meaning |
-|---|---|---|
-| `final_score` | 0–30 | Gittensor's native AST quality score for the agent's patch |
-| `relative_score` | 0–2.0 | Agent quality / oracle quality for this specific problem |
-| `file_coverage` | 0–1.0 | Fraction of reference diff source files the agent also touches |
+**`mean_benchmark_score` is the primary leaderboard ranking metric.**
 
-**`mean_relative_score` is the primary benchmark ranking metric.** It normalizes each problem's contribution so a tiny 2-point fix and a large 25-point fix count equally. An agent that consistently matches the oracle scores 1.0; a better agent scores above 1.0.
+## Benchmark score
 
-`weighted_mean_score` (difficulty-weighted Gittensor score) is retained for backward compatibility and direct comparison to Gittensor native emissions.
+```
+benchmark_score = test_pass_rate × min(relative_score, 2.0)
+```
+
+This is the headline number. A submission that:
+- Passes all tests and matches oracle quality → `benchmark_score = 1.0`
+- Passes all tests and beats oracle quality → `benchmark_score > 1.0` (up to 2.0)
+- Passes 50% of tests at oracle quality → `benchmark_score = 0.5`
+- Passes no tests → `benchmark_score = 0.0`
+
+Partial credit for partial correctness means agents are incentivized to fix as many bugs as possible, not just the easiest ones.
+
+## Test pass rate
+
+```
+test_pass_rate = tests_passed_count / tests_total_count
+```
+
+Parsed from the test runner output for each language:
+
+| Runner | Signal |
+|---|---|
+| pytest | `N passed, M failed in Xs` |
+| cargo test | `test result: ok. N passed; M failed` |
+| go test | count of `--- PASS:` and `--- FAIL:` lines |
+| jest / vitest | `Tests: N passed, M total` |
+| rspec | `N examples, M failures` |
+| gradle | `N tests completed, M failed` |
+
+When parsing fails (unusual output format), `test_pass_rate` falls back to the binary exit-code result (1.0 for pass, 0.0 for fail).
 
 ## Base quality formula
 
@@ -30,7 +67,7 @@ bonus_score  = min(contribution_score / 1500, 1) × 5 # cross-category bonus, 0�
 final_score  = base_score + bonus_score               # 0–30 total
 ```
 
-If tests do not pass, `final_score = 0`.
+`final_score` is used to compute `relative_score` and is retained for direct comparison to Gittensor on-chain emissions scoring.
 
 ## Relative score
 
@@ -38,15 +75,15 @@ If tests do not pass, `final_score = 0`.
 relative_score = min(agent_final_score / oracle_base_score, 2.0)
 ```
 
-`oracle_base_score` is the DAS validator's score on the accepted reference diff for that specific problem (stored in `meta.json` as `das_base_score`). The cap of 2.0 prevents inflating scores with extremely verbose patches.
+`oracle_base_score` is our tree-sitter scorer's score on the accepted reference diff for that specific problem (from `results/baselines.json`). The oracle scores exactly 1.0 against itself. The cap of 2.0 prevents verbose bloated patches from inflating scores unboundedly.
 
 Interpretation:
 - `1.0` — agent's fix has the same quality signal as the accepted solution
 - `> 1.0` — agent wrote a higher-quality fix (more structured code changes)
-- `< 1.0` — agent's fix is lower quality than the accepted solution (but may still be correct)
-- `None` — oracle score unavailable for this problem (doesn't affect the mean)
+- `< 1.0` — agent's fix has lower structural quality than the accepted solution
+- `None` — oracle score unavailable for this problem (excluded from the mean)
 
-The leaderboard ranks agents by `mean_relative_score` across all evaluated problems.
+The leaderboard ranks agents by `mean_benchmark_score` (which incorporates relative_score).
 
 ## File coverage (observational)
 

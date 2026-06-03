@@ -127,8 +127,12 @@ def cmd_eval(args: argparse.Namespace) -> None:
 
     weighted_mean = results.get("weighted_mean_score", mean)
     mean_relative = results.get("mean_relative_score")
+    mean_benchmark = results.get("mean_benchmark_score")
     print(f"\n{'─'*54}")
     print(f"  Problems evaluated : {len(problems)} ({len(passed)} passed, {len(failed)} failed, {len(errored)} errors)")
+    if mean_benchmark is not None:
+        pct = round(mean_benchmark * 100, 1)
+        print(f"  Benchmark score    : {mean_benchmark:.4f}  ({pct}% — PRIMARY: test_pass_rate × quality/oracle)")
     print(f"  Mean score         : {mean:.2f} / 30.00")
     print(f"  Weighted mean      : {weighted_mean:.2f} / 30.00  (easy×1 / medium×1.5 / hard×2)")
     print(f"  Oracle weighted    : {oracle_weighted:.2f} / 30.00  (reference diffs, weighted)")
