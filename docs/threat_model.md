@@ -1,102 +1,132 @@
 # Anti-Gaming Threat Model
 
-## Threat 1: Copying the current champion
+**Implementation status**: each mitigation is marked with its current state:
+
+- **Implemented** — code exists and is enforced
+- **Planned** — described in design docs, not yet in CI
+- **Gittensor-native** — handled by the DAS validator, not our CI
+
+---
+
+## Threat 1: Copying the current champion's source code
 
 **Attack**: Miner reads the champion agent's code in `agent/champion/` and submits it with minor cosmetic edits.
 
 **Mitigations**:
-- **Commit-reveal**: Miner must submit a hash before the private eval. The source is not visible until after scoring.
-- **Marginal reward**: Rewards are proportional to margin over the current leader. A perfect copy earns ~0 margin.
-- **Similarity check**: Submissions are diffed against all prior submissions. Near-duplicates (> 85% Jaccard similarity on normalized token sequences) are flagged for manual review.
-- **First-to-commit credit**: In a tie, the earlier submission wins.
+- **Similarity check — [Implemented, hard-blocking]**: `scripts/check_similarity.py` compares the incoming agent against all existing submissions using AST structural fingerprints + token Jaccard. Exceeding 85% similarity on either signal fails the CI job and blocks merge.
+- **Marginal reward — [Gittensor-native]**: Rewards are proportional to margin over the current leader. A copy that earns the same score earns ~0 marginal reward.
+- **Commit-reveal — [Planned]**: Miner submits a hash before the private eval. The source is not visible until after scoring. *Not yet implemented — current flow posts results publicly on PR open.*
+- **First-to-commit credit — [Planned]**: In a tie, the earlier submission wins. *Not tracked in CI yet.*
 
-**Residual risk**: Low. A copy that truly adds nothing earns nothing.
-
----
-
-## Threat 2: Overfitting to visible test problems
-
-**Attack**: Miner hardcodes solutions to the visible benchmark problems.
-
-**Mitigations**:
-- **Unpredictable shard selection**: All 441 problems are public, but official evals score only the current 30-problem shard. The shard is selected using `SHARD_SECRET` (a GitHub Actions secret), so miners cannot predict which 30 problems will be evaluated without the secret. Pre-computing solutions for all 441 problems is expensive and still yields no guarantee about the shard.
-- **Time segmentation**: Problems are only drawn from PRs merged *after* the model knowledge cutoff. The set grows continuously — yesterday's overfitting target is tomorrow's stale problem.
-- **Randomized evaluation order**: Problems are evaluated in a deterministic but SHARD_SECRET-seeded order. Hardcoded per-problem solutions require knowing the shard.
-
-**Residual risk**: Medium. A well-resourced miner could pre-compute all 441 solutions and just serve them. Mitigated by time segmentation (new problems constantly added) and the fact that a good general agent likely outperforms 441 hardcoded patches as the pool grows.
+**Residual risk**: Low for direct code copies (hard-blocked). Medium for functionally identical agents with different structure (caught by output similarity check).
 
 ---
 
-## Threat 3: Using a non-whitelisted frontier model
+## Threat 2: Hardcoding reference diffs (oracle-level cheating)
 
-**Attack**: Miner uses GPT-5 or Claude 4 (frontier, unlisted) to solve problems, then wraps the result as if it came from a whitelisted model.
+**Attack**: Miner clones the repo, reads `benchmark/problems/{id}/reference.diff` for all pool problems, and builds an agent that returns the stored reference diff for each problem ID it recognizes.
+
+**Why this is the most dangerous attack**: It scores oracle-level without any real reasoning. All reference diffs are public in the repo, making this trivially executable.
 
 **Mitigations**:
-- **Sandbox network control**: During evaluation, only whitelisted model API endpoints are reachable. All other outbound connections are blocked by the Daytona sandbox.
-- **Model logging**: The harness logs every API call (model name, prompt hash, response hash) during evaluation. Discrepancies are detectable.
+- **Reference copy check — [Implemented, hard-blocking]**: `scripts/check_reference_copy.py` hashes each reference diff using the same normalization as the scoring engine and compares against the agent's behavior fingerprint. If >40% of shard problems match the reference exactly, the CI job fails and blocks merge.
+- **Unpredictable shard — [Implemented]**: The shard is selected using a `SHARD_SECRET` GitHub Actions secret. Miners can't predict which 30/441 problems are evaluated — pre-computing all 441 still yields no guarantee.
+- **Time segmentation — [Implemented]**: New problems are continuously added from recently merged PRs. A hardcoded solution for today's pool becomes stale as the pool grows.
 
-**Residual risk**: A miner who proxies a frontier model through a whitelisted endpoint could evade detection. This requires deliberate infrastructure effort — it's not a casual attack. Monitoring for unusual latency and response-length distributions helps.
+**Residual risk**: Medium. A miner who applies the reference diffs with minor modifications (comment changes, whitespace) might fall just below the 40% detection threshold. The unpredictable shard provides a second defense layer.
 
 ---
 
-## Threat 4: Sybil submissions
+## Threat 3: Overfitting to known pool problems (without reference diffs)
 
-**Attack**: Miner creates multiple identities and submits essentially the same agent from each to accumulate leaderboard positions.
+**Attack**: Miner trains or fine-tunes on the 441 known benchmark problems to produce high-scoring patches without reasoning at runtime.
 
 **Mitigations**:
-- **Similarity check across all submissions** (not just vs. champion): near-duplicate submissions across different handles are flagged.
-- **Gittensor credibility gate**: Each submitter must have ≥ 2 merged PRs and ≥ 75% credibility. Building fake credibility requires real merged code contributions, which is expensive.
+- **Unpredictable shard — [Implemented]**: Only 30/441 problems are evaluated, selected via SHARD_SECRET. Pre-fitting to all 441 is expensive without any shard guarantee.
+- **Time segmentation — [Implemented]**: Problems come from PRs merged after 2024-06-01. Pool rotates as new PRs merge, continuously adding problems the model hasn't seen.
+- **Reference copy check — [Implemented]**: Catches near-verbatim memorization of the accepted solutions.
 
-**Residual risk**: Low. Building multiple credible Gittensor identities is expensive.
+**Residual risk**: Medium for a very well-resourced miner. Mitigated primarily by pool growth — the more problems, the harder and more expensive to overfit.
 
 ---
 
-## Threat 5: LLM variance gaming
+## Threat 4: Using a non-whitelisted frontier model
 
-**Attack**: Miner submits many times, exploiting randomness in the model's output to get a lucky high score.
+**Attack**: Miner uses a frontier model (e.g., a non-whitelisted Claude or GPT variant) to get higher scores. The whitelist allows only specific models.
 
 **Mitigations**:
-- **Rate limiting**: Each submitter can only submit once per 48 hours. New submissions require closing the previous open PR.
-- **Deterministic eval seeds**: The harness seeds all random number generators with `problem_id + submission_id`. Same agent always produces the same score.
-- **Reward decay for repeated submissions**: If a new submission scores less than the miner's previous best, their effective score doesn't decrease (no punishment), but the submission earns 0 marginal reward.
+- **Daytona sandbox network control — [Planned]**: During evaluation, only whitelisted model API endpoints would be reachable. *Not yet implemented — agent currently runs with full network access. Daytona integration is a backlog item.*
+- **Allowed models list — [Interface only, not enforced]**: `allowed_models` is passed to `Problem`, but runtime enforcement requires network sandboxing.
 
-**Residual risk**: Low given deterministic seeds.
+**Residual risk**: High until Daytona (or equivalent) is integrated. Currently, any model can be called during eval. This is a known gap — the whitelist exists but has no runtime enforcement.
+
+*This is a scale-readiness gap. Priority: high.*
 
 ---
 
-## Threat 6: Issue-linked PR manipulation
+## Threat 5: Sybil submissions
 
-**Attack**: Miner creates fake issues, then closes them with their own PRs to earn the issue multiplier.
+**Attack**: Miner creates multiple GitHub identities and submits essentially the same agent from each handle to accumulate leaderboard positions.
 
 **Mitigations**:
-- Gittensor's native engine already rejects self-authored linked issues.
-- Maintainer-authored issues earn the `maintainer_issue_multiplier` (2.5×) — much higher than the `standard_issue_multiplier` (1.5×). Well-scoped maintainer issues are more valuable, which directs miner effort toward solving the right problems.
+- **Output behavior similarity — [Implemented, hard-blocking]**: `scripts/check_output_similarity.py` compares per-problem diff hashes across all submitted agents. If ≥70% of overlapping problems produce identical diffs, the CI job fails and blocks merge.
+- **Gittensor credibility gate — [Gittensor-native]**: Each submitter needs ≥2 merged PRs and ≥75% credibility. Building multiple credible identities is expensive.
 
-**Residual risk**: None beyond what Gittensor natively blocks.
+**Residual risk**: Low. Building multiple credible Gittensor identities requires real contribution work.
+
+---
+
+## Threat 6: LLM variance gaming (lucky-run exploitation)
+
+**Attack**: Miner submits many times, exploiting non-determinism in model outputs to get a lucky high score.
+
+**Mitigations**:
+- **Rate limiting — [Implemented, advisory]**: `scripts/check_rate_limit.py` caps merges at 5/week. Currently advisory (logged, not hard-blocking) to avoid false-positive impact on legitimate resubmissions.
+- **Deterministic eval seeds — [Implemented]**: The harness seeds the shard selection with `SHARD_SECRET + week_number`. Same agent, same week → same 30 problems.
+
+**Residual risk**: Low. Deterministic seeds mean LLM randomness is the only remaining variance, and repeated submissions hit the rate limit.
 
 ---
 
 ## Threat 7: Behavioral cloning (output forwarding)
 
-**Attack**: Miner writes an agent that calls a prior champion's API, wraps its output, or is functionally identical despite looking structurally different. Source-level similarity checks cannot catch this if the wrapper code is sufficiently different.
+**Attack**: Miner writes an agent that calls a prior submission's API or uses a different code structure to produce the same output. Source-level similarity misses this.
 
 **Mitigations**:
-- **Output behavior fingerprinting**: Every evaluated submission generates a fingerprint — a per-problem SHA-256 of the normalized diff the agent produced. These fingerprints are stored in `results/behaviors/` and compared on every new submission.
-- **Matching threshold**: If ≥ 70% of overlapping evaluated problems produce identical diff hashes, the submission is flagged. This threshold catches near-exact forwarding while tolerating coincidental matches on simple problems.
-- **Minimum overlap requirement**: Comparisons require ≥ 5 shared problems to be meaningful. Agents evaluated in different weeks share fewer problems — the threshold still applies to the overlap window.
+- **Output behavior fingerprinting — [Implemented, hard-blocking]**: `scripts/check_output_similarity.py` compares per-problem diff hashes. ≥70% identical diffs on ≥5 shared problems fails the CI job.
+- **Reference copy check — [Implemented]**: Also catches agents forwarding the accepted solution's diff.
 
-**Residual risk**: A miner who deliberately varies their outputs problem-by-problem while using the same underlying agent could stay below the threshold. Rate limiting limits how many calibration runs they can make. Marginal-reward design means a forwarded output earns ~0 above the champion's baseline anyway.
+**Residual risk**: A miner who deliberately varies outputs problem-by-problem while using the same agent stays below the threshold. Rate limiting constrains calibration runs.
+
+---
+
+## Threat 8: CI flooding (resource exhaustion)
+
+**Attack**: Miner pushes many PR updates rapidly to exhaust shared GitHub Actions minutes and the shared OPENROUTER_KEY budget.
+
+**Mitigations**:
+- **Per-actor CI concurrency — [Implemented]**: `eval.yml` limits each GitHub actor to one active eval run. New pushes cancel the in-flight eval.
+- **Rate limiting — [Implemented, advisory]**: 5 merges/week cap per handle.
+
+**Residual risk**: Medium. The shared OPENROUTER_KEY is a scale bottleneck — at 100+ concurrent miners, each using the CI key, budget burn is uncontrolled. *Planned fix: miners provide their own OpenRouter key, stored as a per-handle GitHub secret or submitted alongside the agent.*
 
 ---
 
 ## Summary
 
-| Threat | Severity | Mitigation strength |
-|--------|----------|---------------------|
-| Copying champion | High | Strong (commit-reveal + marginal reward) |
-| Overfitting to known problems | Medium | Medium (secret shard + time-segmentation) |
-| Frontier model smuggling | Medium | Medium (sandbox + logging) |
-| Sybil submissions | Low | Strong (credibility gate + similarity check) |
-| LLM variance gaming | Low | Strong (deterministic seeds + rate limiting) |
-| Issue manipulation | Low | Strong (Gittensor native + multiplier design) |
-| Behavioral cloning / output forwarding | Medium | Medium (behavior fingerprint + 70% match threshold) |
+| Threat | Severity | Implemented mitigations | Gaps |
+|--------|----------|-------------------------|------|
+| Champion code copy | High | Similarity check (hard-block) | Commit-reveal not yet live |
+| Reference diff hardcoding | High | Reference copy check (hard-block) | Minor-modification evasion |
+| Pool overfitting | Medium | Secret shard + time segmentation | Resource-heavy miners can pre-compute |
+| Frontier model use | High | Allowed models list | **No runtime enforcement — Daytona needed** |
+| Sybil submissions | Low | Output similarity (hard-block) + credibility gate | — |
+| LLM variance gaming | Low | Deterministic seeds + rate limit | — |
+| Behavioral cloning | Medium | Output fingerprint (hard-block) | Partial match evasion |
+| CI flooding | Medium | Concurrency limit + rate limit | Shared API key at scale |
+
+### Critical gaps for launch readiness
+
+1. **Frontier model enforcement**: No network sandboxing. Daytona integration required to restrict agent network access to whitelisted models only.
+2. **Shared OPENROUTER_KEY**: All CI evals use the same key. Fine for 10 miners; dangerous at 100+. Fix: per-miner key registration.
+3. **Commit-reveal**: Currently, scores are posted publicly as soon as eval runs. A miner who watches eval results can update their submission to exploit the visible benchmark. Private eval (hash-first) requires a two-phase PR flow.
