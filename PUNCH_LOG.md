@@ -2410,3 +2410,19 @@ Two small accuracy issues found during a docs sweep:
 - `docs/rewards.md` chain diagram: showed `contributor cut (59.5%)` — stale from before the maintainer_cut was tuned to 0.15; fixed to `55%` to match the emission table directly below it
 
 Both fixes are cosmetic/accuracy — no logic changes.
+
+---
+
+## 2026-06-03 — Resilience fix: guard record step on eval failure
+
+**Problem**: In `record_submission.yml`, the "Record result" step had no guard against a missing `results_new.json` (produced by the eval step). If the authoritative post-merge eval fails (timeout, Docker crash, network error), `record_result.py` raises `SystemExit` and the job fails — the champion directory would never be updated, the leaderboard stays stale, and the commit step wouldn't fire.
+
+**Fix (commit c0c52bf)**: Added an explicit file-existence check before calling `record_result.py`. If `results_new.json` doesn't exist, the step prints a warning and exits 0 — the rest of the job (champion check, commit) still runs but correctly finds no leaderboard change and is a no-op.
+
+**Effect**: Eval failures are now gracefully handled — they don't cascade into a broken CI job. The miner's PR is still merged; a maintainer can re-trigger the workflow manually to record the score later.
+
+**Also verified this step**:
+- All Python files pass syntax check
+- API running: pool=441, oracle=13.03, shard=30, next_rotation=2026-06-08
+- `load_problem` and `load_agent` both work correctly on current pool
+- No open PRs in either repo
