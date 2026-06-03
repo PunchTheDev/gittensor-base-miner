@@ -4,6 +4,21 @@ Milestone trail for the base-miner benchmark. Discord is the primary channel; th
 
 ---
 
+## Step 221 — 2026-06-03
+
+**Self-hosted: killed GitHub Pages dependency, everything runs on box via PM2.**
+
+- Killed nohup Python http.server (pid 102892, running since Jun 02)
+- Started `gitminer-dashboard` as PM2 process id=7, serving dashboard at port 8082
+- Dashboard and API both externally reachable: `http://143.244.191.193:8082/` and `http://143.244.191.193:8083/`
+- Dashboard now fetches agents discovery doc from live API (`/api/agents`) — was pointing to stale GitHub Pages `agents.json` (430 problems, old data)
+- Diffs now served from live API (`/api/problems/{id}/diff`) — was fetching from raw.githubusercontent.com
+- Updated `api/server.py` dashboard/api URLs to use real server IP
+- Updated `deploy/pm2.json` to include `gitminer-dashboard` process
+- Benchmark commit: `eb9abf47`; dashboard commit: `5fb5a03`
+
+---
+
 ## Step 212 — 2026-06-03
 
 **PR #90 merged** — `gitminer doctor` is now Docker-aware.
