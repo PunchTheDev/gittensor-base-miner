@@ -6,9 +6,9 @@ the current shard, and leaderboard data programmatically — no scraping needed.
 ## Starting the server
 
 ```bash
-python gitminer.py serve-api               # binds 0.0.0.0:8083
-python gitminer.py serve-api --port 9000   # custom port
-python gitminer.py serve-api --host 127.0.0.1 --port 8083
+python3 gitminer.py serve-api               # binds 0.0.0.0:8083
+python3 gitminer.py serve-api --port 9000   # custom port
+python3 gitminer.py serve-api --host 127.0.0.1 --port 8083
 ```
 
 All responses are `application/json`. The server is CORS-open so browser
