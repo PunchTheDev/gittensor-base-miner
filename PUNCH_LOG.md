@@ -4202,3 +4202,28 @@ Pool 1123, oracle 12.64, 65 models. `gitminer init` reduces onboarding friction.
 
 ### Status
 Pool 1123, oracle 12.64, 65 models. API rate-limited, leaderboard pagination ready for volume.
+
+---
+
+## Step 228 — 2026-06-03
+
+### What changed
+- **Dashboard PR #15**: Fix `crypto.randomUUID` crash + inline favicon (merged de29630)
+  - Chart.js 4.4.0 calls `crypto.randomUUID()` which requires HTTPS (secure context)
+  - Dashboard served over plain HTTP from bare IP → always undefined → runtime crash on load
+  - Fix: polyfill before Chart.js loads (Math.random-based, HTTP-safe)
+  - Inline SVG favicon eliminates the 404 noise
+
+- **Dashboard PR #16**: Clarify oracle metric display (merged d811c59)
+  - Hero stat: `Oracle benchmark 1.0 · Gittensor 12.64/30` — makes both metrics explicit
+  - Stat card label → `Oracle (Gittensor)`, sub → `beat benchmark = 1.0 to win`
+  - Hover tooltip explains two-metric system (Gittensor raw vs normalized benchmark)
+
+- **PR #102**: `deploy/cron.txt` — server sync cron for live API updates (merged 56b6c0da)
+  - Root cause: CI pool rotation and submission scoring commit to GitHub remote; local API server
+    reads from disk but had no auto-update mechanism → stale data until manual `git pull`
+  - Fix: `*/15 * * * * git pull origin main` cron (already installed in server crontab)
+  - Covers both weekly pool rotation (Sunday CI) and real-time leaderboard updates post-scoring
+
+### Status
+Pool 1123, oracle 12.64, 65 models. Dashboard console errors cleared, oracle explanation improved, server auto-syncs every 15min.
