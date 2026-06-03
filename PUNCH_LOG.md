@@ -3599,3 +3599,18 @@ Propagated oracle correction from PR #73 (12.70 → 12.61) to 8 remaining files 
 - Allowed models: 21
 - Pool rotation: Sunday 2026-06-08 (automated)
 - CI: all green
+
+## Step 200 — doc accuracy: fix stale metric references
+
+**PR #77 merged** (28a4950d)
+
+Two stale metric references cleaned up before miners arrive:
+
+| File | Was | Now |
+|---|---|---|
+| LEADERBOARD.md formula block | `test_pass_rate × (agent_quality / oracle_quality)` | Full v5: `test_pass_rate × relative_score × anti_gaming_multiplier × test_quality_factor` + weighted variant |
+| LEADERBOARD.md scoring note | `benchmark_score` as primary, `test_pass_rate × relative_score` | `weighted_benchmark_score` as primary, oracle note corrected |
+| CONTRIBUTING.md | "Scores are on the 0–30 scale" | `weighted_benchmark_score` (0–2.0, oracle=1.0); native 0–30 retained for comparison |
+
+Also audited: eval.yml, record_submission.yml, score.py, runner.py, evaluate.py, record_result.py — all clean.
+Pool rotation workflow (refresh_pool.yml) verified: DAS + external repos both refreshed, duplicate-check correct, oracle recalibration correct.
