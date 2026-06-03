@@ -107,14 +107,14 @@ def _shard_problem_dirs(config: dict) -> list[Path]:
 
 
 def _difficulty_by_lines(problem_dir: Path) -> str:
-    """Difficulty tier based on reference diff size — uses catalog thresholds."""
-    from benchmark.catalog import problem_tier
-    ref = problem_dir / "reference.diff"
-    if not ref.exists():
-        return "medium"
-    added = sum(1 for line in ref.read_text(errors="replace").splitlines()
-                if line.startswith("+") and not line.startswith("+++"))
-    name, _ = problem_tier(added)
+    """Difficulty tier using the multi-factor model from evaluate.py.
+
+    Matches the actual scoring weight used at eval time (multi-file and
+    new-file multipliers can promote medium→hard).  Callers should always
+    use this function rather than catalog.problem_tier directly.
+    """
+    from benchmark.evaluate import problem_difficulty
+    name, _ = problem_difficulty(problem_dir)
     return name
 
 
@@ -391,17 +391,21 @@ class Handler(BaseHTTPRequestHandler):
                 "source": "Gittensor DAS network — real merged PRs from registered repos",
             },
             "scoring": {
-                "formula": "25 * (1 - exp(-tokens / 58)) + bonus",
-                "max_score": 30,
+                "primary_metric": "weighted_benchmark_score",
+                "formula": "benchmark_score = test_pass_rate × relative_score × anti_gaming_multiplier × test_quality_factor",
+                "weighted_formula": "weighted_benchmark_score = sum(benchmark_score × difficulty_weight) / sum(weight)",
+                "difficulty_weights": {"easy": 1.0, "medium": 1.5, "hard": 2.0},
                 "correctness_gates_quality": True,
                 "oracle_score": oracle_score,
                 "champion_score": champion_score,
                 "champion_agent": champion_agent,
                 "note": (
-                    "Structural AST tokens (functions, classes, branches) count. "
-                    "Comments and whitespace score 0. "
+                    "Tests must pass first (test_pass_rate); then relative_score = "
+                    "agent_token_score / oracle_token_score measures implementation quality. "
+                    "anti_gaming_multiplier penalises similarity to prior submissions. "
+                    "test_quality_factor (0.85–1.0) rewards agents that add test assertions. "
                     "oracle_score is the difficulty-weighted mean (hard×2/medium×1.5/easy×1). "
-                    "Beat the champion weighted mean across 30 problems to win."
+                    "Beat the champion weighted_benchmark_score across 30 problems to win."
                 ),
             },
             "constraints": {
