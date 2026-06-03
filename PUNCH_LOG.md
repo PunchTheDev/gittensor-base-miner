@@ -2225,3 +2225,25 @@ Repos evaluated and rejected: `celery/celery` (Redis/RabbitMQ integration tests)
 - Benchmark commits: `5c088b8` through `d1e2ee8`
 - Dashboard commit: `7670791`
 - Next DAS pool check: ~2026-06-16
+
+---
+
+## 2026-06-03 — Anti-copy pipeline: behavior fingerprint persistence fixed
+
+**Bug found**: Output similarity check (`check_output_similarity.py`) was effectively a no-op because behavior fingerprints were never persisted to `results/behaviors/`. The CI saved them as artifacts (expire in 30 days) but never committed them to the repo. Future submissions could never be checked against prior submissions.
+
+**Fix (benchmark commits 7498ebc, 4917c7d)**:
+- `scripts/record_result.py`: added `--behaviors FILE` arg — copies fingerprint to `results/behaviors/{handle}.json`
+- `.github/workflows/record_submission.yml`: added `--save-behaviors behaviors_merged.json` to re-eval, passes `--behaviors` to `record_result.py`, stages `results/behaviors/` in commit
+- `results/behaviors/.gitkeep`: directory now tracked
+- `.github/workflows/eval.yml`: champion comment updated — says "merge and CI handles everything automatically"
+- `.github/workflows/record-champion.yml`: disabled (workflow_dispatch only) — was a duplicate of `record_submission.yml` that caused push race conditions on merge
+- `CONTRIBUTING.md`: updated to mention behavior fingerprint in post-merge flow
+
+**Root cause of duplicate workflows**: both `record-champion.yml` (fires on PR closed) and `record_submission.yml` (fires on push to main) were doing the same job. Now only `record_submission.yml` is active.
+
+### Status
+- Benchmark: **441 problems**, oracle **13.03** weighted, commit 4917c7d
+- Anti-copy: behavior fingerprints now persisted on every champion merge
+- CI post-merge: single workflow (`record_submission.yml`) handles eval + leaderboard + fingerprint + champion + dashboard
+- Next DAS check: ~2026-06-16
