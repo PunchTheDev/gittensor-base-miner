@@ -2429,6 +2429,22 @@ Both fixes are cosmetic/accuracy — no logic changes.
 
 ---
 
+## Step 146 — 2026-06-03
+
+**Fixed: `actions: write` missing from CI workflows that trigger `refresh_dashboard.yml`** (commit `fbbd2d1`)
+
+**Root cause**: `record_submission.yml` and `refresh_pool.yml` both commit via `GITHUB_TOKEN`. GitHub does NOT trigger other workflows from a `GITHUB_TOKEN` push (anti-loop protection). Both workflows work around this by calling `gh workflow run refresh_dashboard.yml` — but they only declared `permissions: contents: write`. When any permission is declared explicitly, GitHub sets all other permissions to `none`. So `actions` was `none`, and `gh workflow run` would fail silently.
+
+**Effect of the bug**: After a miner PR merges, the leaderboard and leaderboard history would be recorded correctly, but the dashboard would never refresh. Same after a pool rotation — new problems would be added, but the dashboard would still show the old pool count.
+
+**Fix**:
+- `record_submission.yml`: Added `actions: write` to the permissions block.
+- `refresh_pool.yml`: Added `actions: write`. Also added `pushed` output to the commit step, so the dashboard trigger is skipped (no-op) when there are no new problems.
+
+**System health**: pool=441, oracle=13.03, API healthy, no open PRs.
+
+---
+
 ## Step 145 — 2026-06-03
 
 **Two maintenance fixes** (commits `ad91e9d`, `3eba1b8`)
