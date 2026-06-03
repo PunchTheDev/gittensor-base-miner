@@ -2859,3 +2859,29 @@ Dashboard updated: punchthedev.github.io/gittensor-miner-dashboard/ now shows 67
 - 🚨 Daytona integration — model enforcement + static agent detection
 - 🚨 Per-miner OpenRouter key
 - Commit-reveal (private eval server)
+
+---
+
+### Pool expansion 671→812: 7 new Python repos
+
+**PR #26** — Expand pool with 141 problems from aiohttp, flask, fastapi, tornado, twisted, trio, celery
+
+All 7 repos are well-known Python open-source projects with GitHub issues linked to PRs and in-process test suites. Together they add depth to the Python half of the benchmark (now 434/812 = 53% Python).
+
+New repos:
+- aio-libs/aiohttp: 30 problems (async HTTP client/server)
+- celery/celery: 30 problems (distributed task queue)
+- twisted/twisted: 29 problems (event-driven networking)
+- python-trio/trio: 17 problems (structured async)
+- tornadoweb/tornado: 15 problems (web framework)
+- pallets/flask: 13 problems (web framework)
+- tiangolo/fastapi: 7 problems (API framework)
+
+Oracle: **15.0 → 13.62** weighted / **13.71 → 12.22** arithmetic (smaller Python bug-fix diffs pull the mean down; expected).
+
+Fixes shipped alongside expansion:
+- `expand_pool_external.py`: `has_source_changes()` now filters towncrier news fragments (.misc/.bugfix/.feature extensions and newsfragments/ dir) — these look like source files but score 0 as they're changelog entries
+- `baseline_scores.py`: `--incremental` now prunes removed problems from existing scores so counts stay accurate
+- Shard budget rebalanced: python:13 rust:9 typescript:5 jvm:2 ruby:1
+
+Dashboard: punchthedev.github.io/gittensor-miner-dashboard/ updated to 812 problems, oracle 13.62.
