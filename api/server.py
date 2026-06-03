@@ -332,10 +332,13 @@ class Handler(BaseHTTPRequestHandler):
         shard_dirs = _shard_problem_dirs(config)
 
         epoch = date(2024, 1, 1)
-        week_number = (date.today() - epoch).days // 7
         today = date.today()
-        days_to_monday = (7 - today.weekday()) % 7 or 7
-        next_rotation = str(today + timedelta(days=days_to_monday))
+        week_number = (today - epoch).days // 7
+        # Next rotation is the next 7-day epoch boundary from 2024-01-01,
+        # not the next calendar Monday.  Matches evaluate.py / gitminer.py logic.
+        days_since = (today - epoch).days
+        next_day = ((days_since // 7) + 1) * 7
+        next_rotation = str(epoch + timedelta(days=next_day))
 
         problems = []
         for d in shard_dirs:
@@ -485,7 +488,7 @@ class Handler(BaseHTTPRequestHandler):
             },
             "scoring": {
                 "primary_metric": "weighted_benchmark_score",
-                "formula": "benchmark_score = test_pass_rate × relative_score × anti_gaming_multiplier × test_quality_factor",
+                "formula": "benchmark_score = test_pass_rate × relative_score × anti_gaming_multiplier × test_quality_factor × efficiency_factor",
                 "weighted_formula": "weighted_benchmark_score = sum(benchmark_score × difficulty_weight) / sum(weight)",
                 "difficulty_weights": {"easy": 1.0, "medium": 1.5, "hard": 2.0},
                 "correctness_gates_quality": True,
@@ -495,8 +498,9 @@ class Handler(BaseHTTPRequestHandler):
                 "note": (
                     "Tests must pass first (test_pass_rate); then relative_score = "
                     "agent_token_score / oracle_token_score measures implementation quality. "
-                    "anti_gaming_multiplier penalises similarity to prior submissions. "
+                    "anti_gaming_multiplier penalises test deletion and submission similarity. "
                     "test_quality_factor (0.85–1.0) rewards agents that add test assertions. "
+                    "efficiency_factor (0.85–1.0) rewards agents that use fewer output tokens. "
                     "oracle_score is the difficulty-weighted mean (hard×2/medium×1.5/easy×1). "
                     "Beat the champion weighted_benchmark_score across 30 problems to win."
                 ),
