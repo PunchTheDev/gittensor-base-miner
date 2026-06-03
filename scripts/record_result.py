@@ -27,7 +27,7 @@ def _oracle_score_from_baselines() -> tuple[float, float]:
         weighted = round(float(data.get("weighted_mean_score") or mean), 2)
         return mean, weighted
     except Exception:
-        return 11.83, 12.77
+        return 12.08, 13.03
 
 
 _oracle_mean, _oracle_weighted = _oracle_score_from_baselines()
