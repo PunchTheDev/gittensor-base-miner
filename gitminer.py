@@ -245,10 +245,21 @@ def _build_pr_body(handle: str, sha: str, model: str) -> str:
 
 
 def cmd_parity(args: argparse.Namespace) -> None:
-    """Compare local scorer output against embedded DAS reference scores."""
+    """Compare local tree-sitter scores against embedded DAS reference scores."""
     import json as _json
-    import math as _math
     from benchmark.evaluate import POOL_DIR
+
+    # Load pre-computed tree-sitter baselines (matches DAS scoring engine).
+    # Fallback to heuristic only for problems not yet in baselines.json.
+    baselines_path = REPO_ROOT / "results" / "baselines.json"
+    ts_by_id: dict[str, float] = {}
+    scoring_method = "heuristic"
+    if baselines_path.exists():
+        bl = _json.loads(baselines_path.read_text())
+        ts_by_id = {p["id"]: float(p["base_score"]) for p in bl.get("problems", [])}
+        if ts_by_id:
+            scoring_method = "tree-sitter"
+
     from benchmark.harness.score import approximate_src_token_score, compute_base_score
 
     problems = sorted(POOL_DIR.glob("*/meta.json"))
@@ -260,17 +271,24 @@ def cmd_parity(args: argparse.Namespace) -> None:
         if "das_base_score" not in meta:
             skipped += 1
             continue
-        ref_diff = meta_path.parent / "reference.diff"
-        if not ref_diff.exists():
-            skipped += 1
-            continue
 
+        pid = meta["id"]
         das_base = float(meta["das_base_score"])
-        diff_text = ref_diff.read_text()
-        src_tok, total_tok = approximate_src_token_score(diff_text)
-        local_base = compute_base_score(src_tok, total_tok)
+
+        if pid in ts_by_id:
+            local_base = ts_by_id[pid]
+            method = "ts"
+        else:
+            ref_diff = meta_path.parent / "reference.diff"
+            if not ref_diff.exists():
+                skipped += 1
+                continue
+            src_tok, total_tok = approximate_src_token_score(ref_diff.read_text())
+            local_base = compute_base_score(src_tok, total_tok)
+            method = "heuristic"
+
         ratio = local_base / max(das_base, 0.001)
-        rows.append((meta["id"], das_base, local_base, ratio))
+        rows.append((pid, das_base, local_base, ratio, method))
 
     if not rows:
         print("No problems with DAS reference scores found.")
@@ -279,18 +297,24 @@ def cmd_parity(args: argparse.Namespace) -> None:
     rows.sort(key=lambda r: abs(r[3] - 1), reverse=True)
     limit = args.top if hasattr(args, "top") else 20
 
-    print(f"Local vs DAS score calibration ({len(rows)} problems, {skipped} skipped)\n")
+    ts_count = sum(1 for r in rows if r[4] == "ts")
+    print(f"Local vs DAS score calibration ({len(rows)} problems, {skipped} skipped)")
+    print(f"Scoring method: {scoring_method} ({ts_count}/{len(rows)} via tree-sitter)\n")
     print(f"{'Problem ID':<42} {'DAS Base':>9} {'Local':>8} {'Ratio':>7}")
     print("─" * 72)
-    for pid, das, local, ratio in rows[:limit]:
+    for pid, das, local, ratio, _ in rows[:limit]:
         flag = " ← outlier" if ratio > 10 or ratio < 0.5 else ""
         print(f"{pid:<42} {das:>9.2f} {local:>8.2f} {ratio:>6.1f}×{flag}")
 
     ratios = [r[3] for r in rows]
     median_ratio = sorted(ratios)[len(ratios) // 2]
     print("─" * 72)
-    print(f"Median local/DAS ratio: {median_ratio:.1f}×  "
-          f"(local scores typically read {median_ratio:.0f}× higher than DAS reference)")
+    if scoring_method == "tree-sitter":
+        print(f"Median local/DAS ratio: {median_ratio:.2f}×  "
+              f"(tree-sitter scorer — ratio near 1.0 means tight DAS alignment)")
+    else:
+        print(f"Median local/DAS ratio: {median_ratio:.1f}×  "
+              f"(heuristic — run baseline_scores.py to get tree-sitter parity)")
 
 
 def cmd_submit(args: argparse.Namespace) -> None:
