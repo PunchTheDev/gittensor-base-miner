@@ -3529,3 +3529,27 @@ Three stale documentation entries corrected:
 - Benchmark: 1154 problems, oracle 12.70 weighted, 47 repos, 6 languages
 - Pool rotation: Sunday 2026-06-08 (automated, `refresh_pool.yml`)
 - CI: all green
+
+---
+
+## Step 197 — 2026-06-03
+
+**Bug fix: stale difficulty weights in baselines.json** (PR #73)
+
+Found 71 problems with mismatched `difficulty` and `weight` fields in `results/baselines.json`. Root cause: PR #64 (step 192) backfilled the `difficulty` field when the multi-factor difficulty model was introduced (PR #62), but did not update the corresponding `weight` field. This caused the oracle `weighted_mean_score` to be reported as 12.70 instead of the correct 12.61 (0.09 overstatement in metadata only).
+
+Miner ranking was **not affected** — `weighted_benchmark_score` is always computed fresh from `problem_difficulty()` at eval time.
+
+**Changes:**
+
+- `scripts/baseline_scores.py`: incremental mode now re-applies `problem_difficulty()` to all carried-over entries so difficulty model changes propagate without a full rescore. Drops the legacy `difficulty_weight` field from output.
+- `results/baselines.json`: 71 stale weights corrected, `difficulty_weight` field removed from all 1154 entries.
+- `benchmark/pool_config.json`: `oracle_weighted` 12.70 → 12.61.
+- `results/leaderboard.json` + `docs/dashboard_data.json`: oracle row updated.
+
+### System state after step 197
+
+- base-miner main: 4d7cc4ab (post-PR#73)
+- Benchmark: 1154 problems, oracle **12.61** weighted / 11.48 arithmetic, 47 repos, 6 languages
+- Pool rotation: Sunday 2026-06-08 (automated)
+- CI: all green
