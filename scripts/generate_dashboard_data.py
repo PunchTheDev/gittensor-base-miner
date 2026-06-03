@@ -280,7 +280,13 @@ def main(out_path: str | None = None):
     }
 
     dest = pathlib.Path(out_path) if out_path else pathlib.Path("dashboard_data.json")
-    dest.write_text(json.dumps(data, indent=2))
+    json_str = json.dumps(data, indent=2)
+    dest.write_text(json_str)
+    # Keep docs/ reference copy in sync when running locally (not in CI)
+    if not out_path:
+        docs_dest = pathlib.Path("docs/dashboard_data.json")
+        if docs_dest.parent.exists():
+            docs_dest.write_text(json_str)
     print(f"Wrote {len(problems)} problems, {len(leaderboard)} leaderboard rows, "
           f"{len(history)} history entries to {dest}")
 
