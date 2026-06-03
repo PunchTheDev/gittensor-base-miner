@@ -82,10 +82,10 @@ REPO_CATEGORY: dict[str, str] = {
 
 # Default per-category shard budget (sums to 30) — overridable via pool_config.json
 DEFAULT_SHARD_BUDGET: dict[str, int] = {
-    "python": 12,
-    "typescript": 8,
-    "rust": 5,
-    "jvm": 3,
+    "python": 10,
+    "rust": 10,
+    "typescript": 6,
+    "jvm": 2,
     "ruby": 2,
 }
 
@@ -337,8 +337,8 @@ def run_evaluation(
     # Oracle mode: score reference diffs directly — no agent call needed.
     # Used for pipeline calibration; expected weighted mean matches baselines.json.
     if use_oracle:
-        _oracle_weighted = 15.99
-        _oracle_arithmetic = 14.97
+        _oracle_weighted = 14.81
+        _oracle_arithmetic = 13.50
         _baselines_path = Path(__file__).parent.parent / "results" / "baselines.json"
         if _baselines_path.exists():
             try:
