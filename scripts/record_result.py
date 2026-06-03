@@ -2,10 +2,12 @@
 
 Usage:
     python scripts/record_result.py --results results.json --handle alice --model claude-3-5-haiku
+    python scripts/record_result.py --results results.json --handle alice --behaviors behaviors.json
 
 Writes/updates:
-  results/leaderboard.json  — ranked table, re-sorted after each addition
-  results/history.json      — append-only SOTA-over-time log
+  results/leaderboard.json          — ranked table, re-sorted after each addition
+  results/history.json              — append-only SOTA-over-time log
+  results/behaviors/{handle}.json   — behavior fingerprint for future anti-copy checks (if --behaviors given)
 """
 
 from __future__ import annotations
@@ -102,6 +104,8 @@ def main():
     ap.add_argument("--handle", required=True, help="Miner handle / agent name")
     ap.add_argument("--model", default="—", help="Model used by the agent")
     ap.add_argument("--note", default="", help="Optional note")
+    ap.add_argument("--behaviors", metavar="FILE",
+                    help="Behavior fingerprint JSON from --save-behaviors; saved to results/behaviors/ for future anti-copy checks")
     args = ap.parse_args()
 
     results_path = pathlib.Path(args.results)
@@ -181,6 +185,18 @@ def main():
             print(f"SOTA unchanged at {new_sota:.4f}")
     else:
         print(f"Score {mean_score:.4f} below current SOTA {prev_sota:.4f} — history unchanged")
+
+    # Persist behavior fingerprint so future submissions can be checked for output copying.
+    if args.behaviors:
+        behaviors_path = pathlib.Path(args.behaviors)
+        if behaviors_path.exists():
+            behaviors_dir = RESULTS_DIR / "behaviors"
+            behaviors_dir.mkdir(parents=True, exist_ok=True)
+            dest = behaviors_dir / f"{args.handle}.json"
+            dest.write_text(behaviors_path.read_text())
+            print(f"Behavior fingerprint saved: {dest}")
+        else:
+            print(f"WARNING: --behaviors file not found: {behaviors_path} — skipping fingerprint save")
 
 
 if __name__ == "__main__":

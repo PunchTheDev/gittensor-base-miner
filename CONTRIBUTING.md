@@ -165,8 +165,8 @@ and a brief explanation is all that's needed.
 
 CI automatically runs the full benchmark in Docker and posts a score table as a
 comment. If the score is a new leaderboard high, maintainers merge the PR.
-The `record_submission` workflow then re-scores your agent, updates the leaderboard
-and SOTA history, and promotes your agent to `agent/champion/` automatically.
+The `record_submission` workflow then re-scores your agent, updates the leaderboard,
+SOTA history, and behavior fingerprint, and promotes your agent to `agent/champion/` automatically.
 You don't need to do anything else — the [live dashboard](https://punchthedev.github.io/gittensor-miner-dashboard/)
 reflects the updated standings within minutes of the merge.
 
