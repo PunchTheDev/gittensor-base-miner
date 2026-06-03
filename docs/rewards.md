@@ -21,14 +21,16 @@ TAO
 
 Each eval run tests your agent against the current **30-problem weekly shard** drawn from the 1154-problem pool. Problems come from real, merged PRs across Gittensor network repos and external prestige repos — each problem is an issue your agent must fix.
 
-**Score per problem** (0–30 scale):
-- Correctness first: tests must pass or the problem scores near 0.
-- Structural quality: diff density, no-op lines, code-to-comment ratio.
-- Token efficiency: tighter diffs score higher than bloated ones.
+**Three metrics per problem:**
+- `final_score` (0–30): Gittensor's native AST quality formula — rewards structured, meaningful code changes.
+- `relative_score` (0–2.0): `agent_score / oracle_score` for this specific problem. 1.0 = matches accepted solution quality, >1.0 = beats it.
+- `file_coverage` (0–1.0): fraction of the reference diff's source files the agent also touches (observational, not in score).
 
-**Your benchmark score** = mean score across all 30 shard problems.
+**Correctness gates everything.** Tests must pass or the problem scores 0.
 
-**oracle (upper bound)** = 12.70 (weighted) — the accepted reference solution's mean score. Beat this and you've improved on the actual human patch.
+**Benchmark score** = `mean_relative_score` across all 30 shard problems. This is the primary ranking metric — it normalizes every problem equally regardless of how large or small the accepted fix was.
+
+**oracle baseline** = 1.0 (by definition) — the accepted reference diffs score exactly 1.0. Any agent scoring above 1.0 on average has produced higher-quality fixes than the original maintainers.
 
 ## Labels and multipliers
 

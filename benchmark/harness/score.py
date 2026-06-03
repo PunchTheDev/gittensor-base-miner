@@ -504,6 +504,48 @@ def _relative_score(base_score: float, meta: dict) -> float | None:
     return round(min(base_score / oracle, 2.0), 4)
 
 
+_TEST_ASSERTION_RE = re.compile(
+    r"\b(assert|assertEqual|assertRaises|assertTrue|assertFalse|assertIn|assertIs"
+    r"|expect\(|it\(|test\(|describe\(|@Test|func Test|#\[test\]"
+    r"|should\.|must\.|spec\.)\b"
+)
+
+
+def _detect_test_deletion(diff_text: str) -> dict:
+    """
+    Detect if a diff suspiciously removes test assertions or test functions.
+
+    Scans removed lines (-) in test files for assertion patterns. A high count
+    of removed assertions is a red flag that the agent gamed the test suite
+    (deleted or commented out failing assertions to force a pass).
+
+    Returns a dict with:
+      - test_assertions_removed (int): removed assertion lines in test files
+      - test_deletion_warning (bool): True if removal count exceeds threshold
+    """
+    in_test = False
+    removed_assertions = 0
+
+    for line in diff_text.splitlines():
+        if line.startswith("diff --git"):
+            path_match = re.search(r"b/(.+)$", line)
+            in_test = bool(path_match and _is_test_file(path_match.group(1)))
+            continue
+
+        if not in_test:
+            continue
+        if line.startswith("-") and not line.startswith("---"):
+            content = line[1:].strip()
+            if content and _TEST_ASSERTION_RE.search(content):
+                removed_assertions += 1
+
+    # Warn if more than 3 test assertions were removed — likely gaming.
+    return {
+        "test_assertions_removed": removed_assertions,
+        "test_deletion_warning": removed_assertions > 3,
+    }
+
+
 def _score_in_worktree(
     problem_dir: Path, repo_dir: Path, meta: dict, patch_path: Path, saturation_scale: float
 ) -> dict:
@@ -580,6 +622,7 @@ def _score_in_worktree(
     base_score = compute_base_score(src_tok, total_tok, saturation_scale)
     rel_score = _relative_score(base_score, meta)
     coverage = _file_coverage(problem_dir, diff_text)
+    deletion_info = _detect_test_deletion(diff_text)
 
     return {
         "problem_id": problem_id,
@@ -600,6 +643,8 @@ def _score_in_worktree(
         # file_coverage: fraction of reference-diff source files the agent also touches.
         # Observational only — a different-but-correct fix needn't match reference files.
         **coverage,
+        # Anti-gaming: flag suspicious test assertion removals (deleted/commented-out tests).
+        **deletion_info,
         # Multipliers (time_decay, review_quality, label, issue) require GitHub
         # API data — local scoring sets them to 1.0 as a conservative estimate.
         "multipliers": {"time_decay": 1.0, "review_quality": 1.0, "label": 1.0, "issue": 1.0},
