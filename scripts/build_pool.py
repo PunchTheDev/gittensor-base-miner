@@ -114,6 +114,40 @@ def has_test_files(diff: str) -> bool:
     )
 
 
+def has_source_changes(diff: str) -> bool:
+    """True if the diff modifies at least one non-test source file.
+
+    Filters out test-only PRs whose diffs only touch test files — those
+    produce src_tok=0 and therefore base_score≈0 regardless of correctness,
+    making them unsolvable as benchmark problems.
+    """
+    for line in diff.splitlines():
+        if not line.startswith("diff --git "):
+            continue
+        m = re.search(r" b/(.+)$", line)
+        if not m:
+            continue
+        path = m.group(1)
+        parts = path.lower().split("/")
+        filename = parts[-1]
+        # Classify as test file:
+        if any(d in ("tests", "test", "__tests__", "spec") for d in parts[:-1]):
+            continue
+        if filename.startswith("test_") or "_test." in filename:
+            continue
+        if ".spec." in filename or filename.endswith(".spec"):
+            continue
+        if re.search(r"tests?(?:case)?\.(?:java|kt|scala)$", filename):
+            continue
+        if filename.endswith("_spec.rb"):
+            continue
+        if filename.endswith("_test.go"):
+            continue
+        # This file is a source file
+        return True
+    return False
+
+
 def has_additions(diff: str) -> bool:
     """True if the diff adds at least 5 lines of code (not deletion-only).
 
@@ -352,6 +386,10 @@ def curate_pr(
 
     if not has_test_files(diff):
         print(f"  Skip {repo}#{pr_number}: no test files in diff")
+        return False
+
+    if not has_source_changes(diff):
+        print(f"  Skip {repo}#{pr_number}: test-only diff (no source file changes; scores 0)")
         return False
 
     if not has_additions(diff):
