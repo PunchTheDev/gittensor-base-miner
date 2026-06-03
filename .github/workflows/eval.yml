@@ -114,6 +114,7 @@ jobs:
           else:
               data = json.loads(results_path.read_text())
               mean = data.get("mean_score", 0)
+              weighted_mean = data.get("weighted_mean_score", mean)
               problems = data.get("problems", [])
 
               rows = []
@@ -126,7 +127,7 @@ jobs:
                   rows.append(f"| {pid} | {passed} | {score:.2f} | {note} |")
 
               table = "\n".join(rows)
-              summary = f"**Mean score: {mean:.4f} / 30** across {len(problems)} problems"
+              summary = f"**Weighted mean: {weighted_mean:.4f} / 30** (arithmetic {mean:.4f}) across {len(problems)} problems"
 
           env_file = os.environ.get("GITHUB_ENV", "/dev/null")
           with open(env_file, "a") as f:
@@ -167,12 +168,12 @@ jobs:
               }
             } catch (e) {}
 
-            // Get oracle mean from leaderboard
+            // Get oracle weighted mean from leaderboard (the metric miners compete on)
             let oracleMean = null;
             try {
               const lb = JSON.parse(fs.readFileSync('results/leaderboard.json', 'utf8'));
               const oracle = lb.find(e => e.agent === 'Oracle (accepted solution)');
-              if (oracle) oracleMean = oracle.score;
+              if (oracle) oracleMean = oracle.weighted_score ?? oracle.score;
             } catch (e) {}
 
             function difficulty(score) {
@@ -189,6 +190,7 @@ jobs:
                 `Check the [workflow logs](${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}) for details.`;
             } else {
               const mean = resultsJson.mean_score ?? 0;
+              const weightedMean = resultsJson.weighted_mean_score ?? mean;
               const problems = resultsJson.problems ?? [];
               const passed = problems.filter(p => p.tests_passed).length;
               let beatBaseline = 0;
@@ -209,11 +211,11 @@ jobs:
               }).join('\n');
 
               const oracleNote = oracleMean !== null
-                ? ` &nbsp;|&nbsp; Oracle: **${oracleMean.toFixed(2)} / 30**`
+                ? ` &nbsp;|&nbsp; Oracle: **${oracleMean.toFixed(2)} / 30** (weighted)`
                 : '';
 
               body = `## Benchmark Evaluation — ${handle}\n\n` +
-                `**Mean: ${mean.toFixed(4)} / 30** &nbsp;|&nbsp; ` +
+                `**Weighted mean: ${weightedMean.toFixed(4)} / 30** (arithmetic ${mean.toFixed(4)}) &nbsp;|&nbsp; ` +
                 `**${passed}/${problems.length} passed** &nbsp;|&nbsp; ` +
                 `**${beatBaseline}/${problems.length} beat baseline**` +
                 oracleNote + `\n\n` +
@@ -265,20 +267,24 @@ jobs:
 
             // Parse eval results
             let mean = null;
+            let weightedMean = null;
             let oracleMean = null;
             try {
               const data = JSON.parse(fs.readFileSync('results.json', 'utf8'));
               mean = data.mean_score ?? null;
+              weightedMean = data.weighted_mean_score ?? mean;
             } catch (e) {}
             try {
               const lb = JSON.parse(fs.readFileSync('results/leaderboard.json', 'utf8'));
-              // Highest score among real ranked entries
               const real = lb.filter(r => r.rank !== null && r.score !== null);
-              oracleMean = lb.find(r => r.rank === null)?.score ?? 22.83;
-              // Current SOTA (best non-oracle)
-              const sota = real.length > 0 ? Math.max(...real.map(r => r.score)) : 0;
+              const oracleRow = lb.find(r => r.rank === null);
+              oracleMean = oracleRow?.weighted_score ?? oracleRow?.score ?? 12.77;
+              // Current SOTA by weighted_score (primary ranking metric)
+              const sota = real.length > 0
+                ? Math.max(...real.map(r => r.weighted_score ?? r.score))
+                : 0;
               context.sota = sota;
-            } catch (e) { oracleMean = 22.83; context.sota = 0; }
+            } catch (e) { oracleMean = 12.77; context.sota = 0; }
 
             if (mean === null) return; // eval failed, skip labeling
 
@@ -325,15 +331,16 @@ jobs:
             });
 
             // If new champion, post a celebration comment
+            const scoreStr = weightedMean !== null ? weightedMean.toFixed(4) : (mean ?? 0).toFixed(4);
             if (isNewChampion) {
               const oracleNote = oracleMean !== null
-                ? ` (oracle upper bound: **${oracleMean.toFixed(2)}**)` : '';
+                ? ` (oracle weighted mean: **${oracleMean.toFixed(2)}**)` : '';
               await github.rest.issues.createComment({
                 owner: context.repo.owner,
                 repo: context.repo.repo,
                 issue_number: context.issue.number,
-                body: `### New SOTA: ${mean.toFixed(4)} / 30\n\n` +
-                  `**${handle}** is the new benchmark champion, beating the previous record of **${sota.toFixed(4)}**${oracleNote}.\n\n` +
+                body: `### New SOTA: ${scoreStr} / 30 (weighted)\n\n` +
+                  `**${handle}** is the new benchmark champion, beating the previous record of **${context.sota.toFixed(4)}**${oracleNote}.\n\n` +
                   `When this PR is merged, run \`python scripts/record_result.py\` to update the leaderboard and dashboard.`,
               });
             }
