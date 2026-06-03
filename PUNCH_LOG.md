@@ -3638,3 +3638,25 @@ JS dynamically updates the `id="hs-pool"` and `id="hero-pool-size"` elements fro
 - Allowed models: 19
 - Pool rotation: Sunday 2026-06-08 (automated)
 - CI: all green
+
+## Step 202 — 2026-06-03
+
+**API accuracy fix** (PR #78 merged — 3d8208be)
+
+Two bugs found in `api/server.py` via live API audit:
+
+1. **Wrong difficulty function**: `_difficulty_by_lines()` was calling `catalog.problem_tier()` (line-count only) instead of `evaluate.problem_difficulty()` (multi-factor with ×1.3 for ≥5 files, ×1.2 for new-file creation). `/api/problems`, `/api/shard`, and `/api/stats` were reporting stale difficulty tiers for problems where the multi-factor model promoted them — miners could see "medium" difficulty for problems that score as "hard" (2× weight at eval time).
+
+2. **Stale scoring formula in `/api/agents`**: Still described the old Gittensor formula `25 * (1 - exp(-tokens/58))`. Replaced with:
+   - `formula`: v5 benchmark_score formula  
+   - `weighted_formula`: weighted_benchmark_score aggregation  
+   - `primary_metric`: `weighted_benchmark_score`  
+   - `difficulty_weights`: `{easy: 1.0, medium: 1.5, hard: 2.0}`
+
+### System state after step 202
+
+- base-miner main: 3d8208be (PR #78 merged)
+- Benchmark: 1154 problems, oracle **12.61** weighted / 11.48 arithmetic, 47 repos
+- API: serving correct difficulty tiers + v5 scoring formula
+- Pool rotation: Sunday 2026-06-08 (automated, 5 days)
+- CI: all green
