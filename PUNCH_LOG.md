@@ -3691,3 +3691,44 @@ Dashboard auto-reads the file — will reflect 27 models on next CI refresh.
 - Model whitelist: 27 models across 7 families
 - Pool rotation: Sunday 2026-06-08 (automated, 5 days)
 - CI: all green
+
+---
+
+## Step 204 — 2026-06-03
+
+**Model whitelist audit + fix** (PR #80 merged — 334c490c)
+
+Verified all whitelist entries against OpenRouter API. Found 9 stale/non-existent model IDs that miners couldn't actually use.
+
+**Removed (9 stale entries):**
+- `deepseek/deepseek-v3` → not a valid OpenRouter ID
+- `deepseek/deepseek-coder` → deprecated
+- `anthropic/claude-3-5-haiku` → wrong separator (should use dots, not dashes for minor versions)
+- `anthropic/claude-3-5-sonnet` → not on OpenRouter
+- `google/gemini-flash-1.5` → deprecated
+- `google/gemini-2.0-flash-001` → deprecated
+- `meta-llama/llama-3.1-405b-instruct` → not available
+- `mistralai/mistral-7b-instruct` → deprecated
+- `mistralai/codestral-2501` → outdated
+
+**Added (10 new entries, all verified):**
+- `anthropic/claude-3.5-haiku` (fixed naming)
+- `anthropic/claude-haiku-4.5` (Claude 4 budget)
+- `anthropic/claude-sonnet-4.5` (Claude 4 standard)
+- `anthropic/claude-opus-4` (Claude 4 most capable)
+- `deepseek/deepseek-v3.2` (latest DeepSeek V3)
+- `google/gemini-2.5-pro` (Gemini 2.5 capable)
+- `google/gemini-3.5-flash` (Gemini 3.5 fast)
+- `qwen/qwen3-coder` (Qwen3 coding specialist)
+- `mistralai/codestral-2508` (latest Codestral)
+- `mistralai/devstral-2512` (Mistral coding model)
+
+Net: 27 → 28 models. All 28 verified as live on OpenRouter. API restarted; `/api/agents` constraints.allowed_models confirmed.
+
+### System state after step 204
+
+- base-miner main: 334c490c (PR #80 merged)
+- Benchmark: 1154 problems, oracle **12.61** weighted / 11.48 arithmetic, 47 repos
+- Model whitelist: **28 models**, all verified live on OpenRouter 2026-06-03
+- Pool rotation: Sunday 2026-06-08 (automated, 5 days)
+- CI: all green
