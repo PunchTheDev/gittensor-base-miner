@@ -4111,3 +4111,22 @@ All 65 whitelist models confirmed live on OpenRouter. Submit footgun fixed.
 ### Status
 Pool 1123, oracle 12.64, whitelist 65 models, rotation Sunday 2026-06-08 (5 days, green).
 Stale dashboard data fixed. Trigger gap fixed in pending node24 branch.
+
+---
+
+## Step 223 — 2026-06-03
+
+### Actions
+- **PR #97**: Add per-agent submission history storage and API endpoint (merged fc58e0fa)
+  - `record_result.py`: appends every scored submission to `results/agents/{handle}/history.json`
+    alongside the leaderboard upsert — leaderboard keeps only best entry per handle, history keeps all
+  - `api/server.py`: `GET /api/agents/{handle}/history` returns all submissions summary (breakdown
+    field excluded to keep response small), `AGENTS_DIR` constant, updated docstring + startup print
+- **Dashboard PR #10**: Show per-agent submission history in breakdown drawer (merged 92d6b84)
+  - `loadAgentHistory()`: async fetch from new endpoint; inserts above per-problem table when ready
+  - `renderAgentHistory()`: stat cards (run count, best, latest), Chart.js line chart (≥2 runs),
+    history table newest-first (date/benchmark/score/model/marginal gain)
+  - Chart destroyed on `closeSubDrawer()` to prevent Chart.js canvas reuse errors
+
+### Status
+Pool 1123, oracle 12.64, whitelist 65 models. Agent history tracking live in storage + API + dashboard.
