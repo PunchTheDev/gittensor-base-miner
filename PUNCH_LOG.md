@@ -4227,3 +4227,19 @@ Pool 1123, oracle 12.64, 65 models. API rate-limited, leaderboard pagination rea
 
 ### Status
 Pool 1123, oracle 12.64, 65 models. Dashboard console errors cleared, oracle explanation improved, server auto-syncs every 15min.
+
+---
+
+## Step 229 — 2026-06-03
+
+### What changed
+- **PR #103**: Fix `mine` loop rotation timing + show next rotation in `doctor` (merged faca5ef2)
+  - Bug: `mine --loop` daemon used `_seconds_to_next_monday()` but shard epoch is 2024-01-01
+    with 7-day cycles — not calendar weeks. Daemon could wake 0-2 days before or after actual rotation.
+  - Fix: `_seconds_to_next_rotation()` computes exact time until next epoch week boundary.
+  - `gitminer doctor` now shows `next=2026-06-08 (5d)` in the Shard config line so miners
+    know exactly when their shard will change.
+- DAS check: 19 repos in DAS, all present in registered_repos — no change since step 225.
+
+### Status
+Pool 1123, oracle 12.64, 65 models. Next shard rotation: 2026-06-08 (5 days).
