@@ -1,0 +1,274 @@
+diff --git a/axum-macros/CHANGELOG.md b/axum-macros/CHANGELOG.md
+index e60a577014..decb5172a8 100644
+--- a/axum-macros/CHANGELOG.md
++++ b/axum-macros/CHANGELOG.md
+@@ -9,8 +9,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
+ 
+ - **breaking:** `#[from_request(via(Extractor))]` now uses the extractor's
+   rejection type instead of `axum::response::Response` ([#3261])
++- **breaking:** `Option<T>` fields in `#[derive(FromRequest)]` and
++  `#[derive(FromRequestParts)]` now use `OptionalFromRequest` /
++  `OptionalFromRequestParts` instead of calling `.ok()` on the result. This
++  means the extractor decides when to return `None` vs an error, instead of
++  silently converting all rejections to `None`. Extractors used with
++  `Option<T>` must implement `OptionalFromRequest` or
++  `OptionalFromRequestParts`. ([#3623])
+ 
+ [#3261]: https://github.com/tokio-rs/axum/pull/3261
++[#3623]: https://github.com/tokio-rs/axum/issues/3623
+ 
+ # 0.5.1
+ 
+diff --git a/axum-macros/src/from_request/mod.rs b/axum-macros/src/from_request/mod.rs
+index a2432e74c5..17d9062bbe 100644
+--- a/axum-macros/src/from_request/mod.rs
++++ b/axum-macros/src/from_request/mod.rs
+@@ -476,19 +476,25 @@ fn extract_fields(
+ 
+             if peel_option(&field.ty).is_some() {
+                 let field_ty = into_outer(via.as_ref(), ty_span, peel_option(&field.ty).unwrap());
++                let map_err = if let Some(rejection) = rejection {
++                    quote! { <#rejection as ::std::convert::From<_>>::from }
++                } else {
++                    quote! { ::axum::response::IntoResponse::into_response }
++                };
++
+                 let tokens = match tr {
+                     Trait::FromRequest => {
+                         quote_spanned! {ty_span=>
+                             #member: {
+                                 let (mut parts, body) = req.into_parts();
+                                 let value =
+-                                    <#field_ty as ::axum::extract::FromRequestParts<_>>::from_request_parts(
++                                    <#field_ty as ::axum::extract::OptionalFromRequestParts<_>>::from_request_parts(
+                                         &mut parts,
+                                         state,
+                                     )
+                                     .await
+-                                    .ok()
+-                                    .map(#into_inner);
++                                    .map(|opt| opt.map(#into_inner))
++                                    .map_err(#map_err)?;
+                                 req = ::axum::http::Request::from_parts(parts, body);
+                                 value
+                             },
+@@ -497,13 +503,13 @@ fn extract_fields(
+                     Trait::FromRequestParts => {
+                         quote_spanned! {ty_span=>
+                             #member: {
+-                                <#field_ty as ::axum::extract::FromRequestParts<_>>::from_request_parts(
++                                <#field_ty as ::axum::extract::OptionalFromRequestParts<_>>::from_request_parts(
+                                     parts,
+                                     state,
+                                 )
+                                 .await
+-                                .ok()
+-                                .map(#into_inner)
++                                .map(|opt| opt.map(#into_inner))
++                                .map_err(#map_err)?
+                             },
+                         }
+                     }
+@@ -597,12 +603,18 @@ fn extract_fields(
+ 
+         let item = if peel_option(&field.ty).is_some() {
+             let field_ty = into_outer(via.as_ref(), ty_span, peel_option(&field.ty).unwrap());
++            let map_err = if let Some(rejection) = rejection {
++                quote! { <#rejection as ::std::convert::From<_>>::from }
++            } else {
++                quote! { ::axum::response::IntoResponse::into_response }
++            };
++
+             quote_spanned! {ty_span=>
+                 #member: {
+-                    <#field_ty as ::axum::extract::FromRequest<_, _>>::from_request(req, state)
++                    <#field_ty as ::axum::extract::OptionalFromRequest<_, _>>::from_request(req, state)
+                         .await
+-                        .ok()
+-                        .map(#into_inner)
++                        .map(|opt| opt.map(#into_inner))
++                        .map_err(#map_err)?
+                 },
+             }
+         } else if peel_result_ok(&field.ty).is_some() {
+diff --git a/axum-macros/src/lib.rs b/axum-macros/src/lib.rs
+index 0d143d79ba..6c88cbea98 100644
+--- a/axum-macros/src/lib.rs
++++ b/axum-macros/src/lib.rs
+@@ -136,7 +136,7 @@ use from_request::Trait::{FromRequest, FromRequestParts};
+ ///
+ /// #[derive(FromRequest)]
+ /// struct MyExtractor {
+-///     // This will extracted via `Option::<TypedHeader<ContentType>>::from_request`
++///     // This will extracted via `<TypedHeader<ContentType> as OptionalFromRequestParts>::from_request_parts`
+ ///     #[from_request(via(TypedHeader))]
+ ///     content_type: Option<ContentType>,
+ ///     // This will extracted via
+diff --git a/axum-macros/tests/from_request/fail/option_without_optional_from_request.rs b/axum-macros/tests/from_request/fail/option_without_optional_from_request.rs
+new file mode 100644
+index 0000000000..ce33821586
+--- /dev/null
++++ b/axum-macros/tests/from_request/fail/option_without_optional_from_request.rs
+@@ -0,0 +1,15 @@
++use axum::{routing::get, Router};
++use axum_macros::FromRequest;
++
++struct Payload;
++
++#[derive(FromRequest)]
++struct Args {
++    payload: Option<Payload>,
++}
++
++async fn handler(_: Args) {}
++
++fn main() {
++    let _: Router = Router::new().route("/", get(handler));
++}
+diff --git a/axum-macros/tests/from_request/fail/option_without_optional_from_request.stderr b/axum-macros/tests/from_request/fail/option_without_optional_from_request.stderr
+new file mode 100644
+index 0000000000..2f8b12a154
+--- /dev/null
++++ b/axum-macros/tests/from_request/fail/option_without_optional_from_request.stderr
+@@ -0,0 +1,39 @@
++error[E0277]: the trait bound `Payload: OptionalFromRequest<_, _>` is not satisfied
++ --> tests/from_request/fail/option_without_optional_from_request.rs:8:21
++  |
++8 |     payload: Option<Payload>,
++  |                     ^^^^^^^ unsatisfied trait bound
++  |
++help: the trait `OptionalFromRequest<_, _>` is not implemented for `Payload`
++ --> tests/from_request/fail/option_without_optional_from_request.rs:4:1
++  |
++4 | struct Payload;
++  | ^^^^^^^^^^^^^^
++help: the trait `OptionalFromRequest<S>` is implemented for `Json<T>`
++ --> $WORKSPACE/axum/src/json.rs
++  |
++  | / impl<T, S> OptionalFromRequest<S> for Json<T>
++  | | where
++  | |     T: DeserializeOwned,
++  | |     S: Send + Sync,
++  | |___________________^
++
++error[E0277]: the trait bound `Payload: OptionalFromRequest<_, _>` is not satisfied
++ --> tests/from_request/fail/option_without_optional_from_request.rs:8:14
++  |
++8 |     payload: Option<Payload>,
++  |              ^^^^^^^^^^^^^^^ unsatisfied trait bound
++  |
++help: the trait `OptionalFromRequest<_, _>` is not implemented for `Payload`
++ --> tests/from_request/fail/option_without_optional_from_request.rs:4:1
++  |
++4 | struct Payload;
++  | ^^^^^^^^^^^^^^
++help: the trait `OptionalFromRequest<S>` is implemented for `Json<T>`
++ --> $WORKSPACE/axum/src/json.rs
++  |
++  | / impl<T, S> OptionalFromRequest<S> for Json<T>
++  | | where
++  | |     T: DeserializeOwned,
++  | |     S: Send + Sync,
++  | |___________________^
+diff --git a/axum-macros/tests/from_request/pass/option_via_json.rs b/axum-macros/tests/from_request/pass/option_via_json.rs
+new file mode 100644
+index 0000000000..7b4f0dfed9
+--- /dev/null
++++ b/axum-macros/tests/from_request/pass/option_via_json.rs
+@@ -0,0 +1,48 @@
++use axum::{
++    extract::rejection::{JsonRejection, PathRejection},
++    response::{IntoResponse, Response},
++    routing::post,
++    Json, Router,
++};
++use axum_macros::FromRequest;
++use serde::Deserialize;
++
++fn main() {
++    let _: Router = Router::new().route("/{something}", post(handler));
++}
++
++async fn handler(_: Args) {}
++
++#[derive(Deserialize)]
++struct Payload {
++    value: String,
++}
++
++#[derive(FromRequest)]
++#[from_request(rejection(MyError))]
++struct Args {
++    #[from_request(via(axum::extract::Path))]
++    something: String,
++    #[from_request(via(Json))]
++    request: Option<Payload>,
++}
++
++struct MyError(Response);
++
++impl From<PathRejection> for MyError {
++    fn from(rejection: PathRejection) -> Self {
++        Self(rejection.into_response())
++    }
++}
++
++impl From<JsonRejection> for MyError {
++    fn from(rejection: JsonRejection) -> Self {
++        Self(rejection.into_response())
++    }
++}
++
++impl IntoResponse for MyError {
++    fn into_response(self) -> Response {
++        self.0
++    }
++}
+diff --git a/axum-macros/tests/from_request/pass/option_via_parts.rs b/axum-macros/tests/from_request/pass/option_via_parts.rs
+new file mode 100644
+index 0000000000..a3028d6236
+--- /dev/null
++++ b/axum-macros/tests/from_request/pass/option_via_parts.rs
+@@ -0,0 +1,42 @@
++use axum::{
++    extract::FromRequestParts,
++    response::{IntoResponse, Response},
++};
++use axum_extra::{
++    headers,
++    typed_header::TypedHeaderRejection,
++    TypedHeader,
++};
++
++// Option<T> with via() in a FromRequestParts derive should use
++// OptionalFromRequestParts, not .ok().
++#[derive(FromRequestParts)]
++#[from_request(rejection(MyError))]
++struct Extractor {
++    #[from_request(via(TypedHeader))]
++    content_type: Option<headers::ContentType>,
++    #[from_request(via(TypedHeader))]
++    user_agent: headers::UserAgent,
++}
++
++fn assert_from_request()
++where
++    Extractor: FromRequestParts<(), Rejection = MyError>,
++{
++}
++
++struct MyError(Response);
++
++impl From<TypedHeaderRejection> for MyError {
++    fn from(rejection: TypedHeaderRejection) -> Self {
++        Self(rejection.into_response())
++    }
++}
++
++impl IntoResponse for MyError {
++    fn into_response(self) -> Response {
++        self.0
++    }
++}
++
++fn main() {}

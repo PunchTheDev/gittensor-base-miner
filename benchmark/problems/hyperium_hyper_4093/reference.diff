@@ -1,0 +1,63 @@
+diff --git a/src/proto/h1/io.rs b/src/proto/h1/io.rs
+index d080333282..5719e3ca04 100644
+--- a/src/proto/h1/io.rs
++++ b/src/proto/h1/io.rs
+@@ -222,7 +222,14 @@ where
+ 
+     pub(crate) fn poll_read_from_io(&mut self, cx: &mut Context<'_>) -> Poll<io::Result<usize>> {
+         self.read_blocked = false;
+-        let next = self.read_buf_strategy.next();
++        // Get the next amount to allocate, but make sure we don't go over
++        // the max read buf size configured.
++        let next = cmp::min(
++            self.read_buf_strategy.next(),
++            self.read_buf_strategy
++                .max()
++                .saturating_sub(self.read_buf.len()),
++        );
+         if self.read_buf_remaining_mut() < next {
+             self.read_buf.reserve(next);
+         }
+diff --git a/tests/server.rs b/tests/server.rs
+index 651fbdf40d..b4c66022a6 100644
+--- a/tests/server.rs
++++ b/tests/server.rs
+@@ -2387,6 +2387,38 @@ async fn max_buf_size() {
+         .expect_err("should TooLarge error");
+ }
+ 
++#[cfg(feature = "http1")]
++#[tokio::test]
++async fn max_buf_size_split_header_boundary() {
++    let (listener, addr) = setup_tcp_listener();
++
++    const MAX: usize = 8192;
++
++    thread::spawn(move || {
++        let mut tcp = connect(&addr);
++        tcp.write_all(b"GET / HTTP/1.1\r\nHost: x\r\nConnection: close\r\nX: ")
++            .expect("write 1");
++        tcp.write_all(&[b'a'; 7000]).expect("write 2");
++        thread::sleep(Duration::from_millis(100));
++        tcp.write_all(&[b'a'; 5000]).expect("write 3");
++        tcp.write_all(b"\r\n\r\n").expect("write 4");
++
++        let mut buf = String::new();
++        tcp.read_to_string(&mut buf).expect("read response");
++
++        let expected = "HTTP/1.1 431 ";
++        assert_eq!(&buf[..expected.len()], expected);
++    });
++
++    let (socket, _) = listener.accept().await.unwrap();
++    let socket = TokioIo::new(socket);
++    http1::Builder::new()
++        .max_buf_size(MAX)
++        .serve_connection(socket, HelloWorld)
++        .await
++        .expect_err("should TooLarge error");
++}
++
+ #[cfg(feature = "http1")]
+ #[tokio::test]
+ async fn graceful_shutdown_before_first_request_no_block() {

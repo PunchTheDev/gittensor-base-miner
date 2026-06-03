@@ -53,6 +53,8 @@ REPO_CATEGORY: dict[str, str] = {
     # Rust external repos
     "tokio-rs/tokio": "rust",
     "clap-rs/clap": "rust",
+    "hyperium/hyper": "rust",
+    "tokio-rs/axum": "rust",
 }
 
 # Shard sampling budget per category (sums to 30)
