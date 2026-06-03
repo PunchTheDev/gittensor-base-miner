@@ -19,7 +19,6 @@ Returns None if tree_sitter is not installed (caller falls back to heuristic).
 from __future__ import annotations
 
 import json
-import re
 from collections import Counter
 from pathlib import Path
 from typing import Optional
@@ -35,15 +34,6 @@ except ImportError:
     _TREE_SITTER_AVAILABLE = False
 
 _WEIGHTS_DIR = Path(__file__).parent / "weights"
-
-# Inline-test language extensions (Rust's #[test], etc.)
-_INLINE_TEST_EXTS = {"rs", "zig", "d"}
-_INLINE_TEST_RE = re.compile(
-    r"#\[(?:cfg\(test\)|test|tokio::test)\]|#!\[cfg\(test\)\]"
-    r"|^test\s+\"[^\"]+\"\s*\{|^test\s*\{"
-    r"|^unittest\s*\{",
-    re.MULTILINE,
-)
 
 # Non-code extensions: use line-count scoring, not tree-sitter
 _NON_CODE_EXTS = {
@@ -254,10 +244,6 @@ def is_test_file(path: str, new_content: Optional[str] = None, ext: str = "") ->
         or filename.endswith(".spec.ts")
         or filename.endswith(".spec.js")
     ):
-        return True
-
-    # Inline test detection (Rust #[test], etc.)
-    if ext in _INLINE_TEST_EXTS and new_content and _INLINE_TEST_RE.search(new_content):
         return True
 
     return False

@@ -2639,3 +2639,15 @@ The patch-apply bug fix (`b51d955`) corrected `score_diff_quality` but baselines
 4 remaining zero-score problems all have `das_base_score=0.0` — confirmed as genuine zeros (DAS agrees).
 
 Updated: `results/baselines.json`, `results/leaderboard.json` (oracle row), `docs/dashboard_data.json`. API restarted — oracle_score now reads 13.39.
+
+## 2026-06-03 — Rust inline test detection bug fix; oracle 13.39 → 15.02
+
+**Root cause**: `is_test_file` in `tree_sitter_scorer.py` used `_INLINE_TEST_RE` to classify entire Rust source files as test files if they contained ANY `#[test]` attribute. Large source files like `synthesis.rs` (13,797 lines, 221 `#[test]` attrs) had `file_weight=0.05` applied instead of `1.0`, zeroing out `src_score`. `compute_base_score(0.0, 18.7) = 0.06` instead of the correct ~23.
+
+**Affected**: 51+ Rust source file problems. The 4 phase-rs low outliers (local 1–6% of DAS) were caused entirely by this. After fix: those 4 now score 10.94–23.14.
+
+**Fix**: Removed `_INLINE_TEST_EXTS` and `_INLINE_TEST_RE` from `is_test_file`. Path-based detection (`/tests/`, `_test.`, etc.) already correctly handles test files. Rust files in `src/` with embedded `#[cfg(test)]` blocks are source files, not test files.
+
+**Oracle**: 13.39 → **15.02** weighted / 12.43 → **13.91** arithmetic.
+
+**Parity note**: Fix revealed more phase-rs problems with DAS≈0 (test failures on DAS side). Median local/DAS ratio remains 1.00×; 340/412 within 10×. The new "high outliers" are DAS test-failure cases, not scorer bugs.
