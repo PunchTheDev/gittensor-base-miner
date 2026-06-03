@@ -2469,3 +2469,20 @@ Both fixes are cosmetic/accuracy — no logic changes.
 **Root cause**: Miners could be confused when local Docker score didn't match CI score because CI uses a secret-seeded shard different from the default.
 
 **System health**: pool=441, oracle=13.03, API healthy, no open PRs.
+
+---
+
+## Step 148 — 2026-06-03
+
+**Consistency fix: PR template and `gitminer submit` checklist** (commit `14aa94e`)
+
+Two stale references discovered during pre-launch audit:
+
+| File | Stale | Fixed |
+|---|---|---|
+| `.github/PULL_REQUEST_TEMPLATE.md` | `python scripts/run_eval.py --agent ...` (internal CI script, not miner-facing) | `python3 gitminer.py eval agent/submissions/<my-handle>/agent.py --no-sandbox` |
+| `gitminer.py` `_build_pr_body` | `sha256sum agent/submissions/{handle}/agent.py` (system tool, inconsistent with commit-reveal docs) | `python3 gitminer.py hash agent/submissions/{handle}/agent.py` |
+
+Both now point to the canonical `gitminer` CLI commands documented throughout README and CONTRIBUTING. A miner filling out the PR template checklist will see consistent commands.
+
+**System health**: API pool=441, oracle=13.03, no open PRs, all CLI commands verified.
