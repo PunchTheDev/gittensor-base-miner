@@ -128,12 +128,56 @@ def load_pool_config() -> dict:
     return {"shard_size": 30, "rotation_policy": "weekly", "rotation_seed": 42}
 
 
-def select_shard(all_problem_dirs: list[Path], config: dict) -> list[Path]:
-    """Pick a deterministic, category-balanced shard from the pool.
+def _sample_difficulty_balanced(pool: list[Path], n: int) -> list[Path]:
+    """Sample n problems from pool, proportionally balanced across difficulty tiers.
 
-    Problems are grouped by language category and sampled according to
-    shard_budget (from pool_config.json, or DEFAULT_SHARD_BUDGET). This
-    ensures well-roundedness: no single language can dominate a round.
+    Within each tier (hard/medium/easy), samples proportionally to the tier's
+    share of the pool. Hard problems are prioritised in tie-breaking so every
+    shard is guaranteed to include challenging problems.
+
+    The pool must be pre-shuffled by the caller for randomness.
+    """
+    if n <= 0:
+        return []
+    if n >= len(pool):
+        return pool[:]
+
+    # Sub-group by difficulty; pool is already shuffled by the caller.
+    by_tier: dict[str, list[Path]] = {}
+    for d in pool:
+        tier, _ = problem_difficulty(d)
+        by_tier.setdefault(tier, []).append(d)
+
+    total = len(pool)
+    # Prioritise hard → medium → easy so the last partial slot goes to hard problems.
+    tier_order = [t for t in ("hard", "medium", "easy") if t in by_tier]
+
+    selected: list[Path] = []
+    remaining = n
+
+    for i, tier in enumerate(tier_order):
+        tier_pool = by_tier[tier]
+        if i == len(tier_order) - 1:
+            # Last tier absorbs any rounding remainder.
+            want = remaining
+        else:
+            want = round(n * len(tier_pool) / total)
+        take = min(want, len(tier_pool), remaining)
+        selected.extend(tier_pool[:take])
+        remaining -= take
+        if remaining == 0:
+            break
+
+    return selected
+
+
+def select_shard(all_problem_dirs: list[Path], config: dict) -> list[Path]:
+    """Pick a deterministic, category- and difficulty-balanced shard from the pool.
+
+    Problems are first grouped by language category and sampled according to
+    shard_budget (from pool_config.json, or DEFAULT_SHARD_BUDGET). Within each
+    category bucket, problems are further sampled proportionally across difficulty
+    tiers (hard/medium/easy) so every shard contains a realistic spread.
 
     If a category has fewer problems than its budget, the remainder is
     redistributed to other categories proportionally.
@@ -164,7 +208,7 @@ def select_shard(all_problem_dirs: list[Path], config: dict) -> list[Path]:
 
     rng = random.Random(seed)
 
-    # Group and shuffle each category bucket independently
+    # Group and shuffle each category bucket independently.
     by_category: dict[str, list[Path]] = {}
     for d in all_problem_dirs:
         cat = _problem_category(d)
@@ -172,7 +216,8 @@ def select_shard(all_problem_dirs: list[Path], config: dict) -> list[Path]:
     for cat in by_category:
         rng.shuffle(by_category[cat])
 
-    # First pass: take up to budget from each budgeted category
+    # First pass: take up to budget from each budgeted category,
+    # sampling difficulty-proportionally within each bucket.
     selected: list[Path] = []
     cats = list(budget.keys())
     taken: dict[str, int] = {}
@@ -181,23 +226,23 @@ def select_shard(all_problem_dirs: list[Path], config: dict) -> list[Path]:
         pool = by_category.get(cat, [])
         want = budget.get(cat, 0)
         take = min(want, len(pool))
-        selected.extend(pool[:take])
+        selected.extend(_sample_difficulty_balanced(pool, take))
         taken[cat] = take
         shortfall += want - take
 
-    # Second pass: fill any shortfall from remaining problems in over-budget cats
+    # Second pass: fill any shortfall from remaining problems in over-budget cats.
     if shortfall > 0:
         for cat in cats:
             pool = by_category.get(cat, [])
             extras = pool[taken[cat]:]
             if extras:
                 give = min(shortfall, len(extras))
-                selected.extend(extras[:give])
+                selected.extend(_sample_difficulty_balanced(extras, give))
                 shortfall -= give
                 if shortfall == 0:
                     break
 
-    # Final pass: pick up any "other" category problems if still short
+    # Final pass: pick up any "other" category problems if still short.
     if shortfall > 0:
         others = by_category.get("other", [])
         if others:

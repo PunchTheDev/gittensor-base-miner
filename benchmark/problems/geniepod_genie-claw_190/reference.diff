@@ -1,0 +1,304 @@
+diff --git a/crates/genie-core/src/conversation.rs b/crates/genie-core/src/conversation.rs
+index 45f87ed..bf5487f 100644
+--- a/crates/genie-core/src/conversation.rs
++++ b/crates/genie-core/src/conversation.rs
+@@ -118,6 +118,19 @@ impl ConversationStore {
+         Ok(())
+     }
+ 
++    /// Append a message, logging SQLite/IO failures instead of silently dropping them.
++    pub fn append_or_log(&self, conv_id: &str, role: &str, content: &str, tool_name: Option<&str>) {
++        if let Err(error) = self.append(conv_id, role, content, tool_name) {
++            tracing::error!(
++                conv_id,
++                role,
++                tool_name,
++                error = %error,
++                "conversation append failed"
++            );
++        }
++    }
++
+     /// Get all messages in a conversation.
+     pub fn get_messages(&self, conv_id: &str) -> Result<Vec<Message>> {
+         let mut stmt = self
+@@ -283,6 +296,46 @@ mod tests {
+         assert_eq!(convos[0].title, "New conversation");
+     }
+ 
++    #[test]
++    #[cfg(unix)]
++    fn append_returns_error_on_readonly_db() {
++        use std::os::unix::fs::PermissionsExt;
++
++        let id = TEST_ID.fetch_add(1, Ordering::Relaxed);
++        let path = std::env::temp_dir().join(format!(
++            "geniepod-conv-readonly-{}-{}.db",
++            std::process::id(),
++            id
++        ));
++        let _ = std::fs::remove_file(&path);
++        let store = ConversationStore::open(&path).unwrap();
++        let conv_id = store.create().unwrap();
++        drop(store);
++
++        let mut perms = std::fs::metadata(&path).unwrap().permissions();
++        perms.set_mode(0o444);
++        std::fs::set_permissions(&path, perms).unwrap();
++
++        let store = ConversationStore {
++            conn: Connection::open_with_flags(&path, rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY)
++                .unwrap(),
++        };
++        let error = store
++            .append(&conv_id, "assistant", "hello", None)
++            .unwrap_err();
++        assert!(
++            !error.to_string().is_empty(),
++            "append should fail on readonly db: {error}"
++        );
++
++        store.append_or_log(&conv_id, "assistant", "hello", None);
++
++        let mut perms = std::fs::metadata(&path).unwrap().permissions();
++        perms.set_mode(0o644);
++        std::fs::set_permissions(&path, perms).unwrap();
++        let _ = std::fs::remove_file(&path);
++    }
++
+     #[test]
+     fn append_and_get() {
+         let store = temp_store();
+diff --git a/crates/genie-core/src/repl.rs b/crates/genie-core/src/repl.rs
+index 21cb886..9cbf377 100644
+--- a/crates/genie-core/src/repl.rs
++++ b/crates/genie-core/src/repl.rs
+@@ -59,7 +59,7 @@ pub async fn run(
+         }
+ 
+         // Persist user message.
+-        let _ = conversations.append(&conv_id, "user", text, None);
++        conversations.append_or_log(&conv_id, "user", text, None);
+ 
+         if let Some(call) = tools::quick::route_for_available_tools(
+             text,
+@@ -88,15 +88,14 @@ pub async fn run(
+             .to_string();
+ 
+             eprintln!("\nGeniePod: {}", response);
+-            let _ =
+-                conversations.append(&conv_id, "assistant", &tool_json, Some(&tool_result.tool));
+-            let _ = conversations.append(
++            conversations.append_or_log(&conv_id, "assistant", &tool_json, Some(&tool_result.tool));
++            conversations.append_or_log(
+                 &conv_id,
+                 "system",
+                 &format!("Tool: {}", tool_result.output),
+                 None,
+             );
+-            let _ = conversations.append(&conv_id, "assistant", &response, None);
++            conversations.append_or_log(&conv_id, "assistant", &response, None);
+ 
+             let stored = memory::extract::extract_and_store(memory, text);
+             if stored > 0 {
+@@ -156,13 +155,13 @@ pub async fn run(
+                 .await
+                 {
+                     eprintln!("[TOOL: {}] {}", tool_result.tool, tool_result.output);
+-                    let _ = conversations.append(
++                    conversations.append_or_log(
+                         &conv_id,
+                         "assistant",
+                         &response,
+                         Some(&tool_result.tool),
+                     );
+-                    let _ = conversations.append(
++                    conversations.append_or_log(
+                         &conv_id,
+                         "system",
+                         &format!("Tool: {}", tool_result.output),
+@@ -180,8 +179,12 @@ pub async fn run(
+                     );
+ 
+                     if preserve_raw {
+-                        let _ =
+-                            conversations.append(&conv_id, "assistant", &tool_result.output, None);
++                        conversations.append_or_log(
++                            &conv_id,
++                            "assistant",
++                            &tool_result.output,
++                            None,
++                        );
+                     } else {
+                         // Get follow-up summary.
+                         let recent = conversations.get_recent(&conv_id, 6).unwrap_or_default();
+@@ -207,13 +210,13 @@ pub async fn run(
+                         {
+                             Ok(summary) => {
+                                 eprintln!();
+-                                let _ = conversations.append(&conv_id, "assistant", &summary, None);
++                                conversations.append_or_log(&conv_id, "assistant", &summary, None);
+                             }
+                             Err(_) => eprintln!(),
+                         }
+                     }
+                 } else {
+-                    let _ = conversations.append(&conv_id, "assistant", &response, None);
++                    conversations.append_or_log(&conv_id, "assistant", &response, None);
+                 }
+             }
+             Err(e) => {
+diff --git a/crates/genie-core/src/server.rs b/crates/genie-core/src/server.rs
+index 799e1d8..47da4e5 100644
+--- a/crates/genie-core/src/server.rs
++++ b/crates/genie-core/src/server.rs
+@@ -698,7 +698,7 @@ async fn handle_chat_stream(
+             state.pending.clear();
+             state.emitted_text = true;
+         }
+-        let _ = conversations.append(&conv_id, "assistant", &sanitized, None);
++        conversations.append_or_log(&conv_id, "assistant", &sanitized, None);
+         sanitized
+     };
+ 
+@@ -809,7 +809,7 @@ pub async fn process_chat_turn(
+         .await
+     } else {
+         let sanitized = crate::security::sandbox::sanitize_output(&llm_response);
+-        let _ = conversations.append(conv_id, "assistant", &sanitized, None);
++        conversations.append_or_log(conv_id, "assistant", &sanitized, None);
+         sanitized
+     };
+ 
+@@ -833,8 +833,8 @@ fn finalize_direct_tool_turn(
+         "arguments": call.arguments,
+     })
+     .to_string();
+-    let _ = conversations.append(conv_id, "assistant", &tool_json, Some(&tool_result.tool));
+-    let _ = conversations.append(
++    conversations.append_or_log(conv_id, "assistant", &tool_json, Some(&tool_result.tool));
++    conversations.append_or_log(
+         conv_id,
+         "system",
+         &format!("Tool result: {}", tool_result.output),
+@@ -847,7 +847,7 @@ fn finalize_direct_tool_turn(
+         format!("{} failed: {}", tool_result.tool, tool_result.output)
+     };
+     let sanitized = crate::security::sandbox::sanitize_output(&response);
+-    let _ = conversations.append(conv_id, "assistant", &sanitized, None);
++    conversations.append_or_log(conv_id, "assistant", &sanitized, None);
+     sanitized
+ }
+ 
+@@ -859,8 +859,8 @@ async fn finalize_tool_turn(
+     tool_result: &crate::tools::ToolResult,
+     model_family: ModelFamily,
+ ) -> String {
+-    let _ = conversations.append(conv_id, "assistant", llm_response, Some(&tool_result.tool));
+-    let _ = conversations.append(
++    conversations.append_or_log(conv_id, "assistant", llm_response, Some(&tool_result.tool));
++    conversations.append_or_log(
+         conv_id,
+         "system",
+         &format!("Tool result: {}", tool_result.output),
+@@ -892,7 +892,7 @@ async fn finalize_tool_turn(
+     };
+     let sanitized_summary = crate::security::sandbox::sanitize_output(&summary);
+ 
+-    let _ = conversations.append(conv_id, "assistant", &sanitized_summary, None);
++    conversations.append_or_log(conv_id, "assistant", &sanitized_summary, None);
+     sanitized_summary
+ }
+ 
+diff --git a/crates/genie-core/src/voice_loop.rs b/crates/genie-core/src/voice_loop.rs
+index 6add4c8..782c878 100644
+--- a/crates/genie-core/src/voice_loop.rs
++++ b/crates/genie-core/src/voice_loop.rs
+@@ -378,7 +378,7 @@ async fn run_with_wakeword(
+ 
+                             // Build context and process — reuse voice_cycle but skip recording
+                             // (we already have the text).
+-                            let _ = conversations.append(conv_id, "user", &text, None);
++                            conversations.append_or_log(conv_id, "user", &text, None);
+ 
+                             if handle_quick_tool_for_voice(
+                                 tools,
+@@ -431,8 +431,12 @@ async fn run_with_wakeword(
+                             .await
+                             {
+                                 Ok(response) => {
+-                                    let _ =
+-                                        conversations.append(conv_id, "assistant", &response, None);
++                                    conversations.append_or_log(
++                                        conv_id,
++                                        "assistant",
++                                        &response,
++                                        None,
++                                    );
+                                     eprintln!("[voice] GeniePod: {}", format::for_voice(&response));
+                                 }
+                                 Err(e) => {
+@@ -727,9 +731,9 @@ async fn handle_quick_tool_for_voice(
+         })
+         .to_string();
+ 
+-        let _ = conversations.append(conv_id, "assistant", &tool_json, Some("web_search"));
+-        let _ = conversations.append(conv_id, "system", &format!("Tool: {}", response), None);
+-        let _ = conversations.append(conv_id, "assistant", &response, None);
++        conversations.append_or_log(conv_id, "assistant", &tool_json, Some("web_search"));
++        conversations.append_or_log(conv_id, "system", &format!("Tool: {}", response), None);
++        conversations.append_or_log(conv_id, "assistant", &response, None);
+ 
+         let tts_engine = tts_engine_for_language(voice_cfg, audio_device, response_language);
+         let voice_text = format::for_voice(&voice_response);
+@@ -762,14 +766,14 @@ async fn handle_quick_tool_for_voice(
+     })
+     .to_string();
+ 
+-    let _ = conversations.append(conv_id, "assistant", &tool_json, Some(&tool_result.tool));
+-    let _ = conversations.append(
++    conversations.append_or_log(conv_id, "assistant", &tool_json, Some(&tool_result.tool));
++    conversations.append_or_log(
+         conv_id,
+         "system",
+         &format!("Tool: {}", tool_result.output),
+         None,
+     );
+-    let _ = conversations.append(conv_id, "assistant", &response, None);
++    conversations.append_or_log(conv_id, "assistant", &response, None);
+ 
+     let tts_engine = tts_engine_for_language(voice_cfg, audio_device, response_language);
+     let voice_text = format::for_voice(&response);
+@@ -1029,7 +1033,7 @@ pub async fn process_transcript(
+         "[voice] You said: \"{}\" (STT: {} ms)",
+         text, transcript.duration_ms
+     );
+-    let _ = conversations.append(conv_id, "user", &text, None);
++    conversations.append_or_log(conv_id, "user", &text, None);
+ 
+     if let Some(final_response) = handle_quick_tool_for_voice(
+         tools,
+@@ -1149,8 +1153,8 @@ pub async fn process_transcript(
+             "[voice] Tool: {} → {}",
+             tool_result.tool, tool_result.output
+         );
+-        let _ = conversations.append(conv_id, "assistant", &response, Some(&tool_result.tool));
+-        let _ = conversations.append(
++        conversations.append_or_log(conv_id, "assistant", &response, Some(&tool_result.tool));
++        conversations.append_or_log(
+             conv_id,
+             "system",
+             &format!("Tool: {}", tool_result.output),
+@@ -1209,10 +1213,10 @@ pub async fn process_transcript(
+             }
+         };
+ 
+-        let _ = conversations.append(conv_id, "assistant", &summary, None);
++        conversations.append_or_log(conv_id, "assistant", &summary, None);
+         (summary, Some(tool_result.tool))
+     } else {
+-        let _ = conversations.append(conv_id, "assistant", &response, None);
++        conversations.append_or_log(conv_id, "assistant", &response, None);
+         (response, None)
+     };
+ 

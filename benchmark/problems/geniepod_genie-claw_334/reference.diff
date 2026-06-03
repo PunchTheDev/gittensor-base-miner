@@ -1,0 +1,319 @@
+diff --git a/crates/genie-core/src/eval/bfcl.rs b/crates/genie-core/src/eval/bfcl.rs
+index 62731b0..2c00465 100644
+--- a/crates/genie-core/src/eval/bfcl.rs
++++ b/crates/genie-core/src/eval/bfcl.rs
+@@ -6,13 +6,22 @@
+ 
+ use crate::tools::{ToolCall, parse_tool_calls_for_eval};
+ use anyhow::{Context, Result};
++use async_trait::async_trait;
++use genie_common::config::WebSearchConfig;
+ use serde::de::DeserializeOwned;
+ use serde::{Deserialize, Serialize};
+ use serde_json::Value;
+-use std::collections::HashMap;
++use std::collections::{BTreeMap, HashMap, HashSet};
+ use std::fs::File;
+ use std::io::{BufRead, BufReader};
+ use std::path::Path;
++use std::sync::Arc;
++
++use crate::ha::{
++    ActionResult, DeviceRef, HomeAction, HomeActionKind, HomeAutomationProvider, HomeGraph,
++    HomeState, HomeTarget, HomeTargetKind, IntegrationHealth, SceneRef,
++};
++use crate::tools::dispatch::{ToolDef, ToolDispatcher};
+ 
+ #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+ pub struct BfclCase {
+@@ -411,6 +420,148 @@ fn ratio(count: usize, total: usize) -> f64 {
+     }
+ }
+ 
++struct BfclCatalogHomeStub;
++
++#[async_trait]
++impl HomeAutomationProvider for BfclCatalogHomeStub {
++    async fn health(&self) -> IntegrationHealth {
++        IntegrationHealth {
++            connected: true,
++            cached_graph: false,
++            message: "bfcl-catalog".into(),
++        }
++    }
++
++    async fn sync_structure(&self) -> Result<HomeGraph> {
++        Ok(HomeGraph {
++            areas: Vec::new(),
++            devices: Vec::new(),
++            entities: Vec::new(),
++            scenes: Vec::new(),
++            scripts: Vec::new(),
++            aliases: Vec::new(),
++            domains: Vec::new(),
++            capabilities: Vec::new(),
++        })
++    }
++
++    async fn resolve_target(
++        &self,
++        query: &str,
++        _action_hint: Option<HomeActionKind>,
++    ) -> Result<HomeTarget> {
++        Ok(HomeTarget {
++            kind: HomeTargetKind::Entity,
++            query: query.into(),
++            display_name: query.into(),
++            entity_ids: vec!["light.test".into()],
++            domain: Some("light".into()),
++            area: Some("Kitchen".into()),
++            confidence: 0.96,
++            voice_safe: true,
++        })
++    }
++
++    async fn get_state(&self, target: &HomeTarget) -> Result<HomeState> {
++        Ok(HomeState {
++            target_name: target.display_name.clone(),
++            domain: target.domain.clone(),
++            area: target.area.clone(),
++            entities: Vec::new(),
++            available: true,
++            spoken_summary: format!("{} is available", target.display_name),
++        })
++    }
++
++    async fn execute(&self, action: HomeAction) -> Result<ActionResult> {
++        Ok(ActionResult {
++            success: true,
++            spoken_summary: format!("Executed {:?}", action.kind),
++            affected_targets: vec![action.target.display_name],
++            state_snapshot: None,
++            confidence: Some(action.target.confidence),
++        })
++    }
++
++    async fn list_scenes(&self, _room: Option<&str>) -> Result<Vec<SceneRef>> {
++        Ok(Vec::new())
++    }
++
++    async fn list_devices(&self, _room: Option<&str>) -> Result<Vec<DeviceRef>> {
++        Ok(Vec::new())
++    }
++}
++
++/// Compact BFCL LLM catalog entries derived from runtime `ToolDef` schemas.
++pub fn bfcl_llm_runtime_tool_catalog() -> BTreeMap<String, String> {
++    let web_search = WebSearchConfig {
++        enabled: true,
++        ..WebSearchConfig::default()
++    };
++    let dispatcher =
++        ToolDispatcher::new(Some(Arc::new(BfclCatalogHomeStub))).with_web_search_config(web_search);
++    dispatcher
++        .tool_defs()
++        .into_iter()
++        .map(|def| (def.name.clone(), bfcl_llm_tool_summary(&def)))
++        .collect()
++}
++
++pub fn bfcl_llm_tool_summary(def: &ToolDef) -> String {
++    format!(
++        "{}. {}",
++        bfcl_llm_tool_headline(&def.description),
++        format_bfcl_arguments(&def.parameters)
++    )
++}
++
++fn bfcl_llm_tool_headline(description: &str) -> String {
++    description
++        .split('.')
++        .next()
++        .unwrap_or(description)
++        .trim()
++        .to_string()
++}
++
++fn format_bfcl_arguments(parameters: &Value) -> String {
++    let Some(properties) = parameters.get("properties").and_then(Value::as_object) else {
++        return "arguments: {}".to_string();
++    };
++    if properties.is_empty() {
++        return "arguments: {}".to_string();
++    }
++
++    let required: HashSet<&str> = parameters
++        .get("required")
++        .and_then(Value::as_array)
++        .map(|items| items.iter().filter_map(|v| v.as_str()).collect())
++        .unwrap_or_default();
++
++    let mut parts = Vec::new();
++    for (name, spec) in properties {
++        if let Some(enum_values) = spec.get("enum").and_then(Value::as_array) {
++            let joined = enum_values
++                .iter()
++                .filter_map(Value::as_str)
++                .collect::<Vec<_>>()
++                .join("|");
++            parts.push(format!(r#""{name}": "{joined}""#));
++            continue;
++        }
++
++        let value_type = spec.get("type").and_then(Value::as_str).unwrap_or("string");
++        let prefix = if required.contains(name.as_str()) {
++            String::new()
++        } else {
++            "optional ".to_string()
++        };
++        parts.push(format!(r#""{name}": {prefix}{value_type}"#));
++    }
++
++    format!("arguments: {{{}}}", parts.join(", "))
++}
++
+ #[cfg(test)]
+ mod tests {
+     use super::*;
+@@ -630,4 +781,29 @@ mod tests {
+             );
+         }
+     }
++
++    #[test]
++    fn bfcl_llm_catalog_matches_runtime_home_control_schema() {
++        let catalog = bfcl_llm_runtime_tool_catalog();
++        let home_control = catalog
++            .get("home_control")
++            .expect("home_control catalog entry");
++        for action in [
++            "turn_on",
++            "turn_off",
++            "toggle",
++            "set_brightness",
++            "set_temperature",
++            "open",
++            "close",
++            "lock",
++            "unlock",
++            "activate",
++        ] {
++            assert!(
++                home_control.contains(action),
++                "missing home_control action {action} in BFCL catalog: {home_control}"
++            );
++        }
++    }
+ }
+diff --git a/crates/genie-ctl/src/main.rs b/crates/genie-ctl/src/main.rs
+index 4e3426a..606677e 100644
+--- a/crates/genie-ctl/src/main.rs
++++ b/crates/genie-ctl/src/main.rs
+@@ -1715,6 +1715,7 @@ Prefer deterministic home state, memory retrieval, and typed-tool arguments over
+ }
+ 
+ fn bfcl_llm_tool_catalog(cases: &[genie_core::eval::bfcl::BfclCase]) -> Vec<String> {
++    let runtime_catalog = genie_core::eval::bfcl::bfcl_llm_runtime_tool_catalog();
+     let expected_tools = cases
+         .iter()
+         .flat_map(|case| {
+@@ -1726,18 +1727,14 @@ fn bfcl_llm_tool_catalog(cases: &[genie_core::eval::bfcl::BfclCase]) -> Vec<Stri
+     let include_all = expected_tools.is_empty();
+     let mut rows = Vec::new();
+ 
+-    for (name, description) in BFCL_LLM_KNOWN_TOOLS {
+-        if include_all || expected_tools.contains(name) {
+-            rows.push(format!("- {name}: {description}"));
++    for (name, summary) in &runtime_catalog {
++        if include_all || expected_tools.contains(name.as_str()) {
++            rows.push(format!("- {name}: {summary}"));
+         }
+     }
+ 
+-    let known_names = BFCL_LLM_KNOWN_TOOLS
+-        .iter()
+-        .map(|(name, _)| *name)
+-        .collect::<BTreeSet<_>>();
+     for name in expected_tools {
+-        if !known_names.contains(name) {
++        if !runtime_catalog.contains_key(name) {
+             rows.push(format!(
+                 "- {name}: dynamic local skill tool. Return only the required JSON arguments."
+             ));
+@@ -1747,66 +1744,6 @@ fn bfcl_llm_tool_catalog(cases: &[genie_core::eval::bfcl::BfclCase]) -> Vec<Stri
+     rows
+ }
+ 
+-const BFCL_LLM_KNOWN_TOOLS: &[(&str, &str)] = &[
+-    (
+-        "home_control",
+-        r#"control a home entity. arguments: {"entity": string, "action": "turn_on|turn_off|set_temperature|set_brightness|activate|open|close", "value": optional number}"#,
+-    ),
+-    (
+-        "home_status",
+-        r#"read deterministic home/device state. arguments: {"entity": string}"#,
+-    ),
+-    (
+-        "home_undo",
+-        r#"undo the last reversible home action. arguments: {}"#,
+-    ),
+-    (
+-        "action_history",
+-        r#"summarize recent home/security/action changes. arguments: {}"#,
+-    ),
+-    ("get_time", r#"current local time. arguments: {}"#),
+-    (
+-        "get_weather",
+-        r#"weather for home or a named location. arguments: {"location": string}"#,
+-    ),
+-    (
+-        "set_timer",
+-        r#"create a timer. arguments: {"seconds": number, "label": optional string}"#,
+-    ),
+-    (
+-        "web_search",
+-        r#"fresh external lookup. arguments: {"query": string, "limit": optional number, "fresh": optional bool}"#,
+-    ),
+-    (
+-        "calculate",
+-        r#"deterministic math/unit calculation. arguments: {"expression": string}"#,
+-    ),
+-    (
+-        "play_media",
+-        r#"play media, playlist, station, or local entertainment. arguments: {"query": string}"#,
+-    ),
+-    (
+-        "memory_recall",
+-        r#"retrieve household or family memory. arguments: {"query": string, "limit": optional number}"#,
+-    ),
+-    (
+-        "memory_store",
+-        r#"store an explicit household memory or preference. arguments: {"content": string, "category": optional string}"#,
+-    ),
+-    (
+-        "memory_forget",
+-        r#"remove matching household memory. arguments: {"query": string}"#,
+-    ),
+-    (
+-        "memory_status",
+-        r#"inspect memory health/status. arguments: {}"#,
+-    ),
+-    (
+-        "system_info",
+-        r#"local Jetson/runtime status. arguments: {}"#,
+-    ),
+-];
+-
+ fn format_score_rate(rate: f64) -> String {
+     format!("{:.2}%", rate * 100.0)
+ }
+@@ -3076,6 +3013,9 @@ mod tests {
+ 
+         assert!(system_prompt.contains("4096-token"));
+         assert!(system_prompt.contains("home_control"));
++        assert!(system_prompt.contains("toggle"));
++        assert!(system_prompt.contains("lock"));
++        assert!(system_prompt.contains("unlock"));
+         assert!(system_prompt.contains(r#""tool":"tool_name""#));
+         assert!(system_prompt.len() < 2500);
+         assert_eq!(messages.len(), 2);

@@ -1,0 +1,1157 @@
+diff --git a/Cargo.lock b/Cargo.lock
+index f4a498f..9ff14f1 100644
+--- a/Cargo.lock
++++ b/Cargo.lock
+@@ -199,11 +199,14 @@ name = "genie-common"
+ version = "1.0.0-alpha.9"
+ dependencies = [
+  "anyhow",
++ "rustls",
+  "serde",
+  "serde_json",
+  "tokio",
++ "tokio-rustls",
+  "toml",
+  "tracing",
++ "webpki-roots 0.26.11",
+ ]
+ 
+ [[package]]
+@@ -407,7 +410,7 @@ dependencies = [
+  "tokio",
+  "tokio-rustls",
+  "tower-service",
+- "webpki-roots",
++ "webpki-roots 1.0.7",
+ ]
+ 
+ [[package]]
+@@ -886,7 +889,7 @@ dependencies = [
+  "wasm-bindgen",
+  "wasm-bindgen-futures",
+  "web-sys",
+- "webpki-roots",
++ "webpki-roots 1.0.7",
+ ]
+ 
+ [[package]]
+@@ -1534,6 +1537,15 @@ dependencies = [
+  "wasm-bindgen",
+ ]
+ 
++[[package]]
++name = "webpki-roots"
++version = "0.26.11"
++source = "registry+https://github.com/rust-lang/crates.io-index"
++checksum = "521bc38abb08001b01866da9f51eb7c5d647a19260e00054a8c7fd5f9e57f7a9"
++dependencies = [
++ "webpki-roots 1.0.7",
++]
++
+ [[package]]
+ name = "webpki-roots"
+ version = "1.0.7"
+diff --git a/Cargo.toml b/Cargo.toml
+index af70940..c54cc4d 100644
+--- a/Cargo.toml
++++ b/Cargo.toml
+@@ -27,6 +27,9 @@ tracing-subscriber = { version = "0.3", features = ["env-filter", "json"] }
+ anyhow = "1"
+ rusqlite = { version = "0.32", features = ["bundled"] }
+ libc = "0.2"
++rustls = { version = "0.23", default-features = false, features = ["std", "ring", "tls12"] }
++tokio-rustls = { version = "0.26", default-features = false, features = ["ring", "tls12"] }
++webpki-roots = "0.26"
+ 
+ # Workspace crate references
+ genie-common = { path = "crates/genie-common" }
+diff --git a/crates/genie-api/src/routes.rs b/crates/genie-api/src/routes.rs
+index 064fefc..b5e8b8b 100644
+--- a/crates/genie-api/src/routes.rs
++++ b/crates/genie-api/src/routes.rs
+@@ -1,12 +1,11 @@
+ use genie_common::config::Config;
+ use genie_common::jsonl::{self, DEFAULT_MAX_JSONL_LINE_BYTES};
++use genie_common::probe::{ProbeTimeouts, probe_configured_url};
+ use genie_common::tegrastats;
+ use serde::Serialize;
+ use std::collections::{BTreeMap, BTreeSet};
+ use std::time::Duration;
+ use std::time::Instant;
+-use tokio::io::{AsyncReadExt, AsyncWriteExt};
+-use tokio::net::TcpStream;
+ use tokio::process::Command;
+ 
+ use crate::http::Response;
+@@ -435,51 +434,16 @@ async fn collect_live_latency_rows(
+ 
+ async fn probe_http_latency(url: &str) -> LiveLatencyRow {
+     let start = Instant::now();
+-    let result = async {
+-        let url = url.strip_prefix("http://").unwrap_or(url);
+-        let (host_port, path) = url.split_once('/').unwrap_or((url, ""));
+-        let path = format!("/{path}");
+-
+-        let mut stream =
+-            tokio::time::timeout(Duration::from_millis(750), TcpStream::connect(host_port))
+-                .await
+-                .map_err(|_| "connect timeout".to_string())?
+-                .map_err(|e| e.to_string())?;
+-
+-        let request =
+-            format!("GET {path} HTTP/1.1\r\nHost: {host_port}\r\nConnection: close\r\n\r\n");
+-        stream
+-            .write_all(request.as_bytes())
+-            .await
+-            .map_err(|e| e.to_string())?;
+-
+-        let mut buf = [0u8; 256];
+-        let n = tokio::time::timeout(Duration::from_millis(750), stream.read(&mut buf))
+-            .await
+-            .map_err(|_| "read timeout".to_string())?
+-            .map_err(|e| e.to_string())?;
+-
+-        let response = String::from_utf8_lossy(&buf[..n]);
+-        let status = response
+-            .split_whitespace()
+-            .nth(1)
+-            .and_then(|code| code.parse::<u16>().ok())
+-            .unwrap_or(0);
+-
+-        if (200..400).contains(&status) {
+-            Ok(())
+-        } else if status > 0 {
+-            Err(format!("HTTP {status}"))
+-        } else {
+-            Err("invalid HTTP response".into())
+-        }
+-    }
+-    .await;
++    let timeouts = ProbeTimeouts {
++        connect: Duration::from_millis(750),
++        read: Duration::from_millis(750),
++    };
++    let result = probe_configured_url(url, timeouts).await;
+ 
+     LiveLatencyRow {
+         healthy: result.is_ok(),
+         response_ms: start.elapsed().as_millis() as i64,
+-        error: result.err(),
++        error: result.err().map(|e| e.to_string()),
+     }
+ }
+ 
+diff --git a/crates/genie-common/Cargo.toml b/crates/genie-common/Cargo.toml
+index b76c9ff..6c0c1cb 100644
+--- a/crates/genie-common/Cargo.toml
++++ b/crates/genie-common/Cargo.toml
+@@ -12,3 +12,9 @@ toml = { workspace = true }
+ tracing = { workspace = true }
+ anyhow = { workspace = true }
+ tokio = { workspace = true }
++rustls = { workspace = true }
++tokio-rustls = { workspace = true }
++webpki-roots = { workspace = true }
++
++[dev-dependencies]
++tokio = { workspace = true }
+diff --git a/crates/genie-common/src/config.rs b/crates/genie-common/src/config.rs
+index 7615233..18ebe81 100644
+--- a/crates/genie-common/src/config.rs
++++ b/crates/genie-common/src/config.rs
+@@ -875,11 +875,11 @@ pub struct ServiceEndpoint {
+ /// Result of resolving a configured service URL for the simple TCP probe
+ /// path used by `genie-ctl status` / `diag` / `support-bundle`.
+ ///
+-/// `Http` targets are usable by a plaintext TCP client. Anything else
+-/// (today: `https://`, plus unknown schemes that look like a scheme but
+-/// aren't `http`) is returned as [`ServiceProbeTarget::UnsupportedScheme`]
+-/// so callers can label the row instead of mis-reporting a healthy
+-/// service as DOWN by sending plaintext to a TLS port.
++/// `Http` and `Https` targets are probed with the shared client in
++/// [`crate::probe`]. Unknown schemes are returned as
++/// [`ServiceProbeTarget::UnsupportedScheme`] so callers can label the row
++/// instead of mis-reporting a healthy service as DOWN by sending plaintext
++/// to a TLS port.
+ #[derive(Debug, Clone, PartialEq, Eq)]
+ pub enum ServiceProbeTarget {
+     /// Plain-HTTP probe target.
+@@ -890,26 +890,24 @@ pub enum ServiceProbeTarget {
+         /// Request path, always starting with `/`.
+         path: String,
+     },
+-    /// Scheme the plain-TCP probe cannot service. `genie-ctl` should skip
+-    /// the probe and surface "scheme not supported" rather than DOWN.
+-    /// Wiring in a TLS client is tracked separately; see issue #126
+-    /// discussion.
++    /// TLS HTTP probe target (`https://` URLs).
++    Https { addr: String, path: String },
++    /// Scheme the probe client cannot service (neither plain nor TLS).
+     UnsupportedScheme {
+-        /// The scheme as found in the URL (lowercased), e.g. `"https"`.
++        /// The scheme as found in the URL (lowercased), e.g. `"wss"`.
+         scheme: String,
+     },
+ }
+ 
+ /// Parse a configured service URL into a probe target for `genie-ctl`'s
+-/// plain-TCP HTTP client.
++/// HTTP/TLS probe client.
+ ///
+ /// Behavior:
+ /// - Bare URLs without a scheme are treated as `http://…`.
+ /// - `http://` URLs produce [`ServiceProbeTarget::Http`].
+-/// - `https://` (and any other recognized scheme that isn't `http`) produces
+-///   [`ServiceProbeTarget::UnsupportedScheme`] — the probe path cannot speak
+-///   TLS, so we refuse rather than send plaintext to port 443.
+-/// - Missing port defaults to 80 for `http`.
++/// - `https://` URLs produce [`ServiceProbeTarget::Https`].
++/// - Other recognized schemes produce [`ServiceProbeTarget::UnsupportedScheme`].
++/// - Missing port defaults to 80 for `http` and 443 for `https`.
+ /// - Missing path defaults to `/`.
+ /// - IPv6 hosts must be bracketed (`[::1]`, `[::1]:8123`); brackets are
+ ///   preserved in the returned `addr` so the string parses with
+@@ -924,21 +922,26 @@ pub fn parse_service_probe_target(url: &str) -> ServiceProbeTarget {
+         None => ("http", url),
+     };
+ 
+-    if scheme != "http" {
+-        return ServiceProbeTarget::UnsupportedScheme {
+-            scheme: scheme.to_string(),
+-        };
+-    }
+-
+     let (authority, path) = split_authority_and_path(rest);
+-    let addr = ensure_port(authority, 80);
+     let path = if path.is_empty() {
+         "/".to_string()
+     } else {
+         path.to_string()
+     };
+ 
+-    ServiceProbeTarget::Http { addr, path }
++    match scheme {
++        "http" => ServiceProbeTarget::Http {
++            addr: ensure_port(authority, 80),
++            path,
++        },
++        "https" => ServiceProbeTarget::Https {
++            addr: ensure_port(authority, 443),
++            path,
++        },
++        _ => ServiceProbeTarget::UnsupportedScheme {
++            scheme: scheme.to_string(),
++        },
++    }
+ }
+ 
+ #[derive(Debug, Clone, PartialEq, Eq)]
+@@ -964,7 +967,9 @@ fn record_http_url_drift(
+                 listen_addr: listen_addr.to_string(),
+             });
+         }
+-        ServiceProbeTarget::Http { .. } | ServiceProbeTarget::UnsupportedScheme { .. } => {}
++        ServiceProbeTarget::Http { .. }
++        | ServiceProbeTarget::Https { .. }
++        | ServiceProbeTarget::UnsupportedScheme { .. } => {}
+     }
+ }
+ 
+@@ -1102,6 +1107,10 @@ impl Config {
+     pub fn api_http_addr(&self) -> anyhow::Result<String> {
+         match parse_service_probe_target(&self.services.api.url) {
+             ServiceProbeTarget::Http { addr, .. } => Ok(addr),
++            ServiceProbeTarget::Https { .. } => anyhow::bail!(
++                "genie-api cannot bind from [services.api].url: unsupported scheme \
++                 \"https\" (use http:// for the local bind address)"
++            ),
+             ServiceProbeTarget::UnsupportedScheme { scheme } => anyhow::bail!(
+                 "genie-api cannot bind from [services.api].url: unsupported scheme \
+                  \"{scheme}\" (use http://)"
+@@ -1675,14 +1684,13 @@ systemd_unit = "genie-ai-runtime.service"
+     }
+ 
+     #[test]
+-    fn parse_service_probe_target_rejects_https_as_unsupported() {
+-        // Regression for PR #127 review: HTTPS must NOT silently default to
+-        // port 443 and then be probed with plaintext over a raw TcpStream —
+-        // a healthy HTTPS service would be reported DOWN. Surface it as an
+-        // explicit unsupported scheme so the caller can label the row.
++    fn parse_service_probe_target_parses_https_with_default_port() {
+         match parse_service_probe_target("https://ha.example/api/") {
+-            ServiceProbeTarget::UnsupportedScheme { scheme } => assert_eq!(scheme, "https"),
+-            other => panic!("expected UnsupportedScheme for https://, got {other:?}"),
++            ServiceProbeTarget::Https { addr, path } => {
++                assert_eq!(addr, "ha.example:443");
++                assert_eq!(path, "/api/");
++            }
++            other => panic!("expected Https target, got {other:?}"),
+         }
+     }
+ 
+diff --git a/crates/genie-common/src/lib.rs b/crates/genie-common/src/lib.rs
+index d8a2f2b..ea0b093 100644
+--- a/crates/genie-common/src/lib.rs
++++ b/crates/genie-common/src/lib.rs
+@@ -2,4 +2,5 @@ pub mod config;
+ pub mod http;
+ pub mod jsonl;
+ pub mod mode;
++pub mod probe;
+ pub mod tegrastats;
+diff --git a/crates/genie-common/src/probe.rs b/crates/genie-common/src/probe.rs
+new file mode 100644
+index 0000000..d88ba46
+--- /dev/null
++++ b/crates/genie-common/src/probe.rs
+@@ -0,0 +1,483 @@
++//! Plain-TCP and TLS HTTP probes for configured service URLs.
++//!
++//! HTTPS probes verify server certificates against the Mozilla CA bundle shipped
++//! in the `webpki-roots` crate (not the host OS trust store). LAN services with
++//! self-signed certificates — common for local Home Assistant HTTPS — will fail
++//! TLS verification until an opt-in trust policy is added.
++
++use std::sync::{Arc, OnceLock};
++use std::time::Duration;
++
++use anyhow::{Context, Result};
++use rustls::pki_types::{IpAddr, ServerName};
++use rustls::{ClientConfig, RootCertStore};
++use tokio::io::{AsyncReadExt, AsyncWriteExt};
++use tokio::net::TcpStream;
++use tokio::time::timeout;
++use tokio_rustls::TlsConnector;
++
++use crate::config::ServiceProbeTarget;
++
++#[derive(Debug, Clone, Copy)]
++pub struct ProbeTimeouts {
++    pub connect: Duration,
++    pub read: Duration,
++}
++
++impl Default for ProbeTimeouts {
++    fn default() -> Self {
++        Self {
++            connect: Duration::from_secs(3),
++            read: Duration::from_secs(3),
++        }
++    }
++}
++
++/// Probe a parsed service URL.
++///
++/// `https://` targets use the bundled Mozilla CA roots from `webpki-roots`.
++/// Self-signed LAN certificates (e.g. local Home Assistant HTTPS) are rejected.
++pub async fn probe_service_target(
++    target: &ServiceProbeTarget,
++    timeouts: ProbeTimeouts,
++) -> Result<()> {
++    match target {
++        ServiceProbeTarget::Http { addr, path } => {
++            probe_http_get(addr, path, false, timeouts).await
++        }
++        ServiceProbeTarget::Https { addr, path } => {
++            probe_http_get(addr, path, true, timeouts).await
++        }
++        ServiceProbeTarget::UnsupportedScheme { scheme } => {
++            anyhow::bail!("unsupported URL scheme for probe: {scheme}")
++        }
++    }
++}
++
++/// Probe a configured URL string (bare authority defaults to `http://`).
++pub async fn probe_configured_url(url: &str, timeouts: ProbeTimeouts) -> Result<()> {
++    probe_service_target(&crate::config::parse_service_probe_target(url), timeouts).await
++}
++
++/// Issue a minimal HTTP GET and require a 2xx/3xx status line.
++pub async fn probe_http_get(
++    addr: &str,
++    path: &str,
++    tls: bool,
++    timeouts: ProbeTimeouts,
++) -> Result<()> {
++    let (status, _) = if tls {
++        probe_http_response_tls(addr, path, timeouts).await?
++    } else {
++        probe_http_response_plain(addr, path, timeouts).await?
++    };
++    validate_probe_status(status)
++}
++
++/// Issue a minimal HTTP GET and return the response body on 2xx/3xx.
++pub async fn probe_http_get_body(
++    addr: &str,
++    path: &str,
++    tls: bool,
++    timeouts: ProbeTimeouts,
++) -> Result<String> {
++    let (status, body) = if tls {
++        probe_http_response_tls(addr, path, timeouts).await?
++    } else {
++        probe_http_response_plain(addr, path, timeouts).await?
++    };
++    validate_probe_status(status)?;
++    Ok(body)
++}
++
++pub async fn probe_target_body(
++    target: &ServiceProbeTarget,
++    path: &str,
++    timeouts: ProbeTimeouts,
++) -> Result<String> {
++    match target {
++        ServiceProbeTarget::Http { addr, .. } => {
++            probe_http_get_body(addr, path, false, timeouts).await
++        }
++        ServiceProbeTarget::Https { addr, .. } => {
++            probe_http_get_body(addr, path, true, timeouts).await
++        }
++        ServiceProbeTarget::UnsupportedScheme { scheme } => {
++            anyhow::bail!("unsupported URL scheme for probe: {scheme}")
++        }
++    }
++}
++
++async fn probe_http_response_plain(
++    addr: &str,
++    path: &str,
++    timeouts: ProbeTimeouts,
++) -> Result<(u16, String)> {
++    let mut stream = timeout(timeouts.connect, TcpStream::connect(addr))
++        .await
++        .map_err(|_| anyhow::anyhow!("connect timeout"))??;
++
++    write_get_request(&mut stream, path, addr).await?;
++    read_http_response(&mut stream, timeouts.read).await
++}
++
++async fn probe_http_response_tls(
++    addr: &str,
++    path: &str,
++    timeouts: ProbeTimeouts,
++) -> Result<(u16, String)> {
++    let tcp = timeout(timeouts.connect, TcpStream::connect(addr))
++        .await
++        .map_err(|_| anyhow::anyhow!("connect timeout"))??;
++
++    let server_name = tls_server_name(addr)?;
++    let connector = tls_connector()?;
++    let mut stream = timeout(timeouts.connect, connector.connect(server_name, tcp))
++        .await
++        .map_err(|_| anyhow::anyhow!("TLS handshake timeout"))??;
++
++    write_get_request(&mut stream, path, addr).await?;
++    read_http_response(&mut stream, timeouts.read).await
++}
++
++async fn read_http_response(
++    stream: &mut (impl AsyncReadExt + Unpin),
++    read_timeout: Duration,
++) -> Result<(u16, String)> {
++    let mut buf = Vec::new();
++    let mut chunk = [0u8; 1024];
++
++    loop {
++        if let Some(idx) = buf.windows(4).position(|window| window == b"\r\n\r\n") {
++            let header_end = idx + 4;
++            let status = parse_http_status(&buf[..header_end])?;
++            let headers = String::from_utf8_lossy(&buf[..header_end]).into_owned();
++            let body = read_http_body(stream, &mut buf, header_end, &headers, read_timeout).await?;
++            return Ok((status, body));
++        }
++
++        if buf.len() > 64 * 1024 {
++            anyhow::bail!("response too large");
++        }
++
++        let n = read_with_timeout(stream, read_timeout, &mut chunk).await?;
++        if n == 0 {
++            anyhow::bail!("invalid HTTP response");
++        }
++        buf.extend_from_slice(&chunk[..n]);
++    }
++}
++
++async fn read_http_body(
++    stream: &mut (impl AsyncReadExt + Unpin),
++    buf: &mut Vec<u8>,
++    header_end: usize,
++    headers: &str,
++    read_timeout: Duration,
++) -> Result<String> {
++    let mut body = buf.split_off(header_end);
++
++    if headers
++        .lines()
++        .any(|line| line.eq_ignore_ascii_case("transfer-encoding: chunked"))
++    {
++        let decoded = read_chunked_body(stream, &mut body, read_timeout).await?;
++        return Ok(String::from_utf8_lossy(&decoded).trim().to_string());
++    }
++
++    if let Some(content_length) = parse_content_length(headers) {
++        read_fixed_body(stream, &mut body, content_length, read_timeout).await?;
++        return Ok(String::from_utf8_lossy(&body).trim().to_string());
++    }
++
++    // No Content-Length and not chunked — treat headers as complete. Do not
++    // wait for EOF; keep-alive servers would otherwise hit the read timeout.
++    Ok(String::from_utf8_lossy(&body).trim().to_string())
++}
++
++async fn read_fixed_body(
++    stream: &mut (impl AsyncReadExt + Unpin),
++    body: &mut Vec<u8>,
++    content_length: usize,
++    read_timeout: Duration,
++) -> Result<()> {
++    let mut chunk = [0u8; 1024];
++    while body.len() < content_length {
++        if body.len() > 64 * 1024 {
++            anyhow::bail!("response too large");
++        }
++        let n = read_with_timeout(stream, read_timeout, &mut chunk).await?;
++        if n == 0 {
++            anyhow::bail!("invalid HTTP response");
++        }
++        body.extend_from_slice(&chunk[..n]);
++    }
++    body.truncate(content_length);
++    Ok(())
++}
++
++async fn read_chunked_body(
++    stream: &mut (impl AsyncReadExt + Unpin),
++    scratch: &mut Vec<u8>,
++    read_timeout: Duration,
++) -> Result<Vec<u8>> {
++    let mut decoded = Vec::new();
++    let mut chunk = [0u8; 1024];
++
++    loop {
++        while !scratch.contains(&b'\n') {
++            if scratch.len() > 64 * 1024 {
++                anyhow::bail!("response too large");
++            }
++            let n = read_with_timeout(stream, read_timeout, &mut chunk).await?;
++            if n == 0 {
++                anyhow::bail!("invalid HTTP response");
++            }
++            scratch.extend_from_slice(&chunk[..n]);
++        }
++
++        let line_end = scratch.iter().position(|&b| b == b'\n').unwrap();
++        let size_line = String::from_utf8_lossy(&scratch[..line_end])
++            .trim()
++            .to_string();
++        let chunk_size =
++            usize::from_str_radix(size_line.split(';').next().unwrap_or("").trim(), 16)
++                .map_err(|_| anyhow::anyhow!("invalid HTTP response"))?;
++        scratch.drain(..=line_end);
++
++        if chunk_size == 0 {
++            return Ok(decoded);
++        }
++
++        while scratch.len() < chunk_size + 2 {
++            if decoded.len() + scratch.len() > 64 * 1024 {
++                anyhow::bail!("response too large");
++            }
++            let n = read_with_timeout(stream, read_timeout, &mut chunk).await?;
++            if n == 0 {
++                anyhow::bail!("invalid HTTP response");
++            }
++            scratch.extend_from_slice(&chunk[..n]);
++        }
++
++        decoded.extend_from_slice(&scratch[..chunk_size]);
++        scratch.drain(..chunk_size + 2);
++    }
++}
++
++async fn read_with_timeout(
++    stream: &mut (impl AsyncReadExt + Unpin),
++    read_timeout: Duration,
++    chunk: &mut [u8; 1024],
++) -> Result<usize> {
++    timeout(read_timeout, stream.read(chunk))
++        .await
++        .map_err(|_| anyhow::anyhow!("read timeout"))?
++        .context("failed to read HTTP response")
++}
++
++fn parse_content_length(headers: &str) -> Option<usize> {
++    headers.lines().find_map(|line| {
++        let (name, value) = line.split_once(':')?;
++        if !name.eq_ignore_ascii_case("content-length") {
++            return None;
++        }
++        value.trim().parse().ok()
++    })
++}
++
++async fn write_get_request(
++    stream: &mut (impl AsyncWriteExt + Unpin),
++    path: &str,
++    host: &str,
++) -> Result<()> {
++    let request = format!(
++        "GET {} HTTP/1.1\r\nHost: {}\r\nConnection: close\r\n\r\n",
++        path, host
++    );
++    stream
++        .write_all(request.as_bytes())
++        .await
++        .context("failed to write HTTP request")
++}
++
++fn parse_http_status(buf: &[u8]) -> Result<u16> {
++    let response = String::from_utf8_lossy(buf);
++    response
++        .split_whitespace()
++        .nth(1)
++        .and_then(|code| code.parse::<u16>().ok())
++        .ok_or_else(|| anyhow::anyhow!("invalid HTTP response"))
++}
++
++fn validate_probe_status(status: u16) -> Result<()> {
++    if (200..400).contains(&status) {
++        Ok(())
++    } else if status > 0 {
++        anyhow::bail!("HTTP {status}")
++    } else {
++        anyhow::bail!("invalid HTTP response")
++    }
++}
++
++fn tls_connector() -> Result<TlsConnector> {
++    static CONNECTOR: OnceLock<TlsConnector> = OnceLock::new();
++
++    Ok(CONNECTOR
++        .get_or_init(|| {
++            let mut roots = RootCertStore::empty();
++            // Mozilla CA bundle (webpki-roots), not the host OS trust store.
++            roots.extend(webpki_roots::TLS_SERVER_ROOTS.iter().cloned());
++            let config = ClientConfig::builder()
++                .with_root_certificates(roots)
++                .with_no_client_auth();
++            TlsConnector::from(Arc::new(config))
++        })
++        .clone())
++}
++
++fn tls_server_name(addr: &str) -> Result<ServerName<'static>> {
++    let host = host_from_addr(addr);
++    if let Ok(ip) = host.parse::<std::net::IpAddr>() {
++        return Ok(ServerName::IpAddress(IpAddr::from(ip)));
++    }
++    ServerName::try_from(host.to_string())
++        .map_err(|_| anyhow::anyhow!("invalid TLS server name: {host}"))
++}
++
++fn host_from_addr(addr: &str) -> &str {
++    if let Some(rest) = addr.strip_prefix('[') {
++        rest.split(']').next().unwrap_or(rest)
++    } else if let Some((host, port)) = addr.rsplit_once(':') {
++        if port.chars().all(|ch| ch.is_ascii_digit()) {
++            host
++        } else {
++            addr
++        }
++    } else {
++        addr
++    }
++}
++
++#[cfg(test)]
++mod tests {
++    use super::*;
++    use crate::config::parse_service_probe_target;
++    use tokio::io::AsyncReadExt;
++    use tokio::net::TcpListener;
++
++    #[test]
++    fn parse_https_service_target_uses_default_port() {
++        match parse_service_probe_target("https://ha.example/api/") {
++            ServiceProbeTarget::Https { addr, path } => {
++                assert_eq!(addr, "ha.example:443");
++                assert_eq!(path, "/api/");
++            }
++            other => panic!("expected Https target, got {other:?}"),
++        }
++    }
++
++    #[test]
++    fn host_from_addr_handles_bracketed_ipv6() {
++        assert_eq!(host_from_addr("[::1]:443"), "::1");
++        assert_eq!(host_from_addr("127.0.0.1:8443"), "127.0.0.1");
++    }
++
++    #[tokio::test]
++    async fn probe_http_get_accepts_plain_http_200() {
++        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
++        let addr = listener.local_addr().unwrap();
++
++        let server = tokio::spawn(async move {
++            let (mut stream, _) = listener.accept().await.unwrap();
++            let mut buf = [0u8; 512];
++            let _ = stream.read(&mut buf).await;
++            stream
++                .write_all(b"HTTP/1.1 200 OK\r\nConnection: close\r\n\r\n")
++                .await
++                .unwrap();
++        });
++
++        probe_http_get(
++            &addr.to_string(),
++            "/health",
++            false,
++            ProbeTimeouts {
++                connect: Duration::from_secs(2),
++                read: Duration::from_secs(2),
++            },
++        )
++        .await
++        .unwrap();
++
++        server.await.unwrap();
++    }
++
++    #[tokio::test]
++    async fn probe_http_get_accepts_keep_alive_without_eof() {
++        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
++        let addr = listener.local_addr().unwrap();
++
++        let server = tokio::spawn(async move {
++            let (mut stream, _) = listener.accept().await.unwrap();
++            let mut buf = [0u8; 512];
++            let _ = stream.read(&mut buf).await;
++            stream
++                .write_all(
++                    b"HTTP/1.1 200 OK\r\nConnection: keep-alive\r\nContent-Length: 0\r\n\r\n",
++                )
++                .await
++                .unwrap();
++            // Leave the socket open — a keep-alive server would not send EOF.
++            tokio::time::sleep(Duration::from_secs(30)).await;
++        });
++
++        probe_http_get(
++            &addr.to_string(),
++            "/health",
++            false,
++            ProbeTimeouts {
++                connect: Duration::from_secs(2),
++                read: Duration::from_secs(2),
++            },
++        )
++        .await
++        .unwrap();
++
++        server.abort();
++    }
++
++    #[tokio::test]
++    async fn probe_http_get_body_reads_content_length_without_eof() {
++        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
++        let addr = listener.local_addr().unwrap();
++
++        let server = tokio::spawn(async move {
++            let (mut stream, _) = listener.accept().await.unwrap();
++            let mut buf = [0u8; 512];
++            let _ = stream.read(&mut buf).await;
++            stream
++                .write_all(
++                    b"HTTP/1.1 200 OK\r\nConnection: keep-alive\r\nContent-Length: 5\r\n\r\nhello",
++                )
++                .await
++                .unwrap();
++            tokio::time::sleep(Duration::from_secs(30)).await;
++        });
++
++        let body = probe_http_get_body(
++            &addr.to_string(),
++            "/health",
++            false,
++            ProbeTimeouts {
++                connect: Duration::from_secs(2),
++                read: Duration::from_secs(2),
++            },
++        )
++        .await
++        .unwrap();
++
++        assert_eq!(body, "hello");
++        server.abort();
++    }
++}
+diff --git a/crates/genie-ctl/src/main.rs b/crates/genie-ctl/src/main.rs
+index aaeb672..dbb5b60 100644
+--- a/crates/genie-ctl/src/main.rs
++++ b/crates/genie-ctl/src/main.rs
+@@ -19,6 +19,7 @@
+ 
+ use anyhow::Result;
+ use genie_common::config::{Config, ServiceProbeTarget, parse_service_probe_target};
++use genie_common::probe::{ProbeTimeouts, probe_service_target};
+ use genie_core::skills::{
+     SkillLoader, SkillManifestAudit, find_manifest_sidecar, manifest_sidecar_candidates,
+     skills_dir as runtime_skills_dir,
+@@ -49,10 +50,6 @@ struct OptionalProbe {
+ /// the support bundle inspect alongside `genie-core`. Reads `[services.api]`
+ /// and `[services.homeassistant]` from `geniepod.toml` so non-default
+ /// hosts/ports are honored. Home Assistant is omitted when not configured.
+-///
+-/// HTTPS-configured services come back as
+-/// [`ServiceProbeTarget::UnsupportedScheme`]; callers should label the row
+-/// (e.g. `[SKIP]`) rather than try to probe — see issue #126 review notes.
+ fn optional_http_probes(config: &Config) -> Vec<OptionalProbe> {
+     let mut probes = vec![OptionalProbe {
+         name: "genie-api".to_string(),
+@@ -69,17 +66,19 @@ fn optional_http_probes(config: &Config) -> Vec<OptionalProbe> {
+     probes
+ }
+ 
+-/// HTTP `host:port` for use by callers that need to issue extra probes to
+-/// genie-api (e.g. the support bundle's `/api/security`, `/api/actuation/audit`
+-/// requests). Returns `Err(scheme)` when `[services.api].url` is configured
+-/// with a scheme the plaintext probe can't handle.
+-fn api_probe_addr(config: &Config) -> std::result::Result<String, String> {
++/// Parsed probe target for genie-api when callers need extra HTTPS-aware
++/// probes (support bundle `/api/security`, etc.).
++fn api_probe_target(config: &Config) -> Result<ServiceProbeTarget, String> {
+     match parse_service_probe_target(&config.services.api.url) {
+-        ServiceProbeTarget::Http { addr, .. } => Ok(addr),
++        target @ (ServiceProbeTarget::Http { .. } | ServiceProbeTarget::Https { .. }) => Ok(target),
+         ServiceProbeTarget::UnsupportedScheme { scheme } => Err(scheme),
+     }
+ }
+ 
++async fn probe_optional_target(target: &ServiceProbeTarget) -> Result<()> {
++    probe_service_target(target, ProbeTimeouts::default()).await
++}
++
+ const SKILL_RESTART_HINT: &str =
+     "Restart genie-core to load skill changes, or wait until the next startup.";
+ 
+@@ -1104,21 +1103,19 @@ async fn cmd_health() -> Result<()> {
+         }
+     }
+ 
+-    // Check each remaining HTTP service, honoring [services.*] in geniepod.toml.
++    // Check each remaining HTTP/TLS service, honoring [services.*] in geniepod.toml.
+     for probe in optional_http_probes(&config) {
+-        match probe.target {
+-            ServiceProbeTarget::Http { addr, path } => match http_get(&addr, &path).await {
+-                Ok(_) => println!("  [OK]   {}", probe.name),
+-                Err(_) => println!("  [DOWN] {}", probe.name),
++        match probe_optional_target(&probe.target).await {
++            Ok(()) => println!("  [OK]   {}", probe.name),
++            Err(_) => match probe.target {
++                ServiceProbeTarget::UnsupportedScheme { scheme } => {
++                    println!(
++                        "  [SKIP] {} ({} probe not supported by genie-ctl)",
++                        probe.name, scheme
++                    );
++                }
++                _ => println!("  [DOWN] {}", probe.name),
+             },
+-            ServiceProbeTarget::UnsupportedScheme { scheme } => {
+-                // Don't send plaintext to a TLS port and report DOWN — surface
+-                // the limitation honestly so the operator can adjust.
+-                println!(
+-                    "  [SKIP] {} ({} probe not supported by genie-ctl)",
+-                    probe.name, scheme
+-                );
+-            }
+         }
+     }
+ 
+@@ -1240,14 +1237,14 @@ async fn cmd_diag() -> Result<()> {
+     };
+     println!("  {:20} {}", "genie-core", core_status);
+     for probe in optional_http_probes(&config) {
+-        let status = match probe.target {
+-            ServiceProbeTarget::Http { addr, path } => match http_get(&addr, &path).await {
+-                Ok(_) => "UP".to_string(),
+-                Err(_) => "DOWN".to_string(),
++        let status = match probe_optional_target(&probe.target).await {
++            Ok(()) => "UP".to_string(),
++            Err(_) => match probe.target {
++                ServiceProbeTarget::UnsupportedScheme { scheme } => {
++                    format!("SKIP ({scheme} probe not supported)")
++                }
++                _ => "DOWN".to_string(),
+             },
+-            ServiceProbeTarget::UnsupportedScheme { scheme } => {
+-                format!("SKIP ({scheme} probe not supported)")
+-            }
+         };
+         println!("  {:20} {}", probe.name, status);
+     }
+@@ -1408,7 +1405,7 @@ async fn cmd_diag() -> Result<()> {
+ async fn cmd_support_bundle(output_path: &Path) -> Result<()> {
+     let config = Config::load()?;
+     let core = config.core_http_addr();
+-    let api_addr_result = api_probe_addr(&config);
++    let api_target = api_probe_target(&config);
+ 
+     let mut service_status = vec![serde_json::json!({
+         "service": "genie-core",
+@@ -1418,11 +1415,17 @@ async fn cmd_support_bundle(output_path: &Path) -> Result<()> {
+     })];
+ 
+     for probe in optional_http_probes(&config) {
+-        let row = match probe.target {
+-            ServiceProbeTarget::Http { addr, path } => {
+-                let reachable = http_get(&addr, &path).await.is_ok();
++        let row = match &probe.target {
++            ServiceProbeTarget::Http { addr, path } | ServiceProbeTarget::Https { addr, path } => {
++                let reachable = probe_optional_target(&probe.target).await.is_ok();
++                let scheme = if matches!(probe.target, ServiceProbeTarget::Https { .. }) {
++                    "https"
++                } else {
++                    "http"
++                };
+                 serde_json::json!({
+                     "service": probe.name,
++                    "scheme": scheme,
+                     "addr": addr,
+                     "path": path,
+                     "reachable": reachable,
+@@ -1437,12 +1440,11 @@ async fn cmd_support_bundle(output_path: &Path) -> Result<()> {
+         service_status.push(row);
+     }
+ 
+-    // Resolve once for the two extra genie-api probes below; if the api URL
+-    // can't be probed (https today), record a structured skip in the bundle.
+-    let (api_security, api_audit) = match &api_addr_result {
+-        Ok(api_addr) => (
+-            http_json_value(api_addr, "/api/security").await,
+-            http_json_value(api_addr, "/api/actuation/audit").await,
++    // Resolve once for the two extra genie-api probes below.
++    let (api_security, api_audit) = match &api_target {
++        Ok(target) => (
++            probe_json_value(target, "/api/security").await,
++            probe_json_value(target, "/api/actuation/audit").await,
+         ),
+         Err(scheme) => (
+             serde_json::json!({
+@@ -1515,6 +1517,20 @@ fn unix_time_ms() -> u128 {
+         .as_millis()
+ }
+ 
++async fn probe_json_value(target: &ServiceProbeTarget, path: &str) -> serde_json::Value {
++    use genie_common::probe::probe_target_body;
++
++    match probe_target_body(target, path, ProbeTimeouts::default()).await {
++        Ok(body) => serde_json::from_str(&body).unwrap_or_else(|e| {
++            serde_json::json!({
++                "error": format!("invalid JSON: {e}"),
++                "raw": body,
++            })
++        }),
++        Err(e) => serde_json::json!({ "error": e.to_string() }),
++    }
++}
++
+ async fn http_json_value(addr: &str, path: &str) -> serde_json::Value {
+     match http_get(addr, path).await {
+         Ok(body) => serde_json::from_str(&body).unwrap_or_else(|e| {
+@@ -1789,11 +1805,12 @@ mod tests {
+         toml::from_str("").expect("default config should parse from empty TOML")
+     }
+ 
+-    fn expect_http_target(target: &ServiceProbeTarget) -> (&str, &str) {
++    fn expect_probe_target(target: &ServiceProbeTarget) -> (&str, &str, bool) {
+         match target {
+-            ServiceProbeTarget::Http { addr, path } => (addr.as_str(), path.as_str()),
++            ServiceProbeTarget::Http { addr, path } => (addr.as_str(), path.as_str(), false),
++            ServiceProbeTarget::Https { addr, path } => (addr.as_str(), path.as_str(), true),
+             ServiceProbeTarget::UnsupportedScheme { scheme } => {
+-                panic!("expected Http target, got UnsupportedScheme({scheme})")
++                panic!("expected Http/Https target, got UnsupportedScheme({scheme})")
+             }
+         }
+     }
+@@ -1807,9 +1824,10 @@ mod tests {
+         // Default config has no homeassistant; only the api probe is present.
+         assert_eq!(probes.len(), 1);
+         assert_eq!(probes[0].name, "genie-api");
+-        let (addr, path) = expect_http_target(&probes[0].target);
++        let (addr, path, tls) = expect_probe_target(&probes[0].target);
+         assert_eq!(addr, "10.0.0.7:4080");
+         assert_eq!(path, "/api/status");
++        assert!(!tls);
+     }
+ 
+     #[test]
+@@ -1838,16 +1856,14 @@ mod tests {
+             .iter()
+             .find(|p| p.name == "Home Assistant")
+             .expect("HA probe should be present");
+-        let (addr, path) = expect_http_target(&ha.target);
++        let (addr, path, tls) = expect_probe_target(&ha.target);
+         assert_eq!(addr, "192.168.1.50:8123");
+         assert_eq!(path, "/");
++        assert!(!tls);
+     }
+ 
+     #[test]
+-    fn optional_http_probes_marks_https_homeassistant_as_unsupported() {
+-        // Regression for PR #127 review: an HTTPS HA URL must NOT collapse
+-        // to a plaintext probe — surface it as UnsupportedScheme so the
+-        // caller can label the row rather than report DOWN.
++    fn optional_http_probes_parses_https_homeassistant() {
+         let mut config = default_test_config();
+         config.services.homeassistant = Some(ServiceEndpoint {
+             url: "https://ha.example/api/".into(),
+@@ -1860,27 +1876,33 @@ mod tests {
+             .iter()
+             .find(|p| p.name == "Home Assistant")
+             .expect("HA probe should be present even when https");
+-        match &ha.target {
+-            ServiceProbeTarget::UnsupportedScheme { scheme } => assert_eq!(scheme, "https"),
+-            ServiceProbeTarget::Http { .. } => {
+-                panic!("https HA URL must not produce an Http probe target")
+-            }
+-        }
++        let (addr, path, tls) = expect_probe_target(&ha.target);
++        assert_eq!(addr, "ha.example:443");
++        assert_eq!(path, "/api/");
++        assert!(tls);
+     }
+ 
+     #[test]
+-    fn api_probe_addr_returns_scheme_error_for_https_api() {
++    fn api_probe_target_returns_https_api_target() {
+         let mut config = default_test_config();
+         config.services.api.url = "https://api.example/api/status".into();
+-        assert_eq!(api_probe_addr(&config), Err("https".to_string()));
++        let target = api_probe_target(&config).expect("https api should parse");
++        let (addr, path, tls) = expect_probe_target(&target);
++        assert_eq!(addr, "api.example:443");
++        assert_eq!(path, "/api/status");
++        assert!(tls);
+     }
+ 
+     #[test]
+-    fn api_probe_addr_returns_addr_for_ipv6_without_port() {
++    fn api_probe_target_returns_addr_for_ipv6_without_port() {
+         // Pairs with the IPv6 bracket regression in genie-common.
+         let mut config = default_test_config();
+         config.services.api.url = "http://[::1]/api/status".into();
+-        assert_eq!(api_probe_addr(&config), Ok("[::1]:80".to_string()));
++        let target = api_probe_target(&config).expect("ipv6 api should parse");
++        let (addr, path, tls) = expect_probe_target(&target);
++        assert_eq!(addr, "[::1]:80");
++        assert_eq!(path, "/api/status");
++        assert!(!tls);
+     }
+ 
+     fn workspace_root() -> PathBuf {
+diff --git a/crates/genie-health/src/checker.rs b/crates/genie-health/src/checker.rs
+index 614c71c..afd32db 100644
+--- a/crates/genie-health/src/checker.rs
++++ b/crates/genie-health/src/checker.rs
+@@ -2,6 +2,7 @@ use std::time::Duration;
+ 
+ use anyhow::Result;
+ use genie_common::config::Config;
++use genie_common::probe::{ProbeTimeouts, probe_configured_url};
+ use rusqlite::Connection;
+ use tokio::net::TcpStream;
+ use tokio::signal::unix::{SignalKind, signal};
+@@ -208,56 +209,12 @@ fn prune_health_log(db: &Connection, cutoff_ts_ms: u64) {
+ 
+ async fn check_http(name: &str, url: &str) -> ServiceStatus {
+     let start = std::time::Instant::now();
++    let timeouts = ProbeTimeouts {
++        connect: Duration::from_secs(5),
++        read: Duration::from_secs(5),
++    };
+ 
+-    // Parse host:port from URL for TCP connect.
+-    let result = async {
+-        let url_parsed = url.strip_prefix("http://").unwrap_or(url);
+-        let (host_port, _path) = url_parsed.split_once('/').unwrap_or((url_parsed, ""));
+-
+-        let stream = tokio::time::timeout(Duration::from_secs(5), TcpStream::connect(host_port))
+-            .await
+-            .map_err(|_| anyhow::anyhow!("timeout"))??;
+-
+-        // Send a minimal HTTP GET.
+-        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+-        let path = url_parsed
+-            .find('/')
+-            .map(|i| &url_parsed[i..])
+-            .unwrap_or("/");
+-
+-        let request = format!(
+-            "GET {} HTTP/1.1\r\nHost: {}\r\nConnection: close\r\n\r\n",
+-            path, host_port
+-        );
+-
+-        let mut stream = stream;
+-        stream.write_all(request.as_bytes()).await?;
+-
+-        let mut buf = [0u8; 256];
+-        let n = tokio::time::timeout(Duration::from_secs(5), stream.read(&mut buf))
+-            .await
+-            .map_err(|_| anyhow::anyhow!("read timeout"))??;
+-
+-        let response = String::from_utf8_lossy(&buf[..n]);
+-        if response.starts_with("HTTP/1.") {
+-            // Extract status code.
+-            let status_code: u16 = response
+-                .split_whitespace()
+-                .nth(1)
+-                .and_then(|s| s.parse().ok())
+-                .unwrap_or(0);
+-            if (200..400).contains(&status_code) {
+-                Ok(())
+-            } else {
+-                Err(anyhow::anyhow!("HTTP {}", status_code))
+-            }
+-        } else {
+-            // Non-HTTP but something responded — treat as alive.
+-            Ok(())
+-        }
+-    }
+-    .await;
+-
++    let result = probe_configured_url(url, timeouts).await;
+     let elapsed_ms = start.elapsed().as_millis() as u64;
+ 
+     match result {
+diff --git a/doc/configuration.md b/doc/configuration.md
+index 1e1acd3..54aace5 100644
+--- a/doc/configuration.md
++++ b/doc/configuration.md
+@@ -199,9 +199,22 @@ Each service block has:
+ 
+ | Key | Purpose |
+ | --- | --- |
+-| `url` | Health or base URL |
++| `url` | Health or base URL (`http://` or `https://`) |
+ | `systemd_unit` | Associated systemd unit name |
+ 
++### HTTPS probe trust (status / health / dashboard latency)
++
++`genie-ctl status`, `genie-health`, and the dashboard latency rows probe
++configured `https://` service URLs using the shared helper in
++`genie-common::probe`.
++
++| Behavior | Detail |
++| --- | --- |
++| **Trust roots** | Mozilla CA bundle from the `webpki-roots` crate — **not** the host OS trust store |
++| **Self-signed LAN certs** | Rejected (common for local Home Assistant HTTPS). Use `http://` on the LAN, terminate TLS at a reverse proxy with a public CA, or wait for a future opt-in `tls_ca_file` / pin policy |
++| **Keep-alive responses** | Probes parse the status line (and `Content-Length` / chunked body when present) and return without waiting for EOF, so healthy keep-alive servers do not time out |
++| **Listen addresses** | `[services.api].url` / `api_http_addr` still require `http://` — HTTPS is probe-only, not a listen scheme |
++
+ ## `[telegram]`
+ 
+ | Key | Purpose |
