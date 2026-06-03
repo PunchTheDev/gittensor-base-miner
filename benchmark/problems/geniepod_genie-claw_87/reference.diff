@@ -1,0 +1,499 @@
+diff --git a/crates/genie-core/src/llm/openai_compat.rs b/crates/genie-core/src/llm/openai_compat.rs
+index cb4c1da..c82de15 100644
+--- a/crates/genie-core/src/llm/openai_compat.rs
++++ b/crates/genie-core/src/llm/openai_compat.rs
+@@ -122,7 +122,7 @@ impl RequestProfile {
+             });
+         }
+ 
+-        let compacted_messages = self.compact_messages(messages);
++        let compacted_messages = self.compact_messages(messages, GENIE_RUNTIME_MAX_BODY_BYTES);
+         let compacted_body =
+             self.serialize_body(&compacted_messages, max_tokens, stream, response_format)?;
+         Ok(PreparedChatBody {
+@@ -164,15 +164,16 @@ impl RequestProfile {
+         }
+     }
+ 
+-    fn compact_messages(&self, messages: &[Message]) -> Vec<Message> {
++    fn compact_messages(&self, messages: &[Message], max_body_bytes: usize) -> Vec<Message> {
+         match self {
+             Self::Generic => messages.to_vec(),
+-            Self::GenieAiRuntime => compact_genie_runtime_messages(messages),
++            Self::GenieAiRuntime => compact_genie_runtime_messages(messages, max_body_bytes),
+         }
+     }
+ }
+ 
+-const GENIE_RUNTIME_MAX_BODY_BYTES: usize = 4 * 1024;
++const GENIE_RUNTIME_MAX_BODY_BYTES: usize = 24 * 1024;
++const GENIE_RUNTIME_BODY_OVERHEAD_BYTES: usize = 768;
+ const GENIE_RUNTIME_COMPACT_SYSTEM: &str =
+     "You are GeniePod Home. Answer the user's latest request directly and concisely.";
+ 
+@@ -507,20 +508,65 @@ fn parse_status_line(line: &str) -> u16 {
+         .unwrap_or(0)
+ }
+ 
+-fn compact_genie_runtime_messages(messages: &[Message]) -> Vec<Message> {
+-    let Some(message) = messages
++fn compact_genie_runtime_messages(messages: &[Message], max_body_bytes: usize) -> Vec<Message> {
++    let system_messages = messages
+         .iter()
+-        .rev()
+-        .find(|m| m.role == "user")
+-        .or_else(|| messages.iter().rev().find(|m| m.role != "system"))
++        .filter(|m| m.role == "system")
++        .cloned()
++        .collect::<Vec<_>>();
++    let has_system_context = !system_messages.is_empty();
++
++    let Some(latest_idx) = messages
++        .iter()
++        .rposition(|m| m.role == "user")
++        .or_else(|| messages.iter().rposition(|m| m.role != "system"))
+     else {
+-        return Vec::new();
++        return system_messages;
+     };
+ 
+-    vec![Message {
++    let latest_source = &messages[latest_idx];
++    let latest = Message {
+         role: "user".into(),
+-        content: format!("{}\n\n{}", GENIE_RUNTIME_COMPACT_SYSTEM, message.content),
+-    }]
++        content: if has_system_context {
++            latest_source.content.clone()
++        } else {
++            format!(
++                "{}\n\n{}",
++                GENIE_RUNTIME_COMPACT_SYSTEM, latest_source.content
++            )
++        },
++    };
++
++    let mut compacted = system_messages;
++    let body_budget = max_body_bytes.saturating_sub(GENIE_RUNTIME_BODY_OVERHEAD_BYTES);
++    let mut estimated_bytes = estimate_messages_bytes(&compacted) + estimate_message_bytes(&latest);
++    let mut retained_history = Vec::new();
++
++    for message in messages[..latest_idx]
++        .iter()
++        .rev()
++        .filter(|m| m.role != "system")
++    {
++        let message_bytes = estimate_message_bytes(message);
++        if estimated_bytes + message_bytes > body_budget {
++            break;
++        }
++        retained_history.push(message.clone());
++        estimated_bytes += message_bytes;
++    }
++
++    retained_history.reverse();
++    compacted.extend(retained_history);
++    compacted.push(latest);
++    compacted
++}
++
++fn estimate_messages_bytes(messages: &[Message]) -> usize {
++    messages.iter().map(estimate_message_bytes).sum()
++}
++
++fn estimate_message_bytes(message: &Message) -> usize {
++    message.role.len() + message.content.len() + 32
+ }
+ 
+ fn should_retry_without_system_role(messages: &[Message], err: &str) -> bool {
+@@ -664,11 +710,11 @@ mod tests {
+         let messages = vec![
+             Message {
+                 role: "system".into(),
+-                content: "large tool manifest ".repeat(1_000),
++                content: "tool manifest memory_recall household context ".repeat(128),
+             },
+             Message {
+                 role: "assistant".into(),
+-                content: "older assistant turn ".repeat(200),
++                content: "older assistant turn ".repeat(2_000),
+             },
+             Message {
+                 role: "user".into(),
+@@ -685,13 +731,41 @@ mod tests {
+         assert!(prepared.compacted);
+         assert_eq!(json["model"], "jetson-llm");
+         assert_eq!(json["think"], false);
+-        assert_eq!(json["messages"].as_array().unwrap().len(), 1);
+-        assert_eq!(json["messages"][0]["role"], "user");
+-        assert!(serialized_messages.contains("GeniePod Home"));
++        assert_eq!(json["messages"].as_array().unwrap().len(), 2);
++        assert_eq!(json["messages"][0]["role"], "system");
++        assert!(serialized_messages.contains("memory_recall"));
++        assert!(serialized_messages.contains("household context"));
+         assert!(serialized_messages.contains("Say hello from the GeniePod web UI."));
+-        assert!(!serialized_messages.contains("large tool manifest"));
++        assert!(!serialized_messages.contains("GeniePod Home"));
+         assert!(!serialized_messages.contains("older assistant turn"));
+-        assert!(prepared.body.len() < 1_000);
++        assert!(prepared.body.len() < GENIE_RUNTIME_MAX_BODY_BYTES);
++    }
++
++    #[test]
++    fn genie_runtime_profile_keeps_runtime_prompt_under_expanded_budget() {
++        let profile = RequestProfile::genie_ai_runtime();
++        let messages = vec![
++            Message {
++                role: "system".into(),
++                content: "memory_recall tool manifest household preference ".repeat(160),
++            },
++            Message {
++                role: "user".into(),
++                content: "What is my name?".into(),
++            },
++        ];
++
++        let prepared = profile
++            .prepare_body(&messages, Some(64), false, None)
++            .unwrap();
++        let json: serde_json::Value = serde_json::from_str(&prepared.body).unwrap();
++        let serialized_messages = json["messages"].to_string();
++
++        assert!(!prepared.compacted);
++        assert!(prepared.body.len() > 4 * 1024);
++        assert!(prepared.body.len() < GENIE_RUNTIME_MAX_BODY_BYTES);
++        assert!(serialized_messages.contains("memory_recall"));
++        assert!(serialized_messages.contains("What is my name?"));
+     }
+ 
+     #[test]
+@@ -707,10 +781,11 @@ mod tests {
+             },
+         ];
+ 
+-        let compacted = compact_genie_runtime_messages(&messages);
+-        assert_eq!(compacted.len(), 1);
+-        assert_eq!(compacted[0].role, "user");
+-        assert!(compacted[0].content.contains("assistant fallback"));
++        let compacted = compact_genie_runtime_messages(&messages, GENIE_RUNTIME_MAX_BODY_BYTES);
++        assert_eq!(compacted.len(), 2);
++        assert_eq!(compacted[0].role, "system");
++        assert_eq!(compacted[1].role, "user");
++        assert!(compacted[1].content.contains("assistant fallback"));
+     }
+ 
+     #[test]
+diff --git a/crates/genie-core/src/server.rs b/crates/genie-core/src/server.rs
+index 9d5f39c..55a4daa 100644
+--- a/crates/genie-core/src/server.rs
++++ b/crates/genie-core/src/server.rs
+@@ -1,3 +1,5 @@
++use std::rc::Rc;
++
+ use anyhow::Result;
+ use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+ use tokio::net::TcpListener;
+@@ -63,6 +65,7 @@ pub struct ChatServer {
+     memory: Memory,
+     conversations: ConversationStore,
+     current_conv_id: Mutex<String>,
++    chat_turn_lock: Mutex<()>,
+     system_prompt: String,
+     max_history: usize,
+     model_family: ModelFamily,
+@@ -98,6 +101,7 @@ impl ChatServer {
+             memory,
+             conversations,
+             current_conv_id: Mutex::new(conv_id),
++            chat_turn_lock: Mutex::new(()),
+             system_prompt,
+             max_history,
+             model_family,
+@@ -105,11 +109,12 @@ impl ChatServer {
+         })
+     }
+ 
+-    /// Serve HTTP requests sequentially.
++    /// Serve HTTP requests on the current-thread runtime.
+     ///
+-    /// Single-threaded by design: home appliance with <10 concurrent users.
+-    /// LLM calls are the bottleneck (seconds), not HTTP handling (microseconds).
+-    pub async fn serve(&self, bind_host: &str, port: u16) -> Result<()> {
++    /// Requests are accepted concurrently on one OS thread so health/dashboard
++    /// probes stay responsive while a chat turn is waiting on the local LLM.
++    /// Chat turns themselves are still serialized with `chat_turn_lock`.
++    pub async fn serve(self, bind_host: &str, port: u16) -> Result<()> {
+         let bind_host = bind_host.trim();
+         let bind_host = if bind_host.is_empty() {
+             "127.0.0.1"
+@@ -126,12 +131,95 @@ impl ChatServer {
+         let listener = TcpListener::bind(&addr).await?;
+         tracing::info!(addr = %addr, "genie-core HTTP server listening");
+ 
+-        loop {
+-            let (stream, _) = listener.accept().await?;
+-            if let Err(e) = handle_request(stream, self).await {
+-                tracing::debug!(error = %e, "request error");
+-            }
++        let ctx = Rc::new(self);
++        let local = tokio::task::LocalSet::new();
++        local
++            .run_until(async move {
++                loop {
++                    let (stream, _) = listener.accept().await?;
++                    let request_ctx = Rc::clone(&ctx);
++                    tokio::task::spawn_local(async move {
++                        if let Err(e) = handle_request(stream, request_ctx.as_ref()).await {
++                            tracing::debug!(error = %e, "request error");
++                        }
++                    });
++                }
++                #[allow(unreachable_code)]
++                Ok(())
++            })
++            .await
++    }
++}
++
++#[derive(Debug, Clone, Copy, PartialEq, Eq)]
++enum RequestRoute<'a> {
++    Root,
++    ChatStream,
++    Chat,
++    History,
++    Clear,
++    Conversations,
++    Tools,
++    RuntimeContract,
++    WebSearchStatus,
++    WebSearchPost,
++    Health,
++    Connectivity,
++    ActuationPending,
++    ActuationActions,
++    ActuationConfirm,
++    MemoriesList,
++    MemoriesUpdate,
++    MemoriesDelete,
++    MemoriesReorder,
++    OpenAiChat,
++    Models,
++    Options,
++    Export(&'a str),
++    NotFound,
++}
++
++fn classify_route<'a>(method: &str, path: &'a str) -> RequestRoute<'a> {
++    match (method, path) {
++        ("GET", "/" | "/index.html") => RequestRoute::Root,
++        ("POST", "/api/chat/stream") => RequestRoute::ChatStream,
++        ("POST", "/api/chat") => RequestRoute::Chat,
++        ("GET", "/api/chat/history") => RequestRoute::History,
++        ("POST", "/api/chat/clear") => RequestRoute::Clear,
++        ("GET", "/api/conversations") => RequestRoute::Conversations,
++        ("GET", "/api/tools") => RequestRoute::Tools,
++        ("GET", "/api/runtime/contract") => RequestRoute::RuntimeContract,
++        ("GET", "/api/web-search") => RequestRoute::WebSearchStatus,
++        ("POST", "/api/web-search") => RequestRoute::WebSearchPost,
++        ("GET", "/api/health") => RequestRoute::Health,
++        ("GET", "/api/connectivity") => RequestRoute::Connectivity,
++        ("GET", "/api/actuation/pending") => RequestRoute::ActuationPending,
++        ("GET", "/api/actuation/actions") => RequestRoute::ActuationActions,
++        ("POST", "/api/actuation/confirm") => RequestRoute::ActuationConfirm,
++        ("GET", "/api/memories") => RequestRoute::MemoriesList,
++        ("POST", "/api/memories/update") => RequestRoute::MemoriesUpdate,
++        ("POST", "/api/memories/delete") => RequestRoute::MemoriesDelete,
++        ("POST", "/api/memories/reorder") => RequestRoute::MemoriesReorder,
++        ("POST", "/v1/chat/completions") => RequestRoute::OpenAiChat,
++        ("GET", "/v1/models") => RequestRoute::Models,
++        ("OPTIONS", _) => RequestRoute::Options,
++        ("GET", path) if path.starts_with("/api/chat/export") => {
++            RequestRoute::Export(path.split("id=").nth(1).unwrap_or(""))
+         }
++        _ => RequestRoute::NotFound,
++    }
++}
++
++async fn with_chat_turn_lock<T>(lock: &Mutex<()>, fut: impl std::future::Future<Output = T>) -> T {
++    let _guard = lock.lock().await;
++    fut.await
++}
++
++fn normalized_origin(request_origin: RequestOrigin) -> RequestOrigin {
++    if matches!(request_origin, RequestOrigin::Unknown) {
++        RequestOrigin::Api
++    } else {
++        request_origin
+     }
+ }
+ 
+@@ -143,6 +231,7 @@ async fn handle_request(stream: tokio::net::TcpStream, ctx: &ChatServer) -> Resu
+     let connectivity = ctx.connectivity.as_ref();
+     let conversations = &ctx.conversations;
+     let current_conv_id = &ctx.current_conv_id;
++    let chat_turn_lock = &ctx.chat_turn_lock;
+     let system_prompt = &ctx.system_prompt;
+     let max_history = ctx.max_history;
+     let model_family = ctx.model_family;
+@@ -187,7 +276,9 @@ async fn handle_request(stream: tokio::net::TcpStream, ctx: &ChatServer) -> Resu
+     };
+ 
+     // Route.
+-    if method == "POST" && path == "/api/chat/stream" {
++    let route = classify_route(method, path);
++    if matches!(route, RequestRoute::ChatStream) {
++        let _guard = chat_turn_lock.lock().await;
+         if let Err(e) = handle_chat_stream(
+             &mut writer,
+             body.as_deref(),
+@@ -199,11 +290,7 @@ async fn handle_request(stream: tokio::net::TcpStream, ctx: &ChatServer) -> Resu
+             system_prompt,
+             max_history,
+             model_family,
+-            if matches!(request_origin, RequestOrigin::Unknown) {
+-                RequestOrigin::Api
+-            } else {
+-                request_origin
+-            },
++            normalized_origin(request_origin),
+         )
+         .await
+         {
+@@ -212,32 +299,31 @@ async fn handle_request(stream: tokio::net::TcpStream, ctx: &ChatServer) -> Resu
+         return Ok(());
+     }
+ 
+-    let (status, content_type, response_body) = match (method, path) {
+-        ("GET", "/" | "/index.html") => CHAT_UI.response(),
+-        ("POST", "/api/chat") => {
+-            handle_chat(
+-                body.as_deref(),
+-                llm,
+-                tools,
+-                memory,
+-                conversations,
+-                current_conv_id,
+-                system_prompt,
+-                max_history,
+-                model_family,
+-                if matches!(request_origin, RequestOrigin::Unknown) {
+-                    RequestOrigin::Api
+-                } else {
+-                    request_origin
+-                },
++    let (status, content_type, response_body) = match route {
++        RequestRoute::Root => CHAT_UI.response(),
++        RequestRoute::Chat => {
++            with_chat_turn_lock(
++                chat_turn_lock,
++                handle_chat(
++                    body.as_deref(),
++                    llm,
++                    tools,
++                    memory,
++                    conversations,
++                    current_conv_id,
++                    system_prompt,
++                    max_history,
++                    model_family,
++                    normalized_origin(request_origin),
++                ),
+             )
+             .await
+         }
+-        ("GET", "/api/chat/history") => handle_history(conversations, current_conv_id).await,
+-        ("POST", "/api/chat/clear") => handle_clear(conversations, current_conv_id).await,
+-        ("GET", "/api/conversations") => handle_list_conversations(conversations),
+-        ("GET", "/api/tools") => handle_list_tools(tools),
+-        ("GET", "/api/runtime/contract") => {
++        RequestRoute::History => handle_history(conversations, current_conv_id).await,
++        RequestRoute::Clear => handle_clear(conversations, current_conv_id).await,
++        RequestRoute::Conversations => handle_list_conversations(conversations),
++        RequestRoute::Tools => handle_list_tools(tools),
++        RequestRoute::RuntimeContract => {
+             handle_runtime_contract(
+                 tools,
+                 connectivity,
+@@ -250,9 +336,9 @@ async fn handle_request(stream: tokio::net::TcpStream, ctx: &ChatServer) -> Resu
+             )
+             .await
+         }
+-        ("GET", "/api/web-search") => handle_web_search_status(tools),
+-        ("POST", "/api/web-search") => handle_web_search(body.as_deref(), tools).await,
+-        ("GET", "/api/health") => {
++        RequestRoute::WebSearchStatus => handle_web_search_status(tools),
++        RequestRoute::WebSearchPost => handle_web_search(body.as_deref(), tools).await,
++        RequestRoute::Health => {
+             handle_health(
+                 llm,
+                 tools,
+@@ -266,43 +352,35 @@ async fn handle_request(stream: tokio::net::TcpStream, ctx: &ChatServer) -> Resu
+             )
+             .await
+         }
+-        ("GET", "/api/connectivity") => handle_connectivity(connectivity).await,
+-        ("GET", "/api/actuation/pending") => handle_actuation_pending(tools),
+-        ("GET", "/api/actuation/actions") => handle_actuation_actions(tools),
+-        ("POST", "/api/actuation/confirm") => {
+-            handle_actuation_confirm(body.as_deref(), tools).await
+-        }
+-        ("GET", "/api/memories") => handle_memories_list(memory),
+-        ("POST", "/api/memories/update") => handle_memories_update(body.as_deref(), memory),
+-        ("POST", "/api/memories/delete") => handle_memories_delete(body.as_deref(), memory),
+-        ("POST", "/api/memories/reorder") => handle_memories_reorder(body.as_deref(), memory),
+-        ("POST", "/v1/chat/completions") => {
+-            handle_openai_chat(
+-                body.as_deref(),
+-                llm,
+-                tools,
+-                memory,
+-                system_prompt,
+-                max_history,
+-                model_family,
+-                if matches!(request_origin, RequestOrigin::Unknown) {
+-                    RequestOrigin::Api
+-                } else {
+-                    request_origin
+-                },
++        RequestRoute::Connectivity => handle_connectivity(connectivity).await,
++        RequestRoute::ActuationPending => handle_actuation_pending(tools),
++        RequestRoute::ActuationActions => handle_actuation_actions(tools),
++        RequestRoute::ActuationConfirm => handle_actuation_confirm(body.as_deref(), tools).await,
++        RequestRoute::MemoriesList => handle_memories_list(memory),
++        RequestRoute::MemoriesUpdate => handle_memories_update(body.as_deref(), memory),
++        RequestRoute::MemoriesDelete => handle_memories_delete(body.as_deref(), memory),
++        RequestRoute::MemoriesReorder => handle_memories_reorder(body.as_deref(), memory),
++        RequestRoute::OpenAiChat => {
++            with_chat_turn_lock(
++                chat_turn_lock,
++                handle_openai_chat(
++                    body.as_deref(),
++                    llm,
++                    tools,
++                    memory,
++                    system_prompt,
++                    max_history,
++                    model_family,
++                    normalized_origin(request_origin),
++                ),
+             )
+             .await
+         }
+-        ("GET", "/v1/models") => handle_list_models(),
+-        ("OPTIONS", _) => (200, "text/plain", String::new()),
+-        _ => {
+-            // Check for query params: /api/chat/export?id=X
+-            if method == "GET" && path.starts_with("/api/chat/export") {
+-                let conv_id = path.split("id=").nth(1).unwrap_or("");
+-                handle_export(conversations, conv_id)
+-            } else {
+-                (404, "application/json", r#"{"error":"not found"}"#.into())
+-            }
++        RequestRoute::Models => handle_list_models(),
++        RequestRoute::Options => (200, "text/plain", String::new()),
++        RequestRoute::Export(conv_id) => handle_export(conversations, conv_id),
++        RequestRoute::NotFound | RequestRoute::ChatStream => {
++            (404, "application/json", r#"{"error":"not found"}"#.into())
+         }
+     };
+ 

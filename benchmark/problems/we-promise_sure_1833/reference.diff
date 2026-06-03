@@ -1,0 +1,1860 @@
+diff --git a/app/controllers/api/v1/imports_controller.rb b/app/controllers/api/v1/imports_controller.rb
+index 5f1e9cf3ee..3c92bff208 100644
+--- a/app/controllers/api/v1/imports_controller.rb
++++ b/app/controllers/api/v1/imports_controller.rb
+@@ -35,14 +35,14 @@ def index
+ 
+   rescue StandardError => e
+     Rails.logger.error "ImportsController#index error: #{e.message}"
+-    render json: { error: "internal_server_error", message: e.message }, status: :internal_server_error
++    render json: { error: "internal_server_error", message: "An unexpected error occurred." }, status: :internal_server_error
+   end
+ 
+   def show
+     render :show
+   rescue StandardError => e
+     Rails.logger.error "ImportsController#show error: #{e.message}"
+-    render json: { error: "internal_server_error", message: e.message }, status: :internal_server_error
++    render json: { error: "internal_server_error", message: "An unexpected error occurred." }, status: :internal_server_error
+   end
+ 
+   def rows
+@@ -58,7 +58,7 @@ def rows
+     render :rows
+   rescue StandardError => e
+     Rails.logger.error "ImportsController#rows error: #{e.message}"
+-    render json: { error: "internal_server_error", message: e.message }, status: :internal_server_error
++    render json: { error: "internal_server_error", message: "An unexpected error occurred." }, status: :internal_server_error
+   end
+ 
+   def create
+@@ -133,7 +133,7 @@ def create
+ 
+   rescue StandardError => e
+     Rails.logger.error "ImportsController#create error: #{e.message}"
+-    render json: { error: "internal_server_error", message: e.message }, status: :internal_server_error
++    render json: { error: "internal_server_error", message: "An unexpected error occurred." }, status: :internal_server_error
+   end
+ 
+   def preflight
+@@ -156,7 +156,7 @@ def preflight
+ 
+     render json: {
+       error: "internal_server_error",
+-      message: "Error: #{e.message}"
++      message: "Import preflight could not be completed."
+     }, status: :internal_server_error
+   end
+ 
+@@ -242,7 +242,7 @@ def create_sure_import(family)
+       end
+ 
+       begin
+-        @import.publish_later if @import.publishable? && params[:publish] == "true"
++        @import.publish_later if params[:publish] == "true"
+       rescue Import::MaxRowCountExceededError
+         render json: {
+           error: "max_row_count_exceeded",
+@@ -250,6 +250,22 @@ def create_sure_import(family)
+           import_id: @import.id
+         }, status: :unprocessable_entity
+         return
++      rescue SureImport::PreflightError
++        render json: {
++          error: "preflight_failed",
++          message: "Import was uploaded but did not pass Sure NDJSON preflight.",
++          errors: sure_import_error_lines,
++          import_id: @import.id
++        }, status: :unprocessable_entity
++        return
++      rescue SureImport::NotPublishableError => e
++        Rails.logger.warn "Sure import not publishable for import #{@import.id}: #{e.message}"
++        render json: {
++          error: "not_publishable",
++          message: "Import was uploaded but has no publishable records.",
++          import_id: @import.id
++        }, status: :unprocessable_entity
++        return
+       rescue StandardError => e
+         Rails.logger.error "Sure import publish failed for import #{@import.id}: #{e.message}"
+         restore_pending_sure_import_after_publish_failure
+@@ -284,6 +300,8 @@ def restore_pending_sure_import_after_publish_failure
+       @import.update_column(:status, "pending") if @import&.persisted? && @import.importing?
+     end
+ 
++    def sure_import_error_lines = @import.error.to_s.lines.map(&:strip).reject(&:blank?)
++
+     def clean_up_failed_sure_import(import)
+       return unless import
+ 
+diff --git a/app/models/family/data_exporter.rb b/app/models/family/data_exporter.rb
+index 0435e1ec3f..4042180566 100644
+--- a/app/models/family/data_exporter.rb
++++ b/app/models/family/data_exporter.rb
+@@ -300,27 +300,38 @@ def generate_ndjson
+         }.to_json
+       end
+ 
+-      # Export transactions with full data (exclude split parents, export children instead)
+-      exportable_transactions.includes(:category, :merchant, :tags, entry: :account).find_each do |transaction|
++      ndjson_exportable_transactions.includes(
++        :category,
++        :merchant,
++        :tags,
++        entry: [
++          :account,
++          { child_entries: { entryable: :tags } }
++        ]
++      ).find_each do |transaction|
++        transaction_data = {
++          id: transaction.id,
++          entry_id: transaction.entry.id,
++          account_id: transaction.entry.account_id,
++          date: transaction.entry.date,
++          amount: transaction.entry.amount,
++          currency: transaction.entry.currency,
++          name: transaction.entry.name,
++          notes: transaction.entry.notes,
++          excluded: transaction.entry.excluded,
++          category_id: transaction.category_id,
++          merchant_id: transaction.merchant_id,
++          tag_ids: transaction.tag_ids,
++          kind: transaction.kind,
++          created_at: transaction.created_at,
++          updated_at: transaction.updated_at
++        }
++        split_lines = serialize_split_lines_for_export(transaction.entry)
++        transaction_data[:split_lines] = split_lines if split_lines.any?
++
+         lines << {
+           type: "Transaction",
+-          data: {
+-            id: transaction.id,
+-            entry_id: transaction.entry.id,
+-            account_id: transaction.entry.account_id,
+-            date: transaction.entry.date,
+-            amount: transaction.entry.amount,
+-            currency: transaction.entry.currency,
+-            name: transaction.entry.name,
+-            notes: transaction.entry.notes,
+-            excluded: transaction.entry.excluded,
+-            category_id: transaction.category_id,
+-            merchant_id: transaction.merchant_id,
+-            tag_ids: transaction.tag_ids,
+-            kind: transaction.kind,
+-            created_at: transaction.created_at,
+-            updated_at: transaction.updated_at
+-          }
++          data: transaction_data
+         }.to_json
+       end
+ 
+@@ -456,6 +467,42 @@ def exportable_transactions
+       @family.transactions.merge(Entry.excluding_split_parents)
+     end
+ 
++    def ndjson_exportable_transactions
++      @family.transactions.joins(:entry).where(entries: { parent_entry_id: nil })
++    end
++
++    def serialize_split_lines_for_export(parent_entry)
++      child_entries = split_child_entries_for_export(parent_entry)
++      return [] if child_entries.empty?
++
++      child_entries.map do |child_entry|
++        transaction = child_entry.entryable
++        {
++          id: transaction.id,
++          entry_id: child_entry.id,
++          amount: child_entry.amount,
++          currency: child_entry.currency,
++          name: child_entry.name,
++          notes: child_entry.notes,
++          excluded: child_entry.excluded,
++          category_id: transaction.category_id,
++          merchant_id: transaction.merchant_id,
++          tag_ids: transaction.tag_ids,
++          kind: transaction.kind,
++          created_at: transaction.created_at,
++          updated_at: transaction.updated_at
++        }
++      end
++    end
++
++    def split_child_entries_for_export(parent_entry)
++      if parent_entry.association(:child_entries).loaded?
++        parent_entry.child_entries.sort_by { |entry| [ entry.created_at, entry.id ] }
++      else
++        parent_entry.child_entries.order(:created_at, :id).to_a
++      end
++    end
++
+     def family_transaction_ids
+       @family_transaction_ids ||= exportable_transactions.select(:id)
+     end
+diff --git a/app/models/family/data_importer.rb b/app/models/family/data_importer.rb
+index 8ee468dc87..4de55a9bcd 100644
+--- a/app/models/family/data_importer.rb
++++ b/app/models/family/data_importer.rb
+@@ -2,7 +2,15 @@
+ 
+ class Family::DataImporter
+   SUPPORTED_TYPES = %w[Account Balance Category Tag Merchant RecurringTransaction Transaction Transfer RejectedTransfer Trade Holding Valuation Budget BudgetCategory Rule].freeze
+-  ACCOUNTABLE_TYPES = Accountable::TYPES.freeze
++  ACCOUNTABLE_TYPE_CLASSES = {
++    "Depository" => Depository, "Investment" => Investment, "Crypto" => Crypto,
++    "Property" => Property, "Vehicle" => Vehicle, "OtherAsset" => OtherAsset,
++    "CreditCard" => CreditCard, "Loan" => Loan, "OtherLiability" => OtherLiability
++  }.freeze
++
++  def self.accountable_class_for(type)
++    ACCOUNTABLE_TYPE_CLASSES[type.to_s]
++  end
+ 
+   def initialize(family, ndjson_content)
+     @family = family
+@@ -78,11 +86,9 @@ def import_accounts(records)
+         accountable_data = data["accountable"] || {}
+         accountable_type = data["accountable_type"]
+ 
+-        # Skip if accountable type is not valid
+-        next unless ACCOUNTABLE_TYPES.include?(accountable_type)
++        accountable_class = self.class.accountable_class_for(accountable_type)
++        next unless accountable_class
+ 
+-        # Build accountable
+-        accountable_class = accountable_type.constantize
+         accountable = accountable_class.new
+         accountable.subtype = accountable_data["subtype"] if accountable.respond_to?(:subtype=) && accountable_data["subtype"]
+ 
+@@ -110,8 +116,9 @@ def import_accounts(records)
+         account.save!
+ 
+         # Set opening balance if we have a historical balance and the import
+-        # does not provide an explicit opening-anchor valuation for this account.
+-        if data["balance"].present? && !@imported_opening_anchor_account_ids.include?(old_id)
++        # does not provide either an explicit opening-anchor valuation or an
++        # authoritative balance-history stream for this account.
++        if data["balance"].present? && !skip_opening_balance_import?(old_id, data)
+           manager = Account::OpeningBalanceManager.new(account)
+           result = manager.set_opening_balance(
+             balance: data["balance"].to_d,
+@@ -190,8 +197,8 @@ def import_categories(records)
+           classification_unused: data["classification_unused"] || data["classification"] || "expense",
+           lucide_icon: data["lucide_icon"] || "shapes"
+         )
+-
+         category.save!
++
+         @id_mappings[:categories][old_id] = category.id
+       end
+ 
+@@ -216,8 +223,8 @@ def import_tags(records)
+           name: data["name"],
+           color: data["color"] || Tag::COLORS.sample
+         )
+-
+         tag.save!
++
+         @id_mappings[:tags][old_id] = tag.id
+       end
+     end
+@@ -232,8 +239,8 @@ def import_merchants(records)
+           color: data["color"],
+           logo_url: data["logo_url"]
+         )
+-
+         merchant.save!
++
+         @id_mappings[:merchants][old_id] = merchant.id
+       end
+     end
+@@ -324,10 +331,7 @@ def import_transactions(records)
+         end
+ 
+         # Map tag IDs (optional)
+-        new_tag_ids = []
+-        if data["tag_ids"].present?
+-          new_tag_ids = Array(data["tag_ids"]).map { |old_tag_id| @id_mappings[:tags][old_tag_id] }.compact
+-        end
++        new_tag_ids = mapped_tag_ids(data["tag_ids"])
+ 
+         transaction = Transaction.new(
+           category_id: new_category_id,
+@@ -348,13 +352,80 @@ def import_transactions(records)
+ 
+         entry.save!
+ 
+-        # Add tags through the tagging association
+-        new_tag_ids.each do |tag_id|
++        @id_mappings[:transactions][old_id] = transaction.id
++        split_rows = importable_split_rows(data)
++
++        if split_rows.any?
++          @created_entries << entry
++          import_split_lines!(entry, split_rows, fallback_tag_ids: new_tag_ids)
++        else
++          new_tag_ids.each do |tag_id|
++            transaction.taggings.create!(tag_id: tag_id)
++          end
++
++          @created_entries << entry
++        end
++      end
++    end
++
++    def mapped_tag_ids(old_tag_ids)
++      Array(old_tag_ids).map { |old_tag_id| @id_mappings[:tags][old_tag_id] }.compact
++    end
++
++    def importable_split_rows(data)
++      rows = data["split_lines"].presence || data["splitLines"].presence || data["splits"].presence
++      Array(rows).filter_map do |row|
++        next unless row.is_a?(Hash)
++
++        amount = row["amount"] || row["amount_money"] || row["amount_decimal"]
++        next if amount.blank?
++
++        category_id = remap_optional_id(:categories, row["category_id"])
++        merchant_id = remap_optional_id(:merchants, row["merchant_id"])
++
++        {
++          old_id: row["id"],
++          name: row["name"].presence || row["memo"].presence || row["description"].presence || "Imported split",
++          amount: amount.to_d,
++          category_id: category_id,
++          merchant_id: merchant_id,
++          merchant_id_provided: row.key?("merchant_id"),
++          notes: row["notes"],
++          excluded: boolean_import_value(row, "excluded", default: false),
++          tag_ids: mapped_tag_ids(row["tag_ids"]),
++          tag_ids_provided: row.key?("tag_ids"),
++          kind: row["kind"]
++        }
++      end
++    end
++
++    def import_split_lines!(entry, split_rows, fallback_tag_ids:)
++      children = entry.split!(
++        split_rows.map do |row|
++          {
++            name: row[:name],
++            amount: row[:amount],
++            category_id: row[:category_id],
++            excluded: row[:excluded]
++          }
++        end
++      )
++
++      children.zip(split_rows).each do |child_entry, row|
++        transaction = child_entry.entryable
++        transaction.update!(
++          merchant_id: row[:merchant_id_provided] ? row[:merchant_id] : transaction.merchant_id,
++          kind: row[:kind].presence || transaction.kind
++        )
++        child_entry.update!(notes: row[:notes]) if row[:notes].present?
++
++        tag_ids = row[:tag_ids_provided] ? row[:tag_ids] : fallback_tag_ids
++        tag_ids.each do |tag_id|
+           transaction.taggings.create!(tag_id: tag_id)
+         end
+ 
+-        @created_entries << entry
+-        @id_mappings[:transactions][old_id] = transaction.id
++        @id_mappings[:transactions][row[:old_id]] = transaction.id if row[:old_id].present?
++        @created_entries << child_entry
+       end
+     end
+ 
+@@ -540,6 +611,12 @@ def imported_opening_anchor_account_ids(records)
+       end
+     end
+ 
++    def skip_opening_balance_import?(old_id, data)
++      @imported_opening_anchor_account_ids.include?(old_id) ||
++        truthy?(data["skip_opening_balance_import"]) ||
++        truthy?(data["authoritative_balance_history"])
++    end
++
+     def opening_balance_date_for(old_id, data)
+       explicit_date = parse_import_date(
+         data["opening_balance_date"] || data["opening_balance_on"]
+diff --git a/app/models/import/preflight.rb b/app/models/import/preflight.rb
+index 69051eac3e..20199f80b3 100644
+--- a/app/models/import/preflight.rb
++++ b/app/models/import/preflight.rb
+@@ -232,68 +232,21 @@ def sure_import_raw_content_attributes(content)
+     end
+ 
+     def sure_import_preflight_payload(content, filename, content_type)
+-      line_counts = Hash.new(0)
+-      errors = []
+-      valid_rows_count = 0
+-      nonblank_rows_count = 0
+-
+-      content.each_line.with_index(1) do |line, line_number|
+-        next if line.strip.blank?
+-
+-        nonblank_rows_count += 1
+-        record = JSON.parse(line)
+-
+-        unless record.is_a?(Hash)
+-          errors << {
+-            code: "invalid_ndjson_record",
+-            message: "Line #{line_number} must be a JSON object."
+-          }
+-          next
+-        end
+-
+-        if record["type"].blank? || !record.key?("data")
+-          errors << {
+-            code: "invalid_ndjson_record",
+-            message: "Line #{line_number} must include type and data."
+-          }
+-          next
+-        end
+-
+-        valid_rows_count += 1
+-        line_counts[record["type"]] += 1
+-      rescue JSON::ParserError => e
+-        errors << {
+-          code: "invalid_json",
+-          message: "Line #{line_number} is not valid JSON: #{e.message}"
+-        }
+-      end
+-
+-      if nonblank_rows_count.zero?
+-        errors << {
+-          code: "no_data_rows",
+-          message: "No data rows were found."
+-        }
+-      end
+-
+-      entity_counts = SureImport.dry_run_totals_from_line_type_counts(line_counts)
+-      unsupported_types = line_counts.keys - SureImport.importable_ndjson_types
+-      warnings = []
+-      warnings << "No importable records were found." if nonblank_rows_count.positive? && entity_counts.values.sum.zero?
+-      warnings << "Some records use unsupported types: #{unsupported_types.join(', ')}" if unsupported_types.any?
+-      warnings << "Row count exceeds this import type's publish limit." if nonblank_rows_count > SureImport.max_row_count
++      result = SureImport::Preflight.new(
++        family: family,
++        content: content
++      ).call
++      stats = result.stats
++      warnings = result.warnings.dup
++      warnings << "No importable records were found." if stats[:rows_count].positive? && (stats[:entity_counts] || {}).values.sum.zero?
++      warnings << "Row count exceeds this import type's publish limit." if stats[:rows_count] > SureImport.max_row_count
+ 
+       {
+         type: "SureImport",
+-        valid: errors.empty?,
++        valid: result.valid?,
+         content: content_payload(filename, content_type, content),
+-        stats: {
+-          rows_count: nonblank_rows_count,
+-          valid_rows_count: valid_rows_count,
+-          invalid_rows_count: nonblank_rows_count - valid_rows_count,
+-          entity_counts: entity_counts,
+-          record_type_counts: line_counts
+-        },
+-        errors: errors,
++        stats: stats,
++        errors: result.errors,
+         warnings: warnings
+       }
+     end
+diff --git a/app/models/sure_import.rb b/app/models/sure_import.rb
+index 0fab88a270..c738e6156e 100644
+--- a/app/models/sure_import.rb
++++ b/app/models/sure_import.rb
+@@ -1,5 +1,10 @@
+ class SureImport < Import
+-  MAX_NDJSON_SIZE = 10.megabytes
++  NotPublishableError = Class.new(StandardError)
++  PreflightError = Class.new(StandardError)
++
++  DEFAULT_MAX_NDJSON_SIZE_MB = 10
++  DEFAULT_MAX_ROW_COUNT = 100_000
++  MAX_NDJSON_SIZE = DEFAULT_MAX_NDJSON_SIZE_MB.megabytes
+   IMPORTABLE_NDJSON_TYPES = {
+     "Account" => :accounts,
+     "Balance" => :balances,
+@@ -30,11 +35,11 @@ class SureImport < Import
+ 
+   class << self
+     def max_row_count
+-      100_000
++      positive_integer_env("SURE_IMPORT_MAX_ROWS", DEFAULT_MAX_ROW_COUNT)
+     end
+ 
+     def max_ndjson_size
+-      MAX_NDJSON_SIZE
++      positive_integer_env("SURE_IMPORT_MAX_NDJSON_SIZE_MB", DEFAULT_MAX_NDJSON_SIZE_MB).megabytes
+     end
+ 
+     # Counts JSON lines by top-level "type" (used for dry-run summaries and row limits).
+@@ -90,6 +95,12 @@ def valid_ndjson_first_line?(str)
+         false
+       end
+     end
++
++    private
++      def positive_integer_env(name, default)
++        value = ENV[name].to_i
++        value.positive? ? value : default
++      end
+   end
+ 
+   def requires_csv_workflow?
+@@ -133,6 +144,37 @@ def import!
+     raise
+   end
+ 
++  def publish_later
++    raise MaxRowCountExceededError if row_count_exceeded?
++
++    validate_sure_preflight!
++    raise NotPublishableError, "Import was uploaded but has no publishable records." unless publishable?
++
++    previous_status = status
++    update! status: :importing
++
++    begin
++      ImportJob.perform_later(self)
++    rescue StandardError
++      update! status: previous_status
++      raise
++    end
++  end
++
++  def publish
++    raise MaxRowCountExceededError if row_count_exceeded?
++
++    validate_sure_preflight!
++
++    import!
++
++    family.sync_later
++
++    update! status: :complete
++  rescue StandardError => error
++    update! status: :failed, error: error.message
++  end
++
+   def uploaded?
+     return false unless ndjson_file.attached?
+ 
+@@ -163,6 +205,13 @@ def max_row_count
+     self.class.max_row_count
+   end
+ 
++  def sure_preflight
++    SureImport::Preflight.new(
++      family: family,
++      content: ndjson_blob_string
++    ).call
++  end
++
+   # Row total for max-row enforcement (counts every parsed line with a "type", including unsupported types).
+   def sync_ndjson_rows_count!
+     return unless ndjson_file.attached?
+@@ -302,4 +351,12 @@ def ndjson_blob_string
+       @ndjson_blob_id = blob_id
+       @ndjson_blob_string = ndjson_file.download.force_encoding(Encoding::UTF_8)
+     end
++
++    def validate_sure_preflight!
++      result = sure_preflight
++      return if result.valid?
++
++      update! status: :failed, error: result.error_message
++      raise PreflightError, result.error_message
++    end
+ end
+diff --git a/app/models/sure_import/preflight.rb b/app/models/sure_import/preflight.rb
+new file mode 100644
+index 0000000000..d12eac05cd
+--- /dev/null
++++ b/app/models/sure_import/preflight.rb
+@@ -0,0 +1,312 @@
++# frozen_string_literal: true
++
++require "set"
++
++class SureImport::Preflight
++  Result = Struct.new(:errors, :warnings, :stats, keyword_init: true) do
++    def valid? = errors.empty?
++    def error_messages = errors.map { |error| error[:message] }
++    def error_message = valid? ? "" : ([ "Sure import preflight failed:" ] + error_messages).join("\n")
++    def payload = { valid: valid?, stats: stats, errors: errors, warnings: warnings }
++  end
++
++  REQUIRED_FIELDS = {
++    "Account" => %w[id name balance accountable_type],
++    "Balance" => %w[account_id date balance],
++    "Category" => %w[id name],
++    "Tag" => %w[id name],
++    "Merchant" => %w[id name],
++    "RecurringTransaction" => %w[id amount expected_day_of_month last_occurrence_date next_expected_date],
++    "Transaction" => %w[id account_id date amount],
++    "Transfer" => %w[inflow_transaction_id outflow_transaction_id],
++    "RejectedTransfer" => %w[inflow_transaction_id outflow_transaction_id],
++    "Trade" => %w[account_id date amount qty price ticker],
++    "Holding" => %w[account_id date amount qty price ticker],
++    "Valuation" => %w[account_id date amount],
++    "Budget" => %w[id start_date end_date],
++    "BudgetCategory" => %w[budget_id category_id],
++    "Rule" => %w[name]
++  }.freeze
++
++  TAXONOMY_TYPES = { "Category" => :categories, "Tag" => :tags, "Merchant" => :merchants }.freeze
++
++  SOURCE_ID_TYPES = TAXONOMY_TYPES.merge(
++    "Account" => :accounts,
++    "RecurringTransaction" => :recurring_transactions,
++    "Transaction" => :transactions,
++    "Budget" => :budgets
++  ).freeze
++
++  REFERENCE_FIELDS = {
++    "Balance" => { accounts: %w[account_id] },
++    "Category" => { categories: %w[parent_id] },
++    "RecurringTransaction" => { accounts: %w[account_id], merchants: %w[merchant_id] },
++    "Transaction" => { accounts: %w[account_id], categories: %w[category_id], merchants: %w[merchant_id] },
++    "Transfer" => { transactions: %w[inflow_transaction_id outflow_transaction_id] },
++    "RejectedTransfer" => { transactions: %w[inflow_transaction_id outflow_transaction_id] },
++    "Trade" => { accounts: %w[account_id] },
++    "Holding" => { accounts: %w[account_id] },
++    "Valuation" => { accounts: %w[account_id] },
++    "BudgetCategory" => { budgets: %w[budget_id], categories: %w[category_id] }
++  }.freeze
++
++  def initialize(family:, content:)
++    @family = family
++    @content = content.to_s
++    @errors = []
++    @warnings = []
++    @line_counts = Hash.new(0)
++    @records = Hash.new { |hash, key| hash[key] = [] }
++    @source_ids = Hash.new { |hash, key| hash[key] = Set.new }
++    @source_id_locations = Hash.new { |hash, key| hash[key] = Hash.new { |ids, id| ids[id] = [] } }
++    @rows_count = 0
++    @valid_rows_count = 0
++  end
++
++  def call
++    parse_records
++    validate_taxonomy_collisions
++    validate_duplicate_taxonomy_names
++    validate_duplicate_source_ids
++    validate_required_fields
++    validate_accountables
++    validate_split_lines
++    validate_references
++    validate_duplicate_valuations
++    Result.new(
++      errors: @errors,
++      warnings: @warnings,
++      stats: {
++        rows_count: @rows_count,
++        valid_rows_count: @valid_rows_count,
++        invalid_rows_count: @rows_count - @valid_rows_count,
++        entity_counts: SureImport.dry_run_totals_from_line_type_counts(@line_counts),
++        record_type_counts: @line_counts
++      }
++    )
++  end
++
++  private
++    attr_reader :family
++
++    def parse_records
++      @content.each_line.with_index(1) do |line, line_number|
++        next if line.strip.blank?
++        @rows_count += 1
++        record = JSON.parse(line)
++        unless record.is_a?(Hash)
++          add_error(:invalid_ndjson_record, "Line #{line_number} must be a JSON object.")
++          next
++        end
++
++        type = record["type"]
++        data = record["data"]
++        if type.blank? || !record.key?("data")
++          add_error(:invalid_ndjson_record, "Line #{line_number} must include type and data.")
++          next
++        end
++
++        @line_counts[type] += 1
++        unless Family::DataImporter::SUPPORTED_TYPES.include?(type)
++          add_error(:unsupported_record_type, "Line #{line_number} has unsupported record type #{type}.")
++          next
++        end
++
++        unless data.is_a?(Hash)
++          add_error(:invalid_ndjson_record, "Line #{line_number} data must be a JSON object.")
++          next
++        end
++
++        @valid_rows_count += 1
++        @records[type] << { line_number: line_number, data: data }
++        mapping_key = SOURCE_ID_TYPES[type]
++        track_source_id(mapping_key, data["id"], "Line #{line_number} #{type}") if mapping_key && data["id"].present?
++        add_split_line_source_ids(data, line_number) if type == "Transaction"
++      rescue JSON::ParserError => e
++        add_error(:invalid_json, "Line #{line_number} is not valid JSON: #{e.message}")
++      end
++
++      add_error(:no_data_rows, "No data rows were found.") if @rows_count.zero?
++    end
++
++    def track_source_id(mapping_key, id, location)
++      id = id.to_s
++      @source_ids[mapping_key].add(id)
++      @source_id_locations[mapping_key][id] << location
++    end
++
++    def add_split_line_source_ids(data, line_number)
++      split_lines = split_lines_value(data)
++      return unless split_lines.is_a?(Array)
++      split_lines.each_with_index do |split_line, index|
++        next unless split_line.is_a?(Hash) && split_line["id"].present?
++        track_source_id(:transactions, split_line["id"], "Line #{line_number} Transaction split line #{index + 1}")
++      end
++    end
++
++    def validate_taxonomy_collisions
++      TAXONOMY_TYPES.each do |type, association|
++        existing_names = family.public_send(association).pluck(:name).to_set
++        @records[type].each do |record|
++          name = record[:data]["name"].to_s
++          next if name.blank? || !existing_names.include?(name)
++          add_error(
++            :existing_taxonomy_collision,
++            "Line #{record[:line_number]} #{type} name #{name.inspect} already exists in this family."
++          )
++        end
++      end
++    end
++
++    def validate_duplicate_taxonomy_names
++      TAXONOMY_TYPES.each_key do |type|
++        grouped = @records[type].group_by { |record| record[:data]["name"].to_s }
++        grouped.each do |name, records|
++          next if name.blank? || records.one?
++          lines = records.map { |record| record[:line_number] }.join(", ")
++          add_error(:duplicate_taxonomy_name, "#{type} name #{name.inspect} appears more than once in the NDJSON on lines #{lines}.")
++        end
++      end
++    end
++
++    def validate_duplicate_source_ids
++      @source_id_locations.each do |mapping_key, ids|
++        ids.each do |id, locations|
++          next if locations.one?
++          add_error(
++            :duplicate_source_id,
++            "#{mapping_key.to_s.singularize.tr('_', ' ')} source id #{id.inspect} appears more than once (#{locations.join(', ')})."
++          )
++        end
++      end
++    end
++
++    def validate_required_fields
++      @records.each do |type, records|
++        required_fields = REQUIRED_FIELDS.fetch(type, [])
++        records.each do |record|
++          missing = required_fields.select { |field| blank_required_value?(record[:data][field]) }
++          next if missing.empty?
++          add_error(:missing_required_fields, "Line #{record[:line_number]} #{type} is missing required field(s): #{missing.join(', ')}.")
++        end
++      end
++    end
++
++    def validate_accountables
++      @records["Account"].each do |record|
++        data = record[:data]
++        accountable_type = data["accountable_type"].to_s
++        accountable_class = Family::DataImporter.accountable_class_for(accountable_type)
++        unless accountable_class
++          add_error(:invalid_accountable_type, "Line #{record[:line_number]} Account has invalid accountable_type #{accountable_type.inspect}.")
++          next
++        end
++
++        subtype = data.dig("accountable", "subtype").presence || data["subtype"].presence
++        next if subtype.blank?
++        subtype_map = accountable_class.const_defined?(:SUBTYPES) ? accountable_class::SUBTYPES : {}
++        next if subtype_map.blank? || subtype_map.key?(subtype)
++        add_error(:invalid_accountable_subtype, "Line #{record[:line_number]} Account has invalid #{accountable_type} subtype #{subtype.inspect}.")
++      end
++    end
++
++    def validate_split_lines
++      @records["Transaction"].each do |record|
++        split_lines = split_lines_value(record[:data])
++        next if split_lines.blank?
++        unless split_lines.is_a?(Array)
++          add_error(:invalid_split_lines, "Line #{record[:line_number]} Transaction split_lines must be an array.")
++          next
++        end
++
++        complete_amounts = true
++        split_lines.each_with_index do |split_line, index|
++          unless split_line.is_a?(Hash)
++            add_error(:invalid_split_line, "Line #{record[:line_number]} Transaction split line #{index + 1} must be a JSON object.")
++            complete_amounts = false
++            next
++          end
++
++          next unless blank_required_value?(split_line_amount(split_line))
++          add_error(:missing_required_fields, "Line #{record[:line_number]} Transaction split line #{index + 1} is missing required field(s): amount.")
++          complete_amounts = false
++        end
++
++        validate_split_line_total(record, split_lines) if complete_amounts && record[:data]["amount"].present?
++      end
++    end
++
++    def validate_split_line_total(record, split_lines)
++      expected_amount = record[:data]["amount"].to_d
++      split_total = split_lines.sum { |split_line| split_line_amount(split_line).to_d }
++      return if split_total == expected_amount
++      add_error(
++        :split_amount_mismatch,
++        "Line #{record[:line_number]} Transaction split line amounts must sum to transaction amount #{expected_amount.to_s('F')} but sum to #{split_total.to_s('F')}."
++      )
++    end
++
++    def validate_references
++      @records.each do |type, records|
++        reference_fields = REFERENCE_FIELDS.fetch(type, {})
++        records.each do |record|
++          reference_fields.each do |mapping_key, fields|
++            fields.each do |field|
++              validate_reference(record, type, mapping_key, field, record[:data][field])
++            end
++          end
++
++          validate_tag_references(record, type)
++          validate_split_line_references(record) if type == "Transaction"
++        end
++      end
++    end
++
++    def validate_reference(record, type, mapping_key, field, value)
++      return if value.blank?
++      return if @source_ids[mapping_key].include?(value.to_s)
++      add_error(:missing_reference, "Line #{record[:line_number]} #{type} references missing #{field} #{value.inspect}.")
++    end
++
++    def validate_tag_references(record, type)
++      Array(record[:data]["tag_ids"]).each do |tag_id|
++        validate_reference(record, type, :tags, "tag_ids", tag_id)
++      end
++    end
++
++    def validate_split_line_references(record)
++      split_lines = split_lines_value(record[:data])
++      return unless split_lines.is_a?(Array)
++      Array(split_lines).each do |split_line|
++        next unless split_line.is_a?(Hash)
++        validate_reference(record, "Transaction split line", :categories, "category_id", split_line["category_id"])
++        validate_reference(record, "Transaction split line", :merchants, "merchant_id", split_line["merchant_id"])
++        Array(split_line["tag_ids"]).each do |tag_id|
++          validate_reference(record, "Transaction split line", :tags, "tag_ids", tag_id)
++        end
++      end
++    end
++
++    def split_lines_value(data) = data["split_lines"].presence || data["splitLines"].presence || data["splits"].presence
++
++    def split_line_amount(split_line) = split_line["amount"] || split_line["amount_money"] || split_line["amount_decimal"]
++
++    def validate_duplicate_valuations
++      seen = {}
++      @records["Valuation"].each do |record|
++        account_id = record[:data]["account_id"]
++        date = record[:data]["date"]
++        next if account_id.blank? || date.blank?
++        key = [ account_id.to_s, date.to_s ]
++        if seen.key?(key)
++          add_error(:duplicate_valuation, "Line #{record[:line_number]} duplicates valuation for account #{account_id.inspect} on #{date}; first seen on line #{seen[key]}.")
++        else
++          seen[key] = record[:line_number]
++        end
++      end
++    end
++
++    def blank_required_value?(value) = value.blank?
++
++    def add_error(code, message) = @errors << { code: code.to_s, message: message }
++end
+diff --git a/docs/api/openapi.yaml b/docs/api/openapi.yaml
+index 1102d6fc64..3a1adc911f 100644
+--- a/docs/api/openapi.yaml
++++ b/docs/api/openapi.yaml
+@@ -4680,7 +4680,7 @@ paths:
+               schema:
+                 "$ref": "#/components/schemas/ImportResponse"
+         '422':
+-          description: validation error - file too large
++          description: validation error or publish rejection
+           content:
+             application/json:
+               schema:
+diff --git a/spec/requests/api/v1/imports_spec.rb b/spec/requests/api/v1/imports_spec.rb
+index 7d66916120..dc016df874 100644
+--- a/spec/requests/api/v1/imports_spec.rb
++++ b/spec/requests/api/v1/imports_spec.rb
+@@ -250,7 +250,7 @@
+         run_test!
+       end
+ 
+-      response '422', 'validation error - file too large' do
++      response '422', 'validation error or publish rejection' do
+         schema oneOf: [
+           { '$ref' => '#/components/schemas/ErrorResponse' },
+           { '$ref' => '#/components/schemas/ErrorResponseWithImportId' }
+@@ -269,9 +269,22 @@
+       response '500', 'import uploaded but publish enqueue failed' do
+         schema '$ref' => '#/components/schemas/ErrorResponseWithImportId'
+ 
++        before do
++          allow(ImportJob).to receive(:perform_later).and_raise(StandardError, 'queue offline')
++        end
++
+         let(:body) do
+           {
+-            raw_file_content: { type: 'Account', data: { id: 'account_1', name: 'Checking' } }.to_json,
++            raw_file_content: {
++              type: 'Account',
++              data: {
++                id: 'account_1',
++                name: 'Checking',
++                balance: '100',
++                currency: 'USD',
++                accountable_type: 'Depository'
++              }
++            }.to_json,
+             type: 'SureImport',
+             publish: 'true'
+           }
+diff --git a/test/controllers/api/v1/imports_controller_test.rb b/test/controllers/api/v1/imports_controller_test.rb
+index 41d6c2e43a..e7bb3579f3 100644
+--- a/test/controllers/api/v1/imports_controller_test.rb
++++ b/test/controllers/api/v1/imports_controller_test.rb
+@@ -524,7 +524,16 @@ class Api::V1::ImportsControllerTest < ActionDispatch::IntegrationTest
+   end
+ 
+   test "should preserve Sure import if publish queueing fails" do
+-    ndjson_content = { type: "Account", data: { id: "account_1", name: "Checking" } }.to_json
++    ndjson_content = {
++      type: "Account",
++      data: {
++        id: "account_1",
++        name: "Checking",
++        balance: "100",
++        currency: "USD",
++        accountable_type: "Depository"
++      }
++    }.to_json
+     ImportJob.stubs(:perform_later).raises(StandardError, "queue offline")
+ 
+     assert_difference("Import.count") do
+@@ -548,6 +557,91 @@ class Api::V1::ImportsControllerTest < ActionDispatch::IntegrationTest
+     assert_equal "pending", import.status
+   end
+ 
++  test "should preserve Sure import and return preflight errors when auto publish fails preflight" do
++    @family.categories.create!(
++      name: "Groceries",
++      color: "#407706",
++      lucide_icon: "shopping-basket"
++    )
++    ndjson_content = [
++      { type: "Category", data: { id: "category_1", name: "Groceries" } }
++    ].map(&:to_json).join("\n")
++
++    assert_difference("Import.count") do
++      post api_v1_imports_url,
++           params: {
++             type: "SureImport",
++             raw_file_content: ndjson_content,
++             publish: "true"
++           },
++           headers: api_headers(@api_key)
++    end
++
++    assert_response :unprocessable_entity
++    json_response = JSON.parse(response.body)
++    assert_equal "preflight_failed", json_response["error"]
++    assert_includes json_response["errors"].join("\n"), "Category name \"Groceries\" already exists"
++
++    import = Import.find(json_response["import_id"])
++    assert_equal "failed", import.status
++    assert import.ndjson_file.attached?
++  end
++
++  test "should preserve Sure import and return not publishable when auto publish has no records" do
++    ndjson_content = { type: "Account", data: { id: "account_1", name: "Checking" } }.to_json
++    SureImport.any_instance.stubs(:publish_later).raises(
++      SureImport::NotPublishableError,
++      "raw publishability failure with internal state"
++    )
++
++    assert_difference("Import.count") do
++      post api_v1_imports_url,
++           params: {
++             type: "SureImport",
++             raw_file_content: ndjson_content,
++             publish: "true"
++           },
++           headers: api_headers(@api_key)
++    end
++
++    assert_response :unprocessable_entity
++    json_response = JSON.parse(response.body)
++    assert_equal "not_publishable", json_response["error"]
++    assert_equal "Import was uploaded but has no publishable records.", json_response["message"]
++    assert_not json_response.key?("errors")
++    refute_includes response.body, "raw publishability failure"
++
++    import = Import.find(json_response["import_id"])
++    assert_instance_of SureImport, import
++    assert import.ndjson_file.attached?
++    assert_equal 1, import.rows_count
++    assert_equal "pending", import.status
++  end
++
++  test "should return unsupported Sure record errors during auto publish preflight" do
++    ndjson_content = [
++      { type: "MysteryType", data: { id: "mystery_1" } }
++    ].map(&:to_json).join("\n")
++
++    assert_difference("Import.count") do
++      post api_v1_imports_url,
++           params: {
++             type: "SureImport",
++             raw_file_content: ndjson_content,
++             publish: "true"
++           },
++           headers: api_headers(@api_key)
++    end
++
++    assert_response :unprocessable_entity
++    json_response = JSON.parse(response.body)
++    assert_equal "preflight_failed", json_response["error"]
++    assert_includes json_response["errors"].join("\n"), "unsupported record type MysteryType"
++
++    import = Import.find(json_response["import_id"])
++    assert_equal "failed", import.status
++  end
++
+   test "should preserve Sure import if auto publish exceeds row count" do
+     ndjson_content = { type: "Account", data: { id: "account_1", name: "Checking" } }.to_json
+     SureImport.any_instance.stubs(:publish_later).raises(Import::MaxRowCountExceededError)
+@@ -740,8 +834,8 @@ class Api::V1::ImportsControllerTest < ActionDispatch::IntegrationTest
+     assert_equal "invalid_csv", json_response["error"]
+   end
+ 
+-  test "should include preflight exception message in internal server error response" do
+-    Import::Preflight.any_instance.stubs(:call).raises(StandardError, "boom")
++  test "should hide preflight exception message in internal server error response" do
++    Import::Preflight.any_instance.stubs(:call).raises(StandardError, "boom with raw internals")
+ 
+     post preflight_api_v1_imports_url,
+          params: {
+@@ -755,7 +849,8 @@ class Api::V1::ImportsControllerTest < ActionDispatch::IntegrationTest
+     assert_response :internal_server_error
+     json_response = JSON.parse(response.body)
+     assert_equal "internal_server_error", json_response["error"]
+-    assert_equal "Error: boom", json_response["message"]
++    assert_equal "Import preflight could not be completed.", json_response["message"]
++    refute_includes response.body, "boom with raw internals"
+   end
+ 
+   test "should reject unknown preflight import type" do
+@@ -816,8 +911,19 @@ class Api::V1::ImportsControllerTest < ActionDispatch::IntegrationTest
+ 
+   test "should preflight Sure import without persisting records" do
+     ndjson_content = [
+-      { type: "Account", data: { id: "account_1", name: "Checking" } }.to_json,
+-      { type: "Transaction", data: { id: "entry_1", account_id: "account_1" } }.to_json
++      { type: "Account", data: {
++        id: "account_1",
++        name: "Checking",
++        balance: "100",
++        currency: "USD",
++        accountable_type: "Depository"
++      } }.to_json,
++      { type: "Transaction", data: {
++        id: "entry_1",
++        account_id: "account_1",
++        date: "2024-01-01",
++        amount: "-5"
++      } }.to_json
+     ].join("\n")
+ 
+     assert_no_difference("Import.count") do
+@@ -840,6 +946,55 @@ class Api::V1::ImportsControllerTest < ActionDispatch::IntegrationTest
+     assert_empty data["errors"]
+   end
+ 
++  test "should preflight Sure import taxonomy collisions in strict mode" do
++    @family.tags.create!(name: "Reviewed", color: "#12B76A")
++    ndjson_content = [
++      { type: "Tag", data: { id: "tag_1", name: "Reviewed" } }
++    ].map(&:to_json).join("\n")
++
++    assert_no_difference("Import.count") do
++      post preflight_api_v1_imports_url,
++           params: {
++             type: "SureImport",
++             raw_file_content: ndjson_content
++           },
++           headers: api_headers(@api_key)
++    end
++
++    assert_response :success
++    data = JSON.parse(response.body)["data"]
++    assert_equal false, data["valid"]
++    assert_equal "existing_taxonomy_collision", data["errors"].first["code"]
++  end
++
++  test "should report invalid Sure import accountable type during preflight" do
++    ndjson_content = [
++      { type: "Account", data: {
++        id: "account_1",
++        name: "Checking",
++        balance: "100",
++        currency: "USD",
++        accountable_type: "Kernel"
++      } }.to_json
++    ].join("\n")
++
++    assert_no_difference("Import.count") do
++      post preflight_api_v1_imports_url,
++           params: {
++             type: "SureImport",
++             raw_file_content: ndjson_content
++           },
++           headers: api_headers(@api_key)
++    end
++
++    assert_response :success
++    data = JSON.parse(response.body)["data"]
++
++    assert_equal false, data["valid"]
++    assert_equal "invalid_accountable_type", data["errors"].first["code"]
++    assert_includes data["errors"].first["message"], "Kernel"
++  end
++
+   test "should report invalid Sure import NDJSON during preflight" do
+     assert_no_difference("Import.count") do
+       post preflight_api_v1_imports_url,
+diff --git a/test/models/family/data_exporter_test.rb b/test/models/family/data_exporter_test.rb
+index 206c5e9d6d..83e4ea8cc9 100644
+--- a/test/models/family/data_exporter_test.rb
++++ b/test/models/family/data_exporter_test.rb
+@@ -705,16 +705,24 @@ class Family::DataExporterTest < ActiveSupport::TestCase
+       currency: "USD"
+     )
+ 
+-    split_parent_outflow = create_transaction_entry(@account, amount: 60, date: Date.parse("2024-01-25"), name: "Split transfer parent")
+-    split_parent_outflow.split!([
+-      { name: "Split transfer child", amount: 60, category_id: @category.id }
++    split_parent_outflow = create_transaction_entry(@account, amount: 104, date: Date.parse("2024-01-25"), name: "Split transfer parent")
++    split_children = split_parent_outflow.split!([
++      { name: "Split transfer child", amount: 100, category_id: @category.id },
++      { name: "Split fee child", amount: 4, category_id: @category.id }
+     ])
+-    transfer_inflow = create_transaction_entry(destination_account, amount: -60, date: Date.parse("2024-01-25"), name: "Split transfer inflow")
+-    transfer = Transfer.create!(
++    parent_transfer_inflow = create_transaction_entry(destination_account, amount: -104, date: Date.parse("2024-01-25"), name: "Split parent transfer inflow")
++    parent_transfer = Transfer.create!(
+       outflow_transaction: split_parent_outflow.entryable,
+-      inflow_transaction: transfer_inflow.entryable,
++      inflow_transaction: parent_transfer_inflow.entryable,
+       status: "confirmed"
+     )
++    child_transfer_inflow = create_transaction_entry(destination_account, amount: -100, date: Date.parse("2024-01-25"), name: "Split child transfer inflow")
++    child_transfer = Transfer.create!(
++      outflow_transaction: split_children.first.entryable,
++      inflow_transaction: child_transfer_inflow.entryable,
++      status: "confirmed",
++      notes: "Transfer uses split child"
++    )
+ 
+     zip_data = @exporter.generate_export
+ 
+@@ -728,8 +736,20 @@ class Family::DataExporterTest < ActiveSupport::TestCase
+         .select { |record| record["type"] == "Transfer" }
+         .map { |record| record.dig("data", "id") }
+ 
+-      assert_not_includes transaction_ids, split_parent_outflow.entryable.id
+-      assert_not_includes transfer_ids, transfer.id
++      assert_includes transaction_ids, split_parent_outflow.entryable.id
++      split_parent_data = ndjson_records.find do |record|
++        record["type"] == "Transaction" && record.dig("data", "id") == split_parent_outflow.entryable.id
++      end
++      assert_equal 2, split_parent_data.dig("data", "split_lines").count
++      assert_equal [ "Split transfer child", "Split fee child" ], split_parent_data.dig("data", "split_lines").map { |line| line["name"] }
++      refute_includes transaction_ids, split_children.first.entryable.id
++      refute_includes transaction_ids, split_children.second.entryable.id
++      assert_not_includes transfer_ids, parent_transfer.id
++
++      child_transfer_data = ndjson_records.find { |record| record["type"] == "Transfer" && record.dig("data", "id") == child_transfer.id }
++      assert child_transfer_data
++      assert_equal split_children.first.entryable.id, child_transfer_data.dig("data", "outflow_transaction_id")
++      assert_equal child_transfer_inflow.entryable.id, child_transfer_data.dig("data", "inflow_transaction_id")
+     end
+   end
+ 
+diff --git a/test/models/family/data_importer_test.rb b/test/models/family/data_importer_test.rb
+index c6c75dda1d..0ad0c9870b 100644
+--- a/test/models/family/data_importer_test.rb
++++ b/test/models/family/data_importer_test.rb
+@@ -352,6 +352,42 @@ class Family::DataImporterTest < ActiveSupport::TestCase
+     assert_equal 5000.0, opening_anchors.first.entry.amount.to_f
+   end
+ 
++  test "skips synthesized opening anchor for authoritative balance history imports" do
++    ndjson = build_ndjson([
++      {
++        type: "Account",
++        data: {
++          id: "acct-1",
++          name: "Imported With Full History",
++          balance: "5000",
++          currency: "USD",
++          accountable_type: "Depository",
++          authoritative_balance_history: true
++        }
++      },
++      {
++        type: "Valuation",
++        data: {
++          id: "val-1",
++          account_id: "acct-1",
++          date: "2020-04-01",
++          amount: "4900",
++          name: "Imported balance",
++          currency: "USD",
++          kind: "reconciliation"
++        }
++      }
++    ])
++
++    Family::DataImporter.new(@family, ndjson).import!
++
++    account = @family.accounts.find_by!(name: "Imported With Full History")
++
++    assert_equal 5000.0, account.balance.to_f
++    assert_empty account.valuations.opening_anchor
++    assert_equal 1, account.valuations.reconciliation.count
++  end
++
+   test "imports categories with parent relationships" do
+     ndjson = build_ndjson([
+       {
+@@ -732,6 +768,183 @@ class Family::DataImporterTest < ActiveSupport::TestCase
+     assert_equal "Weekly groceries", transaction.entry.notes
+   end
+ 
++  test "imports native split lines and lets transfers reference split children" do
++    ndjson = build_ndjson([
++      {
++        type: "Account",
++        data: {
++          id: "checking",
++          name: "Checking",
++          balance: "1000",
++          currency: "USD",
++          accountable_type: "Depository"
++        }
++      },
++      {
++        type: "Account",
++        data: {
++          id: "wallet",
++          name: "Wallet",
++          balance: "500",
++          currency: "USD",
++          accountable_type: "Depository"
++        }
++      },
++      {
++        type: "Category",
++        data: {
++          id: "cat-fee",
++          name: "Bank Fees",
++          color: "#FF0000",
++          classification: "expense"
++        }
++      },
++      {
++        type: "Tag",
++        data: {
++          id: "tag-imported",
++          name: "Imported"
++        }
++      },
++      {
++        type: "Transaction",
++        data: {
++          id: "split-parent",
++          account_id: "checking",
++          date: "2024-01-15",
++          amount: "104.00",
++          name: "ATM withdrawal plus fee",
++          currency: "USD",
++          tag_ids: [ "tag-imported" ],
++          split_lines: [
++            {
++              id: "split-transfer-leg",
++              amount: "100.00",
++              name: "Cash movement",
++              notes: "Transfer portion"
++            },
++            {
++              id: "split-fee-line",
++              amount: "4.00",
++              name: "ATM fee",
++              category_id: "cat-fee",
++              notes: "Fee portion"
++            }
++          ]
++        }
++      },
++      {
++        type: "Transaction",
++        data: {
++          id: "wallet-inflow",
++          account_id: "wallet",
++          date: "2024-01-15",
++          amount: "-100.00",
++          name: "Cash received",
++          currency: "USD"
++        }
++      },
++      {
++        type: "Transfer",
++        data: {
++          id: "transfer-1",
++          inflow_transaction_id: "wallet-inflow",
++          outflow_transaction_id: "split-transfer-leg",
++          status: "confirmed",
++          notes: "Split-linked transfer"
++        }
++      }
++    ])
++
++    result = Family::DataImporter.new(@family, ndjson).import!
++
++    parent_entry = @family.entries.find_by!(name: "ATM withdrawal plus fee")
++    assert parent_entry.split_parent?
++    assert_equal true, parent_entry.excluded
++    assert_equal 4, result[:entries].count
++    assert_includes result[:entries].map(&:id), parent_entry.id
++
++    transfer_child = parent_entry.child_entries.find_by!(name: "Cash movement")
++    fee_child = parent_entry.child_entries.find_by!(name: "ATM fee")
++    assert_equal "Transfer portion", transfer_child.notes
++    assert_equal "Fee portion", fee_child.notes
++    assert_equal "Bank Fees", fee_child.transaction.category.name
++    assert_equal [ "Imported" ], transfer_child.transaction.tags.map(&:name)
++    assert_equal [ "Imported" ], fee_child.transaction.tags.map(&:name)
++
++    transfer = Transfer.find_by!(notes: "Split-linked transfer")
++    assert_equal "confirmed", transfer.status
++    assert_equal "Cash movement", transfer.outflow_transaction.entry.name
++    assert_equal "Cash received", transfer.inflow_transaction.entry.name
++  end
++
++  test "imports split lines without adding omitted parent taxonomy to explicit empty values" do
++    ndjson = build_ndjson([
++      {
++        type: "Account",
++        data: {
++          id: "checking",
++          name: "Checking",
++          balance: "1000",
++          currency: "USD",
++          accountable_type: "Depository"
++        }
++      },
++      {
++        type: "Tag",
++        data: {
++          id: "tag-parent",
++          name: "Parent tag"
++        }
++      },
++      {
++        type: "Merchant",
++        data: {
++          id: "merchant-parent",
++          name: "Parent merchant"
++        }
++      },
++      {
++        type: "Transaction",
++        data: {
++          id: "split-parent",
++          account_id: "checking",
++          date: "2024-01-15",
++          amount: "100.00",
++          name: "Tagged merchant split",
++          currency: "USD",
++          merchant_id: "merchant-parent",
++          tag_ids: [ "tag-parent" ],
++          split_lines: [
++            {
++              id: "split-inherits",
++              amount: "40.00",
++              name: "Inherits omitted taxonomy"
++            },
++            {
++              id: "split-empty",
++              amount: "60.00",
++              name: "Explicit empty taxonomy",
++              merchant_id: nil,
++              tag_ids: []
++            }
++          ]
++        }
++      }
++    ])
++
++    Family::DataImporter.new(@family, ndjson).import!
++
++    parent_entry = @family.entries.find_by!(name: "Tagged merchant split")
++    inherited_child = parent_entry.child_entries.find_by!(name: "Inherits omitted taxonomy")
++    explicit_empty_child = parent_entry.child_entries.find_by!(name: "Explicit empty taxonomy")
++
++    assert_equal "Parent merchant", inherited_child.transaction.merchant.name
++    assert_equal [ "Parent tag" ], inherited_child.transaction.tags.map(&:name)
++    assert_nil explicit_empty_child.transaction.merchant
++    assert_empty explicit_empty_child.transaction.tags
++  end
++
+   test "imports trades with securities" do
+     ndjson = build_ndjson([
+       {
+diff --git a/test/models/sure_import_test.rb b/test/models/sure_import_test.rb
+index ff99bb6fde..d0a076bf87 100644
+--- a/test/models/sure_import_test.rb
++++ b/test/models/sure_import_test.rb
+@@ -37,8 +37,23 @@ class SureImportTest < ActiveSupport::TestCase
+   end
+ 
+   test "max_row_count is higher than standard imports" do
+-    assert_equal 100_000, SureImport.max_row_count
+-    assert_equal 100_000, @import.max_row_count
++    with_env_overrides(
++      "SURE_IMPORT_MAX_ROWS" => nil,
++      "SURE_IMPORT_MAX_NDJSON_SIZE_MB" => nil
++    ) do
++      assert_equal 100_000, SureImport.max_row_count
++      assert_equal 100_000, @import.max_row_count
++    end
++  end
++
++  test "max row count and ndjson size can be configured by environment" do
++    with_env_overrides(
++      "SURE_IMPORT_MAX_ROWS" => "150000",
++      "SURE_IMPORT_MAX_NDJSON_SIZE_MB" => "64"
++    ) do
++      assert_equal 150_000, SureImport.max_row_count
++      assert_equal 64.megabytes, SureImport.max_ndjson_size
++    end
+   end
+ 
+   test "dry_run totals can be derived from existing line type counts" do
+@@ -296,7 +311,7 @@ class SureImportTest < ActiveSupport::TestCase
+     assert_equal({ "expected" => 0, "actual" => 1 }, verification.dig("mismatches", "valuations"))
+   end
+ 
+-  test "publish records mismatch when expected rows are skipped by readback" do
++  test "import records mismatch when expected rows are skipped by readback" do
+     attach_ndjson(build_ndjson([
+       { type: "Transaction", data: {
+         id: "transaction-1",
+@@ -308,10 +323,12 @@ class SureImportTest < ActiveSupport::TestCase
+       } }
+     ]))
+ 
+-    @import.publish
++    initial_transaction_count = @family.entries.where(entryable_type: "Transaction").count
++
++    @import.import!
+     @import.reload
+ 
+-    assert_equal "complete", @import.status
++    assert_equal initial_transaction_count, @family.entries.where(entryable_type: "Transaction").count
+     assert_equal "mismatch", @import.readback_verification["status"]
+     assert_equal({ "expected" => 1, "actual" => 0 }, @import.readback_verification.dig("mismatches", "transactions"))
+   end
+@@ -410,6 +427,43 @@ class SureImportTest < ActiveSupport::TestCase
+     assert_equal "Revertable Account", @import.accounts.first.name
+   end
+ 
++  test "import tracks split parent entries for revert" do
++    attach_ndjson(build_ndjson([
++      { type: "Account", data: {
++        id: "split-account",
++        name: "Split Revert Account",
++        balance: "500.00",
++        currency: "USD",
++        accountable_type: "Depository"
++      } },
++      { type: "Transaction", data: {
++        id: "split-parent",
++        account_id: "split-account",
++        date: "2024-01-15",
++        amount: "100.00",
++        name: "Revertable split parent",
++        currency: "USD",
++        split_lines: [
++          { id: "split-child-1", amount: "40.00", name: "Split child one" },
++          { id: "split-child-2", amount: "60.00", name: "Split child two" }
++        ]
++      } }
++    ]))
++
++    @import.publish
++
++    parent_entry = @family.entries.find_by!(name: "Revertable split parent")
++    split_entry_ids = [ parent_entry.id, *parent_entry.child_entries.pluck(:id) ]
++
++    assert parent_entry.split_parent?
++    assert_equal 3, @import.entries.where(id: split_entry_ids).count
++
++    assert_difference -> { Entry.where(id: split_entry_ids).count }, -3 do
++      @import.revert
++    end
++    assert_equal "pending", @import.reload.status
++  end
++
+   test "publishes later enqueues job" do
+     attach_ndjson(build_ndjson([
+       { type: "Account", data: {
+@@ -428,6 +482,242 @@ class SureImportTest < ActiveSupport::TestCase
+     assert_equal "importing", @import.status
+   end
+ 
++  test "publish_later raises custom error when preflight passes but import is not publishable" do
++    @import.stubs(:validate_sure_preflight!).returns(true)
++    @import.stubs(:publishable?).returns(false)
++
++    assert_no_enqueued_jobs do
++      error = assert_raises SureImport::NotPublishableError do
++        @import.publish_later
++      end
++      assert_equal "Import was uploaded but has no publishable records.", error.message
++    end
++    assert_equal "pending", @import.reload.status
++  end
++
++  test "publish_later restores previous status when enqueue fails" do
++    attach_ndjson(build_ndjson([
++      { type: "Account", data: {
++        id: "account-1",
++        name: "Queued Account",
++        balance: "100",
++        currency: "USD",
++        accountable_type: "Depository"
++      } }
++    ]))
++    ImportJob.stubs(:perform_later).raises(StandardError, "queue down")
++
++    assert_no_enqueued_jobs do
++      error = assert_raises StandardError do
++        @import.publish_later
++      end
++      assert_equal "queue down", error.message
++    end
++
++    assert_equal "pending", @import.reload.status
++  end
++
++  test "preflight reports blocking errors before publish_later enqueues" do
++    @family.categories.create!(
++      name: "Groceries",
++      color: "#407706",
++      lucide_icon: "shopping-basket"
++    )
++    attach_ndjson(build_ndjson([
++      { type: "Account", data: {
++        id: "account-1",
++        name: "Blocked Account",
++        balance: "100",
++        currency: "USD",
++        accountable_type: "Depository"
++      } },
++      { type: "Category", data: { id: "category-1", name: "Groceries" } }
++    ]))
++
++    assert_no_enqueued_jobs do
++      assert_raises SureImport::PreflightError do
++        @import.publish_later
++      end
++    end
++
++    assert_equal "failed", @import.reload.status
++    assert_includes @import.error, "Category name \"Groceries\" already exists"
++  end
++
++  test "publish_later reports unsupported records through preflight before publishable check" do
++    attach_ndjson(build_ndjson([
++      { type: "MysteryType", data: { id: "mystery-1" } }
++    ]))
++
++    assert_no_enqueued_jobs do
++      assert_raises SureImport::PreflightError do
++        @import.publish_later
++      end
++    end
++
++    assert_equal "failed", @import.reload.status
++    assert_includes @import.error, "unsupported record type MysteryType"
++  end
++
++  test "publish preflight failure does not partially import records" do
++    attach_ndjson(build_ndjson([
++      { type: "Account", data: {
++        id: "account-1",
++        name: "Should Not Import",
++        balance: "100",
++        currency: "USD",
++        accountable_type: "NotReal"
++      } }
++    ]))
++
++    assert_no_difference -> { @family.accounts.where(name: "Should Not Import").count } do
++      @import.publish
++    end
++
++    assert_equal "failed", @import.reload.status
++    assert_includes @import.error, "invalid accountable_type"
++  end
++
++  test "preflight catches missing fields unsupported types duplicate valuations and references" do
++    attach_ndjson(build_ndjson([
++      { type: "RecurringTransaction", data: { id: "recurring-1" } },
++      { type: "MysteryType", data: { id: "mystery-1" } },
++      { type: "Account", data: {
++        id: "account-1",
++        name: "Bad Subtype",
++        balance: "100",
++        accountable_type: "Depository",
++        accountable: { subtype: "not-a-subtype" }
++      } },
++      { type: "Valuation", data: { account_id: "account-1", date: "2024-01-01", amount: "100" } },
++      { type: "Valuation", data: { account_id: "account-1", date: "2024-01-01", amount: "101" } },
++      { type: "Transaction", data: {
++        id: "transaction-1",
++        account_id: "missing-account",
++        date: "2024-01-02",
++        amount: "-5",
++        tag_ids: [ "missing-tag" ]
++      } }
++    ]))
++
++    result = @import.sure_preflight
++    codes = result.errors.map { |error| error[:code] }
++
++    assert_not result.valid?
++    assert_includes codes, "missing_required_fields"
++    assert_includes codes, "unsupported_record_type"
++    assert_includes codes, "invalid_accountable_subtype"
++    assert_includes codes, "duplicate_valuation"
++    assert_includes codes, "missing_reference"
++  end
++
++  test "preflight rejects invalid accountable types through explicit allowlist" do
++    attach_ndjson(build_ndjson([
++      { type: "Account", data: {
++        id: "account-1",
++        name: "Bad Accountable",
++        balance: "100",
++        accountable_type: "Kernel",
++        accountable: { subtype: "system" }
++      } }
++    ]))
++
++    result = @import.sure_preflight
++
++    assert_not result.valid?
++    assert_nil Accountable.from_type("Kernel")
++    assert_equal Depository, Accountable.from_type("Depository")
++    assert_equal [ "invalid_accountable_type" ], result.errors.map { |error| error[:code] }
++    assert_includes result.error_message, 'invalid accountable_type "Kernel"'
++  end
++
++  test "preflight catches duplicate taxonomy names inside ndjson" do
++    attach_ndjson(build_ndjson([
++      { type: "Category", data: { id: "category-1", name: "Groceries" } },
++      { type: "Category", data: { id: "category-2", name: "Groceries" } }
++    ]))
++
++    result = @import.sure_preflight
++
++    assert_not result.valid?
++    assert_includes result.errors.map { |error| error[:code] }, "duplicate_taxonomy_name"
++    assert_includes result.error_message, "appears more than once"
++  end
++
++  test "preflight rejects split line totals that cannot import atomically" do
++    attach_ndjson(build_ndjson([
++      { type: "Account", data: {
++        id: "split-account",
++        name: "Split Checking",
++        balance: "500.00",
++        currency: "USD",
++        accountable_type: "Depository"
++      } },
++      { type: "Transaction", data: {
++        id: "split-parent",
++        account_id: "split-account",
++        date: "2024-01-15",
++        amount: "100.00",
++        name: "Invalid split parent",
++        currency: "USD",
++        split_lines: [
++          { id: "split-child-1", amount: "40.00", name: "Split child one" },
++          { id: "split-child-2", amount: "50.00", name: "Split child two" }
++        ]
++      } }
++    ]))
++
++    result = @import.sure_preflight
++
++    assert_not result.valid?
++    assert_includes result.errors.map { |error| error[:code] }, "split_amount_mismatch"
++
++    assert_no_enqueued_jobs do
++      assert_raises SureImport::PreflightError do
++        @import.publish_later
++      end
++    end
++    assert_equal "failed", @import.reload.status
++  end
++
++  test "strict preflight requires references to be present in the same ndjson" do
++    existing_account = @family.accounts.first
++    existing_parent = @family.categories.create!(
++      name: "Existing Parent",
++      color: "#407706",
++      lucide_icon: "shapes"
++    )
++
++    attach_ndjson(build_ndjson([
++      {
++        type: "Valuation",
++        data: {
++          account_id: existing_account.id,
++          date: "2024-01-01",
++          amount: "100"
++        }
++      },
++      {
++        type: "Category",
++        data: {
++          id: "category-child",
++          name: "Imported Child",
++          parent_id: existing_parent.id
++        }
++      }
++    ]))
++
++    result = @import.sure_preflight
++
++    assert_not result.valid?
++    assert_equal(
++      [ "missing_reference", "missing_reference" ],
++      result.errors.map { |error| error[:code] }
++    )
++    assert_includes result.error_message, "references missing account_id"
++    assert_includes result.error_message, "references missing parent_id"
++  end
++
+   private
+ 
+     def attach_ndjson(ndjson)
+@@ -492,3 +782,75 @@ def importable_history_ndjson
+       ])
+     end
+ end
++
++class Import::PreflightTest < ActiveSupport::TestCase
++  setup do
++    @family = families(:dylan_family)
++  end
++
++  test "SureImport preflight reports strict taxonomy collisions" do
++    @family.tags.create!(name: "Reviewed", color: "#12B76A")
++    ndjson = build_ndjson([
++      { type: "Tag", data: { id: "tag-1", name: "Reviewed" } }
++    ])
++
++    assert_no_difference("Import.count") do
++      response = Import::Preflight.new(
++        family: @family,
++        params: { type: "SureImport", raw_file_content: ndjson }
++      ).call
++      payload = response.payload[:data]
++
++      assert_equal :ok, response.status
++      assert_equal false, payload[:valid]
++      assert_equal "existing_taxonomy_collision", payload[:errors].first[:code]
++    end
++  end
++
++  test "SureImport preflight counts invalid rows instead of validation errors" do
++    ndjson = build_ndjson([
++      [],
++      { type: "Transaction", data: { id: "transaction-1" } }
++    ])
++
++    response = Import::Preflight.new(
++      family: @family,
++      params: { type: "SureImport", raw_file_content: ndjson }
++    ).call
++    payload = response.payload[:data]
++
++    assert_equal :ok, response.status
++    assert_equal 2, payload[:stats][:rows_count]
++    assert_equal 1, payload[:stats][:valid_rows_count]
++    assert_equal 1, payload[:stats][:invalid_rows_count]
++    assert_operator payload[:errors].size, :>, payload[:stats][:invalid_rows_count]
++  end
++
++  test "SureImport preflight handles missing entity counts" do
++    result = Struct.new(:stats, :errors, :warnings, keyword_init: true) do
++      def valid?
++        true
++      end
++    end.new(
++      stats: { rows_count: 1, valid_rows_count: 1, invalid_rows_count: 0 },
++      errors: [],
++      warnings: []
++    )
++    SureImport::Preflight.stubs(:new).returns(stub(call: result))
++
++    response = Import::Preflight.new(
++      family: @family,
++      params: { type: "SureImport", raw_file_content: "{}" }
++    ).call
++    payload = response.payload[:data]
++
++    assert_equal :ok, response.status
++    assert_includes payload[:warnings], "No importable records were found."
++  end
++
++  private
++
++    def build_ndjson(records)
++      records.map(&:to_json).join("\n")
++    end
++end

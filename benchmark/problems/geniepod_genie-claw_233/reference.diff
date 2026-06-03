@@ -1,0 +1,836 @@
+diff --git a/crates/genie-common/src/config.rs b/crates/genie-common/src/config.rs
+index 38940f5..19b8134 100644
+--- a/crates/genie-common/src/config.rs
++++ b/crates/genie-common/src/config.rs
+@@ -191,6 +191,10 @@ pub struct CoreConfig {
+     /// Final actuation safety gate for home-control execution.
+     #[serde(default)]
+     pub actuation_safety: ActuationSafetyConfig,
++
++    /// Authentication for assuming a privileged request origin over HTTP.
++    #[serde(default)]
++    pub origin_auth: OriginAuthConfig,
+ }
+ 
+ impl Default for CoreConfig {
+@@ -227,6 +231,7 @@ impl Default for CoreConfig {
+             skill_policy: SkillPolicyConfig::default(),
+             tool_policy: ToolPolicyConfig::default(),
+             actuation_safety: ActuationSafetyConfig::default(),
++            origin_auth: OriginAuthConfig::default(),
+         }
+     }
+ }
+@@ -484,6 +489,75 @@ impl Default for ActuationSafetyConfig {
+     }
+ }
+ 
++/// Authentication for assuming a privileged request origin over HTTP (issue
++/// #232).
++///
++/// The request origin (`voice`, `dashboard`, `telegram`, …) drives per-origin
++/// tool ACLs, actuation ACLs, rate limits, audit attribution, and NLU
++/// confidence thresholds. That origin arrives as the client-supplied
++/// `X-Genie-Origin` header, so on its own it is a *forgeable* security
++/// principal: any client that can reach the port could claim `voice` to clear
++/// a higher-trust bar, or rotate origins to dodge a per-origin rate limit.
++///
++/// `genie-core` therefore only honors an origin more privileged than the
++/// untrusted `api` baseline when the request proves entitlement to it. By
++/// default that proof is the transport itself — a loopback peer is the
++/// documented single-host trust boundary (see `doc/household-security.md`) —
++/// which keeps the local dashboard, CLI, and in-process adapters working with
++/// no configuration. A non-loopback peer (i.e. `bind_host = "0.0.0.0"` reached
++/// across the LAN) cannot assume a privileged origin from the header alone; it
++/// must present a matching shared-secret token.
++#[derive(Debug, Deserialize, Clone, Default)]
++pub struct OriginAuthConfig {
++    /// Require a valid token for every privileged origin, even from loopback
++    /// peers. Off by default so a single trusted host needs no setup; turn it
++    /// on to also stop one local process from impersonating another's channel.
++    #[serde(default)]
++    pub require_token: bool,
++
++    /// Map of origin name (`voice`, `dashboard`, `telegram`, `repl`) to the
++    /// shared secret a request must present in the `X-Genie-Origin-Token`
++    /// header to assume that origin. Prefer leaving the value empty here and
++    /// supplying it via the `GENIE_ORIGIN_TOKEN_<ORIGIN>` environment variable
++    /// (keep config files `0600`). An origin with no resolved token cannot be
++    /// claimed by a non-loopback peer at all.
++    #[serde(default)]
++    pub tokens: HashMap<String, String>,
++}
++
++impl OriginAuthConfig {
++    /// Resolve the effective `origin -> secret` map: the configured value
++    /// first, then the `GENIE_ORIGIN_TOKEN_<ORIGIN>` environment variable.
++    /// Blank/whitespace tokens are dropped so an empty entry can never
++    /// authenticate anything.
++    pub fn resolved_tokens(&self) -> HashMap<String, String> {
++        const KNOWN_ORIGINS: [&str; 4] = ["voice", "dashboard", "telegram", "repl"];
++
++        let mut out: HashMap<String, String> = HashMap::new();
++        // Configured origins first, then fill any remaining known origins from
++        // the environment so `GENIE_ORIGIN_TOKEN_TELEGRAM` alone is enough.
++        let names = self.tokens.keys().map(String::as_str).chain(KNOWN_ORIGINS);
++        for name in names {
++            let key = name.trim().to_ascii_lowercase();
++            if key.is_empty() || out.contains_key(&key) {
++                continue;
++            }
++            let configured = self.tokens.get(name).map(|s| s.trim().to_string());
++            let token = match configured {
++                Some(value) if !value.is_empty() => value,
++                _ => std::env::var(format!("GENIE_ORIGIN_TOKEN_{}", key.to_ascii_uppercase()))
++                    .unwrap_or_default()
++                    .trim()
++                    .to_string(),
++            };
++            if !token.is_empty() {
++                out.insert(key, token);
++            }
++        }
++        out
++    }
++}
++
+ #[derive(Debug, Deserialize)]
+ pub struct SpeakerIdentityConfig {
+     /// Enable speaker identity enrichment for voice flows.
+diff --git a/crates/genie-core/src/lib.rs b/crates/genie-core/src/lib.rs
+index 072570e..74c45bb 100644
+--- a/crates/genie-core/src/lib.rs
++++ b/crates/genie-core/src/lib.rs
+@@ -49,6 +49,7 @@ pub mod conversation;
+ pub mod ha;
+ pub mod llm;
+ pub mod memory;
++pub mod origin_auth;
+ pub mod ota;
+ pub mod profile;
+ pub mod prompt;
+diff --git a/crates/genie-core/src/main.rs b/crates/genie-core/src/main.rs
+index 27008ae..c2d6762 100644
+--- a/crates/genie-core/src/main.rs
++++ b/crates/genie-core/src/main.rs
+@@ -283,6 +283,15 @@ async fn main() -> Result<()> {
+         .await
+     } else {
+         // Daemon mode: run HTTP server.
++        // Trusted origin resolution (issue #232): the `X-Genie-Origin` header is
++        // forgeable, so a privileged origin is only honored from a loopback peer
++        // or with a matching `[core.origin_auth]` token. The in-process Telegram
++        // adapter reaches core over loopback, but we also hand it its configured
++        // token so its `telegram` principal stays unforgeable by other local
++        // processes and keeps working under `require_token`.
++        let origin_resolver =
++            genie_core::origin_auth::OriginResolver::from_config(&config.core.origin_auth);
++
+         let chat_server = genie_core::server::ChatServer::new(
+             llm,
+             tool_dispatcher,
+@@ -295,7 +304,8 @@ async fn main() -> Result<()> {
+             model_family,
+             config.core.expected_runtime_contract_hash.clone(),
+         )?
+-        .with_http_config(config.http.clone());
++        .with_http_config(config.http.clone())
++        .with_origin_auth(origin_resolver);
+ 
+         tracing::info!(port, "starting HTTP chat API");
+         if config.telegram.enabled {
+@@ -322,6 +332,9 @@ async fn main() -> Result<()> {
+                     );
+                 }
+ 
++                let telegram_origin_token =
++                    config.core.origin_auth.resolved_tokens().remove("telegram");
++
+                 let telegram_cfg = genie_core::telegram::TelegramRuntimeConfig {
+                     api_base: config.telegram.api_base.clone(),
+                     bot_token,
+@@ -344,6 +357,7 @@ async fn main() -> Result<()> {
+                         piper_model: config.core.piper_model.clone(),
+                         max_parallel_voice: config.telegram.voice.max_parallel_voice,
+                     },
++                    origin_token: telegram_origin_token,
+                 };
+ 
+                 tracing::info!(
+diff --git a/crates/genie-core/src/origin_auth.rs b/crates/genie-core/src/origin_auth.rs
+new file mode 100644
+index 0000000..d26ab6c
+--- /dev/null
++++ b/crates/genie-core/src/origin_auth.rs
+@@ -0,0 +1,329 @@
++//! Trusted resolution of the inbound HTTP request origin (issue #232).
++//!
++//! The `X-Genie-Origin` header decides per-origin tool ACLs, actuation ACLs,
++//! rate limits, audit attribution, and NLU confidence thresholds — but it is
++//! client-supplied, so it cannot, on its own, be trusted as a security
++//! principal. [`OriginResolver`] turns the *claimed* origin into the *trusted*
++//! origin by checking what the request actually proves:
++//!
++//!   * The untrusted `api` baseline (also the value for a missing or
++//!     unrecognized header) needs no proof and is never elevated.
++//!   * A loopback peer is inside the documented single-host trust boundary
++//!     (`doc/household-security.md`); its header is honored unless strict mode
++//!     ([`OriginAuthConfig::require_token`]) is on or a token is configured for
++//!     that origin.
++//!   * An `X-Genie-Origin-Token` matching the secret configured for the
++//!     claimed origin authenticates the claim from any peer.
++//!
++//! Anything else is downgraded to [`RequestOrigin::Api`], the least-privileged
++//! origin, and the rejected claim is logged.
++
++use std::collections::HashMap;
++use std::net::IpAddr;
++
++use genie_common::config::OriginAuthConfig;
++
++use crate::tools::RequestOrigin;
++
++/// Resolves the trusted [`RequestOrigin`] for an inbound HTTP request.
++#[derive(Debug, Clone, Default)]
++pub struct OriginResolver {
++    tokens: HashMap<RequestOrigin, String>,
++    require_token: bool,
++}
++
++impl OriginResolver {
++    /// Build a resolver from the `[core.origin_auth]` config, resolving tokens
++    /// from config values and `GENIE_ORIGIN_TOKEN_<ORIGIN>` env vars.
++    pub fn from_config(cfg: &OriginAuthConfig) -> Self {
++        let mut tokens = HashMap::new();
++        for (name, secret) in cfg.resolved_tokens() {
++            let origin = RequestOrigin::from_header(&name);
++            // Only real, claimable channels can hold a token. `unknown`,
++            // `api`, and `confirmation` are never assumed from the wire, so a
++            // token for them would be dead config; flag it rather than create
++            // a false sense of protection.
++            if matches!(
++                origin,
++                RequestOrigin::Unknown | RequestOrigin::Api | RequestOrigin::Confirmation
++            ) {
++                tracing::warn!(
++                    origin = %name,
++                    "ignoring origin_auth token for an origin that is never assumed from the wire"
++                );
++                continue;
++            }
++            tokens.insert(origin, secret);
++        }
++        Self {
++            tokens,
++            require_token: cfg.require_token,
++        }
++    }
++
++    /// Register a token minted in-process for a first-party adapter (e.g. the
++    /// Telegram channel's loopback credential). Overrides any configured value;
++    /// a blank token is ignored.
++    pub fn insert_token(&mut self, origin: RequestOrigin, token: impl Into<String>) {
++        let token = token.into();
++        if !token.trim().is_empty() {
++            self.tokens.insert(origin, token.trim().to_string());
++        }
++    }
++
++    /// Resolve the trusted origin for a request from `peer`, claiming
++    /// `claimed_header` and presenting `token_header`.
++    ///
++    /// `peer` is `None` only when the peer address could not be determined; it
++    /// is then treated as untrusted (non-loopback).
++    pub fn resolve(
++        &self,
++        peer: Option<IpAddr>,
++        claimed_header: Option<&str>,
++        token_header: Option<&str>,
++    ) -> RequestOrigin {
++        let claimed = claimed_header
++            .map(RequestOrigin::from_header)
++            .unwrap_or(RequestOrigin::Unknown);
++
++        // Baseline: a missing/unknown header, an explicit `api`, or the
++        // never-on-the-wire `confirmation` pseudo-origin all resolve to the
++        // untrusted `api` floor. No header can sink below it and none needs
++        // proof to reach it.
++        let claimed = match claimed {
++            RequestOrigin::Unknown | RequestOrigin::Api | RequestOrigin::Confirmation => {
++                return RequestOrigin::Api;
++            }
++            other => other,
++        };
++
++        // A configured token is authoritative: once an operator (or adapter)
++        // sets a secret for an origin, that origin must always present it —
++        // even over loopback — so one local process cannot assume another's
++        // channel just by being on the same host.
++        if let Some(expected) = self.tokens.get(&claimed) {
++            let presented = token_header.map(str::trim).unwrap_or("");
++            if !presented.is_empty() && constant_time_eq(presented.as_bytes(), expected.as_bytes())
++            {
++                return claimed;
++            }
++            tracing::warn!(
++                origin = %claimed.as_policy_key(),
++                "rejected origin claim: missing or invalid X-Genie-Origin-Token; downgraded to api"
++            );
++            return RequestOrigin::Api;
++        }
++
++        // No token configured for this origin. Honor the header only from a
++        // loopback peer (the single-host trust boundary) and only when strict
++        // mode is off.
++        let loopback = peer.map(ip_is_loopback).unwrap_or(false);
++        if loopback && !self.require_token {
++            return claimed;
++        }
++
++        tracing::warn!(
++            origin = %claimed.as_policy_key(),
++            loopback,
++            require_token = self.require_token,
++            "rejected unauthenticated origin claim; downgraded to api"
++        );
++        RequestOrigin::Api
++    }
++}
++
++/// True for IPv4/IPv6 loopback, including IPv4-mapped IPv6 loopback
++/// (`::ffff:127.0.0.1`), which a dual-stack listener may report.
++fn ip_is_loopback(ip: IpAddr) -> bool {
++    match ip {
++        IpAddr::V4(v4) => v4.is_loopback(),
++        IpAddr::V6(v6) => {
++            v6.is_loopback()
++                || v6
++                    .to_ipv4_mapped()
++                    .map(|mapped| mapped.is_loopback())
++                    .unwrap_or(false)
++        }
++    }
++}
++
++/// Length-checked, content-constant-time byte comparison. Avoids leaking how
++/// many leading bytes of a guessed token are correct via response timing. The
++/// length itself is not treated as secret (standard for bearer tokens).
++fn constant_time_eq(a: &[u8], b: &[u8]) -> bool {
++    if a.len() != b.len() {
++        return false;
++    }
++    let mut diff = 0u8;
++    for (x, y) in a.iter().zip(b.iter()) {
++        diff |= x ^ y;
++    }
++    diff == 0
++}
++
++#[cfg(test)]
++mod tests {
++    use super::*;
++    use std::net::{Ipv4Addr, Ipv6Addr};
++
++    fn loopback_v4() -> Option<IpAddr> {
++        Some(IpAddr::V4(Ipv4Addr::LOCALHOST))
++    }
++
++    fn lan_v4() -> Option<IpAddr> {
++        Some(IpAddr::V4(Ipv4Addr::new(192, 168, 1, 50)))
++    }
++
++    fn cfg(require_token: bool, tokens: &[(&str, &str)]) -> OriginAuthConfig {
++        OriginAuthConfig {
++            require_token,
++            tokens: tokens
++                .iter()
++                .map(|(k, v)| (k.to_string(), v.to_string()))
++                .collect(),
++        }
++    }
++
++    #[test]
++    fn missing_header_is_api_floor() {
++        let r = OriginResolver::default();
++        assert_eq!(r.resolve(loopback_v4(), None, None), RequestOrigin::Api);
++        assert_eq!(r.resolve(lan_v4(), None, None), RequestOrigin::Api);
++    }
++
++    #[test]
++    fn unknown_or_confirmation_header_collapses_to_api() {
++        let r = OriginResolver::default();
++        assert_eq!(
++            r.resolve(loopback_v4(), Some("bogus"), None),
++            RequestOrigin::Api
++        );
++        // `confirmation` is an internal pseudo-origin, never claimable.
++        assert_eq!(
++            r.resolve(loopback_v4(), Some("confirmation"), None),
++            RequestOrigin::Api
++        );
++    }
++
++    #[test]
++    fn loopback_honors_unauthenticated_privileged_header_by_default() {
++        let r = OriginResolver::default();
++        assert_eq!(
++            r.resolve(loopback_v4(), Some("dashboard"), None),
++            RequestOrigin::Dashboard
++        );
++        assert_eq!(
++            r.resolve(loopback_v4(), Some("voice"), None),
++            RequestOrigin::Voice
++        );
++    }
++
++    #[test]
++    fn non_loopback_cannot_forge_privileged_origin_without_token() {
++        let r = OriginResolver::default();
++        // The core fix: a LAN peer claiming `voice` is downgraded.
++        assert_eq!(r.resolve(lan_v4(), Some("voice"), None), RequestOrigin::Api);
++        assert_eq!(
++            r.resolve(lan_v4(), Some("dashboard"), None),
++            RequestOrigin::Api
++        );
++    }
++
++    #[test]
++    fn unknown_peer_is_treated_as_untrusted() {
++        let r = OriginResolver::default();
++        assert_eq!(r.resolve(None, Some("voice"), None), RequestOrigin::Api);
++    }
++
++    #[test]
++    fn matching_token_authenticates_from_any_peer() {
++        let r = OriginResolver::from_config(&cfg(false, &[("telegram", "s3cret")]));
++        assert_eq!(
++            r.resolve(lan_v4(), Some("telegram"), Some("s3cret")),
++            RequestOrigin::Telegram
++        );
++        assert_eq!(
++            r.resolve(loopback_v4(), Some("telegram"), Some("s3cret")),
++            RequestOrigin::Telegram
++        );
++    }
++
++    #[test]
++    fn wrong_or_missing_token_downgrades_even_on_loopback() {
++        // Configuring a token makes it mandatory for that origin everywhere —
++        // loopback trust no longer applies to it.
++        let r = OriginResolver::from_config(&cfg(false, &[("telegram", "s3cret")]));
++        assert_eq!(
++            r.resolve(loopback_v4(), Some("telegram"), Some("wrong")),
++            RequestOrigin::Api
++        );
++        assert_eq!(
++            r.resolve(loopback_v4(), Some("telegram"), None),
++            RequestOrigin::Api
++        );
++        // A different, un-tokened origin still gets loopback trust.
++        assert_eq!(
++            r.resolve(loopback_v4(), Some("dashboard"), None),
++            RequestOrigin::Dashboard
++        );
++    }
++
++    #[test]
++    fn require_token_strips_loopback_trust() {
++        let r = OriginResolver::from_config(&cfg(true, &[("dashboard", "ui-token")]));
++        // Strict mode: no token, no privileged origin, even on loopback.
++        assert_eq!(
++            r.resolve(loopback_v4(), Some("voice"), None),
++            RequestOrigin::Api
++        );
++        // …but a correct token still works.
++        assert_eq!(
++            r.resolve(loopback_v4(), Some("dashboard"), Some("ui-token")),
++            RequestOrigin::Dashboard
++        );
++        // api floor is always reachable.
++        assert_eq!(
++            r.resolve(loopback_v4(), Some("api"), None),
++            RequestOrigin::Api
++        );
++    }
++
++    #[test]
++    fn insert_token_overrides_and_enforces() {
++        let mut r = OriginResolver::default();
++        r.insert_token(RequestOrigin::Telegram, "minted");
++        assert_eq!(
++            r.resolve(loopback_v4(), Some("telegram"), Some("minted")),
++            RequestOrigin::Telegram
++        );
++        // Now that telegram has a token, the bare header no longer suffices.
++        assert_eq!(
++            r.resolve(loopback_v4(), Some("telegram"), None),
++            RequestOrigin::Api
++        );
++        // Blank tokens are ignored (no accidental lockout/elevation).
++        r.insert_token(RequestOrigin::Voice, "   ");
++        assert_eq!(
++            r.resolve(loopback_v4(), Some("voice"), None),
++            RequestOrigin::Voice
++        );
++    }
++
++    #[test]
++    fn ipv4_mapped_ipv6_loopback_is_loopback() {
++        let mapped = IpAddr::V6(Ipv4Addr::LOCALHOST.to_ipv6_mapped());
++        assert!(ip_is_loopback(mapped));
++        assert!(ip_is_loopback(IpAddr::V6(Ipv6Addr::LOCALHOST)));
++        assert!(!ip_is_loopback(IpAddr::V6(Ipv6Addr::new(
++            0x2001, 0xdb8, 0, 0, 0, 0, 0, 1
++        ))));
++    }
++
++    #[test]
++    fn constant_time_eq_matches_semantics() {
++        assert!(constant_time_eq(b"abc", b"abc"));
++        assert!(!constant_time_eq(b"abc", b"abd"));
++        assert!(!constant_time_eq(b"abc", b"abcd"));
++        assert!(constant_time_eq(b"", b""));
++    }
++}
+diff --git a/crates/genie-core/src/server.rs b/crates/genie-core/src/server.rs
+index 5a5b2cb..aee84d0 100644
+--- a/crates/genie-core/src/server.rs
++++ b/crates/genie-core/src/server.rs
+@@ -13,6 +13,7 @@ use crate::connectivity::{ConnectivityController, ConnectivityHealth, Connectivi
+ use crate::conversation::ConversationStore;
+ use crate::llm::{LlmClient, LlmRequestHints, Message};
+ use crate::memory::{Memory, SharedMemory, with_shared_memory};
++use crate::origin_auth::OriginResolver;
+ use crate::prompt::ModelFamily;
+ use crate::reasoning::InteractionKind;
+ use crate::tools::ToolDispatcher;
+@@ -92,6 +93,9 @@ pub struct ChatServer {
+     expected_runtime_contract_hash: String,
+     /// Inbound HTTP-server hardening (read caps, timeout, connection ceiling).
+     http_config: HttpServerConfig,
++    /// Trusted resolution of the request origin from the (forgeable) header,
++    /// the peer transport, and any authenticated token (issue #232).
++    origin_resolver: OriginResolver,
+ }
+ 
+ pub struct ChatTurnResult {
+@@ -131,6 +135,7 @@ impl ChatServer {
+             model_family,
+             expected_runtime_contract_hash,
+             http_config: HttpServerConfig::default(),
++            origin_resolver: OriginResolver::default(),
+         })
+     }
+ 
+@@ -141,6 +146,15 @@ impl ChatServer {
+         self
+     }
+ 
++    /// Override how the request origin is derived from the wire. Defaults to
++    /// [`OriginResolver::default`], which honors the `X-Genie-Origin` header
++    /// only from loopback peers and downgrades any privileged claim from a
++    /// non-loopback peer to `api` (issue #232).
++    pub fn with_origin_auth(mut self, origin_resolver: OriginResolver) -> Self {
++        self.origin_resolver = origin_resolver;
++        self
++    }
++
+     /// Serve HTTP requests on the current-thread runtime.
+     ///
+     /// Requests are accepted concurrently on one OS thread so health/dashboard
+@@ -156,7 +170,9 @@ impl ChatServer {
+         if matches!(bind_host, "0.0.0.0" | "::") {
+             tracing::warn!(
+                 bind_host,
+-                "genie-core is exposed beyond localhost; use only behind a trusted gateway or firewall"
++                "genie-core is exposed beyond localhost; use only behind a trusted gateway or firewall. \
++                 Non-loopback peers cannot assume a privileged X-Genie-Origin without a configured \
++                 [core.origin_auth] token (issue #232)"
+             );
+         }
+         let addr = format!("{}:{}", bind_host, port);
+@@ -331,14 +347,6 @@ async fn with_chat_turn_lock<T>(lock: &Mutex<()>, fut: impl std::future::Future<
+     fut.await
+ }
+ 
+-fn normalized_origin(request_origin: RequestOrigin) -> RequestOrigin {
+-    if matches!(request_origin, RequestOrigin::Unknown) {
+-        RequestOrigin::Api
+-    } else {
+-        request_origin
+-    }
+-}
+-
+ #[allow(clippy::too_many_arguments)]
+ async fn handle_request(
+     stream: tokio::net::TcpStream,
+@@ -358,6 +366,9 @@ async fn handle_request(
+     let max_history = ctx.max_history;
+     let model_family = ctx.model_family;
+     let expected_runtime_contract_hash = &ctx.expected_runtime_contract_hash;
++    // Capture the peer address before splitting the stream: it is the
++    // transport-level proof used to gate privileged origin claims (issue #232).
++    let peer_ip = stream.peer_addr().ok().map(|addr| addr.ip());
+     let (reader, mut writer) = stream.into_split();
+     let mut buf_reader = BufReader::new(reader);
+ 
+@@ -375,11 +386,6 @@ async fn handle_request(
+         }
+     };
+ 
+-    let request_origin = request
+-        .header("x-genie-origin")
+-        .map(RequestOrigin::from_header)
+-        .unwrap_or(RequestOrigin::Unknown);
+-
+     // Cross-origin / DNS-rebinding gate ahead of routing (issue #228). A
+     // disallowed Host/Origin is rejected; an allowlisted Origin is reflected in
+     // the response (no more wildcard). Mutating/actuating routes additionally
+@@ -392,7 +398,8 @@ async fn handle_request(
+             return Ok(());
+         }
+     };
+-    if classify_route(&request.method, &request.path).is_mutating() && !guard.token_ok(&request) {
++    let route = classify_route(&request.method, &request.path);
++    if route.is_mutating() && !guard.token_ok(&request) {
+         tracing::debug!("mutating request without a valid local API token");
+         let _ = write_guard_rejection(
+             &mut writer,
+@@ -403,12 +410,16 @@ async fn handle_request(
+         return Ok(());
+     }
+ 
++    // Derive the trusted origin from the (forgeable) header plus the peer
++    // transport and any authenticated token, rather than trusting the header
++    // outright (issue #232). The result is already normalized to the `api`
++    // floor for unauthenticated/unknown claims.
++    let request_origin = ctx.origin_resolver.resolve(
++        peer_ip,
++        request.header("x-genie-origin"),
++        request.header("x-genie-origin-token"),
++    );
+     let body = request.body;
+-    let method = request.method;
+-    let path = request.path;
+-
+-    // Route.
+-    let route = classify_route(&method, &path);
+     if matches!(route, RequestRoute::ChatStream) {
+         let _guard = chat_turn_lock.lock().await;
+         if let Err(e) = handle_chat_stream(
+@@ -422,7 +433,7 @@ async fn handle_request(
+             system_prompt,
+             max_history,
+             model_family,
+-            normalized_origin(request_origin),
++            request_origin,
+             echo_origin.as_deref(),
+         )
+         .await
+@@ -451,7 +462,7 @@ async fn handle_request(
+                     system_prompt,
+                     max_history,
+                     model_family,
+-                    normalized_origin(request_origin),
++                    request_origin,
+                 ),
+             )
+             .await
+@@ -509,7 +520,7 @@ async fn handle_request(
+                     system_prompt,
+                     max_history,
+                     model_family,
+-                    normalized_origin(request_origin),
++                    request_origin,
+                 ),
+             )
+             .await
+diff --git a/crates/genie-core/src/telegram.rs b/crates/genie-core/src/telegram.rs
+index c6ce81a..ecd3c13 100644
+--- a/crates/genie-core/src/telegram.rs
++++ b/crates/genie-core/src/telegram.rs
+@@ -35,6 +35,11 @@ pub struct TelegramRuntimeConfig {
+     pub allowed_chat_ids: Vec<i64>,
+     pub allow_all_chats: bool,
+     pub voice: TelegramVoiceRuntimeConfig,
++    /// Shared secret presented as `X-Genie-Origin-Token` so genie-core trusts
++    /// the `telegram` origin instead of treating the (forgeable) header as
++    /// proof (issue #232). `None` when no token is configured, in which case
++    /// the loopback `core_base_url` is trusted by transport.
++    pub origin_token: Option<String>,
+ }
+ 
+ /// Voice-message ingestion settings for the Telegram channel (issue #42).
+@@ -738,10 +743,14 @@ impl TelegramApi {
+             conversation_id: Some(format!("telegram-{chat_id}")),
+         };
+ 
+-        let response: CoreChatResponse = self
++        let mut builder = self
+             .client
+             .post(format!("{}/api/chat", self.config.core_base_url))
+-            .header("X-Genie-Origin", "telegram")
++            .header("X-Genie-Origin", "telegram");
++        if let Some(token) = &self.config.origin_token {
++            builder = builder.header("X-Genie-Origin-Token", token);
++        }
++        let response: CoreChatResponse = builder
+             .json(&request)
+             .send()
+             .await
+@@ -1034,6 +1043,7 @@ mod tests {
+                     piper_model: PathBuf::from("/tmp/piper.onnx"),
+                     max_parallel_voice,
+                 },
++                origin_token: None,
+             },
+         )
+     }
+diff --git a/deploy/config/geniepod.dev.toml b/deploy/config/geniepod.dev.toml
+index a6d8c69..365c045 100644
+--- a/deploy/config/geniepod.dev.toml
++++ b/deploy/config/geniepod.dev.toml
+@@ -69,6 +69,13 @@ expected_runtime_contract_hash = ""  # Optional: pin after a known-good boot.
+ # max_actions_per_minute = 12
+ # max_actions_per_minute_by_origin = { telegram = 3, voice = 8 }
+ 
++# Trusted request-origin auth (issue #232). The X-Genie-Origin header is
++# forgeable, so a privileged origin is only honored from a loopback peer or with
++# a matching token. Localhost-only dev needs nothing here.
++# [core.origin_auth]
++# require_token = false
++# tokens = { dashboard = "", telegram = "" }   # Prefer GENIE_ORIGIN_TOKEN_<ORIGIN>.
++
+ [web_search]
+ enabled = true
+ provider = "duckduckgo"
+diff --git a/deploy/config/geniepod.toml b/deploy/config/geniepod.toml
+index c5d399c..cc1ad47 100644
+--- a/deploy/config/geniepod.toml
++++ b/deploy/config/geniepod.toml
+@@ -175,6 +175,19 @@ wakeword_script = ""              # Empty = push-to-talk (alpha.5 default).
+ # max_actions_per_minute = 12
+ # max_actions_per_minute_by_origin = { telegram = 3, voice = 8 }
+ 
++# Trusted resolution of the request origin (issue #232). The per-origin tool/
++# actuation ACLs, rate limits, audit trail, and confidence thresholds above all
++# key off the X-Genie-Origin header, which is client-supplied and therefore
++# forgeable. genie-core only honors a privileged origin (anything but the `api`
++# baseline) from a loopback peer (the single-host trust boundary) or when the
++# request presents a matching token in the X-Genie-Origin-Token header. No setup
++# is needed for a localhost-only deployment; configure tokens when binding to a
++# LAN address behind a gateway, or set require_token to also stop one local
++# process from impersonating another's channel.
++# [core.origin_auth]
++# require_token = false                         # true => tokens mandatory even on loopback
++# tokens = { dashboard = "", telegram = "" }    # Prefer GENIE_ORIGIN_TOKEN_<ORIGIN> env vars.
++
+ [governor]
+ poll_interval_ms = 5000
+ night_start_hour = 23
+diff --git a/doc/configuration.md b/doc/configuration.md
+index 54aace5..a9c9d0e 100644
+--- a/doc/configuration.md
++++ b/doc/configuration.md
+@@ -58,6 +58,7 @@ Runtime load path:
+ | `skill_policy.*` | Runtime load policy for native skills |
+ | `tool_policy.*` | Runtime allow/deny policy for model-callable tools by origin |
+ | `actuation_safety.*` | Final home-actuation safety gate settings |
++| `origin_auth.*` | How a request may assume a privileged origin over HTTP |
+ 
+ ### `[core.speaker_identity]`
+ 
+@@ -136,6 +137,27 @@ Behavior notes:
+ - `unknown` is not in the default `allowed_origins`; direct tool execution without a channel context cannot actuate the home.
+ - Valid origin keys are `voice`, `dashboard`, `api`, `telegram`, `repl`, and `confirmation`.
+ - Rate limits apply before physical execution and are tracked per origin over a 60-second window.
++- The origin these policies key off is resolved per `[core.origin_auth]` below, not taken at face value from the header.
++
++### `[core.origin_auth]`
++
++The `X-Genie-Origin` header is client-supplied, so it cannot by itself be a
++trusted security principal for the policies above (issue #232). A request may
++assume an origin more privileged than the `api` baseline only when it proves
++entitlement — by originating from a loopback peer or by presenting a matching
++token. Otherwise it is downgraded to `api`.
++
++| Key | Purpose |
++| --- | --- |
++| `require_token` | Require a valid token even from loopback peers (default `false`) |
++| `tokens` | Map of origin name to the shared secret expected in `X-Genie-Origin-Token` |
++
++Behavior notes:
++
++- Default (`require_token = false`, no tokens): loopback peers are trusted to set any origin; non-loopback peers cannot assume a privileged origin at all.
++- A configured token makes that origin require the token everywhere, including loopback — so one local process cannot impersonate another's channel.
++- Each token may instead be supplied via the `GENIE_ORIGIN_TOKEN_<ORIGIN>` environment variable (preferred; keep config files `0600`).
++- The in-process Telegram adapter automatically presents its configured token.
+ 
+ ### Runtime Contract Pinning
+ 
+diff --git a/doc/household-security.md b/doc/household-security.md
+index db7ab71..b54b524 100644
+--- a/doc/household-security.md
++++ b/doc/household-security.md
+@@ -67,6 +67,12 @@ fallback policy, and user-visible review.
+ - Keep `genie-core` and `genie-api` on localhost unless a trusted gateway owns
+   authentication.
+ - Prefer environment variables for tokens.
++- The request origin (`voice`/`dashboard`/`telegram`/…) is a trust input, not a
++  client-asserted label: genie-core only honors a privileged `X-Genie-Origin`
++  from a loopback peer or with a matching `[core.origin_auth]` token, and
++  downgrades everything else to `api`. When binding beyond localhost, configure
++  origin tokens (or set `require_token`) so a network peer cannot forge a
++  higher-trust channel.
+ - Keep config files `0600` and data directories `0700`.
+ - Do not use Telegram `allow_all_chats` for a real home.
+ - Keep tool policy and actuation safety enabled.
+diff --git a/doc/http-and-cli.md b/doc/http-and-cli.md
+index f6f424a..cabcb7c 100644
+--- a/doc/http-and-cli.md
++++ b/doc/http-and-cli.md
+@@ -35,6 +35,44 @@ First-party clients should set `X-Genie-Origin` so tool and actuation policy can
+ differentiate `dashboard`, `api`, `voice`, `telegram`, and other surfaces.
+ Requests without the header are treated as `api`, not `dashboard`.
+ 
++#### Trusted Origin Resolution (issue #232)
++
++The origin drives per-origin tool ACLs, actuation ACLs, rate limits, audit
++attribution, and NLU confidence thresholds, so the client-supplied
++`X-Genie-Origin` header cannot be trusted on its own — otherwise any caller
++could claim `voice` to clear a higher-trust bar or rotate origins to dodge a
++per-origin rate limit. genie-core only honors an origin more privileged than the
++`api` baseline when the request proves it is entitled to that origin:
++
++- from a **loopback** peer — the documented single-host trust boundary (see
++  [household-security.md](household-security.md)); or
++- with an **`X-Genie-Origin-Token`** that matches the secret configured for the
++  claimed origin under `[core.origin_auth]`.
++
++Anything else — a privileged claim from a non-loopback peer with no valid token,
++or a mismatched token — is downgraded to `api` and logged. This means a LAN peer
++reaching a `bind_host = "0.0.0.0"` deployment **cannot** assume `voice`,
++`dashboard`, or `telegram` from the header alone.
++
++Configuration:
++
++```toml
++[core.origin_auth]
++# Require a token even from loopback peers (hardens multi-process same-host
++# setups). Off by default so the local dashboard, CLI, and in-process adapters
++# work with no setup.
++require_token = false
++# origin -> shared secret presented in the X-Genie-Origin-Token header.
++# Prefer the GENIE_ORIGIN_TOKEN_<ORIGIN> env var and keep config files 0600.
++tokens = { dashboard = "", telegram = "" }
++```
++
++Each origin's token may instead be supplied via the
++`GENIE_ORIGIN_TOKEN_<ORIGIN>` environment variable (e.g.
++`GENIE_ORIGIN_TOKEN_TELEGRAM`). The in-process Telegram adapter automatically
++presents its configured token, so its `telegram` principal stays unforgeable by
++other local processes and keeps working when `require_token = true`.
++
+ | Method | Path | Purpose |
+ | --- | --- | --- |
+ | `GET` | `/` | Local chat UI |
