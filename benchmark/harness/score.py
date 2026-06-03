@@ -51,6 +51,15 @@ SRC_TOK_SATURATION_SCALE = 58.0
 MAX_CONTRIBUTION_BONUS = 5
 CONTRIBUTION_SCORE_FOR_FULL_BONUS = 1500
 
+# Efficiency scoring constants.
+# Agents that use <= EFFICIENCY_THRESHOLD output tokens earn a 1.0 multiplier.
+# Above that, the multiplier decays linearly to EFFICIENCY_FLOOR at the
+# DEFAULT_TOKEN_BUDGET ceiling.  Agents that don't report tokens (tokens_used=0)
+# receive 1.0 — no penalty for not tracking.
+EFFICIENCY_THRESHOLD = 10_000   # output tokens below this → factor = 1.0
+EFFICIENCY_FLOOR = 0.85         # minimum multiplier (15% penalty at budget cap)
+DEFAULT_TOKEN_BUDGET = 50_000   # matches Problem.output_token_budget default
+
 
 def repo_cache_dir() -> Path:
     """Return (and create) the gitminer repo cache directory."""
@@ -390,7 +399,7 @@ def score_diff_quality(problem_dir: Path, patch_path: Path) -> tuple[float, floa
     return src_tok, total_tok, compute_base_score(src_tok, total_tok, saturation_scale)
 
 
-def score_patch(problem_dir: Path, patch_path: Path) -> dict:
+def score_patch(problem_dir: Path, patch_path: Path, tokens_used: int = 0) -> dict:
     meta = load_problem_meta(problem_dir)
     saturation_scale = float(meta.get("src_tok_saturation_scale", SRC_TOK_SATURATION_SCALE))
 
@@ -419,7 +428,7 @@ def score_patch(problem_dir: Path, patch_path: Path) -> dict:
                 check=True, capture_output=True,
             )
         try:
-            return _score_in_worktree(problem_dir, worktree, meta, patch_path, saturation_scale)
+            return _score_in_worktree(problem_dir, worktree, meta, patch_path, saturation_scale, tokens_used)
         finally:
             subprocess.run(
                 ["git", "-C", str(cached), "worktree", "remove", "--force", str(worktree)],
@@ -714,8 +723,38 @@ def compute_test_quality_factor(test_coverage_ratio: "float | None") -> float:
     return round(0.85 + 0.15 * min(test_coverage_ratio, 1.0), 4)
 
 
+def compute_efficiency_factor(
+    tokens_used: int,
+    budget: int = DEFAULT_TOKEN_BUDGET,
+) -> float:
+    """
+    Convert raw LLM output token count to a score multiplier (0.85–1.0).
+
+    Rationale: an agent that achieves the same quality with fewer tokens is a
+    better agent — it costs less to run and scales to more problems in parallel.
+    Efficiency measures scaffolding quality, not model size.
+
+    Design: linear decay from 1.0 at or below EFFICIENCY_THRESHOLD to
+    EFFICIENCY_FLOOR at the budget ceiling.
+
+      tokens ≤ 10 000  → 1.0   (efficient)
+      tokens = 30 000  → 0.925
+      tokens = 50 000  → 0.85  (budget-exhausted)
+      tokens = 0       → 1.0   (not tracked — no penalty)
+
+    Does not zero-out benchmark_score; agents have a floor even when wasteful.
+    """
+    if tokens_used <= 0 or tokens_used <= EFFICIENCY_THRESHOLD:
+        return 1.0
+    max_excess = max(budget - EFFICIENCY_THRESHOLD, 1)
+    excess = min(tokens_used - EFFICIENCY_THRESHOLD, max_excess)
+    factor = 1.0 - (1.0 - EFFICIENCY_FLOOR) * (excess / max_excess)
+    return round(max(factor, EFFICIENCY_FLOOR), 4)
+
+
 def _score_in_worktree(
-    problem_dir: Path, repo_dir: Path, meta: dict, patch_path: Path, saturation_scale: float
+    problem_dir: Path, repo_dir: Path, meta: dict, patch_path: Path, saturation_scale: float,
+    tokens_used: int = 0,
 ) -> dict:
     problem_id = meta["id"]
     diff_text = patch_path.read_text()
@@ -736,6 +775,8 @@ def _score_in_worktree(
             "base_score": 0.0,
             "relative_score": 0.0,
             "benchmark_score": 0.0,
+            "tokens_used": tokens_used,
+            "efficiency_factor": compute_efficiency_factor(tokens_used),
             "final_score": 0.0,
         }
 
@@ -805,11 +846,20 @@ def _score_in_worktree(
     assertion_info = test_assertion_delta(problem_dir, diff_text)
     tqf = compute_test_quality_factor(assertion_info["test_coverage_ratio"])
 
+    # efficiency_factor: 0.85–1.0 multiplier based on output token usage.
+    # Agents using ≤10 000 tokens earn 1.0; budget-exhausted agents earn 0.85.
+    # When tokens_used=0 (not tracked), factor is 1.0 — no penalty.
+    token_budget = int(meta.get("output_token_budget", DEFAULT_TOKEN_BUDGET))
+    eff = compute_efficiency_factor(tokens_used, token_budget)
+
     # benchmark_score: composite primary leaderboard metric.
-    #   = test_pass_rate × relative_score × anti_gaming_multiplier × test_quality_factor
-    # Correctness depth × quality alignment × integrity × test coverage incentive.
-    # Oracle earns 1.0 by definition; gaming submissions earn ≤0.5.
-    benchmark_score = round(test_pass_rate * (rel_score or 0.0) * anti_gaming_multiplier * tqf, 4)
+    #   = test_pass_rate × relative_score × anti_gaming_multiplier
+    #     × test_quality_factor × efficiency_factor
+    # Correctness depth × quality alignment × integrity × test coverage × token efficiency.
+    # Oracle earns 1.0 by definition (oracle does not report tokens → eff=1.0).
+    benchmark_score = round(
+        test_pass_rate * (rel_score or 0.0) * anti_gaming_multiplier * tqf * eff, 4
+    )
 
     return {
         "problem_id": problem_id,
@@ -837,6 +887,10 @@ def _score_in_worktree(
         # test_quality_factor: 0.85–1.0 multiplier — rewards agents that add test assertions
         # proportional to the reference. 1.0 when reference added no assertions (no expectation).
         "test_quality_factor": tqf,
+        # efficiency_factor: 0.85–1.0 multiplier — rewards token-efficient agents.
+        # 1.0 when tokens_used=0 (not tracked). Decays linearly above 10k tokens.
+        "tokens_used": tokens_used,
+        "efficiency_factor": eff,
         # file_coverage: fraction of reference-diff source files the agent also touches.
         # Observational only — a different-but-correct fix needn't touch the same files.
         **coverage,

@@ -61,6 +61,12 @@ class Patch:
     # Optional: agent's internal reasoning log (not scored, for transparency)
     reasoning: str = ""
 
+    # Total LLM output tokens consumed across all calls in solve().
+    # Set this to enable efficiency scoring: agents that achieve the same
+    # quality with fewer tokens rank higher.  Leave at 0 (default) to opt
+    # out — no efficiency penalty is applied when tokens are not reported.
+    tokens_used: int = 0
+
 
 class BaseAgent(abc.ABC):
     """

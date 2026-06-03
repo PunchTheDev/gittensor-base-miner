@@ -2480,8 +2480,12 @@ def _call(
     max_tokens: int,
     timeout: float,
     temperature: float = 0.2,
-) -> str:
-    """Call the OpenRouter API. Retries once on 429, 5xx, timeout, or missing choices."""
+) -> tuple[str, int]:
+    """Call the OpenRouter API. Returns (content, completion_tokens).
+
+    Retries once on 429, 5xx, timeout, or missing choices.
+    completion_tokens is 0 on any error path so callers can safely accumulate.
+    """
     for attempt in range(2):
         try:
             resp = httpx.post(
@@ -2503,13 +2507,13 @@ def _call(
             if attempt == 0:
                 time.sleep(2)
                 continue
-            return ""  # second timeout — caller handles empty string gracefully
+            return "", 0  # second timeout — caller handles empty string gracefully
         if attempt == 0 and resp.status_code in (400, 429, 500, 502, 503):
             retry_after = int(resp.headers.get("retry-after", "5"))
             time.sleep(min(retry_after, 10))
             continue
         if resp.status_code >= 400:
-            return ""  # non-retriable error — return empty, score gracefully as 0
+            return "", 0  # non-retriable error — return empty, score gracefully as 0
         data = resp.json()
         if "choices" not in data:
             # OpenRouter returned an error body (e.g. "No endpoints found")
@@ -2517,9 +2521,12 @@ def _call(
             if attempt == 0:
                 time.sleep(5)
                 continue
-            return ""
-        return data["choices"][0]["message"]["content"]
-    return ""
+            return "", 0
+        content = data["choices"][0]["message"]["content"]
+        usage = data.get("usage") or {}
+        tokens = int(usage.get("completion_tokens") or usage.get("total_tokens") or 0)
+        return content, tokens
+    return "", 0
 
 
 def _extract_diff(text: str) -> str:
@@ -2711,7 +2718,8 @@ class ExampleAgent(BaseAgent):
             {"role": "system", "content": system_content},
             {"role": "user", "content": observe_user},
         ]
-        plan = _call(history, self.model, api_key, plan_tokens, plan_timeout)
+        plan, _tok = _call(history, self.model, api_key, plan_tokens, plan_timeout)
+        _total_tokens = _tok
         log.append(f"[plan]\n{plan}")
         history.append({"role": "assistant", "content": plan})
 
@@ -2740,7 +2748,8 @@ class ExampleAgent(BaseAgent):
             history.append({"role": "assistant", "content": diff})
         else:
             history.append({"role": "user", "content": ACT_PROMPT})
-            raw_diff = _call(history, self.model, api_key, act_tokens, act_timeout, temperature=0)
+            raw_diff, _tok = _call(history, self.model, api_key, act_tokens, act_timeout, temperature=0)
+            _total_tokens += _tok
             diff = pp(_extract_diff(raw_diff))
             log.append(f"[diff v0]\n{diff}")
             history.append({"role": "assistant", "content": diff})
@@ -2806,7 +2815,8 @@ class ExampleAgent(BaseAgent):
                 else:
                     repair_msg = REPAIR_FORMAT_PROMPT.format(problem=problem_desc, diff=diff)
                     history.append({"role": "user", "content": repair_msg})
-                raw_diff = _call(history, self.model, api_key, act_tokens, act_timeout, temperature=0)
+                raw_diff, _tok = _call(history, self.model, api_key, act_tokens, act_timeout, temperature=0)
+                _total_tokens += _tok
                 diff = pp(_extract_diff(raw_diff))
                 log.append(f"[repair {attempt} (format)]\n{diff}")
                 history.append({"role": "assistant", "content": diff})
@@ -2878,7 +2888,8 @@ class ExampleAgent(BaseAgent):
                 )
                 history.append({"role": "user", "content": verify_user})
             pending_prose_critique = False
-            verdict = _call(history, self.model, api_key, verify_tokens, verify_timeout, temperature=0)
+            verdict, _tok = _call(history, self.model, api_key, verify_tokens, verify_timeout, temperature=0)
+            _total_tokens += _tok
             log.append(f"[verify {attempt}]\n{verdict}")
 
             repaired = pp(_extract_diff(verdict))
@@ -2952,7 +2963,7 @@ class ExampleAgent(BaseAgent):
         diff = pp(diff)
 
         reasoning = f"model={self.model}\n\n" + "\n\n".join(log)
-        return Patch(diff=diff, reasoning=reasoning)
+        return Patch(diff=diff, reasoning=reasoning, tokens_used=_total_tokens)
 
     def repair(self, problem: Problem, failed_patch: Patch, test_output: str) -> Patch:
         """
@@ -3027,7 +3038,8 @@ class ExampleAgent(BaseAgent):
             {"role": "system", "content": SYSTEM_PROMPT},
             {"role": "user", "content": repair_user},
         ]
-        raw_diff = _call(history, self.model, api_key, act_tokens, act_timeout, temperature=0)
+        raw_diff, _tok = _call(history, self.model, api_key, act_tokens, act_timeout, temperature=0)
+        _repair_tokens = _tok
         diff = pp(_extract_diff(raw_diff))
         log.append(f"[repair diff]\n{diff}")
 
@@ -3036,9 +3048,10 @@ class ExampleAgent(BaseAgent):
             problem_desc = _diagnose_diff(diff)
             history.append({"role": "assistant", "content": diff})
             history.append({"role": "user", "content": REPAIR_FORMAT_PROMPT.format(problem=problem_desc, diff=diff)})
-            raw_diff = _call(history, self.model, api_key, act_tokens, act_timeout, temperature=0)
+            raw_diff, _tok = _call(history, self.model, api_key, act_tokens, act_timeout, temperature=0)
+            _repair_tokens += _tok
             diff = pp(_extract_diff(raw_diff))
             log.append(f"[repair format fix]\n{diff}")
 
         reasoning = (failed_patch.reasoning or "") + "\n\n" + f"model={self.model}\n\n" + "\n\n".join(log)
-        return Patch(diff=diff, reasoning=reasoning)
+        return Patch(diff=diff, reasoning=reasoning, tokens_used=_repair_tokens)
