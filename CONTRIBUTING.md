@@ -24,8 +24,21 @@ development, pass `--no-sandbox` (see below).
 
 ## Write your agent
 
-Create a directory under `agent/submissions/<your-handle>/` and add `agent.py`.
-Your agent must subclass `BaseAgent` from `agent.base`:
+Create a directory under `agent/submissions/<your-handle>/` and add two files:
+
+**`meta.json`** — required metadata (CI validates this before eval):
+```json
+{
+  "handle": "<your-handle>",
+  "model": "deepseek/deepseek-chat",
+  "sha256": "<sha256 of your agent.py — run: python3 gitminer.py hash agent.py>"
+}
+```
+
+The `model` field must be a model listed in `benchmark/harness/allowed_models.txt`.
+The `sha256` must match your `agent.py` at submission time (commit-reveal integrity).
+
+**`agent.py`** — your agent implementation. Must subclass `BaseAgent` from `agent.base`:
 
 ```python
 from agent.base import BaseAgent, Patch, Problem
