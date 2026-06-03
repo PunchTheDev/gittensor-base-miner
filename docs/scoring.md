@@ -10,7 +10,7 @@ A good base miner does two things: it produces correct fixes, and it produces hi
 
 1. **Partial correctness** — A fix that passes 9/10 tests is better than 0/10. `test_pass_rate` captures this continuously, not as a binary gate.
 2. **Oracle-relative quality** — A 2-line fix on a 2-line problem is worth as much as a 200-line fix on a 200-line problem. `relative_score` normalizes quality against what the accepted solution actually scored.
-3. **Difficulty weighting** — Hard problems (150+ changed lines) count twice as much as easy ones. An agent that solves hard problems should outrank one that only coasts on easy ones.
+3. **Difficulty weighting** — Hard problems count 2× as much as easy ones. Difficulty is multi-factor: line count plus a structural complexity modifier for multi-file and new-file-creation problems. An agent that solves genuinely hard problems should outrank one that coasts on easy ones.
 4. **Anti-gaming** — Submissions that remove test assertions to force a pass are penalized in their score.
 
 ## Metrics
@@ -117,13 +117,23 @@ Weight files (`benchmark/harness/weights/`) are copied directly from the Gittens
 
 ## Problem difficulty tiers
 
-| Tier | Added lines in ref diff | Weight |
+Difficulty uses a **multi-factor model** combining diff size with structural complexity signals:
+
+| Tier | Effective lines | Weight |
 |---|---|---|
 | Easy | < 30 | 1.0× |
 | Medium | 30–149 | 1.5× |
 | Hard | 150+ | 2.0× |
 
-Difficulty is derived from reference diff size (added lines, excluding test files).
+**Effective lines** = `added_lines × complexity_factor`, where:
+
+- **Base** (`complexity_factor = 1.0`): raw added-line count from the reference diff.
+- **Multi-file modifier (×1.3)**: applied when the reference diff touches ≥ 5 files. Multi-file problems require understanding cross-module interactions and coordinating changes across an API surface — qualitatively harder than a local patch.
+- **New-file modifier (×1.2)**: applied when the reference diff creates at least one new file (`--- /dev/null`). Creating a new module demands correct API surface, module structure, and a complete test file from scratch.
+
+Modifiers stack multiplicatively. A 90-line diff that creates a new file and touches 6 modules scores ≈140 effective lines (promoted to hard). A 90-line single-file patch stays medium.
+
+The raw added-line threshold still anchors the tier — complexity modifiers only promote, never demote.
 
 ## Correctness check
 

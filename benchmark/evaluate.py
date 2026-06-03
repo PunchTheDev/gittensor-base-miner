@@ -49,17 +49,44 @@ POOL_CONFIG_PATH = Path(__file__).parent / "pool_config.json"
 
 
 def problem_difficulty(problem_dir: Path) -> tuple[str, float]:
-    """Return (tier_name, weight) for a problem based on reference diff size."""
+    """Return (tier_name, weight) for a problem using multi-factor difficulty scoring.
+
+    Base signal: number of lines added in the reference diff.
+    Modifiers (each applied multiplicatively to the effective line count):
+      - Files changed ≥ 5: 1.3×  — multi-file problems require understanding
+        interactions across modules, not just making a single local change.
+      - New file creation (--- /dev/null): 1.2×  — creating a file from scratch
+        demands correct API surface, module structure, and complete tests, all
+        without an existing skeleton to patch.
+
+    The modifiers can stack (both active → 1.56×), so a 90-line diff that
+    creates a new file across 6 modules scores as ~140 effective lines
+    (medium → hard boundary), whereas a 90-line single-file change stays medium.
+
+    Thresholds (from DIFFICULTY_TIERS in catalog.py):
+      easy   < 30 effective lines  → weight 1.0
+      medium < 150                 → weight 1.5
+      hard   ≥ 150                 → weight 2.0
+    """
     ref = problem_dir / "reference.diff"
     if not ref.exists():
         return "medium", 1.5
 
-    added = sum(
-        1 for line in ref.read_text(errors="replace").splitlines()
-        if line.startswith("+") and not line.startswith("+++")
-    )
+    lines = ref.read_text(errors="replace").splitlines()
+    added = sum(1 for line in lines if line.startswith("+") and not line.startswith("+++"))
+    files_changed = sum(1 for line in lines if line.startswith("diff --git"))
+    has_new_files = any(line.startswith("--- /dev/null") for line in lines)
+
+    complexity = 1.0
+    if files_changed >= 5:
+        complexity *= 1.3
+    if has_new_files:
+        complexity *= 1.2
+
+    effective = added * complexity
+
     for name, threshold, weight in DIFFICULTY_TIERS:
-        if threshold is None or added < threshold:
+        if threshold is None or effective < threshold:
             return name, weight
     return "hard", 2.0
 
