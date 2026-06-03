@@ -17,28 +17,28 @@ Subcommands:
     mine        Run your agent continuously; auto-submit when it beats the champion
 
 Usage:
-    python gitminer.py eval agent/submissions/myhandle/agent.py
-    python gitminer.py eval agent/submissions/myhandle/agent.py --no-sandbox
-    python gitminer.py eval agent/submissions/myhandle/agent.py --all
-    python gitminer.py eval agent/submissions/myhandle/agent.py --problems 930,986
-    python gitminer.py eval --oracle --no-sandbox   # calibration: score reference diffs, expected weighted mean ~13.03
-    python gitminer.py run --problem 0463
-    python gitminer.py run --problem 0463 --agent agent/submissions/myhandle/agent.py
-    python gitminer.py run --problem 0463 --show-ref --score --no-sandbox
-    python gitminer.py validate --problem 0463 --patch my_fix.diff
-    python gitminer.py validate --problem 0463 --patch my_fix.diff --run-tests
-    python gitminer.py problems
-    python gitminer.py problems --cat python --difficulty hard --limit 10
-    python gitminer.py cache
-    python gitminer.py hash my_patch.diff
-    python gitminer.py shard
-    python gitminer.py info 0463
-    python gitminer.py submit agent/submissions/myhandle/agent.py
-    python gitminer.py submit agent/submissions/myhandle/agent.py --model claude-3-5-haiku-20241022 --open-pr
-    python gitminer.py serve-api
-    python gitminer.py serve-api --port 9000 --host 127.0.0.1
-    python gitminer.py mine --agent agent/submissions/myhandle/agent.py --no-sandbox
-    python gitminer.py mine --agent agent/submissions/myhandle/agent.py --loop
+    python3 gitminer.py eval agent/submissions/myhandle/agent.py
+    python3 gitminer.py eval agent/submissions/myhandle/agent.py --no-sandbox
+    python3 gitminer.py eval agent/submissions/myhandle/agent.py --all
+    python3 gitminer.py eval agent/submissions/myhandle/agent.py --problems 930,986
+    python3 gitminer.py eval --oracle --no-sandbox   # calibration: score reference diffs, expected weighted mean ~13.03
+    python3 gitminer.py run --problem 0463
+    python3 gitminer.py run --problem 0463 --agent agent/submissions/myhandle/agent.py
+    python3 gitminer.py run --problem 0463 --show-ref --score --no-sandbox
+    python3 gitminer.py validate --problem 0463 --patch my_fix.diff
+    python3 gitminer.py validate --problem 0463 --patch my_fix.diff --run-tests
+    python3 gitminer.py problems
+    python3 gitminer.py problems --cat python --difficulty hard --limit 10
+    python3 gitminer.py cache
+    python3 gitminer.py hash my_patch.diff
+    python3 gitminer.py shard
+    python3 gitminer.py info 0463
+    python3 gitminer.py submit agent/submissions/myhandle/agent.py
+    python3 gitminer.py submit agent/submissions/myhandle/agent.py --model claude-3-5-haiku-20241022 --open-pr
+    python3 gitminer.py serve-api
+    python3 gitminer.py serve-api --port 9000 --host 127.0.0.1
+    python3 gitminer.py mine --agent agent/submissions/myhandle/agent.py --no-sandbox
+    python3 gitminer.py mine --agent agent/submissions/myhandle/agent.py --loop
 """
 
 from __future__ import annotations
@@ -579,8 +579,8 @@ def cmd_info(args: argparse.Namespace) -> None:
     # Quick commands
     print(f"\n{sep}")
     print(f"\n{BOLD}Quick commands{RESET}")
-    print(f"  {DIM}Run oracle (no agent):  {RESET}python gitminer.py run --problem {args.id} --show-ref")
-    print(f"  {DIM}Run your agent:         {RESET}python gitminer.py run --problem {args.id} --agent <path/agent.py> --score --no-sandbox")
+    print(f"  {DIM}Run oracle (no agent):  {RESET}python3 gitminer.py run --problem {args.id} --show-ref")
+    print(f"  {DIM}Run your agent:         {RESET}python3 gitminer.py run --problem {args.id} --agent <path/agent.py> --score --no-sandbox")
     print(f"  {DIM}View on GitHub:         {RESET}https://github.com/{meta.get('repo_name','')}/pull/{meta.get('pr_number','?')}")
     print()
 
@@ -741,10 +741,10 @@ def cmd_run(args: argparse.Namespace) -> None:
     eval so the problem is identical to CI.
 
     Examples:
-        python gitminer.py run --problem 0463
-        python gitminer.py run --problem 0463 --agent agent/submissions/alice/agent.py
-        python gitminer.py run --problem 0463 --show-ref --score --no-sandbox
-        python gitminer.py run --problem 0463 --output my_fix.diff --verbose
+        python3 gitminer.py run --problem 0463
+        python3 gitminer.py run --problem 0463 --agent agent/submissions/alice/agent.py
+        python3 gitminer.py run --problem 0463 --show-ref --score --no-sandbox
+        python3 gitminer.py run --problem 0463 --output my_fix.diff --verbose
     """
     import tempfile
     import time
@@ -1030,8 +1030,8 @@ def cmd_mine(args: argparse.Namespace) -> None:
     and walk away.
 
     Examples:
-        python gitminer.py mine --agent agent/submissions/myhandle/agent.py --no-sandbox
-        python gitminer.py mine --agent agent/submissions/myhandle/agent.py --loop
+        python3 gitminer.py mine --agent agent/submissions/myhandle/agent.py --no-sandbox
+        python3 gitminer.py mine --agent agent/submissions/myhandle/agent.py --loop
     """
     import time
     from datetime import datetime, timezone
