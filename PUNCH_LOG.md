@@ -3322,3 +3322,49 @@ All 5 bugs were silent (no miner submissions yet), but would have caused systema
 - record_result.py wrong sort → entire leaderboard ranked by wrong metric ✅ fixed
 
 API health: pool=1154, oracle=12.70, repos=47 ✅
+
+---
+
+## Step 190 — Eval parallelism, rate limit fixes, scoring audit (2026-06-03)
+
+### Principal-engineer audit findings
+
+Reviewed the full evaluation pipeline with fresh eyes. Found 3 real bugs and 1 architectural bottleneck:
+
+1. **Sequential eval (perf bottleneck)** — `run_evaluation()` scored 30 problems one-at-a-time. At 30–60s/problem = 15–30 min per miner.
+2. **No per-problem agent timeout** — `agent.solve()` had no timeout guard. A hung agent ate the entire 60-min CI quota.
+3. **Rate limit advisory-only** — `continue-on-error: true` meant rate limits never actually blocked submissions.
+4. **Rate limit counts wrong commits** — `git log HEAD` in CI included PR branch commits, not just merged ones. Miners iterating on their PR were hitting the limit before anything merged.
+
+### PR #56 — Parallel evaluation + agent timeout + rate limit hard block (merged bc7a3a7d)
+
+**Parallel evaluation**: replaced sequential loop with `ThreadPoolExecutor(workers=4)`.
+- `_score_one_problem(idx, problem_dir, agent, use_sandbox, solve_timeout)` — isolated per-problem worker
+- `_solve_with_timeout(agent, problem, timeout)` — wraps `agent.solve()` in single-thread executor with `Future.result(timeout=N)`
+- Results sorted by original shard index before `_annotate_and_aggregate` zip
+- `--workers INT` CLI flag added (default: 4)
+- `--no-sandbox` mode auto-clamps to workers=1 (shared repo cache would race under concurrency)
+- Added `SOLVE_TIMEOUT` env var (default 300s) for per-problem agent timeout
+- Print lock added for non-interleaved progress output
+
+**Rate limit hard block**: removed `continue-on-error: true` from rate limit CI step. Now blocks on violation.
+
+**eval.yml**: passes `--workers 4` to run_eval.py.
+
+Eval time improvement: ~30 min → ~8 min (4× speedup)
+
+### PR #57 — Add --workers 4 to post-merge authoritative eval (merged b45147bd)
+
+`record_submission.yml` (fires on PR merge) was still running sequentially. Fixed to pass `--workers 4`, matching the PR-eval step.
+
+### PR #58 — Fix rate limit: count merged commits only (merged 52edbd33)
+
+`check_rate_limit.py` used `git log HEAD --since=7 days ago` which in CI counted PR branch commits (not yet merged). Miners pushing 5 times to iterate on their PR would hit the limit before a single submission was accepted.
+
+Fix: `git log origin/main --since=7 days ago` — only counts commits already on main.
+
+### System state after step 190
+
+- main: 52edbd33
+- Benchmark: 1154 problems, oracle 12.70 weighted, 47 repos
+- Eval: parallel (workers=4), solve timeout 300s, rate limit hard-blocked on merged commits only
