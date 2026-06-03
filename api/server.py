@@ -66,6 +66,8 @@ REPO_CATEGORY: dict[str, str] = {
     "seroperson/jvm-live-reload": "jvm",
     "touchpilot/touchpilot": "jvm",
     "we-promise/sure": "ruby",
+    "rubocop/rubocop": "ruby",
+    "rubocop/rubocop-rails": "ruby",
 }
 
 
