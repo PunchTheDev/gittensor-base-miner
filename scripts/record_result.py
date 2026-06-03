@@ -188,7 +188,7 @@ def main():
         else:
             print(f"SOTA unchanged at {new_sota:.4f}")
     else:
-        print(f"Score {mean_score:.4f} below current SOTA {prev_sota:.4f} — history unchanged")
+        print(f"Weighted score {weighted_mean:.4f} below current SOTA {prev_sota:.4f} — history unchanged")
 
     # Persist behavior fingerprint so future submissions can be checked for output copying.
     if args.behaviors:
