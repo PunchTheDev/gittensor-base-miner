@@ -4331,3 +4331,7 @@ benchmark_score = test_pass_rate × relative_score × anti_gaming_multiplier
 - **Dashboard PR #20 merged**: Efficiency column in leaderboard table (colour-coded) + Efficiency column in per-problem breakdown drawer + efficiency_factor in scoring page formula
 - **PR #109 merged** (base-miner): Decaying crown threshold anti-copy — `marginal_gain` now requires `score > crown_threshold(sota)` where threshold decays 0.02→0 as SOTA→ceiling. Clones below threshold earn zero champion bonus. `crown_threshold` stored per entry.
 - **Dashboard PR #21 merged**: Crown threshold docs in Scoring page + Gain cell tooltip showing required threshold score
+
+## Step 244
+- **Dashboard PR #22 merged**: Restore `Δ vs leader` column + agent history to submission drawer — Δ Leader column per problem (colour-coded green/red/muted), compares vs rank-1 or rank-2 if current agent is leader; Submission History section shows stat cards, Chart.js progression (≥2 runs), history table; agentHistChart destroyed on close to prevent canvas reuse
+- **PR #110 merged** (base-miner): Fix `/api/shard` `next_rotation` to use epoch-based 7-day cycle from 2024-01-01 (not "next Monday"), matching gitminer.py logic; update `/api/agents` scoring formula to include `× efficiency_factor` (added in PR #107)
