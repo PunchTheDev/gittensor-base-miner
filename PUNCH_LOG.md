@@ -4324,3 +4324,10 @@ benchmark_score = test_pass_rate × relative_score × anti_gaming_multiplier
 ### Next
 - Dashboard: display efficiency_factor + tokens_used in leaderboard/agent drawer
 - Decaying margin for forks (anti-copy scoring engine)
+
+## Step 243 — 2026-06-03
+
+- **PR #108 merged** (base-miner): Add `total_tokens_used` + `avg_efficiency_factor` aggregate fields to leaderboard entries
+- **Dashboard PR #20 merged**: Efficiency column in leaderboard table (colour-coded) + Efficiency column in per-problem breakdown drawer + efficiency_factor in scoring page formula
+- **PR #109 merged** (base-miner): Decaying crown threshold anti-copy — `marginal_gain` now requires `score > crown_threshold(sota)` where threshold decays 0.02→0 as SOTA→ceiling. Clones below threshold earn zero champion bonus. `crown_threshold` stored per entry.
+- **Dashboard PR #21 merged**: Crown threshold docs in Scoring page + Gain cell tooltip showing required threshold score
