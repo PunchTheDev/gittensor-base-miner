@@ -52,6 +52,8 @@ EXTERNAL_REPOS = [
     # Ruby
     "rubocop/rubocop",        # 13k stars — Ruby linter/formatter, RSpec tests, real cop bug-fixes
     "rubocop/rubocop-rails",  # 2k stars  — Rails-specific cops, same RSpec harness
+    # TypeScript
+    "colinhacks/zod",         # 38k stars — TypeScript schema validation, vitest tests, active bug-fixes
 ]
 
 
@@ -205,9 +207,20 @@ def extract_added_file(diff: str, path: str) -> str | None:
 def infer_test_cmd(repo: str, diff: str) -> list[str]:
     """Infer the test command from changed files in the diff.
 
-    Handles Python (pytest), Ruby (bundle exec rspec), with Python as default.
+    Handles TypeScript (npm test), Python (pytest), Ruby (bundle exec rspec),
+    with Python as default.
     """
     changed = re.findall(r"^diff --git a/(.+) b/", diff, re.MULTILINE)
+
+    # TypeScript/JavaScript: *.test.ts / *.spec.ts → npm test
+    # npm runner in Docker handles npm ci + npm test; can't easily target individual files
+    # for jest/vitest without knowing the package.json test script.
+    ts_test_files = [
+        p for p in changed
+        if re.search(r"\.(test|spec)\.[jt]sx?$", p)
+    ]
+    if ts_test_files:
+        return ["npm", "test"]
 
     # Ruby: _spec.rb files → bundle exec rspec <specs>
     spec_files = [p for p in changed if p.endswith("_spec.rb")][:5]

@@ -1,0 +1,185 @@
+diff --git a/packages/docs/content/api.mdx b/packages/docs/content/api.mdx
+index b8c1179b1a..97c7d6795e 100644
+--- a/packages/docs/content/api.mdx
++++ b/packages/docs/content/api.mdx
+@@ -3024,3 +3024,44 @@ You can customize the error message and other options by passing a second argume
+ ```ts
+ z.custom<...>((val) => ..., "custom error message");
+ ```
++
++## Apply
++
++Use `.apply()` to incorporate external functions into Zod's method chain:
++
++<Tabs groupId="lib" items={["Zod", "Zod Mini"]}>
++<Tab value="Zod">
++```ts
++function setCommonNumberChecks<T extends z.ZodNumber>(schema: T) {
++  return schema
++    .min(0)
++    .max(100);
++}
++
++const schema = z.number()
++  .apply(setCommonNumberChecks)
++  .nullable();
++
++schema.parse(0);  // => 0
++schema.parse(-1); // ❌ throws
++schema.parse(101); // ❌ throws
++schema.parse(null); // => null
++```
++</Tab>
++<Tab value="Zod Mini">
++```ts
++function setCommonNumberChecks<T extends z.ZodMiniNumber>(schema: T) {
++  return schema.check(z.minimum(0), z.maximum(100));
++}
++
++const schema = z.nullable(
++  z.number().apply(setCommonNumberChecks)
++);
++
++z.parse(schema, 0);   // => 0
++z.parse(schema, -1);  // ❌ throws
++z.parse(schema, 101); // ❌ throws
++z.parse(schema, null); // => null
++```
++</Tab>
++</Tabs>
+\ No newline at end of file
+diff --git a/packages/zod/src/v4/classic/schemas.ts b/packages/zod/src/v4/classic/schemas.ts
+index 57b7693c78..12c1985572 100644
+--- a/packages/zod/src/v4/classic/schemas.ts
++++ b/packages/zod/src/v4/classic/schemas.ts
+@@ -132,6 +132,7 @@ export interface ZodType<
+    * ```
+    */
+   isNullable(): boolean;
++  apply<T>(fn: (schema: this) => T): T;
+ }
+ 
+ export interface _ZodType<out Internals extends core.$ZodTypeInternals = core.$ZodTypeInternals>
+@@ -225,6 +226,7 @@ export const ZodType: core.$constructor<ZodType> = /*@__PURE__*/ core.$construct
+   // helpers
+   inst.isOptional = () => inst.safeParse(undefined).success;
+   inst.isNullable = () => inst.safeParse(null).success;
++  inst.apply = (fn) => fn(inst);
+   return inst;
+ });
+ 
+diff --git a/packages/zod/src/v4/classic/tests/apply.test.ts b/packages/zod/src/v4/classic/tests/apply.test.ts
+new file mode 100644
+index 0000000000..0117594c5c
+--- /dev/null
++++ b/packages/zod/src/v4/classic/tests/apply.test.ts
+@@ -0,0 +1,59 @@
++import { expect, expectTypeOf, test } from "vitest";
++
++import * as z from "zod/v4";
++
++test("basic apply (object)", () => {
++  const schema = z
++    .object({
++      a: z.number(),
++      b: z.string(),
++    })
++    .apply((s) => s.omit({ b: true }))
++    .apply((s) => s.extend({ c: z.boolean() }));
++
++  expect(z.toJSONSchema(schema)).toMatchInlineSnapshot(`
++    {
++      "$schema": "https://json-schema.org/draft/2020-12/schema",
++      "additionalProperties": false,
++      "properties": {
++        "a": {
++          "type": "number",
++        },
++        "c": {
++          "type": "boolean",
++        },
++      },
++      "required": [
++        "a",
++        "c",
++      ],
++      "type": "object",
++    }
++  `);
++  expectTypeOf<z.infer<typeof schema>>().toEqualTypeOf<{
++    a: number;
++    c: boolean;
++  }>();
++});
++
++test("basic apply (number)", () => {
++  const setCommonNumberChecks = <T extends z.ZodNumber>(schema: T) => {
++    return schema.min(0).max(100);
++  };
++
++  const schema = z.number().apply(setCommonNumberChecks).nullable();
++
++  expect(() => schema.parse(-1)).toThrowError();
++  expect(() => schema.parse(101)).toThrowError();
++  expect(schema.parse(0)).toBe(0);
++  expect(schema.parse(null)).toBe(null);
++  expectTypeOf<z.infer<typeof schema>>().toEqualTypeOf<number | null>();
++});
++
++test("The callback's return value becomes the apply's return value.", () => {
++  const symbol = Symbol();
++  const result = z.number().apply(() => symbol);
++
++  expect(result).toBe(symbol);
++  expectTypeOf<typeof result>().toEqualTypeOf<symbol>();
++});
+diff --git a/packages/zod/src/v4/mini/schemas.ts b/packages/zod/src/v4/mini/schemas.ts
+index 6f5ee30f42..ae6ffca0cb 100644
+--- a/packages/zod/src/v4/mini/schemas.ts
++++ b/packages/zod/src/v4/mini/schemas.ts
+@@ -33,6 +33,7 @@ export interface ZodMiniType<
+     data: unknown,
+     params?: core.ParseContext<core.$ZodIssue>
+   ): Promise<util.SafeParseResult<core.output<this>>>;
++  apply<T>(fn: (schema: this) => T): T;
+ }
+ 
+ interface _ZodMiniType<out Internals extends core.$ZodTypeInternals = core.$ZodTypeInternals>
+@@ -71,6 +72,7 @@ export const ZodMiniType: core.$constructor<ZodMiniType> = /*@__PURE__*/ core.$c
+       reg.add(inst, meta);
+       return inst;
+     }) as any;
++    inst.apply = (fn) => fn(inst);
+   }
+ );
+ 
+diff --git a/packages/zod/src/v4/mini/tests/apply.test.ts b/packages/zod/src/v4/mini/tests/apply.test.ts
+new file mode 100644
+index 0000000000..095e4af567
+--- /dev/null
++++ b/packages/zod/src/v4/mini/tests/apply.test.ts
+@@ -0,0 +1,24 @@
++import { expect, expectTypeOf, test } from "vitest";
++import * as z from "../index.js";
++
++test("basic apply (number)", () => {
++  const setCommonNumberChecks = <T extends z.ZodMiniNumber>(schema: T) => {
++    return schema.check(z.minimum(0), z.maximum(100));
++  };
++
++  const schema = z.nullable(z.number().apply(setCommonNumberChecks));
++
++  expect(() => z.parse(schema, -1)).toThrowError();
++  expect(() => z.parse(schema, 101)).toThrowError();
++  expect(z.parse(schema, 0)).toBe(0);
++  expect(z.parse(schema, null)).toBe(null);
++  expectTypeOf<z.infer<typeof schema>>().toEqualTypeOf<number | null>();
++});
++
++test("The callback's return value becomes the apply's return value.", () => {
++  const symbol = Symbol();
++  const result = z.number().apply(() => symbol);
++
++  expect(result).toBe(symbol);
++  expectTypeOf<typeof result>().toEqualTypeOf<symbol>();
++});
