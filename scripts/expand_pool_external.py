@@ -256,14 +256,11 @@ def infer_test_cmd(repo: str, diff: str) -> list[str]:
     if any(p.endswith((".java", ".kt", ".scala")) for p in changed):
         return ["./gradlew", "test", "--no-daemon", "-q"]
 
-    # TypeScript/JavaScript: *.test.ts / *.spec.ts → npm test
+    # TypeScript/JavaScript: any .ts/.tsx/.js/.jsx file → npm test
+    # Check for test files first (more specific), then any .ts/.js file.
     # npm runner in Docker handles npm ci + npm test; can't easily target individual files
     # for jest/vitest without knowing the package.json test script.
-    ts_test_files = [
-        p for p in changed
-        if re.search(r"\.(test|spec)\.[jt]sx?$", p)
-    ]
-    if ts_test_files:
+    if any(re.search(r"\.[mc]?[jt]sx?$", p) for p in changed):
         return ["npm", "test"]
 
     # Ruby: _spec.rb files → bundle exec rspec <specs>
