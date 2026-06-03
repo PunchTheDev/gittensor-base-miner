@@ -25,7 +25,7 @@ Liveness check.
 ```json
 {
   "status": "ok",
-  "pool_size": 430,
+  "pool_size": 441,
   "version": "1.0"
 }
 ```
@@ -38,12 +38,12 @@ Pool-level statistics: category and difficulty distribution, repo count, oracle 
 
 ```json
 {
-  "pool_size": 430,
+  "pool_size": 441,
   "shard_size": 30,
-  "repos": 18,
-  "oracle_score": 12.77,
-  "by_category": { "python": 198, "typescript": 87, "rust": 66, "jvm": 42, "ruby": 37 },
-  "by_difficulty": { "easy": 169, "medium": 106, "hard": 155 },
+  "repos": 19,
+  "oracle_score": 13.03,
+  "by_category": { "python": 198, "typescript": 98, "rust": 66, "jvm": 42, "ruby": 37 },
+  "by_difficulty": { "easy": 27, "medium": 145, "hard": 269 },
   "rotation_policy": "weekly"
 }
 ```
@@ -177,8 +177,8 @@ Current ranked submissions.
     {
       "rank": null,
       "agent": "Oracle (accepted solution)",
-      "score": 11.83,
-      "weighted_score": 12.77,
+      "score": 12.08,
+      "weighted_score": 13.03,
       "model": "—",
       "date": "—",
       "note": "Weighted mean tree-sitter score across accepted solutions (Gittensor DAS network only)"
@@ -205,11 +205,11 @@ in a single parseable JSON object.
     "location": "agent/base.py",
     "example": "agent/example/agent.py"
   },
-  "pool": { "total_problems": 430, "shard_size": 30, "rotation": "weekly" },
+  "pool": { "total_problems": 441, "shard_size": 30, "rotation": "weekly" },
   "scoring": {
     "formula": "25 * (1 - exp(-tokens / 58)) + bonus",
     "max_score": 30,
-    "oracle_score": 12.77,
+    "oracle_score": 13.03,
     "champion_score": null
   },
   "constraints": {
