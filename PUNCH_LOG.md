@@ -3141,3 +3141,35 @@ Dashboard: punchthedev.github.io/gittensor-miner-dashboard/ updated to 812 probl
 - Composition: python:442 (38.3%), rust:277 (24.0%), typescript:188 (16.3%), go:96 (8.3%), jvm:76 (6.6%), ruby:75 (6.5%)
 - Shard budget: python:11 / rust:7 / typescript:5 / go:3 / jvm:2 / ruby:2 = 30 ✅
 - Sunday rotation 2026-06-08: all 34 external + 13 DAS repos will auto-expand
+
+---
+
+## Step 185 — Scoring sophistication: relative score + file coverage + anti-gaming
+
+### Problem addressed
+Operator asked: "How do we score benchmark performance? It can't just be Gittensor scoring methods." The raw Gittensor token formula rewards verbose diffs, not correct fixes. Problems with different oracle scores contributed unequally to the mean.
+
+### Changes (PRs #45, #46 — both merged)
+
+**PR #45: `relative_score` + `file_coverage` (score.py, evaluate.py, gitminer.py, docs/scoring.md)**
+- `relative_score = agent_score / oracle_score` per problem (oracle from `results/baselines.json`)
+  - Oracle scores exactly 1.0 against itself (verified)
+  - Capped at 2.0 to prevent bloated-diff inflation
+  - `mean_relative_score` added to aggregate output as the primary ranking metric
+- `file_coverage`: fraction of reference diff source files agent also touches (observational, not in score)
+- `oracle_base_score`: exposed per-problem oracle denominator in result dict
+- docs/scoring.md: three-metric model documented clearly
+
+**PR #46: test deletion detection + rewards.md fix (score.py, docs/rewards.md)**
+- `_detect_test_deletion`: scans diff for removed test assertions; sets `test_deletion_warning: true` if >3 removed
+- Fixed false rewards.md claim: "tighter diffs score higher" → corrected to accurate three-metric description
+
+### Scoring model now
+1. **Correctness gate**: tests must pass (binary, hard)
+2. **Quality** (`final_score`): Gittensor tree-sitter AST formula (0–30)
+3. **Relative quality** (`relative_score`): agent_score / oracle_score — primary ranking metric
+4. **File coverage** (`file_coverage`): observational — % of reference files touched
+5. **Anti-gaming** (`test_deletion_warning`): flags suspicious test assertion removal
+
+### Pool state
+- Pool: **1154 problems** | Oracle: **12.70** weighted / **11.48** arithmetic | Repos: **47** (13 DAS + 34 external)
