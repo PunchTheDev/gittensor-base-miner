@@ -4029,3 +4029,19 @@ Pre-rotation health audit + dashboard sync to 65 models.
 
 ### Status
 Pool 1123, oracle 12.64, whitelist **65 models**, rotation Sunday 2026-06-08 (all green).
+
+---
+
+## Step 217 — 2026-06-03
+
+### Actions
+- **PR #94**: Add deploy artifacts — `deploy/nginx-location.conf` + `deploy/pm2.json` (merged df0fd00f)
+  - `deploy/nginx-location.conf`: nginx location block proxying `/gitminer/` → `localhost:8083`
+    Drop into any `server {}` block to expose the gitminer API publicly
+  - `deploy/pm2.json`: PM2 ecosystem file matching the running `gitminer-api` process
+    `pm2 start deploy/pm2.json` re-creates the managed process after server restart/re-clone
+  - Both files were referenced as pending operator actions in STATE.md but `deploy/` didn't exist
+
+### Status
+Pool 1123, oracle 12.64, whitelist **65 models**, rotation Sunday 2026-06-08 (5 days, green).
+Deploy artifacts now in repo. Operator blocked items: nginx hookup, Node.js 24 workflow scope, registration.
