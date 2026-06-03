@@ -4,6 +4,22 @@ Milestone trail for the base-miner benchmark. Discord is the primary channel; th
 
 ---
 
+## 2026-06-03 — Oracle calibration message fix (commit 62c528e)
+
+`benchmark/evaluate.py` oracle mode was printing "Expected mean: ~23.46 / 30.00" — a very old hardcoded value from before tree-sitter recalibration. Fixed to read `weighted_mean_score` and `mean_score` from `results/baselines.json` at runtime, with a fallback of 13.03/12.08. Message now reads:
+
+> `Expected weighted mean: ~13.03 / 30.00  (arithmetic: ~12.08)`
+
+Also ran a full pipeline health check:
+- API live: pool_size=441, oracle=13.03
+- `gitminer leaderboard`: correct oracle 13.03, no submissions yet
+- `gitminer problems --limit 5`: correct line-count difficulty tiers
+- `parity --top 10`: median local/DAS ratio 2.5× — consistent with documented behavior
+- All CI workflows reviewed: eval, record_submission, record_champion (disabled), refresh_dashboard, refresh_pool, build-scorer — all correct
+- Behaviors directory in results/ confirmed tracked
+
+---
+
 ## 2026-06-03 — Stale oracle fallback cleanup (commit 06c9987)
 
 Three files had hardcoded fallback values (11.83/12.77) from before the gittensory pool expansion. The fallbacks are only reached when baselines.json/leaderboard.json can't be read, but they should still reflect current state.
