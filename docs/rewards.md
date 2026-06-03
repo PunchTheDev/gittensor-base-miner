@@ -52,8 +52,8 @@ The repo is registered on Gittensor with a 2% emission share. Each scoring cycle
 | Recipient | Share | Notes |
 |-----------|-------|-------|
 | Issue discovery | 30% | Allocated to the issue filer |
-| Contributor | 59.5% | Split among scored PRs by weighted score |
-| Maintainer | 10.5% | Reserved for repo maintenance |
+| Contributor | 55% | Split among scored PRs by weighted score |
+| Maintainer | 15% | Reserved for repo maintenance |
 
 ### Marginal-gain formula
 
@@ -90,7 +90,7 @@ Merged PRs decay in value over time using a sigmoid:
 
 ### Open PR threshold
 
-Each miner gets a base threshold of open PRs (default 10). Going over the threshold zeros your score for new PRs until some are closed. Top contributors earn a higher threshold: `+1 for every 500 token score across unlocked tiers`.
+Each miner gets a base threshold of 3 open PRs. Going over the threshold zeros your score for new PRs until some are closed. Top contributors earn a higher threshold: `+1 for every 250 token score`, up to a maximum of 15.
 
 ## Eligibility
 
@@ -118,8 +118,10 @@ Current `hyperparameters.json` (registered with Gittensor):
 ```json
 {
   "emission_share": 0.02,
-  "issue_discovery_share": 0.30,
+  "issue_discovery_share": 0.3,
   "maintainer_cut": 0.15,
+  "trusted_label_pipeline": true,
+  "default_label_multiplier": 0.0,
   "label_multipliers": {
     "benchmark-problem": 2.5,
     "harness": 2.0,
@@ -127,6 +129,13 @@ Current `hyperparameters.json` (registered with Gittensor):
     "bug": 1.5,
     "refactor": 0.75,
     "docs": 0.5
+  },
+  "eligibility": {
+    "min_valid_merged_prs": 2,
+    "min_credibility": 0.75,
+    "excessive_pr_penalty_base_threshold": 3,
+    "open_pr_threshold_token_score": 250.0,
+    "max_open_pr_threshold": 15
   },
   "scoring": {
     "pr_lookback_days": 45,

@@ -63,7 +63,7 @@ class MyAgent(BaseAgent):
 
 A `Problem` contains the issue body, repository context (file tree + relevant file contents), and constraints (model whitelist, time limit, token budget). A `Patch` is a unified diff string.
 
-See `agent/example/` for a minimal reference implementation.
+See `agent/example/` for the baseline reference implementation — a full observe→plan→act loop with context ranking, hunk repair, and diff post-processing. Fork it as your starting point.
 
 ---
 
@@ -135,7 +135,7 @@ See [docs/api.md](docs/api.md) for the full API reference.
 agent/
   base.py              # BaseAgent interface and data types
   champion/            # current champion agent (populated after first winner)
-  example/             # minimal reference implementation
+  example/             # baseline reference implementation (observe → plan → act loop)
   submissions/         # miner agent landing zone
 benchmark/
   problems/            # 441 curated historical issues (one dir per PR id)
