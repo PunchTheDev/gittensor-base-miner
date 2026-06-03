@@ -2486,3 +2486,18 @@ Two stale references discovered during pre-launch audit:
 Both now point to the canonical `gitminer` CLI commands documented throughout README and CONTRIBUTING. A miner filling out the PR template checklist will see consistent commands.
 
 **System health**: API pool=441, oracle=13.03, no open PRs, all CLI commands verified.
+
+## Step 151 — 2026-06-03
+
+### Fixed: `?lang=py` returns empty results; dead code in server.py (commit 6dada2a)
+
+**Bugs found via codebase audit:**
+
+| Issue | File | Root cause | Fix |
+|---|---|---|---|
+| `?lang=py` always returns empty | README.md:125, CONTRIBUTING.md:194 | Category values are `python`/`typescript`/etc., not `py`. `?lang=py` filters to category `"py"` which matches nothing | → `?cat=python` |
+| Dead `ALLOWED_MODELS` constant | api/server.py:40 | Constant pointed to `benchmark/allowed_models.txt` (doesn't exist); actual path used in code is `benchmark/harness/allowed_models.txt` (line 394) — constant was never read | Removed |
+
+The `?lang=` alias in the server accepts it but maps to the same `cat_filter` comparison — the value still had to be the full category name, not a shorthand.
+
+**System health:** API pool=441, oracle=13.03, no open PRs. Holding pre-registration.
