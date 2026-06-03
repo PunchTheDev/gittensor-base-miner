@@ -3279,3 +3279,46 @@ Phase 2 exited early with `base_score: 0.0` when `tests_passed == False`. Since 
 ### Why these bugs were silent
 
 Both bugs affected only sandbox (Docker CI) runs, not `--no-sandbox` local dev mode. Since there are no miner submissions yet, nobody had tested the full CI pipeline end-to-end with an actual agent submission. The bugs would have produced systematically wrong scores for all miners once registration goes live — everyone would have seen `weighted_benchmark_score: 0.0` regardless of actual performance.
+
+## Step 189 — 2026-06-03
+
+### Principal-engineer code audit: 4 PRs, systemic bugs fixed
+
+**Context**: No miner submissions yet; operator asked for continuous self-review and interrogation of the scoring philosophy. Found and fixed 5 latent bugs that would have caused production failures once miners submit.
+
+### PR #52 — Centralize shared constants, fix API shard (merged 204ba9fc)
+
+**Problem**: `REPO_CATEGORY` was copy-pasted across 4 files (evaluate.py, api/server.py, generate_dashboard_data.py, gitminer.py). The vouchdev/vouch category bug (step 183) was caused by exactly this pattern — one file updated, three others stale.
+
+**Fix**: Created `benchmark/catalog.py` as single source of truth for `REPO_CATEGORY`, `DIFFICULTY_TIERS`, and `DEFAULT_SHARD_BUDGET`. All files now import from catalog. Adding a new repo is one line in one file.
+
+**Also fixed**: `/api/shard` endpoint was doing a flat shuffle (no category/difficulty balance). Miners querying the API to preview the shard saw different problems than they'd actually be scored on. Fixed by delegating to `evaluate.py`'s `select_shard()` — the same function CI uses.
+
+**Also**: Extracted `_annotate_and_aggregate()` helper in evaluate.py, eliminating an identical 40-line aggregation loop duplicated in both the oracle and agent eval paths.
+
+### PR #53 — Preserve benchmark_score in oracle leaderboard row on rotation (merged b49d0e06)
+
+**Problem**: Sunday pool rotation (`refresh_pool.yml`) regenerates the oracle leaderboard row but was missing `benchmark_score: 1.0` and `weighted_benchmark_score: 1.0`. After the first rotation (scheduled 2026-06-08), the primary ranking metric would be `None` for the oracle row — breaking leaderboard sort and champion detection.
+
+**Fix**: Added the two benchmark fields to the oracle row in `refresh_pool.yml`.
+
+### PR #54 — Dashboard oracle row missing benchmark fields (merged 38506adb)
+
+**Problem**: `generate_dashboard_data.py`'s `_load_oracle_row()` didn't include benchmark fields. Since `load_leaderboard()` replaces the stored oracle row with a freshly computed one, the live dashboard oracle row was always missing the primary metric. Also fixed stale hardcoded fallback values (count=800, mean=12.38 → 1154, 11.48).
+
+### PR #55 — Rank leaderboard by weighted_benchmark_score (merged 943e5f3e)
+
+**Problem** (most critical): `record_result.py` ranked the leaderboard by `weighted_score` (raw Gittensor formula, 0–30 scale) — not `weighted_benchmark_score` (the primary metric since step 186). First miner submission would have been ranked and SOTA-tracked against the wrong metric, with wrong champion detection and wrong marginal gain / contribution weight calculations.
+
+**Fix**: Added `primary_score()` helper, updated `current_sota()`, `update_leaderboard()` sort, and marginal_gain/contribution_weight computation to use `weighted_benchmark_score`. Oracle row in `record_result.py` now also includes benchmark fields. Per-problem breakdown in leaderboard entries now includes `benchmark_score` and `test_pass_rate`. Champion metadata in `record_submission.yml` includes `weighted_benchmark_score`.
+
+### System state after step 189
+
+All 5 bugs were silent (no miner submissions yet), but would have caused systematic wrong behavior in production:
+- REPO_CATEGORY bug → wrong category classification for new repos ✅ fixed
+- /api/shard flat shuffle → miners see wrong preview shard ✅ fixed  
+- Oracle row fields missing → leaderboard sort breaks after rotation ✅ fixed
+- Dashboard oracle row → missing primary metric on live site ✅ fixed
+- record_result.py wrong sort → entire leaderboard ranked by wrong metric ✅ fixed
+
+API health: pool=1154, oracle=12.70, repos=47 ✅
