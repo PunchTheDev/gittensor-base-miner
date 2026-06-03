@@ -2577,3 +2577,20 @@ python3 gitminer.py doctor --agent agent/submissions/myhandle/agent.py
 Also added two `doctor` examples to the README "Running locally" section so miners see it first, before the eval commands.
 
 **System health:** API pool=441, oracle=13.03, no open PRs. Holding pre-registration.
+
+---
+
+## Step 157 — 2026-06-03
+
+**Parity command fix: use tree-sitter baselines instead of heuristic** (commit f081293)
+
+Investigation found that the `parity` command was comparing DAS reference scores against the *heuristic* diff-token approximation (known to run ~2.5x above DAS). The heuristic is the fallback; the actual CI scorer is tree-sitter, which matches DAS at median 1.00x.
+
+Fix: `cmd_parity` now reads pre-computed tree-sitter scores from `results/baselines.json` (same scores used for the oracle) and compares against `das_base_score` in meta.json. Falls back to heuristic only for the 29 problems without `das_base_score`.
+
+**Result of fixed parity run (412 problems, 412 via tree-sitter):**
+- Median local/DAS ratio: **1.00x** — tight alignment confirmed
+- Outliers: problems with DAS base score near zero (0.00–0.13) but meaningful code changes — likely DAS had test failures at scoring time
+- Heuristic median was 2.5x (misleading); tree-sitter median is 1.00x (accurate)
+
+No other issues found this cycle. System healthy: API pool=441, oracle=13.03, no open PRs.
