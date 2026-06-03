@@ -321,7 +321,7 @@ def score_patch(problem_dir: Path, patch_path: Path) -> dict:
                 check=True, capture_output=True,
             )
         try:
-            return _score_in_worktree(worktree, meta, patch_path, saturation_scale)
+            return _score_in_worktree(problem_dir, worktree, meta, patch_path, saturation_scale)
         finally:
             subprocess.run(
                 ["git", "-C", str(cached), "worktree", "remove", "--force", str(worktree)],
@@ -414,8 +414,98 @@ def _fill_new_contents(repo_dir: Path, pairs: list) -> None:
             pair.new_content = _read_file_safe(abs_path)
 
 
+_TEST_PATH_RE = re.compile(
+    r"(/test|^test|_test\.|test_[^/]*\.[a-z]+$|spec\.|\.spec\.|\.test\.)",
+    re.IGNORECASE,
+)
+
+
+def _is_test_file(path: str) -> bool:
+    return bool(_TEST_PATH_RE.search(path))
+
+
+def _file_coverage(problem_dir: Path, agent_diff_text: str) -> dict:
+    """
+    Measure what fraction of the reference diff's source files the agent also touches.
+
+    Scores 0.0–1.0 where 1.0 = agent changed every non-test file the reference changed.
+    Test files are excluded (they vary legitimately). Returns None when coverage cannot
+    be computed (reference.diff missing or touches only test files).
+
+    This is an observational signal, not part of final_score. An agent that identifies
+    a different but correct fix touching different files is not penalized.
+    """
+    ref_diff_path = problem_dir / "reference.diff"
+    if not ref_diff_path.exists():
+        return {"file_coverage": None, "reference_source_files": 0, "agent_files_matched": 0}
+
+    ref_diff_text = ref_diff_path.read_text(errors="replace")
+    ref_src_paths = {p for p, _ in _parse_diff_paths(ref_diff_text) if not _is_test_file(p)}
+    agent_src_paths = {p for p, _ in _parse_diff_paths(agent_diff_text) if not _is_test_file(p)}
+
+    if not ref_src_paths:
+        return {"file_coverage": None, "reference_source_files": 0, "agent_files_matched": 0}
+
+    matched = len(ref_src_paths & agent_src_paths)
+    return {
+        "file_coverage": round(matched / len(ref_src_paths), 3),
+        "reference_source_files": len(ref_src_paths),
+        "agent_files_matched": matched,
+    }
+
+
+_BASELINES_CACHE: "dict[str, float] | None" = None
+
+
+def _load_baselines() -> "dict[str, float]":
+    """Return {problem_id: base_score} from results/baselines.json (loaded once)."""
+    global _BASELINES_CACHE
+    if _BASELINES_CACHE is not None:
+        return _BASELINES_CACHE
+
+    baselines_path = _REPO_ROOT / "results" / "baselines.json"
+    mapping: dict[str, float] = {}
+    if baselines_path.exists():
+        try:
+            data = json.loads(baselines_path.read_text())
+            for entry in data.get("problems", []):
+                pid = entry.get("id")
+                score = entry.get("base_score")
+                if pid and score is not None:
+                    mapping[pid] = float(score)
+        except Exception:
+            pass
+
+    _BASELINES_CACHE = mapping
+    return mapping
+
+
+def _relative_score(base_score: float, meta: dict) -> float | None:
+    """
+    Compute relative benchmark score: agent_score / oracle_score.
+
+    Oracle is our own tree-sitter scorer's output on the reference diff for this
+    problem (from results/baselines.json). This ensures the oracle scores 1.0 by
+    definition and all agents are measured on the same scale.
+
+    Returns None when the oracle baseline is unavailable or zero.
+
+    Interpretation:
+      1.0  = exactly matches oracle quality
+      >1.0 = agent produced a higher-quality fix than the accepted solution
+      <1.0 = agent's fix has lower quality signal than the accepted solution
+    Capped at 2.0 so verbose diffs can't inflate scores unboundedly.
+    """
+    pid = meta.get("id", "")
+    baselines = _load_baselines()
+    oracle = baselines.get(pid, 0.0)
+    if oracle <= 0.0:
+        return None
+    return round(min(base_score / oracle, 2.0), 4)
+
+
 def _score_in_worktree(
-    repo_dir: Path, meta: dict, patch_path: Path, saturation_scale: float
+    problem_dir: Path, repo_dir: Path, meta: dict, patch_path: Path, saturation_scale: float
 ) -> dict:
     problem_id = meta["id"]
     diff_text = patch_path.read_text()
@@ -431,6 +521,7 @@ def _score_in_worktree(
             "tests_passed": False,
             "source_token_score": 0.0,
             "base_score": 0.0,
+            "relative_score": 0.0,
             "final_score": 0.0,
         }
 
@@ -453,6 +544,7 @@ def _score_in_worktree(
             "test_output": test_output[-2000:],
             "source_token_score": 0.0,
             "base_score": 0.0,
+            "relative_score": 0.0,
             "final_score": 0.0,
         }
 
@@ -486,6 +578,8 @@ def _score_in_worktree(
         )
 
     base_score = compute_base_score(src_tok, total_tok, saturation_scale)
+    rel_score = _relative_score(base_score, meta)
+    coverage = _file_coverage(problem_dir, diff_text)
 
     return {
         "problem_id": problem_id,
@@ -496,6 +590,16 @@ def _score_in_worktree(
         "total_token_score": round(total_tok, 2),
         "scoring_method": scoring_method,
         "base_score": base_score,
+        # relative_score: agent quality / oracle quality for this specific problem.
+        # 1.0 = matches accepted solution, >1.0 = better fix, <1.0 = lower quality.
+        # The primary benchmark metric is mean_relative_score across the shard.
+        "relative_score": rel_score,
+        # oracle_base_score: our tree-sitter scorer's score on the reference diff (from baselines.json).
+        # This is the correct denominator for relative_score.
+        "oracle_base_score": _load_baselines().get(meta.get("id", ""), 0.0),
+        # file_coverage: fraction of reference-diff source files the agent also touches.
+        # Observational only — a different-but-correct fix needn't match reference files.
+        **coverage,
         # Multipliers (time_decay, review_quality, label, issue) require GitHub
         # API data — local scoring sets them to 1.0 as a conservative estimate.
         "multipliers": {"time_decay": 1.0, "review_quality": 1.0, "label": 1.0, "issue": 1.0},

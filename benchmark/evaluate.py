@@ -427,6 +427,7 @@ def run_evaluation(
         mean = total / len(results) if results else 0.0
 
         weighted_total = weighted_count = 0.0
+        rel_total = rel_count = 0
         for r, d in zip(results, selected):
             tier, w = problem_difficulty(d)
             r["difficulty"] = tier
@@ -434,11 +435,17 @@ def run_evaluation(
             r["category"] = _problem_category(d)
             weighted_total += r["final_score"] * w
             weighted_count += w
+            rel = r.get("relative_score")
+            if rel is not None and isinstance(rel, (int, float)):
+                rel_total += rel
+                rel_count += 1
         weighted_mean = weighted_total / weighted_count if weighted_count else 0.0
+        mean_relative = round(rel_total / rel_count, 4) if rel_count else None
 
         return {
             "mean_score": round(mean, 4),
             "weighted_mean_score": round(weighted_mean, 4),
+            "mean_relative_score": mean_relative,
             "problems_evaluated": len(results),
             "pool_size": len(all_problem_dirs),
             "shard_size": len(selected),
@@ -482,7 +489,9 @@ def run_evaluation(
             score["elapsed_seconds"] = round(elapsed, 2)
             results.append(score)
             status = "PASS" if score.get("tests_passed") else "FAIL"
-            print(f"       {status}  final_score={score['final_score']}  ({elapsed:.1f}s)")
+            rel = score.get("relative_score")
+            rel_str = f"  rel={rel:.2f}" if rel is not None else ""
+            print(f"       {status}  final_score={score['final_score']}{rel_str}  ({elapsed:.1f}s)")
 
         except Exception as e:
             elapsed = time.time() - start
@@ -490,6 +499,7 @@ def run_evaluation(
                 "problem_id": problem.id,
                 "error": str(e),
                 "final_score": 0.0,
+                "relative_score": 0.0,
                 "elapsed_seconds": round(elapsed, 2),
             })
             print(f"       ERROR: {e}")
@@ -498,6 +508,7 @@ def run_evaluation(
     mean = total / len(results) if results else 0.0
 
     weighted_total = weighted_count = 0.0
+    rel_total = rel_count = 0
     for r, d in zip(results, selected):
         tier, w = problem_difficulty(d)
         r["difficulty"] = tier
@@ -505,11 +516,17 @@ def run_evaluation(
         r["category"] = _problem_category(d)
         weighted_total += r["final_score"] * w
         weighted_count += w
+        rel = r.get("relative_score")
+        if rel is not None and isinstance(rel, (int, float)):
+            rel_total += rel
+            rel_count += 1
     weighted_mean = weighted_total / weighted_count if weighted_count else 0.0
+    mean_relative = round(rel_total / rel_count, 4) if rel_count else None
 
     return {
         "mean_score": round(mean, 4),
         "weighted_mean_score": round(weighted_mean, 4),
+        "mean_relative_score": mean_relative,
         "problems_evaluated": len(results),
         "pool_size": len(all_problem_dirs),
         "shard_size": len(selected),
@@ -569,6 +586,10 @@ def main() -> None:
     pool_info = f"{results['shard_size']}/{results['pool_size']} problems"
     print(f"\nMean score:          {results['mean_score']} ({pool_info})")
     print(f"Weighted mean score: {results['weighted_mean_score']} (easy×1 / medium×1.5 / hard×2)")
+    rel = results.get("mean_relative_score")
+    if rel is not None:
+        pct = round(rel * 100, 1)
+        print(f"Relative score:      {rel}  ({pct}% of oracle — 1.0 = matches accepted solution)")
 
     if args.output:
         Path(args.output).write_text(json.dumps(results, indent=2))
