@@ -4471,3 +4471,28 @@ API restarted. Dashboard updated. Verified via browser audit.
 - Shows "⚠ old shard" badge on entries from past pool rotations (stale entries)
 
 Services restarted. `/api/leaderboard` → `current_shard_week: 126` ✅
+
+## Step 253 — 2026-06-04
+
+**Dashboard PR #32 merged** (`punch/mobile-qs-statcard-fixes`):
+- `body`: `overflow-x: hidden` — prevents page-level horizontal scroll on narrow (375px) viewports
+- `.qs-body`: `overflow-x: auto` — long terminal commands scroll within block instead of overflowing page
+- Mining stat card: `sub: '5 curated OSS models'` → `'curated OSS models'` — value "5" + sub "5 curated OSS models" was visually reading as "55 curated OSS models"
+
+**Base-miner PR #118 merged** (`punch/fix-runner-efficiency-factor`):
+- `runner.py`: `_enrich_result()` was missing `efficiency_factor` in `benchmark_score`
+- Added `compute_efficiency_factor`, `DEFAULT_TOKEN_BUDGET` to imports
+- `benchmark_score` now = `test_pass_rate × rel_score × anti_gaming × tqf × eff` — matches `score.py` formula exactly
+- Sandbox and `--no-sandbox` paths now produce identical `benchmark_score` for identical inputs
+
+**Base-miner PR #119 merged** (`punch/mine-auto-commit`):
+- `gitminer mine` now auto-POSTs commit-reveal hash to API when champion is beaten — eliminates manual `gitminer commit` step
+- Added `--api` argument to mine subparser
+
+**Base-miner PR #120 merged** (`punch/docs-mine-auto-commit`):
+- `CONTRIBUTING.md`: updated mine daemon section to reflect auto-commit behavior
+
+**Housekeeping:**
+- `punch/node24-action-upgrades` rebased onto main (still blocked on `workflow` scope)
+- Dashboard PR #31 merged (had been created but not merged in prior step)
+- Services restarted: all PM2 processes healthy ✅
