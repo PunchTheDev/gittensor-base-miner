@@ -243,6 +243,68 @@ def cmd_hash(args: argparse.Namespace) -> None:
     print(f"It proves you held this version at submission time — used for first-to-commit credit.")
 
 
+def cmd_commit(args: argparse.Namespace) -> None:
+    """Hash the agent file and POST a commitment to the API before opening a PR.
+
+    This is the commit step in commit-reveal anti-copy:
+    1. The server records your hash + timestamp.
+    2. You then open your PR (code becomes visible on GitHub).
+    3. At scoring time the evaluator checks the commitment timestamp is
+       earlier than the PR open time — proving you authored the code first.
+    4. In a tie, the earlier commitment wins.
+    """
+    import json as _json
+    import urllib.request
+    import urllib.error
+
+    agent_path = Path(args.agent)
+    if not agent_path.exists():
+        print(f"Error: agent file not found: {agent_path}", file=sys.stderr)
+        sys.exit(1)
+
+    handle = args.handle
+    if not handle:
+        # Try to infer from meta.json alongside agent.py
+        meta_path = agent_path.parent / "meta.json"
+        if meta_path.exists():
+            try:
+                handle = _json.loads(meta_path.read_text()).get("handle", "")
+            except Exception:
+                pass
+    if not handle:
+        print("Error: --handle required (or place meta.json next to agent.py)", file=sys.stderr)
+        sys.exit(1)
+
+    content = agent_path.read_bytes()
+    agent_hash = hashlib.sha256(content).hexdigest()
+
+    api_url = args.api.rstrip("/")
+    endpoint = f"{api_url}/api/commit"
+
+    payload = _json.dumps({"handle": handle, "agent_hash": agent_hash}).encode()
+    req = urllib.request.Request(
+        endpoint,
+        data=payload,
+        method="POST",
+        headers={"Content-Type": "application/json"},
+    )
+    try:
+        with urllib.request.urlopen(req, timeout=10) as resp:
+            result = _json.loads(resp.read())
+        print(f"Commitment recorded at {result.get('timestamp', '?')}")
+        print(f"  handle:     {handle}")
+        print(f"  agent_hash: {agent_hash}")
+        print(f"\nNext: open your PR. The commitment timestamp proves authorship before PR open.")
+        print(f"Check your commitments: GET {api_url}/api/commitments/{handle}")
+    except urllib.error.HTTPError as e:
+        body = e.read().decode(errors="replace")
+        print(f"Error {e.code}: {body}", file=sys.stderr)
+        sys.exit(1)
+    except urllib.error.URLError as e:
+        print(f"Connection error: {e.reason}", file=sys.stderr)
+        sys.exit(1)
+
+
 def cmd_shard(args: argparse.Namespace) -> None:
     from benchmark.evaluate import select_shard, load_pool_config, POOL_DIR, _problem_category, problem_difficulty
 
@@ -1629,6 +1691,18 @@ def main() -> None:
     p_hash = sub.add_parser("hash", help="Compute commit-reveal SHA-256 for your agent file")
     p_hash.add_argument("agent", help="Path to your agent.py file")
     p_hash.set_defaults(func=cmd_hash)
+
+    # commit
+    p_commit = sub.add_parser(
+        "commit",
+        help="Hash your agent and record a timestamped commitment before opening a PR (commit-reveal anti-copy)",
+    )
+    p_commit.add_argument("agent", help="Path to your agent.py file")
+    p_commit.add_argument("--handle", metavar="HANDLE", default="",
+                          help="Your agent handle (inferred from meta.json if omitted)")
+    p_commit.add_argument("--api", metavar="URL", default="http://143.244.191.193:8083",
+                          help="API base URL (default: http://143.244.191.193:8083)")
+    p_commit.set_defaults(func=cmd_commit)
 
     # shard
     p_shard = sub.add_parser("shard", help="Print current week's 30-problem shard")

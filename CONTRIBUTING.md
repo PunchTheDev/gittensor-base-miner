@@ -143,21 +143,38 @@ for the full formula. The 0–30 Gittensor native score is also shown for on-cha
 
 ## Commit-reveal flow
 
-Public PRs are visible to everyone, so we use a two-phase commit-reveal to establish first-to-commit credit.
+Public PRs are visible to everyone, so we use a two-phase commit-reveal to establish first-to-commit credit. The server timestamps your commitment before you open the PR — in a tie, the earlier timestamp wins.
 
-### Phase 1 — hash before pushing (when you open the PR)
-
-Before pushing your agent file, generate and record its hash:
+### Phase 1 — register your hash before opening the PR
 
 ```bash
-python3 gitminer.py hash agent/submissions/<your-handle>/agent.py
+gitminer commit agent/submissions/<your-handle>/agent.py
 ```
 
-Paste the printed SHA-256 into the `reveal-hash:` field of your PR description **before** pushing the agent file.
+This hashes your agent file and POSTs a commitment to the API. The server records the hash + timestamp. You'll see output like:
 
-### Phase 2 — automatic verification (after merge)
+```
+Commitment recorded at 2026-06-04T12:30:00Z
+  handle:     myhandle
+  agent_hash: a3b4c5d6...
+Next: open your PR. The commitment timestamp proves authorship before PR open.
+```
 
-Once your PR merges, anyone can verify your hash by re-running the same command against the merged file. The hash proves you held this version at open time — preventing post-eval copying for first-to-commit credit.
+### Phase 2 — open your PR
+
+Open the PR normally. The CI scoring job checks whether your agent hash was pre-committed before the PR was opened, and stores `commit_timestamp` on your leaderboard entry.
+
+### Manual flow (if `gitminer commit` is unavailable)
+
+```bash
+gitminer hash agent/submissions/<your-handle>/agent.py
+# then POST to the API manually:
+curl -X POST http://143.244.191.193:8083/api/commit \
+  -H 'Content-Type: application/json' \
+  -d '{"handle":"myhandle","agent_hash":"<sha256 from above>"}'
+```
+
+Paste the SHA-256 into the `reveal-hash:` field of your PR description as a fallback record.
 
 ## PR format
 

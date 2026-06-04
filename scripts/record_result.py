@@ -16,12 +16,29 @@ Falls back to weighted_mean_score for entries that predate the benchmark_score s
 from __future__ import annotations
 
 import argparse
+import hashlib
 import json
 import pathlib
 from datetime import date
 
 REPO_ROOT = pathlib.Path(__file__).parent.parent
 RESULTS_DIR = REPO_ROOT / "results"
+COMMITMENTS_FILE = RESULTS_DIR / "commitments.json"
+
+
+def _lookup_commitment(handle: str, agent_hash: str) -> dict | None:
+    """Return the earliest commitment for (handle, agent_hash), or None."""
+    if not COMMITMENTS_FILE.exists():
+        return None
+    try:
+        store = json.loads(COMMITMENTS_FILE.read_text())
+    except Exception:
+        return None
+    records = store.get(handle, [])
+    matches = [r for r in records if r.get("agent_hash") == agent_hash]
+    if not matches:
+        return None
+    return min(matches, key=lambda r: r.get("timestamp", float("inf")))
 
 
 def _oracle_scores_from_baselines() -> tuple[float, float]:
@@ -158,6 +175,8 @@ def main():
     ap.add_argument("--note", default="", help="Optional note")
     ap.add_argument("--behaviors", metavar="FILE",
                     help="Behavior fingerprint JSON from --save-behaviors; saved to results/behaviors/ for future anti-copy checks")
+    ap.add_argument("--agent-file", metavar="FILE",
+                    help="Path to the agent.py being scored — used for commit-reveal hash verification")
     args = ap.parse_args()
 
     results_path = pathlib.Path(args.results)
@@ -228,6 +247,23 @@ def main():
         )
     else:
         entry["avg_efficiency_factor"] = 1.0
+
+    # Commit-reveal: check for a pre-PR hash commitment
+    if args.agent_file:
+        agent_path = pathlib.Path(args.agent_file)
+        if agent_path.exists():
+            agent_hash = hashlib.sha256(agent_path.read_bytes()).hexdigest()
+            commitment = _lookup_commitment(args.handle, agent_hash)
+            if commitment:
+                entry["commit_hash"] = agent_hash
+                entry["commit_timestamp"] = commitment["iso"]
+                print(f"  Commit-reveal: commitment found at {commitment['iso']} (hash {agent_hash[:12]}…)")
+            else:
+                entry["commit_hash"] = agent_hash
+                entry["commit_timestamp"] = None
+                print(f"  Commit-reveal: no pre-PR commitment found for hash {agent_hash[:12]}… — submission unverified")
+        else:
+            print(f"  WARNING: --agent-file not found: {agent_path}")
 
     prev_sota = current_sota(leaderboard)
     my_primary = primary_score(entry)
