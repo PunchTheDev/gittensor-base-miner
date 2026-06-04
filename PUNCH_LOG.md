@@ -4515,3 +4515,21 @@ Services restarted. `/api/leaderboard` → `current_shard_week: 126` ✅
 - Oracle score, baselines, pool config: all cached at 5 min
 
 **Verified:** pool=1123, oracle=12.64, go filter=136, python filter=368 — data correct ✅
+
+---
+
+## Step 256 — 2026-06-04
+
+**Dashboard PR #35 merged** (`punch/home-featured-problems-polish`):
+- Home page: "Sample Problems" section — 3 hard problems picked daily (seeded by day of year); clicking navigates to problem in Problems page with search pre-filled
+- Home page: "Ready to Mine?" CTA at page bottom — prevents page ending abruptly after stats row
+- Mining page: step grid `repeat(5, 1fr)` — all 5 quickstart steps on one row at desktop; responsive at 900px
+
+**Dashboard direct commit `78d7bf6`** — interactive Score Calculator on Scoring page:
+- Sliders: test_pass_rate, relative_score, assertions removed, output tokens
+- Tier selector: Hard/Medium/Easy (applies difficulty weight)
+- Live breakdown showing each factor value + color code (green/yellow/red)
+- Result: benchmark_score + weighted score; "vs Oracle" comparison showing % difference
+- Exact formula matches harness: `tpr × rel × anti_gaming × tqf × eff`
+
+**State:** pool=1123, oracle=12.64, 5 models, rotation June 8 (4 days). All services healthy.
