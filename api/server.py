@@ -12,7 +12,8 @@ Endpoints:
     GET  /api/health              liveness check
     GET  /api/stats               pool-level statistics
     GET  /api/shard               current weekly shard (30 problems)
-    GET  /api/problems            full problem list (filterable, paginated)
+    GET  /api/problems            full problem list (filterable, sortable, paginated)
+    GET  /api/problems/random     random problem sample (?n=5&cat=python&difficulty=hard)
     GET  /api/problems/{id}       one problem by ID (includes diff_stats)
     GET  /api/problems/{id}/diff  raw unified diff of the accepted solution
     GET  /api/leaderboard              current ranked submissions
@@ -444,6 +445,8 @@ class Handler(BaseHTTPRequestHandler):
             return self._agents()
         if path == "/api/problems":
             return self._problems(qs)
+        if path == "/api/problems/random":
+            return self._problems_random(qs)
         if path.startswith("/api/problems/"):
             rest = path[len("/api/problems/"):]
             if rest.endswith("/diff"):
@@ -523,22 +526,15 @@ class Handler(BaseHTTPRequestHandler):
             "problems": problems,
         }
 
-    def _problems(self, qs: dict) -> dict:
-        # Accept both `cat` (preferred) and `lang` (deprecated alias)
+    def _filter_problems(self, qs: dict) -> list:
+        """Apply category/difficulty/repo/search filters and return matching summaries."""
         cat_filter = qs.get("cat", qs.get("lang", [None]))[0]
         diff_filter = qs.get("difficulty", [None])[0]
         repo_filter = qs.get("repo", [None])[0]
         search = qs.get("q", [None])[0]
-        try:
-            limit = int(qs.get("limit", [100])[0])
-            offset = int(qs.get("offset", [0])[0])
-        except ValueError:
-            limit, offset = 100, 0
 
-        all_summaries = _all_problem_summaries()
         results = []
-
-        for s in all_summaries:
+        for s in _all_problem_summaries():
             if cat_filter and s["category"] != cat_filter:
                 continue
             if diff_filter and s["difficulty"] != diff_filter:
@@ -550,10 +546,66 @@ class Handler(BaseHTTPRequestHandler):
                 if q not in s["issue_title"].lower() and q not in s["repo"].lower():
                     continue
             results.append(s)
+        return results
+
+    def _problems(self, qs: dict) -> dict:
+        # Accept both `cat` (preferred) and `lang` (deprecated alias)
+        sort = qs.get("sort", [None])[0]  # baseline_score | difficulty | merged_at
+        order = qs.get("order", ["desc"])[0]  # asc | desc
+        try:
+            limit = min(int(qs.get("limit", [100])[0]), 500)
+            offset = int(qs.get("offset", [0])[0])
+        except ValueError:
+            limit, offset = 100, 0
+
+        results = self._filter_problems(qs)
+
+        # Optional sort
+        _SORT_KEYS = {
+            "baseline_score": lambda s: s.get("baseline_score") or 0.0,
+            "difficulty": lambda s: {"hard": 3, "medium": 2, "easy": 1}.get(s.get("difficulty", ""), 0),
+            "merged_at": lambda s: s.get("merged_at") or "",
+        }
+        if sort in _SORT_KEYS:
+            results.sort(key=_SORT_KEYS[sort], reverse=(order != "asc"))
 
         total = len(results)
         page = results[offset : offset + limit]
         return {"total": total, "offset": offset, "limit": limit, "problems": page}
+
+    def _problems_random(self, qs: dict) -> dict:
+        """Return N random problems from the filtered pool.
+
+        Useful for agents exploring the problem space or building diverse eval sets.
+        Seeded by current timestamp so repeated requests within the same second return
+        the same sample (cache-friendly), but differ across seconds.
+
+        Query params:
+            n         — sample size (default 5, max 30)
+            cat       — category filter (python | typescript | rust | go | jvm | ruby)
+            difficulty — tier filter (easy | medium | hard)
+            seed      — optional integer seed for reproducible sampling
+        """
+        try:
+            n = min(int(qs.get("n", [5])[0]), 30)
+        except ValueError:
+            n = 5
+
+        seed_param = qs.get("seed", [None])[0]
+        try:
+            seed = int(seed_param) if seed_param is not None else int(time.time())
+        except (ValueError, TypeError):
+            seed = int(time.time())
+
+        results = self._filter_problems(qs)
+        rng = random.Random(seed)
+        sample = rng.sample(results, min(n, len(results)))
+        return {
+            "n": len(sample),
+            "seed": seed,
+            "pool_filtered": len(results),
+            "problems": sample,
+        }
 
     def _problem(self, pid: str) -> dict:
         meta = _load_meta(pid)
@@ -716,7 +768,8 @@ class Handler(BaseHTTPRequestHandler):
                 "spec": f"{self._base_url()}/api/openapi.json",
                 "endpoints": {
                     "/api/shard": "Current 30-problem weekly eval set (category-balanced)",
-                    "/api/problems": "Full pool (filterable: ?cat=python&difficulty=hard)",
+                    "/api/problems": "Full pool (filterable: ?cat=python&difficulty=hard&sort=baseline_score)",
+                    "/api/problems/random": "Random sample (?n=5&cat=python&difficulty=hard&seed=42)",
                     "/api/problems/{id}": "Single problem detail with context files",
                     "/api/problems/{id}/diff": "Reference diff (accepted solution)",
                     "/api/leaderboard": "Ranked submissions",
@@ -853,7 +906,9 @@ class Handler(BaseHTTPRequestHandler):
                             {"name": "difficulty", "in": "query", "description": "Filter by difficulty (easy, medium, hard)", "schema": {"type": "string", "enum": ["easy", "medium", "hard"]}},
                             {"name": "repo", "in": "query", "description": "Filter by repo name substring", "schema": {"type": "string"}},
                             {"name": "q", "in": "query", "description": "Full-text search on title and repo", "schema": {"type": "string"}},
-                            {"name": "limit", "in": "query", "description": "Max results to return (default 100)", "schema": {"type": "integer", "default": 100}},
+                            {"name": "sort", "in": "query", "description": "Sort field: baseline_score | difficulty | merged_at", "schema": {"type": "string", "enum": ["baseline_score", "difficulty", "merged_at"]}},
+                            {"name": "order", "in": "query", "description": "Sort direction: asc | desc (default desc)", "schema": {"type": "string", "enum": ["asc", "desc"], "default": "desc"}},
+                            {"name": "limit", "in": "query", "description": "Max results to return (default 100, max 500)", "schema": {"type": "integer", "default": 100, "maximum": 500}},
                             {"name": "offset", "in": "query", "description": "Pagination offset (default 0)", "schema": {"type": "integer", "default": 0}},
                         ],
                         "responses": {
@@ -862,6 +917,26 @@ class Handler(BaseHTTPRequestHandler):
                                 "content": {"application/json": {"schema": {"$ref": "#/components/schemas/ProblemsResponse"}}},
                             },
                             "429": {"description": "Rate limit exceeded", "content": {"application/json": {"schema": {"$ref": "#/components/schemas/RateLimitError"}}}},
+                        },
+                    }
+                },
+                "/api/problems/random": {
+                    "get": {
+                        "summary": "Random problem sample",
+                        "description": "Returns N randomly sampled problems from the filtered pool. Seeded by timestamp (reproducible within same second). Useful for agents exploring the problem space.",
+                        "operationId": "randomProblems",
+                        "tags": ["Problems"],
+                        "parameters": [
+                            {"name": "n", "in": "query", "description": "Number of problems to sample (default 5, max 30)", "schema": {"type": "integer", "default": 5, "maximum": 30}},
+                            {"name": "cat", "in": "query", "description": "Filter by category before sampling", "schema": {"type": "string"}},
+                            {"name": "difficulty", "in": "query", "description": "Filter by difficulty before sampling", "schema": {"type": "string", "enum": ["easy", "medium", "hard"]}},
+                            {"name": "seed", "in": "query", "description": "Integer seed for reproducible sampling", "schema": {"type": "integer"}},
+                        ],
+                        "responses": {
+                            "200": {
+                                "description": "Random sample of problems",
+                                "content": {"application/json": {"schema": {"$ref": "#/components/schemas/ProblemsResponse"}}},
+                            }
                         },
                     }
                 },
