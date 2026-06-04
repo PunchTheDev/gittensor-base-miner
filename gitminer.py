@@ -1307,14 +1307,35 @@ def cmd_mine(args: argparse.Namespace) -> None:
             oracle_note = f"  (gap to oracle=1.0: {1.0 - my_score:.4f})"
         print(f"\n{status}! Your weighted_benchmark_score: {my_score:.4f}{oracle_note}")
 
-        # Generate commit-reveal hash from agent file content
+        # Auto-commit: register hash before the PR so commit-reveal credit is established.
+        import json as _json
+        import urllib.request
+        import urllib.error
+
         agent_bytes = Path(agent_path).read_bytes()
         reveal_hash = hashlib.sha256(agent_bytes).hexdigest()
-        print(f"\nCommit-reveal hash: {reveal_hash}")
+        handle = Path(agent_path).parent.name
+        api_url = getattr(args, "api", "http://143.244.191.193:8083").rstrip("/")
+
+        print(f"\nAuto-committing hash (commit-reveal)...")
+        payload = _json.dumps({"handle": handle, "agent_hash": reveal_hash}).encode()
+        req = urllib.request.Request(
+            f"{api_url}/api/commit",
+            data=payload,
+            method="POST",
+            headers={"Content-Type": "application/json"},
+        )
+        try:
+            with urllib.request.urlopen(req, timeout=10) as resp:
+                result = _json.loads(resp.read())
+            print(f"  Committed at {result.get('timestamp', '?')}")
+            print(f"  Hash: {reveal_hash[:16]}...")
+        except Exception as exc:
+            print(f"  Warning: commitment POST failed ({exc}) — run 'gitminer commit' manually.")
+
         print(f"\nNext steps:")
-        print(f"  1. Run: python3 gitminer.py submit {agent_path}")
-        print(f"  2. Open a PR — the CI will score your agent and publish results.")
-        print(f"  3. Post the hash {reveal_hash[:16]}... in your PR body to claim credit.\n")
+        print(f"  1. Run: python3 gitminer.py submit {agent_path} --open-pr")
+        print(f"  2. CI scores your agent and posts results as a PR comment.")
 
         if args.loop:
             print("Submission ready. Waiting for next shard rotation to mine again...\n")
@@ -1764,6 +1785,8 @@ def main() -> None:
                         help="Skip Docker sandbox (faster, ~2× higher scores — local dev only)")
     p_mine.add_argument("--loop", action="store_true",
                         help="Run continuously, sleeping between shard rotations (daemon mode)")
+    p_mine.add_argument("--api", metavar="URL", default="http://143.244.191.193:8083",
+                        help="Base-miner API URL for commit-reveal (default: http://143.244.191.193:8083)")
     p_mine.set_defaults(func=cmd_mine)
 
     # doctor
