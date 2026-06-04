@@ -84,6 +84,43 @@ def repo_lang(repo: str) -> str:
     return REPO_CATEGORY.get(repo.lower(), "python")
 
 
+# Mapping from test runner executable to language category.
+_TEST_CMD_LANG: dict[str, str] = {
+    "go":         "go",
+    "cargo":      "rust",
+    "npm":        "typescript",
+    "npx":        "typescript",
+    "node":       "typescript",
+    "yarn":       "typescript",
+    "pnpm":       "typescript",
+    "bun":        "typescript",
+    "bundle":     "ruby",
+    "rspec":      "ruby",
+    "ruby":       "ruby",
+    "./gradlew":  "jvm",
+    "gradlew":    "jvm",
+    "mvn":        "jvm",
+    "gradle":     "jvm",
+}
+
+
+def problem_lang(meta: dict) -> str:
+    """Derive language category from test_cmd, falling back to repo_lang.
+
+    Multi-language monorepos (e.g. infiniflow/ragflow which has Python and Go
+    subsystems) produce problems whose test runner reveals the actual language
+    better than the repo-level category. This function reads the first element
+    of test_cmd and maps it to a category before falling back to repo_lang.
+    """
+    test_cmd = meta.get("test_cmd") or []
+    if test_cmd:
+        cmd0 = test_cmd[0]
+        lang = _TEST_CMD_LANG.get(cmd0)
+        if lang:
+            return lang
+    return repo_lang(meta.get("repo_name", ""))
+
+
 # ---------------------------------------------------------------------------
 # Difficulty tiers
 # ---------------------------------------------------------------------------
@@ -114,10 +151,10 @@ def problem_tier(added_lines: int) -> tuple[str, float]:
 # Must sum to shard_size (30) and be proportional to pool composition.
 
 DEFAULT_SHARD_BUDGET: dict[str, int] = {
-    "python":     11,
+    "python":     10,
     "rust":        7,
     "typescript":  5,
-    "go":          3,
+    "go":          4,
     "jvm":         2,
     "ruby":        2,
 }

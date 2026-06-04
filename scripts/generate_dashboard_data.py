@@ -10,7 +10,7 @@ _REPO_ROOT = pathlib.Path(__file__).parent.parent
 if str(_REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(_REPO_ROOT))
 
-from benchmark.catalog import DEFAULT_SHARD_BUDGET, REPO_CATEGORY  # noqa: E402
+from benchmark.catalog import DEFAULT_SHARD_BUDGET, problem_lang  # noqa: E402
 from benchmark.evaluate import problem_difficulty  # noqa: E402
 
 
@@ -30,9 +30,9 @@ def _load_shard_budget() -> dict:
 SHARD_BUDGET = _load_shard_budget()
 
 
-def repo_category(repo: str) -> str:
-    """Return language category for a repo, lower-cased."""
-    return REPO_CATEGORY.get(repo.lower(), REPO_CATEGORY.get(repo, "other"))
+def repo_category(meta: dict) -> str:
+    """Return language category for a problem, derived from test_cmd."""
+    return problem_lang(meta)
 
 REPO_ROOT = _REPO_ROOT
 PROBLEMS_DIR = REPO_ROOT / "benchmark" / "problems"
@@ -152,7 +152,7 @@ def load_problems():
         ctx_files, test_files = context_files_for(p)
         stats = diff_stats_for(p)
         b_score = baselines.get(pid, {}).get("base_score") if isinstance(baselines.get(pid), dict) else baselines.get(pid)
-        cat = repo_category(repo)
+        cat = repo_category(meta)
         problems.append(
             {
                 "id": pid,

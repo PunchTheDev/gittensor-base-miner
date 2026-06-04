@@ -138,7 +138,7 @@ def cmd_eval(args: argparse.Namespace) -> None:
     mean = sum(scores) / len(scores)
     oracle_weighted = _oracle_weighted()
 
-    from benchmark.evaluate import REPO_CATEGORY
+    from benchmark.catalog import problem_lang as _problem_lang
 
     # Read category info from meta.json for each problem
     pool_dir = REPO_ROOT / "benchmark" / "problems"
@@ -151,7 +151,7 @@ def cmd_eval(args: argparse.Namespace) -> None:
             if meta_path.exists():
                 try:
                     meta = json.loads(meta_path.read_text())
-                    cat = REPO_CATEGORY.get(meta.get("repo_name", ""), "?")
+                    cat = _problem_lang(meta)
                 except Exception:
                     cat = "?"
         cat_map[pid] = cat or "?"
@@ -527,7 +527,7 @@ def cmd_submit(args: argparse.Namespace) -> None:
 def cmd_problems(args: argparse.Namespace) -> None:
     """List benchmark problems with filtering and sorting."""
     import json as _json
-    from benchmark.evaluate import REPO_CATEGORY
+    from benchmark.catalog import problem_lang as _problem_lang
 
     pool_dir = REPO_ROOT / "benchmark" / "problems"
     baselines_path = REPO_ROOT / "results" / "baselines.json"
@@ -546,7 +546,7 @@ def cmd_problems(args: argparse.Namespace) -> None:
         meta = _json.loads(meta_path.read_text())
         pid = meta.get("id", "")
         repo = meta.get("repo_name", "")
-        cat = REPO_CATEGORY.get(repo.lower(), "python")
+        cat = _problem_lang(meta)
         baseline = baseline_lookup.get(pid)
 
         rows.append({
