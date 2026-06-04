@@ -4650,3 +4650,15 @@ Browser audit found 5 dashboard issues; 3 PRs merged.
 - Dashboard: `9d1036c` — copy buttons ✅, oracle calc messages fixed ✅, RALPH expanded ✅
 - API: `e3bf5a6b`, oracle_weighted_benchmark_score=1.0 ✅, cwd=/tmp/base-miner-review ✅
 - Pool rotation: Sunday 2026-06-08 (automated, 4 days) ✅
+
+## Step 263 — 2026-06-04
+
+### Actions
+- Browser audit: found 3 remaining UX issues — inaccurate "Whitelisted models" label, difficulty chips missing colored dots, DAS internals cluttering drawer
+- Dashboard commit `5977a13`: stat card renamed "Curated models"; Easy/Medium/Hard filter chips now have colored dots (green/amber/red); DAS validator components in problem drawer collapsed into `<details>` toggle
+- PM2 restarted; verified live
+
+### Commits
+- dashboard: 5977a13
+
+---
