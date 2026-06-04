@@ -1421,7 +1421,6 @@ def cmd_doctor(args: argparse.Namespace) -> None:
             if meta_path_agent.exists():
                 try:
                     import hashlib
-                    import re as _re
                     meta_data = json.loads(meta_path_agent.read_text())
                     declared_model = meta_data.get("model", "")
                     declared_sha = meta_data.get("sha256", "")
@@ -1438,10 +1437,10 @@ def cmd_doctor(args: argparse.Namespace) -> None:
                     elif not declared_model:
                         fail("Model (meta.json)", "missing 'model' key in meta.json")
 
-                    # sha256 integrity: declared hash must match current agent.py
+                    # sha256 integrity: declared hash must match current agent.py.
+                    # Uses read_bytes() to match cmd_hash and CI eval.yml exactly.
                     if declared_sha:
-                        normalized = _re.sub(r"\r\n", "\n", p.read_text(errors="replace"))
-                        actual_sha = hashlib.sha256(normalized.encode()).hexdigest()
+                        actual_sha = hashlib.sha256(p.read_bytes()).hexdigest()
                         if actual_sha == declared_sha:
                             ok("sha256 (meta.json)", "matches agent.py")
                         else:
