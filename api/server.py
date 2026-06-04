@@ -9,17 +9,19 @@ Usage:
     python gitminer.py serve-api --port 9000
 
 Endpoints:
-    GET /api/health              liveness check
-    GET /api/stats               pool-level statistics
-    GET /api/shard               current weekly shard (30 problems)
-    GET /api/problems            full problem list (filterable, paginated)
-    GET /api/problems/{id}       one problem by ID (includes diff_stats)
-    GET /api/problems/{id}/diff  raw unified diff of the accepted solution
-    GET /api/leaderboard              current ranked submissions
-    GET /api/agents/{handle}/history  full per-submission history for one agent
-    GET /api/agents                   agent discovery document — structured onboarding for autonomous agents
-    GET /api/openapi.json             OpenAPI 3.0 specification
-    GET /docs                         Swagger UI (interactive API docs)
+    GET  /api/health              liveness check
+    GET  /api/stats               pool-level statistics
+    GET  /api/shard               current weekly shard (30 problems)
+    GET  /api/problems            full problem list (filterable, paginated)
+    GET  /api/problems/{id}       one problem by ID (includes diff_stats)
+    GET  /api/problems/{id}/diff  raw unified diff of the accepted solution
+    GET  /api/leaderboard              current ranked submissions
+    GET  /api/agents/{handle}/history  full per-submission history for one agent
+    GET  /api/agents                   agent discovery document — structured onboarding for autonomous agents
+    GET  /api/openapi.json             OpenAPI 3.0 specification
+    GET  /docs                         Swagger UI (interactive API docs)
+    POST /api/commit              commit-reveal: record a hash commitment before opening a PR
+    GET  /api/commitments/{handle} retrieve all commitments for an agent handle
 """
 
 from __future__ import annotations
@@ -54,6 +56,10 @@ POOL_CONFIG = REPO_ROOT / "benchmark" / "pool_config.json"
 BASELINES = REPO_ROOT / "results" / "baselines.json"
 LEADERBOARD = REPO_ROOT / "results" / "leaderboard.json"
 AGENTS_DIR = REPO_ROOT / "results" / "agents"
+COMMITMENTS = REPO_ROOT / "results" / "commitments.json"
+
+# Protects in-memory commitment writes against concurrent requests.
+_commit_lock = threading.Lock()
 
 # Regex for safe identifiers used in URL path segments (agent handles, problem IDs).
 # Handles: alphanumeric, underscores, hyphens — no dots, no slashes, no traversal.
@@ -67,7 +73,7 @@ _DASHBOARD_URL = os.environ.get("DASHBOARD_URL", "http://143.244.191.193:8082/")
 
 CORS_HEADERS = {
     "Access-Control-Allow-Origin": "*",
-    "Access-Control-Allow-Methods": "GET, OPTIONS",
+    "Access-Control-Allow-Methods": "GET, POST, OPTIONS",
     "Access-Control-Allow-Headers": "Content-Type",
 }
 
@@ -186,6 +192,54 @@ def _diff_stats(problem_id: str) -> dict:
 
 
 # ---------------------------------------------------------------------------
+# Commit-reveal helpers
+# ---------------------------------------------------------------------------
+
+def _load_commitments() -> dict:
+    """Load the commitments store. Returns {handle: [commitment, ...]}."""
+    if not COMMITMENTS.exists():
+        return {}
+    try:
+        return json.loads(COMMITMENTS.read_text())
+    except Exception:
+        return {}
+
+
+def _save_commitments(store: dict) -> None:
+    COMMITMENTS.parent.mkdir(parents=True, exist_ok=True)
+    COMMITMENTS.write_text(json.dumps(store, indent=2))
+
+
+def _record_commitment(handle: str, agent_hash: str) -> dict:
+    """Thread-safe commitment write. Returns the new commitment record."""
+    ts = time.time()
+    record = {
+        "handle": handle,
+        "agent_hash": agent_hash,
+        "timestamp": ts,
+        "iso": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(ts)),
+    }
+    with _commit_lock:
+        store = _load_commitments()
+        store.setdefault(handle, []).append(record)
+        _save_commitments(store)
+    return record
+
+
+def _get_commitments(handle: str) -> list[dict]:
+    store = _load_commitments()
+    return store.get(handle, [])
+
+
+def _earliest_commitment(handle: str, agent_hash: str) -> dict | None:
+    """Return the earliest commitment record matching both handle and hash."""
+    for c in _get_commitments(handle):
+        if c.get("agent_hash") == agent_hash:
+            return c
+    return None
+
+
+# ---------------------------------------------------------------------------
 # Swagger UI HTML (served at /docs)
 # ---------------------------------------------------------------------------
 
@@ -246,6 +300,45 @@ class Handler(BaseHTTPRequestHandler):
 
     def do_OPTIONS(self) -> None:
         self._send(200, {})
+
+    def do_POST(self) -> None:
+        parsed = urlparse(self.path)
+        path = parsed.path.rstrip("/")
+
+        if path != "/api/commit":
+            self._send(404, {"error": "not found"})
+            return
+
+        # Read body (cap at 8 KB to prevent abuse)
+        try:
+            length = int(self.headers.get("Content-Length", 0))
+            if length > 8192:
+                self._send(413, {"error": "request too large"})
+                return
+            raw = self.rfile.read(length)
+            body = json.loads(raw)
+        except (ValueError, json.JSONDecodeError):
+            self._send(400, {"error": "invalid JSON"})
+            return
+
+        handle = body.get("handle", "")
+        agent_hash = body.get("agent_hash", "")
+
+        if not _SAFE_HANDLE_RE.match(handle):
+            self._send(400, {"error": "invalid handle — alphanumeric, underscores, hyphens, 1-64 chars"})
+            return
+        if not re.match(r"^[0-9a-fA-F]{64}$", agent_hash):
+            self._send(400, {"error": "agent_hash must be a 64-character SHA-256 hex string"})
+            return
+
+        record = _record_commitment(handle, agent_hash)
+        self._send(201, {
+            "committed": True,
+            "handle": record["handle"],
+            "agent_hash": record["agent_hash"],
+            "timestamp": record["iso"],
+            "message": "Commitment recorded. Submit your PR now. The commit timestamp proves you authored this hash before opening the PR.",
+        })
 
     def do_GET(self) -> None:
         parsed = urlparse(self.path)
@@ -310,6 +403,11 @@ class Handler(BaseHTTPRequestHandler):
             return self._problem(rest)
         if path == "/api/openapi.json":
             return self._openapi_spec()
+        if path.startswith("/api/commitments/"):
+            handle = path[len("/api/commitments/"):]
+            if not handle or not _SAFE_HANDLE_RE.match(handle):
+                raise _NotFound("Invalid agent handle")
+            return self._commitments(handle)
         raise _NotFound(f"Unknown endpoint: {path}")
 
     def _health(self) -> dict:
@@ -562,6 +660,11 @@ class Handler(BaseHTTPRequestHandler):
                     "--agent agent/submissions/<handle>/agent.py "
                     "--loop"
                 ),
+                "commit_before_pr": (
+                    "python3 gitminer.py commit "
+                    "agent/submissions/<handle>/agent.py "
+                    "  # run BEFORE opening PR — records hash + timestamp for first-to-commit credit"
+                ),
             },
             "api": {
                 "base": self._base_url(),
@@ -577,6 +680,8 @@ class Handler(BaseHTTPRequestHandler):
                     "/api/agents": "This document",
                     "/api/openapi.json": "OpenAPI 3.0 spec",
                     "/docs": "Swagger UI (interactive API docs)",
+                    "POST /api/commit": "Commit-reveal: register your agent hash before opening a PR — establishes first-to-commit timestamp",
+                    "/api/commitments/{handle}": "Retrieve all hash commitments for an agent handle",
                 },
             },
         }
@@ -592,6 +697,10 @@ class Handler(BaseHTTPRequestHandler):
             for e in entries
         ]
         return {"handle": handle, "submissions": summary, "total": len(summary)}
+
+    def _commitments(self, handle: str) -> dict:
+        records = _get_commitments(handle)
+        return {"handle": handle, "total": len(records), "commitments": records}
 
     def _leaderboard(self) -> dict:
         if not LEADERBOARD.exists():
@@ -786,6 +895,44 @@ class Handler(BaseHTTPRequestHandler):
                         "responses": {"200": {"description": "This document"}},
                     }
                 },
+                "/api/commit": {
+                    "post": {
+                        "summary": "Record a hash commitment (commit-reveal anti-copy)",
+                        "description": "Submit a SHA-256 hash of your agent file *before* opening a PR. The server timestamps the commitment. When your PR is scored, the evaluator checks that a matching commitment exists and was recorded before the PR opened — this proves you authored the code without it being visible. In a tie, the earlier commitment wins.",
+                        "operationId": "postCommit",
+                        "tags": ["Agents"],
+                        "requestBody": {
+                            "required": True,
+                            "content": {
+                                "application/json": {
+                                    "schema": {"$ref": "#/components/schemas/CommitRequest"},
+                                    "example": {"handle": "myagent", "agent_hash": "a3b4c5...64hexchars"},
+                                }
+                            },
+                        },
+                        "responses": {
+                            "201": {
+                                "description": "Commitment recorded",
+                                "content": {"application/json": {"schema": {"$ref": "#/components/schemas/CommitResponse"}}},
+                            },
+                            "400": {"description": "Invalid handle or hash format"},
+                        },
+                    }
+                },
+                "/api/commitments/{handle}": {
+                    "get": {
+                        "summary": "Get all commitments for an agent handle",
+                        "operationId": "getCommitments",
+                        "tags": ["Agents"],
+                        "parameters": [{"name": "handle", "in": "path", "required": True, "schema": {"type": "string"}}],
+                        "responses": {
+                            "200": {
+                                "description": "List of commitments",
+                                "content": {"application/json": {"schema": {"$ref": "#/components/schemas/CommitmentsResponse"}}},
+                            }
+                        },
+                    }
+                },
             },
             "components": {
                 "schemas": {
@@ -924,6 +1071,43 @@ class Handler(BaseHTTPRequestHandler):
                             "submissions": {"type": "array", "items": {"$ref": "#/components/schemas/LeaderboardEntry"}},
                         },
                     },
+                    "CommitRequest": {
+                        "type": "object",
+                        "required": ["handle", "agent_hash"],
+                        "properties": {
+                            "handle": {"type": "string", "description": "Your agent handle (same as the agent/ directory name)", "example": "myagent"},
+                            "agent_hash": {"type": "string", "description": "SHA-256 hex digest of your agent.py file", "example": "a3b4c5d6..."},
+                        },
+                    },
+                    "CommitResponse": {
+                        "type": "object",
+                        "properties": {
+                            "committed": {"type": "boolean", "example": True},
+                            "handle": {"type": "string"},
+                            "agent_hash": {"type": "string"},
+                            "timestamp": {"type": "string", "format": "date-time"},
+                            "message": {"type": "string"},
+                        },
+                    },
+                    "CommitmentsResponse": {
+                        "type": "object",
+                        "properties": {
+                            "handle": {"type": "string"},
+                            "total": {"type": "integer"},
+                            "commitments": {
+                                "type": "array",
+                                "items": {
+                                    "type": "object",
+                                    "properties": {
+                                        "handle": {"type": "string"},
+                                        "agent_hash": {"type": "string"},
+                                        "timestamp": {"type": "number"},
+                                        "iso": {"type": "string", "format": "date-time"},
+                                    },
+                                },
+                            },
+                        },
+                    },
                     "Error": {
                         "type": "object",
                         "properties": {"error": {"type": "string"}},
@@ -942,7 +1126,7 @@ class Handler(BaseHTTPRequestHandler):
                 {"name": "Pool", "description": "Problem pool and shard"},
                 {"name": "Problems", "description": "Individual problem access"},
                 {"name": "Leaderboard", "description": "Submission rankings"},
-                {"name": "Agents", "description": "Agent onboarding and history"},
+                {"name": "Agents", "description": "Agent onboarding, history, and commit-reveal"},
             ],
         }
 
@@ -958,17 +1142,19 @@ class _NotFound(Exception):
 def serve(host: str = "0.0.0.0", port: int = 8083) -> None:
     server = ThreadingHTTPServer((host, port), Handler)
     print(f"Gittensor Base-Miner API listening on http://{host}:{port}")
-    print("  GET /api/health              liveness check")
-    print("  GET /api/stats               pool statistics")
-    print("  GET /api/shard               current weekly shard")
-    print("  GET /api/problems            problem list (filterable)")
-    print("  GET /api/problems/{id}       single problem detail")
-    print("  GET /api/problems/{id}/diff  raw reference diff (text/plain)")
-    print("  GET /api/leaderboard             current leaderboard")
-    print("  GET /api/agents/{handle}/history per-agent submission history")
-    print("  GET /api/agents                  agent discovery document")
-    print("  GET /api/openapi.json            OpenAPI 3.0 spec")
-    print("  GET /docs                        Swagger UI")
+    print("  GET  /api/health              liveness check")
+    print("  GET  /api/stats               pool statistics")
+    print("  GET  /api/shard               current weekly shard")
+    print("  GET  /api/problems            problem list (filterable)")
+    print("  GET  /api/problems/{id}       single problem detail")
+    print("  GET  /api/problems/{id}/diff  raw reference diff (text/plain)")
+    print("  GET  /api/leaderboard             current leaderboard")
+    print("  GET  /api/agents/{handle}/history per-agent submission history")
+    print("  GET  /api/agents                  agent discovery document")
+    print("  GET  /api/openapi.json            OpenAPI 3.0 spec")
+    print("  GET  /docs                        Swagger UI")
+    print("  POST /api/commit                  commit-reveal hash pre-registration")
+    print("  GET  /api/commitments/{handle}    retrieve commitments for an agent")
     print()
     try:
         server.serve_forever()

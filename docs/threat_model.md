@@ -15,8 +15,8 @@
 **Mitigations**:
 - **Similarity check — [Implemented, hard-blocking]**: `scripts/check_similarity.py` compares the incoming agent against all existing submissions using AST structural fingerprints + token Jaccard. Exceeding 85% similarity on either signal fails the CI job and blocks merge.
 - **Marginal reward — [Gittensor-native]**: Rewards are proportional to margin over the current leader. A copy that earns the same score earns ~0 marginal reward.
-- **Commit-reveal — [Planned]**: Miner submits a hash before the private eval. The source is not visible until after scoring. *Not yet implemented — current flow posts results publicly on PR open.*
-- **First-to-commit credit — [Planned]**: In a tie, the earlier submission wins. *Not tracked in CI yet.*
+- **Commit-reveal — [Implemented, phase 1]**: `POST /api/commit` records a SHA-256 hash + timestamp before the PR is opened. `scripts/record_result.py --agent-file` verifies the commitment at scoring time and stores `commit_timestamp` on the leaderboard entry. Phase 2 (private eval before reveal) requires a server-side eval queue — tracked as a backlog item.
+- **First-to-commit credit — [Implemented]**: `commit_timestamp` is stored per leaderboard entry. In a tie, the earlier commitment wins. `gitminer commit <agent.py>` automates the pre-PR hash submission.
 
 **Residual risk**: Low for direct code copies (hard-blocked). Medium for functionally identical agents with different structure (caught by output similarity check).
 
