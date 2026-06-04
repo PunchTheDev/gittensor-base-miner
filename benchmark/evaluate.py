@@ -40,7 +40,7 @@ import time
 from datetime import date
 from pathlib import Path
 
-from benchmark.catalog import DIFFICULTY_TIERS, DEFAULT_SHARD_BUDGET, REPO_CATEGORY
+from benchmark.catalog import DIFFICULTY_TIERS, DEFAULT_SHARD_BUDGET, problem_lang
 
 
 REPO_ROOT = Path(__file__).parent.parent
@@ -92,11 +92,14 @@ def problem_difficulty(problem_dir: Path) -> tuple[str, float]:
 
 
 def _problem_category(problem_dir: Path) -> str:
-    """Return the language category for a problem, based on its repo."""
+    """Return the language category for a problem.
+
+    Derived from test_cmd first (multi-language monorepos like ragflow have
+    Go/TS subsystems), falling back to repo_lang for the repo.
+    """
     try:
         meta = json.loads((problem_dir / "meta.json").read_text())
-        repo = meta.get("repo_name", "").lower()
-        return REPO_CATEGORY.get(repo, "python")
+        return problem_lang(meta)
     except Exception:
         return "python"
 

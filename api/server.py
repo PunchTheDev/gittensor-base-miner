@@ -47,7 +47,7 @@ _REPO_ROOT = Path(__file__).parent.parent
 if str(_REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(_REPO_ROOT))
 
-from benchmark.catalog import REPO_CATEGORY  # noqa: E402
+from benchmark.catalog import problem_lang  # noqa: E402
 
 
 REPO_ROOT = _REPO_ROOT
@@ -156,8 +156,7 @@ def _difficulty_by_lines(problem_dir: Path) -> str:
 
 
 def _category(meta: dict) -> str:
-    repo = meta.get("repo_name", "").lower()
-    return REPO_CATEGORY.get(repo, "python")
+    return problem_lang(meta)
 
 
 def _problem_summary(meta: dict, baselines: dict[str, float]) -> dict:
