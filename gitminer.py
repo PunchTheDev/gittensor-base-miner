@@ -541,10 +541,22 @@ def cmd_problems(args: argparse.Namespace) -> None:
                 baseline_lookup[pid_key] = entry.get("base_score", 0.0)
                 difficulty_lookup[pid_key] = entry.get("difficulty", "medium")
 
+    # If --shard, restrict to current shard problem IDs (without SHARD_SECRET).
+    shard_ids: set[str] | None = None
+    if getattr(args, "shard", False):
+        from benchmark.evaluate import select_shard, load_pool_config
+        config = load_pool_config()
+        all_dirs = sorted(pool_dir.glob("*/meta.json"))
+        all_problem_dirs = [p.parent for p in all_dirs]
+        shard_dirs = select_shard(all_problem_dirs, config)
+        shard_ids = {d.name for d in shard_dirs}
+
     rows = []
     for meta_path in sorted(pool_dir.glob("*/meta.json")):
         meta = _json.loads(meta_path.read_text())
         pid = meta.get("id", "")
+        if shard_ids is not None and pid not in shard_ids:
+            continue
         repo = meta.get("repo_name", "")
         cat = _problem_lang(meta)
         baseline = baseline_lookup.get(pid)
@@ -579,14 +591,24 @@ def cmd_problems(args: argparse.Namespace) -> None:
         rows.sort(key=lambda r: r["id"])
 
     # Display
+    if shard_ids is not None:
+        from datetime import date as _date, timedelta as _td
+        epoch = _date(2024, 1, 1)
+        week = (_date.today() - epoch).days // 7
+        next_epoch = epoch + _td(days=(week + 1) * 7)
+        print(f"\nCurrent shard (week {week}, rotates {next_epoch}) — {len(shard_ids)} problems")
+        print("Note: CI uses SHARD_SECRET, so the live eval shard may differ slightly.\n")
+
     limit = args.limit or len(rows)
-    print(f"\n{'ID':<42} {'Repo':<32} {'Cat':<12} {'Diff':<8} {'Baseline':>9}")
+    print(f"{'ID':<42} {'Repo':<32} {'Cat':<12} {'Diff':<8} {'Baseline':>9}")
     print("─" * 107)
     for r in rows[:limit]:
         b = f"{r['baseline']:.2f}" if r["baseline"] is not None else "n/a"
         print(f"{r['id']:<42} {r['repo']:<32} {r['cat']:<12} {r['difficulty']:<8} {b:>9}  {r['title']}")
 
-    print(f"\n{len(rows[:limit])} of {len(rows)} problems shown.")
+    total_shown = len(rows[:limit])
+    pool_total = len(shard_ids) if shard_ids is not None else sum(1 for _ in pool_dir.glob("*/meta.json"))
+    print(f"\n{total_shown} of {pool_total} problems shown.")
 
 
 def cmd_leaderboard(args: argparse.Namespace) -> None:
@@ -1690,6 +1712,8 @@ def main() -> None:
 
     # problems
     p_problems = sub.add_parser("problems", help="List benchmark problems with optional filters")
+    p_problems.add_argument("--shard", action="store_true",
+                            help="Show only the current weekly shard (30 problems you are scored on)")
     p_problems.add_argument("--cat", choices=["python", "typescript", "rust", "go", "jvm", "ruby"],
                             help="Filter by language category")
     p_problems.add_argument("--difficulty", choices=["easy", "medium", "hard"], help="Filter by difficulty")
