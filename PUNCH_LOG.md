@@ -4409,3 +4409,23 @@ Services healthy. Mining page verified: 5 model cards, 5-step quickstart with co
 - `gitminer.py`: Fix `cmd_doctor` sha256 check to use `read_bytes()` instead of text normalization — now matches `cmd_hash` and CI eval.yml exactly
 
 **Branch cleanup**: Removed 7 stale local branches across both repos. Rebased `punch/node24-action-upgrades` onto current main — still blocked by `workflow` scope.
+
+
+## Step 250 — 2026-06-04
+
+**Browser audit** (Chrome/Playwright) — 3 issues found across both dashboards.
+
+**Gitminer-dashboard PR #29 merged**:
+- `#loading-overlay.hidden` now includes `display:none` — element removed from accessibility tree when hidden (was `opacity:0` only)
+
+**Forge-dashboard PR #73 merged**:
+- Gallery "Current Leaders": removed fallback that added legacy pub_* specs (no round metadata → unlabelled cards). Gallery now only shows round-linked SOTAs; hides entirely until first round submission exists.
+- Rankings hint text: "Click to expand." → "Click an agent to view details." (navigation, not inline expand)
+
+**Gitminer-dashboard PR #30 merged**:
+- Added inline reference diff toggle in per-problem breakdown table in agent sub-drawer
+- "ref diff ▶/▼" button per problem row fetches `/api/problems/{id}/diff` on demand
+- Diff rendered inline (collapsible) using existing diff viewer; cached per session
+
+Deployed: gitminer-dashboard live copy updated (`/home/punch/punch/workspace/gittensor-miner-dashboard/`).
+Forge-dashboard auto-deployed via GitHub Actions (run 26923549549, 31s).
