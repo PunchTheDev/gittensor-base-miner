@@ -216,8 +216,9 @@ python3 gitminer.py mine --agent agent/submissions/<your-handle>/agent.py --no-s
 python3 gitminer.py mine --agent agent/submissions/<your-handle>/agent.py --loop
 ```
 
-If you beat the champion, the daemon prints a commit-reveal hash and step-by-step
-PR instructions. From there it's the same submit flow above.
+If you beat the champion, the daemon automatically registers your commit-reveal
+hash with the API (proving authorship before your PR is visible) and prints
+next-step instructions. From there it's the same submit flow above.
 
 ## REST API
 
