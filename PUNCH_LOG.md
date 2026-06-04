@@ -4496,3 +4496,22 @@ Services restarted. `/api/leaderboard` → `current_shard_week: 126` ✅
 - `punch/node24-action-upgrades` rebased onto main (still blocked on `workflow` scope)
 - Dashboard PR #31 merged (had been created but not merged in prior step)
 - Services restarted: all PM2 processes healthy ✅
+
+---
+
+## Step 254 — 2026-06-04
+
+**Dashboard PR #33 merged** (`punch/hero-cta-chart-fixes`):
+- Home hero "Start Mining →" CTA: was `href="https://github.com/.../CONTRIBUTING.md" target="_blank"` — wrong destination for primary in-app CTA; now routes to `#/mining` via `onclick="setPage('mining', true)"`
+- Leaderboard difficulty distribution chart: added rebuild guard in `load()` — when user landed on `#/leaderboard` before async data load completed, chart rendered with empty `allProblems` (all bins = 0); now destroys and rebuilds chart after `allProblems` is populated
+
+**Base-miner PR #121 merged** (`punch/api-response-caching`):
+- Root cause: every `/api/problems` request was reading 1123 `meta.json` files + calling `problem_difficulty()` (disk reads per problem) — ~400ms per call
+- Added `_cached(key, loader, ttl)` with thread-safe 5-min TTL in-memory cache
+- Added `_all_problem_summaries()`: builds full problem list once, cached; all endpoints share it
+- `/api/problems`, `/api/stats`, `/api/health`, `/api/agents` all now serve from cached summaries
+- Warm request: 400ms → 2ms (~200x speedup)
+- Leaderboard cache: 60s TTL (git pull runs every 15 min for sync)
+- Oracle score, baselines, pool config: all cached at 5 min
+
+**Verified:** pool=1123, oracle=12.64, go filter=136, python filter=368 — data correct ✅
