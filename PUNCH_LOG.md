@@ -4388,3 +4388,24 @@ Both services restarted, path traversal verified blocked via curl test. All PM2 
 
 Services healthy. Mining page verified: 5 model cards, 5-step quickstart with commit step.
 
+
+## Step 249 — 2026-06-04
+
+**Browser audit** (Chrome/Playwright) — found 2 issues:
+1. Leaderboard: `sota-empty` "SOTA progress chart will appear after first submission" shown alongside fallback Difficulty Distribution chart (contradictory — chart IS rendered)
+2. Problems page: lang badge `<span>` inside title `<td>` concatenated into accessible text
+
+**Dashboard PR #28 merged**:
+- Remove `sota-empty` display in `buildSotaChart()` fallback branch (the chart is shown, message was wrong)
+- Add `aria-hidden="true"` to `catBadgeHTML()` output — badge abbreviation excluded from screen reader title text
+
+**Base-miner PR #115 merged**:
+- `benchmark/harness/runner.py`: Fix anti-gaming multiplier — was binary 0.5/1.0, now matches `score.py` graduated formula (≤3=1.0, 4–8 linear 0.9→0.5, >8=0.5). Sandbox and local runs now consistent.
+- `docs/scoring.md`: Add `efficiency_factor` to metrics table and formula. Update anti-gaming section with graduated table (was binary). Add new "Efficiency Factor" section.
+- `LEADERBOARD.md`: Add `× efficiency_factor` to formula.
+
+**Hotfixes (direct to main)**:
+- `benchmark/harness/score.py`: Fix stale comment in benchmark_score block (was missing `efficiency_factor`)
+- `gitminer.py`: Fix `cmd_doctor` sha256 check to use `read_bytes()` instead of text normalization — now matches `cmd_hash` and CI eval.yml exactly
+
+**Branch cleanup**: Removed 7 stale local branches across both repos. Rebased `punch/node24-action-upgrades` onto current main — still blocked by `workflow` scope.
