@@ -92,46 +92,86 @@ _rate_buckets: dict[str, collections.deque] = {}
 
 
 # ---------------------------------------------------------------------------
+# In-memory cache — 5-minute TTL avoids re-reading 1123 meta.json files per request
+# ---------------------------------------------------------------------------
+
+_cache_lock = threading.Lock()
+_cache: dict[str, tuple[float, Any]] = {}  # key → (expires_at, value)
+_CACHE_TTL = 300.0  # seconds
+
+
+def _cached(key: str, loader: Any, ttl: float = _CACHE_TTL) -> Any:
+    """Return a cached value, calling loader() to refresh on expiry."""
+    now = time.monotonic()
+    with _cache_lock:
+        if key in _cache:
+            expires, val = _cache[key]
+            if now < expires:
+                return val
+    val = loader()
+    with _cache_lock:
+        _cache[key] = (now + ttl, val)
+    return val
+
+
+def _invalidate_cache(*keys: str) -> None:
+    """Remove named keys from cache (e.g. after a write)."""
+    with _cache_lock:
+        for k in keys:
+            _cache.pop(k, None)
+
+
+# ---------------------------------------------------------------------------
 # Data loading helpers
 # ---------------------------------------------------------------------------
 
 def _pool_config() -> dict:
-    if POOL_CONFIG.exists():
-        return json.loads(POOL_CONFIG.read_text())
-    return {"shard_size": 30, "rotation_policy": "weekly", "rotation_seed": 42}
+    def _load() -> dict:
+        if POOL_CONFIG.exists():
+            return json.loads(POOL_CONFIG.read_text())
+        return {"shard_size": 30, "rotation_policy": "weekly", "rotation_seed": 42}
+    return _cached("pool_config", _load, ttl=60.0)
 
 
 def _all_problem_ids() -> list[str]:
-    if not POOL_DIR.exists():
-        return []
-    return sorted(p.name for p in POOL_DIR.iterdir() if p.is_dir())
+    def _load() -> list[str]:
+        if not POOL_DIR.exists():
+            return []
+        return sorted(p.name for p in POOL_DIR.iterdir() if p.is_dir())
+    return _cached("problem_ids", _load)
 
 
 def _load_meta(problem_id: str) -> dict | None:
-    path = POOL_DIR / problem_id / "meta.json"
-    if not path.exists():
-        return None
-    return json.loads(path.read_text())
+    def _load() -> dict | None:
+        path = POOL_DIR / problem_id / "meta.json"
+        if not path.exists():
+            return None
+        return json.loads(path.read_text())
+    return _cached(f"meta:{problem_id}", _load)
 
 
 def _baseline_map() -> dict[str, float]:
     """Returns {problem_id: base_score}."""
-    if not BASELINES.exists():
-        return {}
-    data = json.loads(BASELINES.read_text())
-    return {p["id"]: p["base_score"] for p in data.get("problems", [])}
+    def _load() -> dict[str, float]:
+        if not BASELINES.exists():
+            return {}
+        data = json.loads(BASELINES.read_text())
+        return {p["id"]: p["base_score"] for p in data.get("problems", [])}
+    return _cached("baselines", _load)
 
 
 def _oracle_weighted_score() -> float:
     """Returns the difficulty-weighted oracle mean (the metric miners compete on)."""
-    if not BASELINES.exists():
-        return 0.0
-    try:
-        data = json.loads(BASELINES.read_text())
-        ws = data.get("weighted_mean_score")
-        return float(ws) if ws is not None else float(data.get("mean_score", 0))
-    except Exception:
-        return 0.0
+    def _load() -> float:
+        if not BASELINES.exists():
+            return 0.0
+        try:
+            data = json.loads(BASELINES.read_text())
+            ws = data.get("weighted_mean_score")
+            return float(ws) if ws is not None else float(data.get("mean_score", 0))
+        except Exception:
+            return 0.0
+    return _cached("oracle_score", _load)
 
 
 def _shard_problem_dirs(config: dict) -> list[Path]:
@@ -157,6 +197,20 @@ def _difficulty_by_lines(problem_dir: Path) -> str:
 
 def _category(meta: dict) -> str:
     return problem_lang(meta)
+
+
+def _all_problem_summaries() -> list[dict]:
+    """Build and cache the full problem summary list (avoids 1123 per-request disk reads)."""
+    def _load() -> list[dict]:
+        ids = _all_problem_ids()
+        baselines = _baseline_map()
+        summaries = []
+        for pid in ids:
+            meta = _load_meta(pid)
+            if meta:
+                summaries.append(_problem_summary(meta, baselines))
+        return summaries
+    return _cached("all_summaries", _load)
 
 
 def _problem_summary(meta: dict, baselines: dict[str, float]) -> dict:
@@ -412,32 +466,27 @@ class Handler(BaseHTTPRequestHandler):
     def _health(self) -> dict:
         return {
             "status": "ok",
-            "pool_size": len(_all_problem_ids()),
+            "pool_size": len(_all_problem_summaries()),
             "version": "1.0",
         }
 
     def _stats(self) -> dict:
-        baselines = _baseline_map()
-        scores = list(baselines.values())
         config = _pool_config()
-        all_ids = _all_problem_ids()
         shard = _shard_problem_dirs(config)
+        all_summaries = _all_problem_summaries()
 
         by_category: dict[str, int] = {}
         by_difficulty: dict[str, int] = {}
         repos: set[str] = set()
-        for pid in all_ids:
-            meta = _load_meta(pid)
-            if not meta:
-                continue
-            cat = _category(meta)
+        for s in all_summaries:
+            cat = s["category"]
             by_category[cat] = by_category.get(cat, 0) + 1
-            diff = _difficulty_by_lines(POOL_DIR / pid)
+            diff = s["difficulty"]
             by_difficulty[diff] = by_difficulty.get(diff, 0) + 1
-            repos.add(meta.get("repo_name", ""))
+            repos.add(s["repo"])
 
         return {
-            "pool_size": len(all_ids),
+            "pool_size": len(all_summaries),
             "shard_size": len(shard),
             "repos": len(repos),
             "oracle_score": _oracle_weighted_score(),
@@ -486,15 +535,10 @@ class Handler(BaseHTTPRequestHandler):
         except ValueError:
             limit, offset = 100, 0
 
-        all_ids = _all_problem_ids()
-        baselines = _baseline_map()
+        all_summaries = _all_problem_summaries()
         results = []
 
-        for pid in all_ids:
-            meta = _load_meta(pid)
-            if not meta:
-                continue
-            s = _problem_summary(meta, baselines)
+        for s in all_summaries:
             if cat_filter and s["category"] != cat_filter:
                 continue
             if diff_filter and s["difficulty"] != diff_filter:
@@ -555,8 +599,7 @@ class Handler(BaseHTTPRequestHandler):
     def _agents(self) -> dict:
         """Discovery document for AI agents — structured onboarding for autonomous competitors."""
         config = _pool_config()
-        baselines = _baseline_map()
-        all_ids = _all_problem_ids()
+        all_summaries = _all_problem_summaries()
         shard_dirs = _shard_problem_dirs(config)
 
         # Load allowed models
@@ -572,7 +615,7 @@ class Handler(BaseHTTPRequestHandler):
         champion_score = None
         champion_agent = None
         if LEADERBOARD.exists():
-            entries = json.loads(LEADERBOARD.read_text())
+            entries = _cached("leaderboard", lambda: json.loads(LEADERBOARD.read_text()), ttl=60.0)
             ranked = [e for e in entries if e.get("rank") is not None and e.get("score") is not None]
             if ranked:
                 top = max(ranked, key=lambda e: e.get("weighted_score") or e.get("score", 0))
@@ -601,7 +644,7 @@ class Handler(BaseHTTPRequestHandler):
                 "example": "agent/example/agent.py",
             },
             "pool": {
-                "total_problems": len(all_ids),
+                "total_problems": len(all_summaries),
                 "shard_size": len(shard_dirs),
                 "rotation": config.get("rotation_policy", "weekly"),
                 "categories": config.get("shard_budget", {}),
@@ -707,7 +750,7 @@ class Handler(BaseHTTPRequestHandler):
         current_week = (_date.today() - epoch).days // 7
         if not LEADERBOARD.exists():
             return {"current_shard_week": current_week, "entries": []}
-        entries = json.loads(LEADERBOARD.read_text())
+        entries = _cached("leaderboard", lambda: json.loads(LEADERBOARD.read_text()), ttl=60.0)
         return {"current_shard_week": current_week, "entries": entries}
 
     def _send(self, status: int, body: Any) -> None:
