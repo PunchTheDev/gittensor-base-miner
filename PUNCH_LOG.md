@@ -4366,3 +4366,9 @@ All services healthy. Pool rotation June 8 (automated).
 - 7-row penalty table added to scoring page showing exact assertion-count → multiplier mapping
 
 Both services restarted, path traversal verified blocked via curl test. All PM2 processes healthy.
+## Step 247 — 2026-06-04
+
+- Dashboard PR #26: Problems pagination (50/page), lang-badge overflow fix, scoring card grid fix
+- Base-miner PR #113: Commit-reveal phase 1 — POST /api/commit, gitminer commit CLI, hash verification in record_result.py, threat model updated
+- API live: POST /api/commit and GET /api/commitments/{handle} verified working
+
