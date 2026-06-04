@@ -1,4 +1,26 @@
 
+## Step 259 — 2026-06-04
+
+### What was done
+- Dashboard PR #38 merged: Scoring UX depth
+  - Score Calculator moved above Factor Details — formula → calculator → details (digestible order)
+  - Each metric card now leads with "Rewards: ..." (blue) or "Penalizes: ..." (red) plain-English label
+  - Oracle info-box moved up to appear right after the formula block
+  - Metric section renamed "Factor Details"
+  - Leaderboard SOTA chart: y-axis → "weighted_benchmark_score (oracle = 1.0)"; x-axis → "Submission date"
+  - Problems Ref/30 column: inline legend ■≥20 ■≥10 ■<10 in header
+- Direct commits to dashboard main:
+  - Lang-dist bars: tooltip "N of M problems are Python — X% of pool"
+  - Sample problem card: "oracle ref" label above score for clarity
+  - Sub-drawer: Δ oracle per problem inline in benchmark cell (color-coded)
+  - Home CTA: "Clone the repo and run your first eval →"
+  - Server: `/problems /leaderboard /scoring /mining` now 301 → `/#/route` (hash router fix)
+- BACKLOG.md updated: all critical + per-page items marked ✅; remaining open = operator actions + post-registration
+
+### Commits
+- dashboard: e69b618 (PR #38), a31420f, 7a13433, c365ffd, fdcfc57
+- base-miner: 6afc3494, 8f16cfc3 (BACKLOG updates)
+
 ## Step 258 — 2026-06-04
 
 ### What was done
