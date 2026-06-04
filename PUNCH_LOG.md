@@ -1,4 +1,29 @@
 
+## Step 260 — 2026-06-04
+
+### What was done
+- Browser audit (20 issues found): fixed 12 in this step
+  - SOTA pill: "SOTA —" → "Best score: none yet" — clearer for first-timers
+  - LB target score sub-label: shortened to "weighted_benchmark_score to beat" (was wrapping badly)
+  - Oracle row "▸ per-problem": styled as clickable blue "▸ expand" with tooltip
+  - Oracle row gain cell: "—" → "baseline" with tooltip explaining it's the reference row
+  - Oracle row efficiency: "—" → "1.000" with tooltip (1.0 by definition)
+  - Leaderboard search: hidden when no real agents (looked broken on empty LB)
+  - Score calculator: "Matches oracle" → yellow warning "Ties oracle — not enough to win, you must EXCEED 1.0"
+  - Data updated footer: "Data updated" → "Pool data last updated" (clarifies what data)
+  - Difficulty chart x-axis: "Oracle score range (0–30)" → "Oracle ref score (out of 30 test runs)"
+  - Sample Problems "oracle ref": added ⓘ tooltip explaining 0-30 scale vs 1.0 win target
+  - Scoring page: 7-item jump nav at top (Formula / Calculator / Factors / Sampling / Difficulty / Anti-Copy / Pool)
+  - Models stat card: shows first 3 model short names in sub-label (hover for full list)
+- API: /api/problems/random endpoint (n, cat, difficulty, seed params)
+- API: /api/problems now supports ?sort=baseline_score|difficulty|merged_at&order=asc|desc
+- API: /api/openapi.json and /api/agents discovery doc updated with new endpoints
+- Dashboard mining page: API table updated with new endpoints
+
+### Commits
+- dashboard: 41cf829, b6fe372, 995e6c8
+- base-miner: fbbe11a5
+
 ## Step 259 — 2026-06-04
 
 ### What was done
