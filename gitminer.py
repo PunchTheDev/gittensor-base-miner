@@ -1669,7 +1669,7 @@ def main() -> None:
 
     # problems
     p_problems = sub.add_parser("problems", help="List benchmark problems with optional filters")
-    p_problems.add_argument("--cat", choices=["python", "typescript", "rust", "jvm", "ruby"],
+    p_problems.add_argument("--cat", choices=["python", "typescript", "rust", "go", "jvm", "ruby"],
                             help="Filter by language category")
     p_problems.add_argument("--difficulty", choices=["easy", "medium", "hard"], help="Filter by difficulty")
     p_problems.add_argument("--repo", metavar="PATTERN", help="Filter by repo name substring")
