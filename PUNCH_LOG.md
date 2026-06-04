@@ -4450,3 +4450,24 @@ Root cause discovered via pool stats audit: 52 problems misclassified because RE
 **Hotfix direct to main**: `gitminer problems --cat go` was erroring (choices list missing "go"). Fixed argparse choices.
 
 API restarted. Dashboard updated. Verified via browser audit.
+
+## Step 252 — 2026-06-04
+
+**Browser audit (via agent):** found 4 real bugs + shard week gap.
+
+**Dashboard PR #31 merged** (`punch/dashboard-polish-252`):
+- Scoring page shard quota text corrected: "11 Python · 3 Go" → "10 Python · 4 Go" (matches `/api/stats`)
+- DeepSeek V4 Flash pricing: "Low cost" → "~$0.10/$0.20 per M tokens" (from OpenRouter API)
+- Per-page `document.title` via `PAGE_TITLES` map in `setPage()` — tabs/history now show correct page
+- "For Agents" href wired to `${API}/api/agents` at load time — right-click/middle-click works
+
+**Base-miner PR #117 merged** (`punch/shard-week-tracking`):
+- `benchmark/evaluate.py`: adds `shard_week` (int) to eval results output
+- `scripts/record_result.py`: stores `shard_week` in leaderboard entries
+- `api/server.py`: `/api/leaderboard` returns `current_shard_week` + LeaderboardEntry/LeaderboardResponse OpenAPI schemas updated
+
+**Dashboard (direct to main):**
+- Merges `current_shard_week` from live leaderboard API
+- Shows "⚠ old shard" badge on entries from past pool rotations (stale entries)
+
+Services restarted. `/api/leaderboard` → `current_shard_week: 126` ✅
