@@ -4533,3 +4533,28 @@ Services restarted. `/api/leaderboard` → `current_shard_week: 126` ✅
 - Exact formula matches harness: `tpr × rel × anti_gaming × tqf × eff`
 
 **State:** pool=1123, oracle=12.64, 5 models, rotation June 8 (4 days). All services healthy.
+
+---
+
+## Step 257 — 2026-06-04
+
+### Action
+Browser audit found 5 dashboard issues; 3 PRs merged.
+
+### What changed
+**Dashboard PR #36 merged** — Language-colored filter chips, repo bars, lang-dist bars:
+- Problems page filter chips: colored language dots + per-language hover/active accent (no generic blue)
+- Missing `.lang-go` CSS class added (Go badges were rendering with fallback color)
+- Home lang-dist bars: gradient fills matching repo breakdown style
+- Scoring pool composition: bars colored by repo's dominant language (computed from allProblems)
+- Mining: model card hover effect; GPT-4o-mini pricing `$` → `~$`
+
+**Dashboard PR #37 merged** — Bug fix: `load()` was destroying `.chip-dot` spans with `textContent =` assignment. Fixed to clear text nodes only.
+
+**Dashboard direct commit `5090ce5`** — Mini score bars in problems table:
+- Each oracle score cell now shows a small colored bar (green ≥20, yellow ≥10, red <10) visualizing where the problem sits in the 0–30 range
+
+### State
+- Dashboard: `5090ce5` — language-colored chips, score bars, gradient repo bars ✅
+- API: healthy, pool=1123, oracle=12.64 ✅
+- Pool rotation: Sunday 2026-06-08 (automated, 4 days) ✅
