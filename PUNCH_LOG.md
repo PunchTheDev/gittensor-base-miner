@@ -1,3 +1,19 @@
+
+## Step 258 — 2026-06-04
+
+### What was done
+- BACKLOG.md: full 3-pillar teardown from operator message.txt — every page/component with pillar tags (Beautiful/Seamless/Understandable)
+- SPA routing: server.py replaces python3 -m http.server; /scoring /problems /leaderboard /mining all return 200 on direct load
+- Oracle coherence: one definition everywhere — "Beat 1.0" not "Oracle 12.64/30"; stat card fixed; SOTA uses weighted_benchmark_score
+- relative_score: description clarified (weighted AST nodes, not raw count; tests gate first)
+- Champion code on Leaderboard: "code ↗" link when agent_code_url stored; oracle row → "example ↗"; record_result.py --pr-number arg
+- Swagger UI confirmed live at port 8083 /docs
+- One-Copy-Paste Start section on Mining page with expected output + RALPH-loop
+
+### Commits
+- dashboard: b5d3800 (SPA routing + oracle coherence + champion code + mining onramp)
+- base-miner: 576aac79 (BACKLOG.md + record_result.py --pr-number)
+
 # Punch Log — Gittensor Base-Miner Flywheel
 
 Milestone trail for the base-miner benchmark. Discord is the primary channel; this file is the audit trail.
