@@ -4372,3 +4372,19 @@ Both services restarted, path traversal verified blocked via curl test. All PM2 
 - Base-miner PR #113: Commit-reveal phase 1 — POST /api/commit, gitminer commit CLI, hash verification in record_result.py, threat model updated
 - API live: POST /api/commit and GET /api/commitments/{handle} verified working
 
+## Step 248 — 2026-06-04
+
+**Browser audit** (Chrome/Playwright) — found stale models bug: Mining page showed 65 models instead of 5 curated ones
+
+**Dashboard PR #27 merged**:
+- `data.json`: fix `allowed_models` 65 → 5 curated OSS models (stale since PR #105)
+- `index.html`: fetch `/api/agents` in `load()` to merge live `constraints.allowed_models` — model list auto-syncs from API going forward
+- Mining quickstart: 4-step → 5-step, added "Commit Hash" card + terminal step (`gitminer commit`)
+- API reference table: added `POST /api/commit` and `GET /api/commitments/{handle}` rows (implemented in #113 but not documented on dashboard)
+
+**Base-miner PR #114 merged**:
+- Regenerate `docs/dashboard_data.json` from current pool (correct 5 models, 2026-06-04 date)
+- Clear `results/commitments.json` of test entries
+
+Services healthy. Mining page verified: 5 model cards, 5-step quickstart with commit step.
+
