@@ -584,12 +584,18 @@ def run_evaluation(
     results = [r for _, r in indexed_results]
 
     agg = _annotate_and_aggregate(results, selected)
+    policy = config.get("rotation_policy", "weekly")
+    shard_week = None
+    if policy == "weekly":
+        epoch = date(2024, 1, 1)
+        shard_week = (date.today() - epoch).days // 7
     return {
         **agg,
         "problems_evaluated": len(results),
         "pool_size": len(all_problem_dirs),
         "shard_size": len(selected),
-        "rotation_policy": config.get("rotation_policy", "weekly"),
+        "shard_week": shard_week,
+        "rotation_policy": policy,
         "workers": effective_workers,
         "problems": results,
     }

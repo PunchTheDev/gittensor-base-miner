@@ -702,10 +702,13 @@ class Handler(BaseHTTPRequestHandler):
         return {"handle": handle, "total": len(records), "commitments": records}
 
     def _leaderboard(self) -> dict:
+        from datetime import date as _date
+        epoch = _date(2024, 1, 1)
+        current_week = (_date.today() - epoch).days // 7
         if not LEADERBOARD.exists():
-            return {"entries": []}
+            return {"current_shard_week": current_week, "entries": []}
         entries = json.loads(LEADERBOARD.read_text())
-        return {"entries": entries}
+        return {"current_shard_week": current_week, "entries": entries}
 
     def _send(self, status: int, body: Any) -> None:
         payload = json.dumps(body, indent=2).encode()
@@ -1023,6 +1026,7 @@ class Handler(BaseHTTPRequestHandler):
                             "handle": {"type": "string"},
                             "score": {"type": "number"},
                             "weighted_score": {"type": "number"},
+                            "shard_week": {"type": "integer", "nullable": True, "description": "Pool rotation week when this score was recorded. Null for oracle row and entries predating this field. Compare with current_shard_week to check staleness."},
                             "model": {"type": "string"},
                             "submitted_at": {"type": "string", "format": "date-time"},
                             "breakdown": {
@@ -1041,7 +1045,10 @@ class Handler(BaseHTTPRequestHandler):
                     },
                     "LeaderboardResponse": {
                         "type": "object",
-                        "properties": {"entries": {"type": "array", "items": {"$ref": "#/components/schemas/LeaderboardEntry"}}},
+                        "properties": {
+                            "current_shard_week": {"type": "integer", "description": "Week number of the currently active shard (epoch 2024-01-01, 7-day cycles). Compare against entry.shard_week to detect stale scores from a prior rotation."},
+                            "entries": {"type": "array", "items": {"$ref": "#/components/schemas/LeaderboardEntry"}},
+                        },
                     },
                     "AgentsDocument": {
                         "type": "object",

@@ -191,6 +191,7 @@ def main():
     weighted_mean = results.get("weighted_mean_score", mean_score)
     benchmark_score = results.get("mean_benchmark_score")
     weighted_benchmark = results.get("weighted_benchmark_score")
+    shard_week = results.get("shard_week")
 
     RESULTS_DIR.mkdir(parents=True, exist_ok=True)
     lb_file = RESULTS_DIR / "leaderboard.json"
@@ -236,6 +237,8 @@ def main():
         entry["benchmark_score"] = round(float(benchmark_score), 4)
     if weighted_benchmark is not None:
         entry["weighted_benchmark_score"] = round(float(weighted_benchmark), 4)
+    if shard_week is not None:
+        entry["shard_week"] = int(shard_week)
 
     # Aggregate token efficiency across all problems
     entry["total_tokens_used"] = sum(b["tokens_used"] for b in breakdown)
