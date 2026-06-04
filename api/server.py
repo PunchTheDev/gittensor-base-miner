@@ -177,11 +177,14 @@ def _oracle_weighted_score() -> float:
 
 def _shard_problem_dirs(config: dict) -> list[Path]:
     """Return the category-balanced shard dirs, matching evaluate.py exactly."""
-    from benchmark.evaluate import select_shard
-    all_dirs = sorted(POOL_DIR.glob("*/meta.json"))
-    if not all_dirs:
-        return []
-    return select_shard([p.parent for p in all_dirs], config)
+    def _load() -> list[Path]:
+        from benchmark.evaluate import select_shard
+        all_dirs = sorted(POOL_DIR.glob("*/meta.json"))
+        if not all_dirs:
+            return []
+        return select_shard([p.parent for p in all_dirs], config)
+    # Shard is stable for 7 days — cache for the full rotation window (TTL=3600s).
+    return _cached("shard_dirs", _load, ttl=3600.0)
 
 
 def _difficulty_by_lines(problem_dir: Path) -> str:
