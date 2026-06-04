@@ -4674,3 +4674,21 @@ Browser audit found 5 dashboard issues; 3 PRs merged.
 - dashboard: 5977a13
 
 ---
+
+## Step 265 — 2026-06-04
+
+### What was done
+- Thorough browser audit via Puppeteer — 20 issues catalogued
+- Dashboard `41fb238`: 7 UX clarity fixes — calculator "pool contrib" label, mining loop comment, epoch date, step 4 title, anti-gaming notes, empty submissions card
+- Dashboard `5ebde9f`: JVM → "JVM (Java/Kotlin)" everywhere, "6 languages" tooltip, contribution_weight inline formula note
+- Dashboard `914524b`: Shard filter chip on Problems page — "⚡ This shard (30)" fetches /api/shard, filters to 30 current eval problems, shows ⚡ indicators on shard problems in table
+- Dashboard `c9c324d`: Sampling section 3-column grid — fixes Ruby card orphan layout
+- Base-miner `6f20b6b4`: Oracle leaderboard note simplified (arithmetic 11.49 removed)
+- Terminology: "Ref / 30" → "Oracle / 30", "oracle ref" → "oracle / 30", diff chart axis standardized
+- Pushed all changes; PM2 restarted; services verified healthy
+
+### Commits
+- dashboard: 41fb238, 5ebde9f, 914524b, c9c324d
+- base-miner: 6f20b6b4
+
+---
