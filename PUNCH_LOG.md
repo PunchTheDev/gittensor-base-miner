@@ -4352,3 +4352,17 @@ benchmark_score = test_pass_rate × relative_score × anti_gaming_multiplier
 - `cmd_init` model warning: now prints actual allowed models list instead of pointing to wrong command
 
 All services healthy. Pool rotation June 8 (automated).
+
+## Step 246 — 2026-06-04
+
+**PR #112 merged** (base-miner): Server hardening + graduated anti-gaming
+- Path traversal fix: `_SAFE_HANDLE_RE`/`_SAFE_PROBLEM_ID_RE` validate all URL path segments — handles like `../../../etc/passwd` return 404 instead of touching FS
+- Dynamic server URLs: `/api/agents` and `/api/openapi.json` now derive base URL from `Host` request header, with `API_BASE_URL`/`DASHBOARD_URL` env var overrides — no more hardcoded IP in responses
+- Graduated anti-gaming multiplier in score.py: binary 0.5/1.0 → ≤3=1.0, 4=0.9, 5=0.8, 6=0.7, 7=0.6, ≥8=floor 0.5
+
+**Dashboard PR #25 merged**: Search debounce + anti-gaming docs update
+- 150ms debounce on both problem search and leaderboard search — was firing full DOM render on every keystroke
+- Anti-gaming metric card range updated 0.0-1.0 → 0.5-1.0, description explains graduated rules
+- 7-row penalty table added to scoring page showing exact assertion-count → multiplier mapping
+
+Both services restarted, path traversal verified blocked via curl test. All PM2 processes healthy.
