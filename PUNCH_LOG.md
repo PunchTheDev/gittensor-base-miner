@@ -4596,3 +4596,18 @@ Browser audit found 5 dashboard issues; 3 PRs merged.
 - Dashboard: `5090ce5` — language-colored chips, score bars, gradient repo bars ✅
 - API: healthy, pool=1123, oracle=12.64 ✅
 - Pool rotation: Sunday 2026-06-08 (automated, 4 days) ✅
+
+---
+
+## Step 260 — 2026-06-04
+
+### Actions
+- Dashboard PR #39 merged: 4 browser-audit fixes — copy buttons on mining bash blocks, scoring calc oracle/zero messages, SOTA subtext unified
+- Dashboard direct `9d1036c`: RALPH acronym expanded (R/A/L/P/H spelled out)
+- Base-miner PR #122 merged: `/api/agents` oracle score clarified — `oracle_weighted_benchmark_score: 1.0` + `oracle_raw_weighted_score: 12.64`
+- **Deployment fix**: PM2 gitminer-dashboard + gitminer-api were serving from deleted directory paths — both re-registered with correct paths (`/home/punch/repos/gittensor-miner-dashboard`, `/tmp/base-miner-review`)
+
+### State
+- Dashboard: `9d1036c` — copy buttons ✅, oracle calc messages fixed ✅, RALPH expanded ✅
+- API: `e3bf5a6b`, oracle_weighted_benchmark_score=1.0 ✅, cwd=/tmp/base-miner-review ✅
+- Pool rotation: Sunday 2026-06-08 (automated, 4 days) ✅
