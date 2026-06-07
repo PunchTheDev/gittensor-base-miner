@@ -1,0 +1,309 @@
+diff --git a/apps/web/src/lib/source-repo-signals.server.ts b/apps/web/src/lib/source-repo-signals.server.ts
+index 83ad2a723d..1f868af0b5 100644
+--- a/apps/web/src/lib/source-repo-signals.server.ts
++++ b/apps/web/src/lib/source-repo-signals.server.ts
+@@ -1,4 +1,7 @@
+ import { parseAbbreviatedCount } from "@heyclaude/registry/presentation";
++import {
++  parseGitHubRepoUrl as parseCanonicalGitHubRepoUrl,
++} from "@heyclaude/registry/source-repo";
+ 
+ import { getEnvString } from "@/lib/cloudflare-env.server";
+ import { chunk, inPlaceholders } from "@/lib/d1-batch";
+@@ -53,24 +56,14 @@ type SourceRepoSignalRow = {
+ };
+ 
+ export function parseGitHubRepoUrl(value: unknown) {
+-  try {
+-    const parsed = new URL(String(value ?? ""));
+-    // Accept github.com and its www. alias; stripping only a leading "www."
+-    // keeps other subdomains (gist., api., raw.) rejected.
+-    if (parsed.hostname.toLowerCase().replace(/^www\./, "") !== "github.com") {
+-      return null;
+-    }
+-    const [owner, repoRaw] = parsed.pathname.split("/").filter(Boolean);
+-    if (!owner || !repoRaw) return null;
+-    const repo = repoRaw.replace(/\.git$/i, "");
+-    if (!/^[a-z0-9_.-]+$/i.test(owner) || !/^[a-z0-9_.-]+$/i.test(repo)) {
+-      return null;
+-    }
+-    const normalized = `${owner}/${repo}`.toLowerCase();
+-    return { owner, repo, key: normalized };
+-  } catch {
+-    return null;
+-  }
++  // Delegate to the shared canonical parser (handles www., the scp/SSH short
++  // form, and the git+/git:// schemes). The source-signal cache keys repos
++  // case-insensitively, so lowercase the dedup key here.
++  const parsed = parseCanonicalGitHubRepoUrl(value);
++  if (!parsed) return null;
++
++  const { owner, repo } = parsed;
++  return { owner, repo, key: `${owner}/${repo}`.toLowerCase() };
+ }
+ 
+ function sourceRepoForEntry(entry: EntryWithRepoStats) {
+diff --git a/packages/registry/package.json b/packages/registry/package.json
+index a9285fb2fb..86fd994493 100644
+--- a/packages/registry/package.json
++++ b/packages/registry/package.json
+@@ -30,6 +30,10 @@
+       "types": "./src/index.d.ts",
+       "default": "./src/seo.js"
+     },
++    "./source-repo": {
++      "types": "./src/source-repo.d.ts",
++      "default": "./src/source-repo.js"
++    },
+     "./submission": {
+       "types": "./src/index.d.ts",
+       "default": "./src/submission.js"
+diff --git a/packages/registry/src/content-builder.js b/packages/registry/src/content-builder.js
+index 0286f094e3..b0894a3fab 100644
+--- a/packages/registry/src/content-builder.js
++++ b/packages/registry/src/content-builder.js
+@@ -10,6 +10,7 @@ import {
+   normalizeBody,
+ } from "./content-schema.js";
+ import { buildBrandAssetMetadata } from "./brand-assets.js";
++import { parseGitHubRepoUrl } from "./source-repo.js";
+ import { parseSafeFrontmatter } from "./frontmatter.js";
+ 
+ export const DEFAULT_DIRECTORY_REPO_URL =
+@@ -21,32 +22,14 @@ export function buildGitHubUrl(filePath, repoRoot) {
+ }
+ 
+ export function parseGitHubRepo(repoUrl) {
+-  if (!repoUrl) return null;
++  // Delegate to the shared canonical parser (handles www., the scp/SSH short
++  // form, and the git+/git:// schemes). The registry preserves owner/repo case
++  // in its dedup key, so derive the key here rather than in the shared parser.
++  const parsed = parseGitHubRepoUrl(repoUrl);
++  if (!parsed) return null;
+ 
+-  try {
+-    const url = new URL(repoUrl);
+-    // Accept github.com and its www. alias (both appear in author-provided
+-    // repo URLs); stripping only a leading "www." keeps other subdomains
+-    // (gist., api., raw.) rejected.
+-    if (url.hostname.toLowerCase().replace(/^www\./, "") !== "github.com") {
+-      return null;
+-    }
+-
+-    const parts = url.pathname.split("/").filter(Boolean);
+-    if (parts.length < 2) return null;
+-
+-    const owner = parts[0];
+-    const repo = parts[1].replace(/\.git$/, "");
+-
+-    return {
+-      owner,
+-      repo,
+-      key: `${owner}/${repo}`,
+-      url: `https://github.com/${owner}/${repo}`,
+-    };
+-  } catch {
+-    return null;
+-  }
++  const { owner, repo, url } = parsed;
++  return { owner, repo, key: `${owner}/${repo}`, url };
+ }
+ 
+ export function normalizeDownloadUrl(downloadUrl) {
+diff --git a/packages/registry/src/source-repo.d.ts b/packages/registry/src/source-repo.d.ts
+new file mode 100644
+index 0000000000..cb1b0cebe2
+--- /dev/null
++++ b/packages/registry/src/source-repo.d.ts
+@@ -0,0 +1,6 @@
++export function parseGitHubRepoUrl(value: unknown): {
++  host: string;
++  owner: string;
++  repo: string;
++  url: string;
++} | null;
+diff --git a/packages/registry/src/source-repo.js b/packages/registry/src/source-repo.js
+new file mode 100644
+index 0000000000..9b20d21be4
+--- /dev/null
++++ b/packages/registry/src/source-repo.js
+@@ -0,0 +1,102 @@
++// Canonical parsing of a GitHub repository URL, shared by the registry content
++// builder and the website's source-repo signal lookup so the two never drift.
++//
++// Accepts the formats authors actually paste into `repoUrl`:
++//   - https/http, with or without a leading "www."
++//   - a trailing slash, a query string, or a fragment
++//   - deep paths (".../tree/main", ".../blob/...", ".../issues")
++//   - a ".git" suffix
++//   - the scp/SSH short form "git@github.com:owner/repo.git"
++//   - the "git+https://", "git://", and "ssh://git@github.com/..." schemes
++//
++// Returns the case-preserved owner/repo plus a canonical https URL, or null.
++// Callers derive their own dedup key from `owner`/`repo` (the registry keeps the
++// original case; the website lowercases) so this module never dictates casing.
++
++const GITHUB_HOST = "github.com";
++
++// GitHub usernames/orgs: alphanumeric with single internal hyphens.
++const OWNER_PATTERN = /^[A-Za-z0-9](?:[A-Za-z0-9-]*[A-Za-z0-9])?$/;
++// GitHub repository names: alphanumeric plus "-", "_", and ".".
++const REPO_PATTERN = /^[A-Za-z0-9._-]+$/;
++
++// First path segments that are GitHub product surfaces, never repo owners.
++// GitHub reserves these, so "github.com/sponsors/x" is never a repository.
++const RESERVED_OWNERS = new Set([
++  "about",
++  "apps",
++  "collections",
++  "explore",
++  "marketplace",
++  "notifications",
++  "orgs",
++  "pulls",
++  "settings",
++  "sponsors",
++  "topics",
++]);
++
++// Strip a single leading "www." so the www alias resolves to the bare host,
++// while other subdomains (gist., api., raw.) stay distinct and get rejected.
++function normalizeHost(host) {
++  return String(host).toLowerCase().replace(/^www\./, "");
++}
++
++// Pull "owner" and "repo" from the first two non-empty path segments, dropping a
++// trailing ".git". Deep paths (tree/blob/issues) keep their owner/repo prefix.
++function ownerRepoFromPath(pathname) {
++  const parts = String(pathname)
++    .split("/")
++    .filter(Boolean);
++  if (parts.length < 2) return null;
++  return { owner: parts[0], repo: parts[1].replace(/\.git$/i, "") };
++}
++
++// Parse the scp short form "user@host:owner/repo(.git)", which is not a URL and
++// therefore cannot go through the URL parser.
++function fromScpLike(value) {
++  const match = /^[^/@\s]+@([^:/\s]+):(.+)$/.exec(value);
++  if (!match) return null;
++  const rest = match[2].replace(/\/+$/, "");
++  const segments = rest.split("/").filter(Boolean);
++  if (segments.length < 2) return null;
++  return {
++    host: normalizeHost(match[1]),
++    owner: segments[0],
++    repo: segments[1].replace(/\.git$/i, ""),
++  };
++}
++
++/**
++ * Parse a GitHub repository reference into its canonical parts.
++ *
++ * @param {unknown} value A repo URL in any of the supported formats.
++ * @returns {{ host: string, owner: string, repo: string, url: string } | null}
++ */
++export function parseGitHubRepoUrl(value) {
++  const raw = String(value ?? "").trim();
++  if (!raw) return null;
++
++  let parsed = fromScpLike(raw);
++
++  if (!parsed) {
++    let url;
++    try {
++      // Drop a "git+" prefix so "git+https://..." parses; "git://" and "ssh://"
++      // are already valid URL schemes that keep their host and path.
++      url = new URL(raw.replace(/^git\+/i, ""));
++    } catch {
++      return null;
++    }
++    const ownerRepo = ownerRepoFromPath(url.pathname);
++    if (!ownerRepo) return null;
++    parsed = { host: normalizeHost(url.hostname), ...ownerRepo };
++  }
++
++  const { host, owner, repo } = parsed;
++  if (host !== GITHUB_HOST) return null;
++  if (RESERVED_OWNERS.has(owner.toLowerCase())) return null;
++  if (!OWNER_PATTERN.test(owner) || !REPO_PATTERN.test(repo)) return null;
++
++  return { host, owner, repo, url: `https://github.com/${owner}/${repo}` };
++}
+diff --git a/tests/source-repo.test.ts b/tests/source-repo.test.ts
+new file mode 100644
+index 0000000000..613b9085ea
+--- /dev/null
++++ b/tests/source-repo.test.ts
+@@ -0,0 +1,71 @@
++import { describe, expect, it } from "vitest";
++
++import { parseGitHubRepoUrl } from "@heyclaude/registry/source-repo";
++
++describe("parseGitHubRepoUrl (canonical source-repo parser)", () => {
++  const canonical = {
++    host: "github.com",
++    owner: "OpenAI",
++    repo: "whisper",
++    url: "https://github.com/OpenAI/whisper",
++  };
++
++  it("parses the common https forms to the same canonical repo", () => {
++    for (const input of [
++      "https://github.com/OpenAI/whisper",
++      "https://github.com/OpenAI/whisper.git",
++      "https://github.com/OpenAI/whisper/",
++      "http://github.com/OpenAI/whisper",
++      "https://www.github.com/OpenAI/whisper",
++      "https://github.com/OpenAI/whisper/tree/main/src",
++      "https://github.com/OpenAI/whisper?tab=readme#install",
++    ]) {
++      expect(parseGitHubRepoUrl(input)).toEqual(canonical);
++    }
++  });
++
++  it("parses the scp/ssh short form and the git+/git:// schemes", () => {
++    for (const input of [
++      "git@github.com:OpenAI/whisper.git",
++      "git@github.com:OpenAI/whisper",
++      "ssh://git@github.com/OpenAI/whisper.git",
++      "git+https://github.com/OpenAI/whisper.git",
++      "git://github.com/OpenAI/whisper.git",
++    ]) {
++      expect(parseGitHubRepoUrl(input)).toEqual(canonical);
++    }
++  });
++
++  it("preserves owner/repo case in the parsed result", () => {
++    expect(
++      parseGitHubRepoUrl("https://github.com/Microsoft/TypeScript"),
++    ).toEqual({
++      host: "github.com",
++      owner: "Microsoft",
++      repo: "TypeScript",
++      url: "https://github.com/Microsoft/TypeScript",
++    });
++  });
++
++  it("rejects non-github hosts and other github subdomains", () => {
++    expect(parseGitHubRepoUrl("https://example.com/OpenAI/whisper")).toBeNull();
++    expect(
++      parseGitHubRepoUrl("https://gist.github.com/OpenAI/whisper"),
++    ).toBeNull();
++    expect(
++      parseGitHubRepoUrl(
++        "https://raw.githubusercontent.com/OpenAI/whisper/main/x",
++      ),
++    ).toBeNull();
++  });
++
++  it("rejects reserved GitHub product roots and malformed input", () => {
++    expect(parseGitHubRepoUrl("https://github.com/sponsors/OpenAI")).toBeNull();
++    expect(parseGitHubRepoUrl("https://github.com/orgs/OpenAI")).toBeNull();
++    expect(parseGitHubRepoUrl("https://github.com/OpenAI")).toBeNull();
++    expect(parseGitHubRepoUrl("https://github.com/Open AI/whisper")).toBeNull();
++    expect(parseGitHubRepoUrl("")).toBeNull();
++    expect(parseGitHubRepoUrl(null)).toBeNull();
++    expect(parseGitHubRepoUrl("not a url")).toBeNull();
++  });
++});

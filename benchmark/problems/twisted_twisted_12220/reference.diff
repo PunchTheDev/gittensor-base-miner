@@ -1,0 +1,247 @@
+diff --git a/.github/workflows/test.yaml b/.github/workflows/test.yaml
+index 23fadfc3515..9dc547b7868 100644
+--- a/.github/workflows/test.yaml
++++ b/.github/workflows/test.yaml
+@@ -381,7 +381,7 @@ jobs:
+     - name: Install dependencies
+       run: |
+         python -m pip install --upgrade pip
+-        python -m pip install . pytest pytest-codspeed pytest-cov pytest-benchmark
++        python -m pip install '.[tls,conch,http2]' pytest pytest-codspeed pytest-cov pytest-benchmark
+ 
+     - name: Run benchmarks
+       uses: CodSpeedHQ/action@v3
+diff --git a/benchmarks/test_conch_ssh.py b/benchmarks/test_conch_ssh.py
+new file mode 100644
+index 00000000000..4b756de3216
+--- /dev/null
++++ b/benchmarks/test_conch_ssh.py
+@@ -0,0 +1,96 @@
++# Copyright (c) Twisted Matrix Laboratories.
++# See LICENSE for details.
++
++"""
++Benchmark for SSH connection setup between a Conch client and server using RSA
++keys.
++"""
++from twisted.conch.ssh.factory import SSHFactory
++from twisted.conch.ssh.keys import Key
++from twisted.conch.ssh.transport import SSHClientTransport
++from twisted.internet import reactor
++from twisted.internet.defer import Deferred, succeed
++from twisted.internet.endpoints import (
++    TCP4ClientEndpoint,
++    TCP4ServerEndpoint,
++    connectProtocol,
++)
++from twisted.internet.testing import _benchmarkWithReactor as benchmarkWithReactor
++
++PUBLIC_KEY = (
++    b"ssh-rsa AAAAB3NzaC1yc2EAAAABIwAAAGEArzJx8OYOnJmzf4tfBEvLi8DVPrJ3/c9k2I/Az6"
++    b"4fxjHf9imyRJbixtQhlH9lfNjUIx+4LmrJH5QNRsFporcHDKOTwTTYLh5KmRpslkYHRivcJSkb"
++    b"h/C+BR3utDS555mV"
++)
++
++PRIVATE_KEY = b"""-----BEGIN RSA PRIVATE KEY-----
++MIIByAIBAAJhAK8ycfDmDpyZs3+LXwRLy4vA1T6yd/3PZNiPwM+uH8Yx3/YpskSW
++4sbUIZR/ZXzY1CMfuC5qyR+UDUbBaaK3Bwyjk8E02C4eSpkabJZGB0Yr3CUpG4fw
++vgUd7rQ0ueeZlQIBIwJgbh+1VZfr7WftK5lu7MHtqE1S1vPWZQYE3+VUn8yJADyb
++Z4fsZaCrzW9lkIqXkE3GIY+ojdhZhkO1gbG0118sIgphwSWKRxK0mvh6ERxKqIt1
++xJEJO74EykXZV4oNJ8sjAjEA3J9r2ZghVhGN6V8DnQrTk24Td0E8hU8AcP0FVP+8
++PQm/g/aXf2QQkQT+omdHVEJrAjEAy0pL0EBH6EVS98evDCBtQw22OZT52qXlAwZ2
++gyTriKFVoqjeEjt3SZKKqXHSApP/AjBLpF99zcJJZRq2abgYlf9lv1chkrWqDHUu
++DZttmYJeEfiFBBavVYIF1dOlZT0G8jMCMBc7sOSZodFnAiryP+Qg9otSBjJ3bQML
++pSTqy7c3a2AScC/YyOwkDaICHnnD3XyjMwIxALRzl0tQEKMXs6hH8ToUdlLROCrP
++EhQ0wahUTCk1gKA4uPD6TMTChavbh4K63OvbKg==
++-----END RSA PRIVATE KEY-----"""
++
++
++class BenchmarkSSHClientTransport(SSHClientTransport):
++    """
++    The client used in the tests.
++    """
++
++    def verifyHostKey(self, hostKey, fingerprint):
++        """
++        For this test, we don't validate the server identity.
++        """
++        return succeed(True)
++
++    def connectionSecure(self):
++        """
++        As soon as the SSH handshake is done, we disconnect,
++        without requesting for any SSH service.
++        """
++        self.transport.loseConnection()
++
++    def connectionLost(self, reason):
++        self.factory.clientDisconnected.callback(None)
++
++
++class BenchmarkSSHServerFactory(SSHFactory):
++    """
++    A simple SSH server factory with static RSA keys.
++    """
++
++    publicKeys = {b"ssh-rsa": Key.fromString(data=PUBLIC_KEY)}
++    privateKeys = {b"ssh-rsa": Key.fromString(data=PRIVATE_KEY)}
++
++    def __init__(self):
++        # Called by the client once disconnected.
++        self.clientDisconnected = Deferred()
++
++
++@benchmarkWithReactor
++async def test_connect_and_disconnect():
++    """
++    This is the test for key exchange for both client and server.
++    Once KEX is done the client disconnects.
++    """
++    serverFactory = BenchmarkSSHServerFactory()
++    serverEndpoint = TCP4ServerEndpoint(reactor, 0)
++    serverPort = await serverEndpoint.listen(serverFactory)
++
++    clientProtocol = BenchmarkSSHClientTransport()
++    clientProtocol.factory = serverFactory
++
++    clientEndpoint = TCP4ClientEndpoint(
++        reactor,
++        "127.0.0.1",
++        serverPort.getHost().port,
++        timeout=5,
++    )
++    await connectProtocol(clientEndpoint, clientProtocol)
++    await serverFactory.clientDisconnected
++    await serverPort.stopListening()
+diff --git a/src/twisted/internet/testing.py b/src/twisted/internet/testing.py
+index 2c372495844..6563184edf9 100644
+--- a/src/twisted/internet/testing.py
++++ b/src/twisted/internet/testing.py
+@@ -9,7 +9,18 @@
+ 
+ from io import BytesIO
+ from socket import AF_INET, AF_INET6
+-from typing import Callable, Iterator, Sequence, overload
++from time import time
++from typing import (
++    Any,
++    Callable,
++    Coroutine,
++    Generator,
++    Iterator,
++    Sequence,
++    TypeVar,
++    Union,
++    overload,
++)
+ 
+ from zope.interface import implementedBy, implementer
+ from zope.interface.verify import verifyClass
+@@ -19,7 +30,7 @@
+ from twisted.internet import address, error, protocol, task
+ from twisted.internet.abstract import _dataMustBeBytes, isIPv6Address
+ from twisted.internet.address import IPv4Address, IPv6Address, UNIXAddress
+-from twisted.internet.defer import Deferred
++from twisted.internet.defer import Deferred, ensureDeferred, succeed
+ from twisted.internet.error import UnsupportedAddressFamily
+ from twisted.internet.interfaces import (
+     IConnector,
+@@ -967,3 +978,95 @@ def createWithCleanup(cls, testInstance: TestCase, publisher: LogPublisher) -> S
+         publisher.addObserver(obs)
+         testInstance.addCleanup(lambda: publisher.removeObserver(obs))
+         return obs
++
++
++_T = TypeVar("_T")
++
++
++def _benchmarkWithReactor(
++    test_target: Callable[
++        [],
++        Union[
++            Coroutine[Deferred[Any], Any, _T],
++            Generator[Deferred[Any], Any, _T],
++            Deferred[_T],
++        ],
++    ]
++) -> Callable[[Any], None]:  # pragma: no cover
++    """
++    Decorator for running a benchmark tests that loops the reactor.
++
++    This is designed to decorate test method executed using pytest and
++    pytest-benchmark.
++    """
++
++    def deferredWrapper():
++        return ensureDeferred(test_target())
++
++    def benchmark_test(benchmark: Any) -> None:
++        # Spinning up and spinning down the reactor adds quite a lot of
++        # overhead to the benchmarked function. So, make sure that the overhead
++        # isn't making the benchmark meaningless before we bother with any real
++        # benchmarking.
++        start = time()
++        _runReactor(lambda: succeed(None))
++        justReactorElapsed = time() - start
++
++        start = time()
++        _runReactor(deferredWrapper)
++        benchmarkElapsed = time() - start
++
++        if benchmarkElapsed / justReactorElapsed < 5:
++            raise RuntimeError(  # pragma: no cover
++                "The function you are benchmarking is fast enough that its "
++                "run time is being swamped by the startup/shutdown of the "
++                "reactor. Consider adding a for loop to the benchmark "
++                "function so it does the work a number of times."
++            )
++
++        benchmark(_runReactor, deferredWrapper)
++
++    return benchmark_test
++
++
++def _runReactor(callback: Callable[[], Deferred[_T]]) -> None:  # pragma: no cover
++    """
++    (re)Start a reactor that might have been previously started.
++    """
++    # Delay to import to prevent side-effect in normal tests that are
++    # expecting to import twisted.internet.testing while no reactor is
++    # installed.
++    from twisted.internet import reactor
++
++    errors: list[failure.Failure] = []
++
++    deferred = callback()
++    deferred.addErrback(errors.append)
++    deferred.addBoth(lambda _: reactor.callLater(0, _stopReactor, reactor))  # type: ignore[attr-defined]
++    reactor.run(installSignalHandlers=False)  # type: ignore[attr-defined]
++
++    if errors:  # pragma: no cover
++        # Make sure the test fails in a visible way:
++        errors[0].raiseException()
++
++
++def _stopReactor(reactor):  # pragma: no cover
++    """
++    Stop the reactor and allow it to be re-started later.
++    """
++    reactor.stop()
++    # Allow for on shutdown hooks to execute.
++    reactor.iterate()
++    # Since we're going to be poking the reactor's guts, let's make sure what
++    # we're doing is vaguely reasonable:
++    assert hasattr(reactor, "_startedBefore")
++    assert hasattr(reactor, "_started")
++    assert hasattr(reactor, "_justStopped")
++    assert hasattr(reactor, "running")
++    reactor._startedBefore = False
++    reactor._started = False
++    reactor._justStopped = False
++    reactor.running = False
++    # Start running has consumed the startup events, so we need
++    # to restore them.
++    reactor.addSystemEventTrigger("during", "startup", reactor._reallyStartRunning)
+diff --git a/src/twisted/newsfragments/12219.misc b/src/twisted/newsfragments/12219.misc
+new file mode 100644
+index 00000000000..e69de29bb2d

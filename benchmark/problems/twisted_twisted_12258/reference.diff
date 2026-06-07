@@ -1,0 +1,225 @@
+diff --git a/.github/workflows/test.yaml b/.github/workflows/test.yaml
+index 3b5cf9a7d55..8787ecdf88a 100644
+--- a/.github/workflows/test.yaml
++++ b/.github/workflows/test.yaml
+@@ -427,7 +427,7 @@ jobs:
+         # This makes sure that the benchmark tests always have 100% coverage.
+         # Make sure the include expression is escaped to prevent shell
+         # expansion.
+-        coverage report --fail-under=100 --include 'benchmarks/*'
++        coverage report --fail-under=100 --include 'benchmarks/*' --show-missing
+ 
+ 
+   static-checks:
+diff --git a/benchmarks/README.md b/benchmarks/README.md
+index b9b31ddf4a7..326c1b34ed1 100644
+--- a/benchmarks/README.md
++++ b/benchmarks/README.md
+@@ -13,6 +13,7 @@ Note that as of mid-2024, codspeed.io uses a simulated CPU (Cachegrind) to run t
+ ## Running benchmarks locally
+ 
+ You can run benchmarks locally by installing `pytest-benchmark` and then running `pytest benchmarks/`.
++`tox -e benchmark` does this automatically.
+ Unlike `pytest-codspeed`, the results are specific to your computer, but they're helpful for local before/after comparisons.
+ And `pytest-codspeed` outputs nothing when run locally, at least at the time of writing (May 2024).
+ 
+diff --git a/benchmarks/test_linereceiver.py b/benchmarks/test_linereceiver.py
+index 6a89c209e7d..82d07b6e561 100644
+--- a/benchmarks/test_linereceiver.py
++++ b/benchmarks/test_linereceiver.py
+@@ -5,8 +5,8 @@
+ import pytest
+ 
+ from twisted.internet.protocol import Protocol
++from twisted.internet.testing import StringTransport
+ from twisted.protocols.basic import LineOnlyReceiver, LineReceiver
+-from twisted.test.proto_helpers import StringTransport
+ 
+ 
+ def deliverData(protocol: Protocol, data: bytes, chunkSize: int) -> None:
+diff --git a/benchmarks/test_web_server.py b/benchmarks/test_web_server.py
+index 86e421ee76c..605ffaf8616 100644
+--- a/benchmarks/test_web_server.py
++++ b/benchmarks/test_web_server.py
+@@ -29,10 +29,22 @@ def render_GET(self, request):
+         return self.data
+ 
+ 
+-def test_http11_server_empty_request(benchmark):
++class ComplexData(Data):
++    """
++    Interact more with the request.
++    """
++
++    def render_GET(self, request):
++        request.setLastModified(123)
++        request.setETag(b"xykjlk")
++        _ = request.getRequestHostname()
++        request.setHost(b"example.com", 80)
++        return Data.render_GET(self, request)
++
++
++def http11_server_empty_request(resource, benchmark):
+     """Benchmark of handling an bodyless HTTP/1.1 request."""
+-    data = Data(b"This is a result hello hello" * 4, b"text/plain")
+-    factory = server.Site(data)
++    factory = server.Site(resource)
+ 
+     def go():
+         transport = StringTransport()
+@@ -53,3 +65,127 @@ def go():
+         assert b"200 OK" in transport.io.getvalue()
+ 
+     benchmark(go)
++
++
++def test_http11_server_empty_request(benchmark):
++    """Benchmark just returning some data."""
++    data = Data(b"This is a result hello hello" * 4, b"text/plain")
++    http11_server_empty_request(data, benchmark)
++
++
++def test_bit_more_complex_response(benchmark):
++    """Benchmark that also involves calling more request methods."""
++    data = ComplexData(b"This is a result hello hello" * 4, b"text/plain")
++    http11_server_empty_request(data, benchmark)
++
++
++def test_http11_server_many_headers(benchmark):
++    """Benchmark handling of an HTTP/1.1 request with many headers."""
++    request = b"\r\n".join(
++        [
++            b"GET / HTTP/1.1",
++            b"Host: example.com",
++        ]
++        + [f"X-{name}: {name}".encode() for name in ("foo", "bar", "Baz", "biff")]
++        + [f"x-tab:   {name}\t{name}".encode() for name in ("x", "y", "z", "q")]
++        + [
++            f"Cookie:   {c}={c * 26}".encode()
++            for c in "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ"
++        ]
++        + [b"", b""]
++    )
++    data = Data(b"...\n", b"text/plain")
++    factory = server.Site(data)
++
++    def go():
++        transport = StringTransport()
++        protocol = factory.buildProtocol(None)
++        protocol.makeConnection(transport)
++        protocol.dataReceived(request)
++        assert b"200 OK" in transport.io.getvalue()
++
++    benchmark(go)
++
++
++def test_http11_server_chunked_request(benchmark):
++    """
++    Benchmark receipt of a largeish chunked request.
++    """
++    request = (
++        b"""\
++GET / HTTP/1.1
++Host: example.com
++user-agent: XXX
++Transfer-encoding: chunked
++
++""".replace(
++            b"\n", b"\r\n"
++        )
++        + b"d\r\nHello, world!\r\n" * 100
++        + b"0\r\n\r\n"
++    )
++    data = Data(b"Goodbye!\n", b"text/plain")
++    factory = server.Site(data)
++
++    def go():
++        transport = StringTransport()
++        protocol = factory.buildProtocol(None)
++        protocol.makeConnection(transport)
++        protocol.dataReceived(request)
++        assert transport.io.getvalue().startswith(b"HTTP/1.1 200 ")
++
++    benchmark(go)
++
++
++class Chunker(resource.Resource):
++    """
++    Static data that is written out in chunks.
++    """
++
++    isLeaf = True  # no getChild
++
++    def __init__(self, chunks, type):
++        resource.Resource.__init__(self)
++        self.chunks = chunks
++        self.type = type
++
++    def render_GET(self, request):
++        request.setHeader(b"Content-Type", self.type)
++        for chunk in self.chunks:
++            request.write(chunk)
++        request.finish()
++        return server.NOT_DONE_YET
++
++
++def test_http11_server_chunked_response(benchmark):
++    """
++    Benchmark generation of a largeish chunked response.
++    """
++    data = Chunker(
++        [
++            bytes([c]) * 1024
++            for c in b"abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ"
++        ],
++        b"application/octet-stream",
++    )
++    factory = server.Site(data)
++
++    def go():
++        transport = StringTransport()
++        protocol = factory.buildProtocol(None)
++        protocol.makeConnection(transport)
++        protocol.dataReceived(
++            b"""\
++GET / HTTP/1.1
++host: example.com
++accept: *
++
++""".replace(
++                b"\n", b"\r\n"
++            )
++        )
++        response = transport.io.getvalue()
++        assert response.startswith(b"HTTP/1.1 200 ")
++        assert b"Transfer-Encoding: chunked" in response[:1024]
++
++    benchmark(go)
+diff --git a/src/twisted/web/newsfragments/12257.misc b/src/twisted/web/newsfragments/12257.misc
+new file mode 100644
+index 00000000000..e69de29bb2d
+diff --git a/tox.ini b/tox.ini
+index 3117ef1452a..227916f3753 100644
+--- a/tox.ini
++++ b/tox.ini
+@@ -133,6 +133,20 @@ commands =
+     newsfragment: python -m towncrier check --compare-with=origin/trunk
+ 
+ 
++[testenv:benchmark]
++description = Run the benchmarks.
++
++deps =
++    pytest-benchmark
++
++extras =
++    all_non_platform
++
++commands =
++    pytest benchmarks/ {posargs}
++
++
++
+ [testenv:towncrier]
+ description = Create the release notes from the current fragment files found in the source tree.
+ 

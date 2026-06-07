@@ -1,0 +1,141 @@
+diff --git a/crates/lobby-broker/src/broker.rs b/crates/lobby-broker/src/broker.rs
+index 3240935e3c..29acf207d1 100644
+--- a/crates/lobby-broker/src/broker.rs
++++ b/crates/lobby-broker/src/broker.rs
+@@ -331,6 +331,10 @@ impl Broker {
+             }
+         };
+ 
++        if conn.client_hello.is_none() {
++            return vec![error("ClientHello required before any other message")];
++        }
++
+         let mut out = Vec::new();
+ 
+         // Re-registration cleanup: drop a previously-owned entry first so a
+@@ -985,6 +989,19 @@ mod tests {
+         assert!(updated_pos < removed_pos, "Updated must precede Removed");
+     }
+ 
++    #[test]
++    fn create_without_client_hello_is_rejected() {
++        let env = FakeEnv::new();
++        let mut broker = Broker::new();
++        let mut conn = ConnState::default();
++        let out = create(&mut conn, &mut broker, &env);
++        assert!(matches!(
++            out.as_slice(),
++            [Outbound::ToSelf(LobbyServerMessage::Error { .. })]
++        ));
++        assert!(conn.host_game.is_none());
++    }
++
+     #[test]
+     fn create_without_peer_id_is_rejected() {
+         let env = FakeEnv::new();
+diff --git a/lobby-worker/src/hello-gate.ts b/lobby-worker/src/hello-gate.ts
+new file mode 100644
+index 0000000000..d7aac14232
+--- /dev/null
++++ b/lobby-worker/src/hello-gate.ts
+@@ -0,0 +1,57 @@
++// Mirrors phase-server `classify_hello_gate` for the Cloudflare DO shell.
++
++import { PROTOCOL_VERSION } from "./protocol";
++
++export const MIN_SUPPORTED_PROTOCOL = PROTOCOL_VERSION - 1;
++
++export type HelloGateOutcome =
++  | { kind: "accept" }
++  | { kind: "reject_handshake" }
++  | { kind: "reject_protocol"; client: number; server: number }
++  | { kind: "ignore" }
++  | { kind: "pass" };
++
++export interface ConnAttachment {
++  client_hello: { client_version: string; build_commit: string } | null;
++  subscribed: boolean;
++  host_game: string | null;
++  reservations: unknown[];
++}
++
++export function classifyHelloGate(
++  helloReceived: boolean,
++  frame: { type?: string; data?: Record<string, unknown> },
++): HelloGateOutcome {
++  if (frame.type === "ClientHello") {
++    if (!helloReceived) {
++      const protocolVersion = Number(frame.data?.protocol_version ?? 0);
++      if (
++        protocolVersion < MIN_SUPPORTED_PROTOCOL ||
++        protocolVersion > PROTOCOL_VERSION
++      ) {
++        return {
++          kind: "reject_protocol",
++          client: protocolVersion,
++          server: PROTOCOL_VERSION,
++        };
++      }
++      return { kind: "accept" };
++    }
++    return { kind: "ignore" };
++  }
++  if (!helloReceived) {
++    return { kind: "reject_handshake" };
++  }
++  return { kind: "pass" };
++}
++
++export function helloGateErrorMessage(outcome: HelloGateOutcome): string | null {
++  switch (outcome.kind) {
++    case "reject_handshake":
++      return "ClientHello required before any other message";
++    case "reject_protocol":
++      return `Protocol version mismatch: client=${outcome.client} server=${outcome.server}`;
++    default:
++      return null;
++  }
++}
+diff --git a/lobby-worker/src/lobby-do.ts b/lobby-worker/src/lobby-do.ts
+index 0a5bd6ee10..664166edb7 100644
+--- a/lobby-worker/src/lobby-do.ts
++++ b/lobby-worker/src/lobby-do.ts
+@@ -19,6 +19,11 @@
+ 
+ import wasmModule from "./broker-wasm-pkg/broker_bg.wasm";
+ import { initSync, WasmBroker } from "./broker-wasm-pkg/broker.js";
++import {
++  classifyHelloGate,
++  helloGateErrorMessage,
++  type ConnAttachment,
++} from "./hello-gate";
+ import { moderationErrorForLobbyFrame } from "./name-filter";
+ import { PROTOCOL_VERSION } from "./protocol";
+ 
+@@ -125,6 +130,26 @@ export class LobbyDO {
+       return;
+     }
+ 
++    let frame: { type?: string; data?: Record<string, unknown> };
++    try {
++      frame = JSON.parse(text) as { type?: string; data?: Record<string, unknown> };
++    } catch {
++      console.warn({ event: "lobby_frame_rejected", reason: "invalid_json" });
++      return;
++    }
++
++    const attachment = conn as ConnAttachment;
++    const gate = classifyHelloGate(attachment.client_hello != null, frame);
++    const gateError = helloGateErrorMessage(gate);
++    if (gateError) {
++      ws.send(JSON.stringify({ type: "Error", data: { message: gateError } }));
++      console.warn({ event: "lobby_hello_gate_rejected", reason: gate.kind });
++      return;
++    }
++    if (gate.kind === "ignore") {
++      return;
++    }
++
+     const result = JSON.parse(broker.handle(JSON.stringify(conn), text, Date.now())) as CallResult;
+ 
+     if (result.reject) {

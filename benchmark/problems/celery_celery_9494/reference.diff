@@ -1,0 +1,155 @@
+diff --git a/celery/app/log.py b/celery/app/log.py
+index 4c807f4e349..a4db1057791 100644
+--- a/celery/app/log.py
++++ b/celery/app/log.py
+@@ -18,6 +18,7 @@
+ from celery._state import get_current_task
+ from celery.exceptions import CDeprecationWarning, CPendingDeprecationWarning
+ from celery.local import class_property
++from celery.platforms import isatty
+ from celery.utils.log import (ColorFormatter, LoggingProxy, get_logger, get_multiprocessing_logger, mlevel,
+                               reset_multiprocessing_logger)
+ from celery.utils.nodenames import node_format
+@@ -203,7 +204,7 @@ def supports_color(self, colorize=None, logfile=None):
+         if colorize or colorize is None:
+             # Only use color if there's no active log file
+             # and stderr is an actual terminal.
+-            return logfile is None and sys.stderr.isatty()
++            return logfile is None and isatty(sys.stderr)
+         return colorize
+ 
+     def colored(self, logfile=None, enabled=None):
+diff --git a/celery/apps/worker.py b/celery/apps/worker.py
+index 8669e7d621e..5558dab8e5f 100644
+--- a/celery/apps/worker.py
++++ b/celery/apps/worker.py
+@@ -20,7 +20,7 @@
+ from celery import VERSION_BANNER, platforms, signals
+ from celery.app import trace
+ from celery.loaders.app import AppLoader
+-from celery.platforms import EX_FAILURE, EX_OK, check_privileges
++from celery.platforms import EX_FAILURE, EX_OK, check_privileges, isatty
+ from celery.utils import static, term
+ from celery.utils.debug import cry
+ from celery.utils.imports import qualname
+@@ -107,7 +107,7 @@ def on_after_init(self, purge=False, no_color=None,
+         super().setup_defaults(**kwargs)
+         self.purge = purge
+         self.no_color = no_color
+-        self._isatty = sys.stdout.isatty()
++        self._isatty = isatty(sys.stdout)
+         self.colored = self.app.log.colored(
+             self.logfile,
+             enabled=not no_color if no_color is not None else no_color
+diff --git a/celery/platforms.py b/celery/platforms.py
+index a9c30a3251e..c0d0438a78e 100644
+--- a/celery/platforms.py
++++ b/celery/platforms.py
+@@ -42,7 +42,7 @@
+     'DaemonContext', 'detached', 'parse_uid', 'parse_gid', 'setgroups',
+     'initgroups', 'setgid', 'setuid', 'maybe_drop_privileges', 'signals',
+     'signal_name', 'set_process_title', 'set_mp_process_title',
+-    'get_errno_name', 'ignore_errno', 'fd_by_path',
++    'get_errno_name', 'ignore_errno', 'fd_by_path', 'isatty',
+ )
+ 
+ # exitcodes
+@@ -95,6 +95,14 @@
+ SIGMAP = {getattr(_signal, name): name for name in SIGNAMES}
+ 
+ 
++def isatty(fh):
++    """Return true if the process has a controlling terminal."""
++    try:
++        return fh.isatty()
++    except AttributeError:
++        pass
++
++
+ def pyimplementation():
+     """Return string identifying the current Python implementation."""
+     if hasattr(_platform, 'python_implementation'):
+diff --git a/celery/utils/term.py b/celery/utils/term.py
+index 53236ad549d..ba6a3215fbc 100644
+--- a/celery/utils/term.py
++++ b/celery/utils/term.py
+@@ -165,7 +165,11 @@ def __add__(self, other: object) -> str:
+ 
+ 
+ def supports_images() -> bool:
+-    return sys.stdin.isatty() and ITERM_PROFILE is not None
++
++    try:
++        return sys.stdin.isatty() and bool(os.environ.get('ITERM_PROFILE'))
++    except AttributeError:
++        return False
+ 
+ 
+ def _read_as_base64(path: str) -> str:
+diff --git a/t/unit/utils/test_platforms.py b/t/unit/utils/test_platforms.py
+index fdac88288dc..ebbcdc236c2 100644
+--- a/t/unit/utils/test_platforms.py
++++ b/t/unit/utils/test_platforms.py
+@@ -13,9 +13,9 @@
+ from celery.exceptions import SecurityError, SecurityWarning
+ from celery.platforms import (ASSUMING_ROOT, ROOT_DISALLOWED, ROOT_DISCOURAGED, DaemonContext, LockFailed, Pidfile,
+                               _setgroups_hack, check_privileges, close_open_fds, create_pidlock, detached,
+-                              fd_by_path, get_fdmax, ignore_errno, initgroups, maybe_drop_privileges, parse_gid,
+-                              parse_uid, set_mp_process_title, set_pdeathsig, set_process_title, setgid, setgroups,
+-                              setuid, signals)
++                              fd_by_path, get_fdmax, ignore_errno, initgroups, isatty, maybe_drop_privileges,
++                              parse_gid, parse_uid, set_mp_process_title, set_pdeathsig, set_process_title, setgid,
++                              setgroups, setuid, signals)
+ from celery.utils.text import WhateverIO
+ from t.unit import conftest
+ 
+@@ -25,6 +25,13 @@
+     resource = None
+ 
+ 
++def test_isatty():
++    fh = Mock(name='fh')
++    assert isatty(fh) is fh.isatty()
++    fh.isatty.side_effect = AttributeError()
++    assert not isatty(fh)
++
++
+ class test_find_option_with_arg:
+ 
+     def test_long_opt(self):
+diff --git a/t/unit/utils/test_term.py b/t/unit/utils/test_term.py
+index 2261b59f8e3..1a505ca54e5 100644
+--- a/t/unit/utils/test_term.py
++++ b/t/unit/utils/test_term.py
+@@ -1,11 +1,13 @@
++import os
+ from base64 import b64encode
+ from tempfile import NamedTemporaryFile
++from unittest.mock import patch
+ 
+ import pytest
+ 
+ import t.skip
+ from celery.utils import term
+-from celery.utils.term import _read_as_base64, colored, fg
++from celery.utils.term import _read_as_base64, colored, fg, supports_images
+ 
+ 
+ @t.skip.if_win32
+@@ -70,3 +72,16 @@ def test_read_as_base64(self):
+             expected_result = b64encode(test_data).decode('ascii')
+ 
+             assert result == expected_result
++
++    @pytest.mark.parametrize('is_tty, iterm_profile, expected', [
++        (True, 'test_profile', True),
++        (False, 'test_profile', False),
++        (True, None, False),
++    ])
++    @patch('sys.stdin.isatty')
++    @patch.dict(os.environ, {'ITERM_PROFILE': 'test_profile'}, clear=True)
++    def test_supports_images(self, mock_isatty, is_tty, iterm_profile, expected):
++        mock_isatty.return_value = is_tty
++        if iterm_profile is None:
++            del os.environ['ITERM_PROFILE']
++        assert supports_images() == expected

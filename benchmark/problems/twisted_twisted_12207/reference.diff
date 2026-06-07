@@ -1,0 +1,2312 @@
+diff --git a/docs/core/howto/logger.rst b/docs/core/howto/logger.rst
+index d639c19d3ee..8df02aa40c0 100644
+--- a/docs/core/howto/logger.rst
++++ b/docs/core/howto/logger.rst
+@@ -101,26 +101,27 @@ For example:
+ This example will show the string "object with value 7 doing a task" because the ``log_source`` key is automatically set to the ``MyObject`` instance that the ``Logger`` is retrieved from.
+ 
+ 
+-Capturing Failures
+-~~~~~~~~~~~~~~~~~~
++Handling Failures
++~~~~~~~~~~~~~~~~~
+ 
+-:py:class:`Logger <twisted.logger.Logger>` provides a :py:meth:`failure <twisted.logger.Logger.failure>` method, which allows one to capture a :py:class:`Failure <twisted.python.failure.Failure>` object conveniently:
++:py:class:`Logger <twisted.logger.Logger>` provides a :py:meth:`failuresHandled <twisted.logger.Logger.failuresHandled>` method, which allows one to run some application code, then capture a :py:class:`Failure <twisted.python.failure.Failure>` in the log stream if that code raises an exception:
+ 
+ .. code-block:: python
+ 
+     from twisted.logger import Logger
+     log = Logger()
+ 
+-    try:
++    with log.failuresHandled("While doing some math:") as math:
+         1 / 0
+-    except BaseException:
+-        log.failure("Math is hard!")
++
++    if math.succeeded:
++        print("Surprisingly, division by zero is possible.")
+ 
+ The emitted event will have the ``"log_failure"`` key set, which is a :py:class:`Failure <twisted.python.failure.Failure>` that captures the exception.
+ This can be used by my observers to obtain a traceback.
+-For example, :py:class:`FileLogObserver <twisted.logger.FileLogObserver>` will append the traceback to it's output::
++For example, :py:class:`FileLogObserver <twisted.logger.FileLogObserver>` will append the traceback to its output::
+ 
+-    Math is hard!
++    While doing some math:
+ 
+     Traceback (most recent call last):
+     --- <exception caught here> ---
+@@ -128,10 +129,40 @@ For example, :py:class:`FileLogObserver <twisted.logger.FileLogObserver>` will a
+         1/0
+     exceptions.ZeroDivisionError: integer division or modulo by zero
+ 
+-Note that this API is meant to capture unexpected and unhandled errors (that is: bugs, which is why tracebacks are preserved).
++This API is meant to capture **unexpected and otherwise unhandled** errors (in other words: bugs, which is why tracebacks are preserved).
+ As such, it defaults to logging at the :py:attr:`critical <twisted.logger.LogLevel.critical>` level.
+-It is generally more appropriate to instead use `log.error()` when logging an expected error condition that was appropriately handled by the software.
++It is generally more appropriate to instead use ``log.error()`` when logging an expected type of error condition that was fully handled by your code.
++To put it differently, use ``.failuresHandled(...)`` for handling bugs in your code, and ``.error()`` for handling errors in input data, user configuration, and the like.
++
++The ``as`` clause binds an :py:class:`Operation <twisted.logger.Operation>` object that allows you to determine whether the code under the ``with`` block succeeded or failed, and inspect its failure if so.
++For more performance-sensitive applications, a simpler context manager which does *not* provide an :py:class:`Operation <twisted.logger.Operation>` is also available, :py:meth:`failureHandler <twisted.logger.Logger.failureHandler>`.
++Since :py:meth:`failureHandler <twisted.logger.Logger.failureHandler>` is designed to be created once and used repeatedly, it does not allow for passing any placeholder parameters or inspecting the result of the operation.  Using it would look more like this:
++
++.. code-block:: python
++
++     from twisted.logger import Logger
++     log = Logger()
++
++     dividingByZero = log.failureHandler("While doing some math:")
++
++     def later() -> None:
++         with dividingByZero:
++             1 / 0
++
++``.failuresHandled(...)`` and ``.failureHandler(...)`` are intended for frameworks (such as Twisted itself) which call out to “application code”, where misbehavior on the part of the application should not corrupt the state of the framework itself.
++For example, a buggy protocol implementation will not cause the entire Twisted reactor to crash and exit, it will log a traceback, disconnect the protocol which caused the exception, and keep running.
++
++Therefore, most of the time, you should be accepting the behavior of ``failuresHandled``, of catching everything via ``BaseException``.
++However, if you require more customization of behavior beyond catching everything and continuing on, you can use :py:meth:`failure <twisted.logger.Logger.failure>` directly, like so:
++
++.. code-block:: python
++
++    try:
++        1 / 0
++    except ZeroDivisionError:
++        log.failure("While dividing by zero, specifically:")
+ 
++The ``.failure`` method requires a log message, but can discover an exception on the stack automatically, so if it is called from within an ``except:`` block it will do the right thing.
+ 
+ Namespaces
+ ~~~~~~~~~~
+diff --git a/src/twisted/internet/_baseprocess.py b/src/twisted/internet/_baseprocess.py
+index 83bc08fdc0b..142273143ae 100644
+--- a/src/twisted/internet/_baseprocess.py
++++ b/src/twisted/internet/_baseprocess.py
+@@ -9,11 +9,13 @@
+ 
+ from typing import Optional
+ 
++from twisted.logger import Logger
+ from twisted.python.deprecate import getWarningMethod
+ from twisted.python.failure import Failure
+-from twisted.python.log import err
+ from twisted.python.reflect import qual
+ 
++_log = Logger()
++
+ _missingProcessExited = (
+     "Since Twisted 8.2, IProcessProtocol.processExited "
+     "is required.  %s must implement it."
+@@ -39,10 +41,8 @@ def _callProcessExited(self, reason):
+                 stacklevel=0,
+             )
+         else:
+-            try:
++            with _log.failuresHandled("while calling processExited:"):
+                 processExited(Failure(reason))
+-            except BaseException:
+-                err(None, "unexpected error in processExited")
+ 
+     def processEnded(self, status):
+         """
+@@ -62,7 +62,5 @@ def maybeCallProcessEnded(self):
+             reason = self._getReason(self.status)
+             proto = self.proto
+             self.proto = None
+-            try:
++            with _log.failuresHandled("while calling processEnded:"):
+                 proto.processEnded(Failure(reason))
+-            except BaseException:
+-                err(None, "unexpected error in processEnded")
+diff --git a/src/twisted/internet/_posixstdio.py b/src/twisted/internet/_posixstdio.py
+index b7ef9cdac39..e99920ead3f 100644
+--- a/src/twisted/internet/_posixstdio.py
++++ b/src/twisted/internet/_posixstdio.py
+@@ -10,11 +10,16 @@
+ 
+ Maintainer: James Y Knight
+ """
++from __future__ import annotations
+ 
+ from zope.interface import implementer
+ 
+-from twisted.internet import error, interfaces, process
+-from twisted.python import failure, log
++from twisted.internet import interfaces, process
++from twisted.internet.interfaces import IProtocol, IReactorFDSet
++from twisted.logger import Logger
++from twisted.python.failure import Failure
++
++_log = Logger()
+ 
+ 
+ @implementer(interfaces.IAddress)
+@@ -34,10 +39,16 @@ class StandardIO:
+     disconnected = False
+     disconnecting = False
+ 
+-    def __init__(self, proto, stdin=0, stdout=1, reactor=None):
++    def __init__(
++        self,
++        proto: IProtocol,
++        stdin: int = 0,
++        stdout: int = 1,
++        reactor: IReactorFDSet | None = None,
++    ):
+         if reactor is None:
+-            from twisted.internet import reactor
+-        self.protocol = proto
++            from twisted.internet import reactor  # type:ignore[assignment]
++        self.protocol: IProtocol = proto
+ 
+         self._writer = process.ProcessWriter(reactor, self, "write", stdout)
+         self._reader = process.ProcessReader(reactor, self, "read", stdin)
+@@ -75,21 +86,16 @@ def getHost(self):
+         return PipeAddress()
+ 
+     # Callbacks from process.ProcessReader/ProcessWriter
+-    def childDataReceived(self, fd, data):
++    def childDataReceived(self, fd: str, data: bytes) -> None:
+         self.protocol.dataReceived(data)
+ 
+-    def childConnectionLost(self, fd, reason):
++    def childConnectionLost(self, fd: str, reason: Failure) -> None:
+         if self.disconnected:
+             return
+-
+-        if reason.value.__class__ == error.ConnectionDone:
+-            # Normal close
+-            if fd == "read":
+-                self._readConnectionLost(reason)
+-            else:
+-                self._writeConnectionLost(reason)
++        if fd == "read":
++            self._readConnectionLost(reason)
+         else:
+-            self.connectionLost(reason)
++            self._writeConnectionLost(reason)
+ 
+     def connectionLost(self, reason):
+         self.disconnected = True
+@@ -99,7 +105,7 @@ def connectionLost(self, reason):
+         _writer = self._writer
+         protocol = self.protocol
+         self._reader = self._writer = None
+-        self.protocol = None
++        self.protocol = None  # type:ignore[assignment]
+ 
+         if _writer is not None and not _writer.disconnected:
+             _writer.connectionLost(reason)
+@@ -107,12 +113,10 @@ def connectionLost(self, reason):
+         if _reader is not None and not _reader.disconnected:
+             _reader.connectionLost(reason)
+ 
+-        try:
++        with _log.failuresHandled("while calling stdio connectionLost:"):
+             protocol.connectionLost(reason)
+-        except BaseException:
+-            log.err()
+ 
+-    def _writeConnectionLost(self, reason):
++    def _writeConnectionLost(self, reason: Failure) -> None:
+         self._writer = None
+         if self.disconnecting:
+             self.connectionLost(reason)
+@@ -120,21 +124,21 @@ def _writeConnectionLost(self, reason):
+ 
+         p = interfaces.IHalfCloseableProtocol(self.protocol, None)
+         if p:
+-            try:
++            with _log.failuresHandled(
++                "while calling stdio writeConnectionLost:"
++            ) as wcl:
+                 p.writeConnectionLost()
+-            except BaseException:
+-                log.err()
+-                self.connectionLost(failure.Failure())
++            if wcl.failed:
++                self.connectionLost(wcl.failure)
+ 
+-    def _readConnectionLost(self, reason):
++    def _readConnectionLost(self, reason: Failure) -> None:
+         self._reader = None
+         p = interfaces.IHalfCloseableProtocol(self.protocol, None)
+         if p:
+-            try:
++            with _log.failuresHandled("while calling stdio readConnectionLost:") as rcl:
+                 p.readConnectionLost()
+-            except BaseException:
+-                log.err()
+-                self.connectionLost(failure.Failure())
++            if rcl.failed:
++                self.connectionLost(rcl.failure)
+         else:
+             self.connectionLost(reason)
+ 
+diff --git a/src/twisted/internet/_producer_helpers.py b/src/twisted/internet/_producer_helpers.py
+index c2136e05091..7583a9e4594 100644
+--- a/src/twisted/internet/_producer_helpers.py
++++ b/src/twisted/internet/_producer_helpers.py
+@@ -1,4 +1,4 @@
+-# -*- test-case-name: twisted.test.test_producer_helpers -*-
++# -*- test-case-name: twisted.protocols.test.test_tls,twisted.web.test.test_http2 -*-
+ # Copyright (c) Twisted Matrix Laboratories.
+ # See LICENSE for details.
+ 
+@@ -12,8 +12,9 @@
+ 
+ from twisted.internet.interfaces import IPushProducer
+ from twisted.internet.task import cooperate
+-from twisted.python import log
+-from twisted.python.reflect import safe_str
++from twisted.logger import Logger
++
++_log = Logger()
+ 
+ # This module exports nothing public, it's for internal Twisted use only.
+ __all__: List[str] = []
+@@ -60,26 +61,19 @@ def _pull(self):
+         unregistered, which should result in streaming stopping.
+         """
+         while True:
+-            try:
++            with _log.failuresHandled(
++                "while calling resumeProducing on {producer}", producer=self._producer
++            ) as op:
+                 self._producer.resumeProducing()
+-            except BaseException:
+-                log.err(
+-                    None,
+-                    "%s failed, producing will be stopped:"
+-                    % (safe_str(self._producer),),
+-                )
+-                try:
++            if op.failed:
++                with _log.failuresHandled(
++                    "while calling unregisterProducer on {consumer}",
++                    consumer=self._consumer,
++                ) as handlingop:
+                     self._consumer.unregisterProducer()
++                if handlingop.failed:
+                     # The consumer should now call stopStreaming() on us,
+                     # thus stopping the streaming.
+-                except BaseException:
+-                    # Since the consumer blew up, we may not have had
+-                    # stopStreaming() called, so we just stop on our own:
+-                    log.err(
+-                        None,
+-                        "%s failed to unregister producer:"
+-                        % (safe_str(self._consumer),),
+-                    )
+                     self._finished = True
+                     return
+             yield None
+diff --git a/src/twisted/internet/_sslverify.py b/src/twisted/internet/_sslverify.py
+index 0da15769b62..2095fe69eca 100644
+--- a/src/twisted/internet/_sslverify.py
++++ b/src/twisted/internet/_sslverify.py
+@@ -28,13 +28,16 @@
+     IOpenSSLClientConnectionCreator,
+     IOpenSSLContextFactory,
+ )
+-from twisted.python import log, util
++from twisted.logger import Logger
+ from twisted.python.compat import nativeString
+ from twisted.python.deprecate import _mutuallyExclusiveArguments, deprecated
+ from twisted.python.failure import Failure
+ from twisted.python.randbytes import secureRandom
++from twisted.python.util import nameToLabel
+ from ._idna import _idnaBytes
+ 
++_log = Logger()
++
+ 
+ class TLSVersion(Names):
+     """
+@@ -344,7 +347,7 @@ def uniqueValues(mapping):
+             return set(mapping.values())
+ 
+         for k in sorted(uniqueValues(_x509names)):
+-            label = util.nameToLabel(k)
++            label = nameToLabel(k)
+             lablen = max(len(label), lablen)
+             v = getattr(self, k, None)
+             if v is not None:
+@@ -1057,13 +1060,13 @@ def _tolerateErrors(wrapped):
+     @rtype: L{callable}
+     """
+ 
+-    def infoCallback(connection, where, ret):
+-        try:
+-            return wrapped(connection, where, ret)
+-        except BaseException:
+-            f = Failure()
+-            log.err(f, "Error during info_callback")
++    def infoCallback(connection: SSL.Connection, where: int, ret: int) -> object:
++        result = None
++        with _log.failuresHandled("Error during info_callback") as op:
++            result = wrapped(connection, where, ret)
++        if (f := op.failure) is not None:
+             connection.get_app_data().failVerification(f)
++        return result
+ 
+     return infoCallback
+ 
+diff --git a/src/twisted/internet/_threadedselect.py b/src/twisted/internet/_threadedselect.py
+index 8a53e4ca962..1c7db16b0a6 100644
+--- a/src/twisted/internet/_threadedselect.py
++++ b/src/twisted/internet/_threadedselect.py
+@@ -10,14 +10,14 @@
+ 
+ There are three things you'll need to do to use this reactor.
+ 
+-Install the reactor at the beginning of your program, before importing
+-the rest of Twisted::
++Install the reactor at the beginning of your program, before importing the rest
++of Twisted::
+ 
+     | from twisted.internet import _threadedselect
+     | _threadedselect.install()
+ 
+-Interleave this reactor with your foreign event loop, at some point after
+-your event loop is initialized::
++Interleave this reactor with your foreign event loop, at some point after your
++event loop is initialized::
+ 
+     | from twisted.internet import reactor
+     | reactor.interleave(foreignEventLoopWakerFunction)
+@@ -31,68 +31,113 @@
+ 
+ In order for Twisted to do its work in the main thread (the thread that
+ interleave is called from), a waker function is necessary.  The waker function
+-will be called from a "background" thread with one argument: func.
+-The waker function's purpose is to call func() from the main thread.
+-Many GUI toolkits ship with appropriate waker functions.
+-Some examples of this are wxPython's wx.callAfter (may be wxCallAfter in
+-older versions of wxPython) or PyObjC's PyObjCTools.AppHelper.callAfter.
+-These would be used in place of "foreignEventLoopWakerFunction" in the above
+-example.
++will be called from a "background" thread with one argument: func.  The waker
++function's purpose is to call func() from the main thread.  Many GUI toolkits
++ship with appropriate waker functions.  One example of this is wxPython's
++wx.callAfter (may be wxCallAfter in older versions of wxPython).  These would
++be used in place of "foreignEventLoopWakerFunction" in the above example.
+ 
+ The other integration point at which the foreign event loop and this reactor
+-must integrate is shutdown.  In order to ensure clean shutdown of Twisted,
+-you must allow for Twisted to come to a complete stop before quitting the
++must integrate is shutdown.  In order to ensure clean shutdown of Twisted, you
++must allow for Twisted to come to a complete stop before quitting the
+ application.  Typically, you will do this by setting up an after shutdown
+ trigger to stop your foreign event loop, and call reactor.stop() where you
+ would normally have initiated the shutdown procedure for the foreign event
+-loop.  Shutdown functions that could be used in place of
+-"foreignEventloopStop" would be the ExitMainLoop method of the wxApp instance
+-with wxPython, or the PyObjCTools.AppHelper.stopEventLoop function.
++loop.  Shutdown functions that could be used in place of "foreignEventloopStop"
++would be the ExitMainLoop method of the wxApp instance with wxPython.
+ """
++from __future__ import annotations
+ 
+-import select
+-import sys
+ from errno import EBADF, EINTR
+-from functools import partial
+ from queue import Empty, Queue
+ from threading import Thread
++from typing import Any, Callable
+ 
+ from zope.interface import implementer
+ 
++from twisted._threads import ThreadWorker
+ from twisted.internet import posixbase
+-from twisted.internet.interfaces import IReactorFDSet
+-from twisted.internet.posixbase import _NO_FILEDESC, _NO_FILENO
+-from twisted.internet.selectreactor import _select
+-from twisted.python import failure, log, threadable
++from twisted.internet.interfaces import IReactorFDSet, IReadDescriptor, IWriteDescriptor
++from twisted.internet.selectreactor import _preenDescriptors, _select
++from twisted.logger import Logger
++from twisted.python.log import callWithLogger as _callWithLogger
+ 
+-
+-def dictRemove(dct, value):
+-    try:
+-        del dct[value]
+-    except KeyError:
+-        pass
++_log = Logger()
+ 
+ 
+ def raiseException(e):
+     raise e
+ 
+ 
++def _threadsafeSelect(
++    timeout: float | None,
++    readmap: dict[int, IReadDescriptor],
++    writemap: dict[int, IWriteDescriptor],
++    handleResult: Callable[
++        [
++            list[int],
++            list[int],
++            dict[int, IReadDescriptor],
++            dict[int, IWriteDescriptor],
++            bool,
++        ],
++        None,
++    ],
++) -> None:
++    """
++    Invoke C{select}.  This will be called in a non-main thread, so it is very
++    careful to work only on integers and avoid calling any application code.
++    """
++    preen = False
++    r = []
++    w = []
++    while 1:
++        readints = readmap.keys()
++        writeints = writemap.keys()
++        try:
++            result = _select(readints, writeints, [], timeout)
++        except ValueError:
++            # Possible problems with file descriptors that were passed:
++            # ValueError may indicate that a file descriptor has gone negative.
++            preen = True
++            break
++        except OSError as se:
++            # The select() system call encountered an error.
++            if se.args[0] == EINTR:
++                # EINTR is hard to replicate in tests using an actual select(),
++                # and I don't want to dedicate effort to testing this function
++                # when it needs to be refactored with selectreactor.
++
++                return  # pragma: no cover
++            elif se.args[0] == EBADF:
++                preen = True
++                break
++            else:
++                # OK, I really don't know what's going on.  Blow up.  Never
++                # mind with the coverage here, since we are just trying to make
++                # sure we don't swallow an exception.
++                raise  # pragma: no cover
++        else:
++            r, w, ignored = result
++            break
++    handleResult(r, w, readmap, writemap, preen)
++
++
+ @implementer(IReactorFDSet)
+ class ThreadedSelectReactor(posixbase.PosixReactorBase):
+     """A threaded select() based reactor - runs on all POSIX platforms and on
+     Win32.
+     """
+ 
+-    def __init__(self):
+-        threadable.init(1)
+-        self.reads = {}
+-        self.writes = {}
+-        self.toThreadQueue = Queue()
+-        self.toMainThread = Queue()
+-        self.workerThread = None
+-        self.mainWaker = None
++    def __init__(
++        self, waker: Callable[[Callable[[], None]], None] | None = None
++    ) -> None:
++        self.reads: set[IReadDescriptor] = set()
++        self.writes: set[IWriteDescriptor] = set()
+         posixbase.PosixReactorBase.__init__(self)
+-        self.addSystemEventTrigger("after", "shutdown", self._mainLoopShutdown)
++        self._selectorThread: ThreadWorker | None = None
++        self.mainWaker = waker
++        self._iterationQueue: Queue[Callable[[], None]] | None = None
+ 
+     def wakeUp(self):
+         # we want to wake up from any thread
+@@ -103,205 +148,131 @@ def callLater(self, *args, **kw):
+         self.wakeUp()
+         return tple
+ 
+-    def _sendToMain(self, msg, *args):
+-        self.toMainThread.put((msg, args))
+-        if self.mainWaker is not None:
+-            self.mainWaker()
+-
+-    def _sendToThread(self, fn, *args):
+-        self.toThreadQueue.put((fn, args))
+-
+-    def _preenDescriptorsInThread(self):
+-        log.msg("Malformed file descriptor found.  Preening lists.")
+-        readers = self.reads.keys()
+-        writers = self.writes.keys()
+-        self.reads.clear()
+-        self.writes.clear()
+-        for selDict, selList in ((self.reads, readers), (self.writes, writers)):
+-            for selectable in selList:
+-                try:
+-                    select.select([selectable], [selectable], [selectable], 0)
+-                except BaseException:
+-                    log.msg("bad descriptor %s" % selectable)
+-                else:
+-                    selDict[selectable] = 1
++    def _doReadOrWrite(self, selectable: object, method: str) -> None:
++        with _log.failuresHandled(
++            "while handling selectable {sel}", sel=selectable
++        ) as op:
++            why = getattr(selectable, method)()
++        if (fail := op.failure) is not None:
++            why = fail.value
++        if why:
++            self._disconnectSelectable(selectable, why, method == "doRead")
+ 
+-    def _workerInThread(self):
+-        try:
+-            while 1:
+-                fn, args = self.toThreadQueue.get()
+-                fn(*args)
+-        except SystemExit:
+-            pass  # Exception indicates this thread should exit
+-        except BaseException:
+-            f = failure.Failure()
+-            self._sendToMain("Failure", f)
+-
+-    def _doSelectInThread(self, timeout):
+-        """Run one iteration of the I/O monitor loop.
+-
+-        This will run all selectables who had input or output readiness
+-        waiting for them.
+-        """
+-        reads = self.reads
+-        writes = self.writes
+-        while 1:
+-            try:
+-                r, w, ignored = _select(reads.keys(), writes.keys(), [], timeout)
+-                break
+-            except ValueError:
+-                # Possibly a file descriptor has gone negative?
+-                log.err()
+-                self._preenDescriptorsInThread()
+-            except TypeError:
+-                # Something *totally* invalid (object w/o fileno, non-integral
+-                # result) was passed
+-                log.err()
+-                self._preenDescriptorsInThread()
+-            except OSError as se:
+-                # select(2) encountered an error
+-                if se.args[0] in (0, 2):
+-                    # windows does this if it got an empty list
+-                    if (not reads) and (not writes):
+-                        return
+-                    else:
+-                        raise
+-                elif se.args[0] == EINTR:
++    def _selectOnce(self, timeout: float | None, keepGoing: bool) -> None:
++        reads: dict[int, Any] = {}
++        writes: dict[int, Any] = {}
++        for isRead, fdmap, d in [
++            (True, self.reads, reads),
++            (False, self.writes, writes),
++        ]:
++            for each in fdmap:  # type:ignore[attr-defined]
++                d[each.fileno()] = each
++
++        mainWaker = self.mainWaker
++        assert mainWaker is not None, (
++            "neither .interleave() nor .mainLoop() / .run() called, "
++            "but we are somehow running the reactor"
++        )
++
++        def callReadsAndWrites(
++            r: list[int],
++            w: list[int],
++            readmap: dict[int, IReadDescriptor],
++            writemap: dict[int, IWriteDescriptor],
++            preen: bool,
++        ) -> None:
++            @mainWaker
++            def onMainThread() -> None:
++                if preen:
++                    _preenDescriptors(
++                        self.reads, self.writes, self._disconnectSelectable
++                    )
+                     return
+-                elif se.args[0] == EBADF:
+-                    self._preenDescriptorsInThread()
++                _drdw = self._doReadOrWrite
++
++                for readable in r:
++                    rselectable = readmap[readable]
++                    if rselectable in self.reads:
++                        _callWithLogger(rselectable, _drdw, rselectable, "doRead")
++
++                for writable in w:
++                    wselectable = writemap[writable]
++                    if wselectable in self.writes:
++                        _callWithLogger(wselectable, _drdw, wselectable, "doWrite")
++
++                self.runUntilCurrent()
++                if self._started and keepGoing:
++                    # see coverage note in .interleave()
++                    self._selectOnce(self.timeout(), True)  # pragma: no cover
+                 else:
+-                    # OK, I really don't know what's going on.  Blow up.
+-                    raise
+-        self._sendToMain("Notify", r, w)
+-
+-    def _process_Notify(self, r, w):
+-        reads = self.reads
+-        writes = self.writes
+-
+-        _drdw = self._doReadOrWrite
+-        _logrun = log.callWithLogger
+-        for selectables, method, dct in ((r, "doRead", reads), (w, "doWrite", writes)):
+-            for selectable in selectables:
+-                # if this was disconnected in another thread, kill it.
+-                if selectable not in dct:
+-                    continue
+-                # This for pausing input when we're not ready for more.
+-                _logrun(selectable, _drdw, selectable, method, dct)
+-
+-    def _process_Failure(self, f):
+-        f.raiseException()
+-
+-    _doIterationInThread = _doSelectInThread
+-
+-    def ensureWorkerThread(self):
+-        if self.workerThread is None or not self.workerThread.isAlive():
+-            self.workerThread = Thread(target=self._workerInThread)
+-            self.workerThread.start()
+-
+-    def doThreadIteration(self, timeout):
+-        self._sendToThread(self._doIterationInThread, timeout)
+-        self.ensureWorkerThread()
+-        msg, args = self.toMainThread.get()
+-        getattr(self, "_process_" + msg)(*args)
+-
+-    doIteration = doThreadIteration
+-
+-    def _interleave(self):
+-        while self.running:
+-            self.runUntilCurrent()
+-            t2 = self.timeout()
+-            t = self.running and t2
+-            self._sendToThread(self._doIterationInThread, t)
+-            yield None
+-            msg, args = self.toMainThread.get_nowait()
+-            getattr(self, "_process_" + msg)(*args)
+-
+-    def interleave(self, waker, *args, **kw):
++                    self._cleanUpThread()
++
++        if self._selectorThread is None:
++            self._selectorThread = ThreadWorker(
++                lambda target: Thread(target=target).start(), Queue()
++            )
++        self._selectorThread.do(
++            lambda: _threadsafeSelect(timeout, reads, writes, callReadsAndWrites)
++        )
++
++    def _cleanUpThread(self) -> None:
++        """
++        Ensure that the selector thread is stopped.
+         """
+-        interleave(waker) interleaves this reactor with the
+-        current application by moving the blocking parts of
+-        the reactor (select() in this case) to a separate
+-        thread.  This is typically useful for integration with
+-        GUI applications which have their own event loop
+-        already running.
++        oldThread, self._selectorThread = self._selectorThread, None
++        if oldThread is not None:
++            oldThread.quit()
++
++    def interleave(
++        self,
++        waker: Callable[[Callable[[], None]], None],
++        installSignalHandlers: bool = True,
++    ) -> None:
++        """
++        interleave(waker) interleaves this reactor with the current application
++        by moving the blocking parts of the reactor (select() in this case) to
++        a separate thread.  This is typically useful for integration with GUI
++        applications which have their own event loop already running.
+ 
+         See the module docstring for more information.
+         """
+-        self.startRunning(*args, **kw)
+-        loop = self._interleave()
+-
+-        def mainWaker(waker=waker, loop=loop):
+-            waker(partial(next, loop))
+-
+-        self.mainWaker = mainWaker
+-        next(loop)
+-        self.ensureWorkerThread()
+-
+-    def _mainLoopShutdown(self):
+-        self.mainWaker = None
+-        if self.workerThread is not None:
+-            self._sendToThread(raiseException, SystemExit)
+-            self.wakeUp()
+-            try:
+-                while 1:
+-                    msg, args = self.toMainThread.get_nowait()
+-            except Empty:
+-                pass
+-            self.workerThread.join()
+-            self.workerThread = None
+-        try:
+-            while 1:
+-                fn, args = self.toThreadQueue.get_nowait()
+-                if fn is self._doIterationInThread:
+-                    log.msg("Iteration is still in the thread queue!")
+-                elif fn is raiseException and args[0] is SystemExit:
+-                    pass
+-                else:
+-                    fn(*args)
+-        except Empty:
+-            pass
+-
+-    def _doReadOrWrite(self, selectable, method, dict):
+-        try:
+-            why = getattr(selectable, method)()
+-            handfn = getattr(selectable, "fileno", None)
+-            if not handfn:
+-                why = _NO_FILENO
+-            elif handfn() == -1:
+-                why = _NO_FILEDESC
+-        except BaseException:
+-            why = sys.exc_info()[1]
+-            log.err()
+-        if why:
+-            self._disconnectSelectable(selectable, why, method == "doRead")
+-
+-    def addReader(self, reader):
++        # TODO: This method is excluded from coverage because it only happens
++        # in the case where we are actually running on a foreign event loop,
++        # and twisted's test suite isn't set up that way.  It would be nice to
++        # add some dedicated tests for ThreadedSelectReactor that covered this
++        # case.
++        self.mainWaker = waker  # pragma: no cover
++        self.startRunning(installSignalHandlers)  # pragma: no cover
++        self._selectOnce(0.0, True)  # pragma: no cover
++
++    def addReader(self, reader: IReadDescriptor) -> None:
+         """Add a FileDescriptor for notification of data available to read."""
+-        self._sendToThread(self.reads.__setitem__, reader, 1)
++        self.reads.add(reader)
+         self.wakeUp()
+ 
+-    def addWriter(self, writer):
++    def addWriter(self, writer: IWriteDescriptor) -> None:
+         """Add a FileDescriptor for notification of data available to write."""
+-        self._sendToThread(self.writes.__setitem__, writer, 1)
++        self.writes.add(writer)
+         self.wakeUp()
+ 
+-    def removeReader(self, reader):
++    def removeReader(self, reader: IReadDescriptor) -> None:
+         """Remove a Selectable for notification of data available to read."""
+-        self._sendToThread(dictRemove, self.reads, reader)
++        if reader in self.reads:
++            self.reads.remove(reader)
+ 
+-    def removeWriter(self, writer):
++    def removeWriter(self, writer: IWriteDescriptor) -> None:
+         """Remove a Selectable for notification of data available to write."""
+-        self._sendToThread(dictRemove, self.writes, writer)
++        if writer in self.writes:
++            self.writes.remove(writer)
+ 
+-    def removeAll(self):
+-        return self._removeAll(self.reads, self.writes)
++    def removeAll(self) -> list[IReadDescriptor | IWriteDescriptor]:
++        return self._removeAll(self.reads, self.writes)  # type:ignore[no-any-return]
+ 
+-    def getReaders(self):
+-        return list(self.reads.keys())
++    def getReaders(self) -> list[IReadDescriptor]:
++        return list(self.reads)
+ 
+-    def getWriters(self):
+-        return list(self.writes.keys())
++    def getWriters(self) -> list[IWriteDescriptor]:
++        return list(self.writes)
+ 
+     def stop(self):
+         """
+@@ -311,18 +282,52 @@ def stop(self):
+         posixbase.PosixReactorBase.stop(self)
+         self.wakeUp()
+ 
+-    def run(self, installSignalHandlers=True):
+-        self.startRunning(installSignalHandlers=installSignalHandlers)
+-        self.mainLoop()
+-
+-    def mainLoop(self):
+-        q = Queue()
+-        self.interleave(q.put)
+-        while self.running:
+-            try:
+-                q.get()()
+-            except StopIteration:
+-                break
++    def crash(self):
++        posixbase.PosixReactorBase.crash(self)
++        self.wakeUp()
++
++    # The following methods are mostly for test-suite support, to make
++    # ThreadedSelectReactor behave like another reactor you might call run()
++    # on.
++    def _testMainLoopSetup(self) -> None:
++        """
++        Mostly for compliance with L{IReactorCore} and usability with the
++        tests, set up a fake blocking main-loop; make the "foreign" main loop
++        we are interfacing with be C{self.mainLoop()}, that is reading from a
++        basic Queue.
++        """
++        self._iterationQueue = Queue()
++        self.mainWaker = self._iterationQueue.put
++
++    def _uninstallHandler(self) -> None:
++        """
++        Handle uninstallation to ensure that cleanup is properly performed by
++        ReactorBuilder tests.
++        """
++        super()._uninstallHandler()
++        self._cleanUpThread()
++
++    def iterate(self, timeout: float = 0.0) -> None:
++        if self._iterationQueue is None and self.mainWaker is None:  # pragma: no branch
++            self._testMainLoopSetup()
++        self.wakeUp()
++        super().iterate(timeout)
++
++    def doIteration(self, timeout: float | None) -> None:
++        assert self._iterationQueue is not None
++        self._selectOnce(timeout, False)
++        try:
++            work = self._iterationQueue.get(timeout=timeout)
++        except Empty:
++            return
++        work()
++
++    def mainLoop(self) -> None:
++        """
++        This should not normally be run.
++        """
++        self._testMainLoopSetup()
++        super().mainLoop()
+ 
+ 
+ def install():
+diff --git a/src/twisted/internet/_win32stdio.py b/src/twisted/internet/_win32stdio.py
+index 104d65f348c..f6a80403d04 100644
+--- a/src/twisted/internet/_win32stdio.py
++++ b/src/twisted/internet/_win32stdio.py
+@@ -20,8 +20,11 @@
+     IPushProducer,
+     ITransport,
+ )
++from twisted.logger import Logger
+ from twisted.python.failure import Failure
+ 
++_log = Logger()
++
+ 
+ @implementer(IAddress)
+ class Win32PipeAddress:
+@@ -66,14 +69,20 @@ def dataReceived(self, data):
+         self.proto.dataReceived(data)
+ 
+     def readConnectionLost(self):
+-        if IHalfCloseableProtocol.providedBy(self.proto):
+-            self.proto.readConnectionLost()
++        with _log.failuresHandled("read connection lost") as op:
++            if IHalfCloseableProtocol.providedBy(self.proto):
++                self.proto.readConnectionLost()
+         self.checkConnLost()
++        if not op.succeeded and not self.disconnecting:
++            self.loseConnection()
+ 
+     def writeConnectionLost(self):
+-        if IHalfCloseableProtocol.providedBy(self.proto):
+-            self.proto.writeConnectionLost()
++        with _log.failuresHandled("write connection lost") as op:
++            if IHalfCloseableProtocol.providedBy(self.proto):
++                self.proto.writeConnectionLost()
+         self.checkConnLost()
++        if not op.succeeded and not self.disconnecting:
++            self.loseConnection()
+ 
+     connsLost = 0
+ 
+diff --git a/src/twisted/internet/base.py b/src/twisted/internet/base.py
+index f039dfe5c4e..c807f418731 100644
+--- a/src/twisted/internet/base.py
++++ b/src/twisted/internet/base.py
+@@ -56,8 +56,10 @@
+     _ISupportsExitSignalCapturing,
+ )
+ from twisted.internet.protocol import ClientFactory
+-from twisted.python import log, reflect
++from twisted.logger import Logger
++from twisted.python import reflect
+ from twisted.python.failure import Failure
++from twisted.python.log import callWithLogger as _callWithLogger
+ from twisted.python.runtime import platform, seconds as runtimeSeconds
+ from ._signals import SignalHandling, _WithoutSignalHandling, _WithSignalHandling
+ 
+@@ -73,6 +75,14 @@
+ else:
+     ThreadPool = None  # type: ignore[misc, assignment]
+ 
++_log = Logger()
++
++# Pre-allocate some static application-code failure logging handlers so that we
++# do not need to allocate them in performance-sensitive bits of code below.
++_topHandler = _log.failureHandler("Unexpected error in main loop")
++_threadCallHandler = _log.failureHandler("while calling from thread")
++_systemEventHandler = _log.failureHandler("While calling system event trigger handler")
++
+ 
+ @implementer(IDelayedCall)
+ class DelayedCall:
+@@ -494,13 +504,11 @@ def fireEvent(self) -> None:
+         while self.before:
+             callable, args, kwargs = self.before.pop(0)
+             self.finishedBefore.append((callable, args, kwargs))
+-            try:
++            result = None
++            with _systemEventHandler:
+                 result = callable(*args, **kwargs)
+-            except BaseException:
+-                log.err()
+-            else:
+-                if isinstance(result, Deferred):
+-                    beforeResults.append(result)
++            if isinstance(result, Deferred):
++                beforeResults.append(result)
+         DeferredList(beforeResults).addCallback(self._continueFiring)
+ 
+     def _continueFiring(self, ignored: object) -> None:
+@@ -512,10 +520,8 @@ def _continueFiring(self, ignored: object) -> None:
+         for phase in self.during, self.after:
+             while phase:
+                 callable, args, kwargs = phase.pop(0)
+-                try:
++                with _systemEventHandler:
+                     callable(*args, **kwargs)
+-                except BaseException:
+-                    log.err()
+ 
+ 
+ @implementer(IReactorPluggableNameResolver, IReactorPluggableResolver)
+@@ -698,19 +704,13 @@ def run(self, installSignalHandlers: bool = True) -> None:
+ 
+     def mainLoop(self) -> None:
+         while self._started:
+-            try:
+-                while self._started:
+-                    # Advance simulation time in delayed event
+-                    # processors.
+-                    self.runUntilCurrent()
+-                    t2 = self.timeout()
+-                    t = self.running and t2
+-                    self.doIteration(t)
+-            except BaseException:
+-                log.msg("Unexpected error in main loop.")
+-                log.err()
+-            else:
+-                log.msg("Main loop terminated.")  # type:ignore[unreachable]
++            with _topHandler:
++                # Advance simulation time in delayed event processors.
++                self.runUntilCurrent()
++                t2 = self.timeout()
++                t = self.running and t2
++                self.doIteration(t)
++        _log.info("Main loop terminated.")
+ 
+     # override in subclasses
+ 
+@@ -815,7 +815,7 @@ def sigInt(self, number: int, frame: Optional[FrameType] = None) -> None:
+         @param number: See handler specification in L{signal.signal}
+         @param frame: See handler specification in L{signal.signal}
+         """
+-        log.msg("Received SIGINT, shutting down.")
++        _log.info("Received SIGINT, shutting down.")
+         self.callFromThread(self.stop)
+         self._exitSignal = number
+ 
+@@ -826,7 +826,7 @@ def sigBreak(self, number: int, frame: Optional[FrameType] = None) -> None:
+         @param number: See handler specification in L{signal.signal}
+         @param frame: See handler specification in L{signal.signal}
+         """
+-        log.msg("Received SIGBREAK, shutting down.")
++        _log.info("Received SIGBREAK, shutting down.")
+         self.callFromThread(self.stop)
+         self._exitSignal = number
+ 
+@@ -837,7 +837,7 @@ def sigTerm(self, number: int, frame: Optional[FrameType] = None) -> None:
+         @param number: See handler specification in L{signal.signal}
+         @param frame: See handler specification in L{signal.signal}
+         """
+-        log.msg("Received SIGTERM, shutting down.")
++        _log.info("Received SIGTERM, shutting down.")
+         self.callFromThread(self.stop)
+         self._exitSignal = number
+ 
+@@ -845,7 +845,7 @@ def disconnectAll(self) -> None:
+         """Disconnect every reader, and writer in the system."""
+         selectables = self.removeAll()
+         for reader in selectables:
+-            log.callWithLogger(
++            _callWithLogger(
+                 reader, reader.connectionLost, Failure(main.CONNECTION_LOST)
+             )
+ 
+@@ -1059,10 +1059,8 @@ def runUntilCurrent(self) -> None:
+             count = 0
+             total = len(self.threadCallQueue)
+             for f, a, kw in self.threadCallQueue:
+-                try:
++                with _threadCallHandler:
+                     f(*a, **kw)
+-                except BaseException:
+-                    log.err()
+                 count += 1
+                 if count == total:
+                     break
+@@ -1085,21 +1083,20 @@ def runUntilCurrent(self) -> None:
+                 heappush(self._pendingTimedCalls, call)
+                 continue
+ 
+-            try:
++            with _log.failuresHandled(
++                "while handling timed call {previous()}",
++                previous=lambda creator=call.creator: (
++                    ""
++                    if creator is None
++                    else "\n"
++                    + (" C: from a DelayedCall created here:\n")
++                    + " C:"
++                    + "".join(creator).rstrip().replace("\n", "\n C:")
++                    + "\n"
++                ),
++            ):
+                 call.called = 1
+                 call.func(*call.args, **call.kw)
+-            except BaseException:
+-                log.err()
+-                if call.creator is not None:
+-                    e = "\n"
+-                    e += (
+-                        " C: previous exception occurred in "
+-                        + "a DelayedCall created here:\n"
+-                    )
+-                    e += " C:"
+-                    e += "".join(call.creator).rstrip().replace("\n", "\n C:")
+-                    e += "\n"
+-                    log.msg(e)
+ 
+         if (
+             self._cancellations > 50
+diff --git a/src/twisted/internet/posixbase.py b/src/twisted/internet/posixbase.py
+index ed218b37f35..3be65752a2f 100644
+--- a/src/twisted/internet/posixbase.py
++++ b/src/twisted/internet/posixbase.py
+@@ -39,7 +39,6 @@
+ )
+ 
+ # Exceptions that doSelect might return frequently
+-_NO_FILENO = error.ConnectionFdescWentAway("Handler has no fileno method")
+ _NO_FILEDESC = error.ConnectionFdescWentAway("File descriptor lost")
+ 
+ 
+diff --git a/src/twisted/internet/selectreactor.py b/src/twisted/internet/selectreactor.py
+index 199dc406711..ee233f7f10b 100644
+--- a/src/twisted/internet/selectreactor.py
++++ b/src/twisted/internet/selectreactor.py
+@@ -5,18 +5,18 @@
+ """
+ Select reactor
+ """
+-
++from __future__ import annotations
+ 
+ import select
+ import sys
+ from errno import EBADF, EINTR
+ from time import sleep
+-from typing import Type
++from typing import Callable, Type, TypeVar
+ 
+ from zope.interface import implementer
+ 
+ from twisted.internet import posixbase
+-from twisted.internet.interfaces import IReactorFDSet
++from twisted.internet.interfaces import IReactorFDSet, IReadDescriptor, IWriteDescriptor
+ from twisted.python import log
+ from twisted.python.runtime import platformType
+ 
+@@ -52,6 +52,36 @@ def win32select(r, w, e, timeout=None):
+ else:
+     _extraBase = _ThreadedWin32EventsMixin
+ 
++_T = TypeVar("_T")
++
++
++def _onePreen(
++    toPreen: list[_T],
++    preenInto: set[_T],
++    disconnect: Callable[[_T, Exception, bool], None],
++) -> None:
++    preenInto.clear()
++    for selectable in toPreen:
++        try:
++            select.select([selectable], [selectable], [selectable], 0)
++        except Exception as e:
++            log.msg("bad descriptor %s" % selectable)
++            disconnect(selectable, e, False)
++        else:
++            preenInto.add(selectable)
++
++
++def _preenDescriptors(
++    reads: set[IReadDescriptor],
++    writes: set[IWriteDescriptor],
++    disconnect: Callable[[IReadDescriptor | IWriteDescriptor, Exception, bool], None],
++) -> None:
++    log.msg("Malformed file descriptor found.  Preening lists.")
++    readers: list[IReadDescriptor] = list(reads)
++    writers: list[IWriteDescriptor] = list(writes)
++    _onePreen(readers, reads, disconnect)
++    _onePreen(writers, writes, disconnect)
++
+ 
+ @implementer(IReactorFDSet)
+ class SelectReactor(posixbase.PosixReactorBase, _extraBase):  # type: ignore[misc,valid-type]
+@@ -65,29 +95,16 @@ class SelectReactor(posixbase.PosixReactorBase, _extraBase):  # type: ignore[mis
+         checked for writability.
+     """
+ 
+-    def __init__(self):
++    def __init__(self) -> None:
+         """
+         Initialize file descriptor tracking dictionaries and the base class.
+         """
+-        self._reads = set()
+-        self._writes = set()
++        self._reads: set[IReadDescriptor] = set()
++        self._writes: set[IWriteDescriptor] = set()
+         posixbase.PosixReactorBase.__init__(self)
+ 
+-    def _preenDescriptors(self):
+-        log.msg("Malformed file descriptor found.  Preening lists.")
+-        readers = list(self._reads)
+-        writers = list(self._writes)
+-        self._reads.clear()
+-        self._writes.clear()
+-        for selSet, selList in ((self._reads, readers), (self._writes, writers)):
+-            for selectable in selList:
+-                try:
+-                    select.select([selectable], [selectable], [selectable], 0)
+-                except Exception as e:
+-                    log.msg("bad descriptor %s" % selectable)
+-                    self._disconnectSelectable(selectable, e, False)
+-                else:
+-                    selSet.add(selectable)
++    def _preenDescriptors(self) -> None:
++        _preenDescriptors(self._reads, self._writes, self._disconnectSelectable)
+ 
+     def doSelect(self, timeout):
+         """
+@@ -136,7 +153,7 @@ def doSelect(self, timeout):
+             for selectable in selectables:
+                 # if this was disconnected in another thread, kill it.
+                 # ^^^^ --- what the !@#*?  serious!  -exarkun
+-                if selectable not in fdset:
++                if selectable not in fdset:  # type:ignore[operator]
+                     continue
+                 # This for pausing input when we're not ready for more.
+                 _logrun(selectable, _drdw, selectable, method)
+diff --git a/src/twisted/internet/test/reactormixins.py b/src/twisted/internet/test/reactormixins.py
+index 506f6e73ae0..9dbc910dfd9 100644
+--- a/src/twisted/internet/test/reactormixins.py
++++ b/src/twisted/internet/test/reactormixins.py
+@@ -154,6 +154,7 @@ class ReactorBuilder:
+         )
+ 
+         _reactors.append("twisted.internet.test.reactormixins.AsyncioSelectorReactor")
++        _reactors.append("twisted.internet._threadedselect.ThreadedSelectReactor")
+ 
+         if platform.isMacOSX():
+             _reactors.append("twisted.internet.cfreactor.CFReactor")
+diff --git a/src/twisted/internet/test/test_fdset.py b/src/twisted/internet/test/test_fdset.py
+index 931a81274b4..f6f48fd5b4d 100644
+--- a/src/twisted/internet/test/test_fdset.py
++++ b/src/twisted/internet/test/test_fdset.py
+@@ -8,19 +8,22 @@
+ import os
+ import socket
+ import traceback
++from typing import TYPE_CHECKING
+ from unittest import skipIf
+ 
+ from zope.interface import implementer
+ 
+ from twisted.internet.abstract import FileDescriptor
+ from twisted.internet.interfaces import IReactorFDSet, IReadDescriptor
+-
+-# twisted.internet.tcp nicely defines some names with proper values on
+-# several different platforms.
+ from twisted.internet.tcp import EINPROGRESS, EWOULDBLOCK
+ from twisted.internet.test.reactormixins import ReactorBuilder
+ from twisted.python.runtime import platform
+-from twisted.trial.unittest import SkipTest
++from twisted.trial.unittest import SkipTest, SynchronousTestCase
++
++if TYPE_CHECKING:
++    PretendTestCase = SynchronousTestCase
++else:
++    PretendTestCase = object
+ 
+ 
+ def socketpair():
+@@ -46,7 +49,7 @@ def socketpair():
+     return client, server
+ 
+ 
+-class ReactorFDSetTestsBuilder(ReactorBuilder):
++class ReactorFDSetTestsBuilder(ReactorBuilder, PretendTestCase):
+     """
+     Builder defining tests relating to L{IReactorFDSet}.
+     """
+diff --git a/src/twisted/logger/__init__.py b/src/twisted/logger/__init__.py
+index 62f2f71f4e3..32a91cd0b0e 100644
+--- a/src/twisted/logger/__init__.py
++++ b/src/twisted/logger/__init__.py
+@@ -56,6 +56,7 @@ def oops(self, data):
+     "LogEvent",
+     # From ._logger
+     "Logger",
++    "Operation",
+     "_loggerFor",
+     # From ._observer
+     "LogPublisher",
+@@ -102,7 +103,7 @@ def oops(self, data):
+ 
+ from ._interfaces import ILogObserver, LogEvent
+ 
+-from ._logger import Logger, _loggerFor
++from ._logger import Logger, _loggerFor, Operation
+ 
+ from ._observer import LogPublisher
+ 
+diff --git a/src/twisted/logger/_logger.py b/src/twisted/logger/_logger.py
+index cc428d87af1..b7f3e2e1213 100644
+--- a/src/twisted/logger/_logger.py
++++ b/src/twisted/logger/_logger.py
+@@ -6,8 +6,11 @@
+ Logger class.
+ """
+ 
++from __future__ import annotations
++
+ from time import time
+-from typing import Any, Optional, cast
++from types import TracebackType
++from typing import Any, Callable, ContextManager, Optional, Protocol, cast
+ 
+ from twisted.python.compat import currentframe
+ from twisted.python.failure import Failure
+@@ -15,6 +18,87 @@
+ from ._levels import InvalidLogLevelError, LogLevel
+ 
+ 
++class Operation(Protocol):
++    """
++    An L{Operation} represents the success (or lack thereof) of code performed
++    within the body of the L{Logger.failureHandler} context manager.
++    """
++
++    @property
++    def succeeded(self) -> bool:
++        """
++        Did the operation succeed?  C{True} iff the code completed without
++        raising an exception; C{False} while the code is running and C{False}
++        if it raises an exception.
++        """
++
++    @property
++    def failure(self) -> Failure | None:
++        """
++        Did the operation raise an exception?  If so, this L{Failure} is that
++        exception.
++        """
++
++    @property
++    def failed(self) -> bool:
++        """
++        Did the operation fail?  C{True} iff the code raised an exception;
++        C{False} while the code is running and C{False} if it completed without
++        error.
++        """
++
++
++class _FailCtxMgr:
++    succeeded: bool = False
++    failure: Failure | None = None
++
++    def __init__(self, fail: Callable[[Failure], None]) -> None:
++        self._fail = fail
++
++    @property
++    def failed(self) -> bool:
++        return self.failure is not None
++
++    def __enter__(self) -> Operation:
++        return self
++
++    def __exit__(
++        self,
++        exc_type: type[BaseException] | None,
++        exc_value: BaseException | None,
++        traceback: TracebackType | None,
++        /,
++    ) -> bool:
++        if exc_type is not None:
++            failure = Failure()
++            self.failure = failure
++            self._fail(failure)
++        else:
++            self.succeeded = True
++        return True
++
++
++class _FastFailCtxMgr:
++    def __init__(self, fail: Callable[[Failure], None]) -> None:
++        self._fail = fail
++
++    def __enter__(self) -> None:
++        pass
++
++    def __exit__(
++        self,
++        exc_type: type[BaseException] | None,
++        exc_value: BaseException | None,
++        traceback: TracebackType | None,
++        /,
++    ) -> bool:
++        if exc_type is not None:
++            failure = Failure()
++            self.failure = failure
++            self._fail(failure)
++        return True
++
++
+ class Logger:
+     """
+     A L{Logger} emits log messages to an observer.  You should instantiate it
+@@ -164,25 +248,32 @@ def failure(
+             d.addErrback(lambda f: log.failure("While frobbing {knob}",
+                                                f, knob=knob))
+ 
+-        This method is generally meant to capture unexpected exceptions in
+-        code; an exception that is caught and handled somehow should be logged,
+-        if appropriate, via L{Logger.error} instead.  If some unknown exception
++        This method is meant to capture unexpected exceptions in code; an
++        exception that is caught and handled somehow should be logged, if
++        appropriate, via L{Logger.error} instead.  If some unknown exception
+         occurs and your code doesn't know how to handle it, as in the above
+-        example, then this method provides a means to describe the failure in
+-        nerd-speak.  This is done at L{LogLevel.critical} by default, since no
+-        corrective guidance can be offered to an user/administrator, and the
+-        impact of the condition is unknown.
++        example, then this method provides a means to describe the failure.
++        This is done at L{LogLevel.critical} by default, since no corrective
++        guidance can be offered to an user/administrator, and the impact of the
++        condition is unknown.
+ 
+         @param format: a message format using new-style (PEP 3101) formatting.
+             The logging event (which is a L{dict}) is used to render this
+             format string.
++
+         @param failure: a L{Failure} to log.  If L{None}, a L{Failure} is
+             created from the exception in flight.
++
+         @param level: a L{LogLevel} to use.
++
+         @param kwargs: additional key/value pairs to include in the event.
+             Note that values which are later mutated may result in
+             non-deterministic behavior from observers that schedule work for
+             later execution.
++
++        @see: L{Logger.failureHandler}
++
++        @see: L{Logger.failuresHandled}
+         """
+         if failure is None:
+             failure = Failure()
+@@ -264,6 +355,101 @@ def critical(self, format: Optional[str] = None, **kwargs: object) -> None:
+         """
+         self.emit(LogLevel.critical, format, **kwargs)
+ 
++    def failuresHandled(
++        self, format: str, level: LogLevel = LogLevel.critical, **kwargs: object
++    ) -> ContextManager[Operation]:
++        """
++        Run some application code, logging a failure and emitting a traceback
++        in the event that any of it fails, but continuing on.  For example::
++
++            log = Logger(...)
++
++            def frameworkCode() -> None:
++                with log.failuresHandled("While frobbing {knob}:", knob=knob) as op:
++                    frob(knob)
++                if op.succeeded:
++                    log.info("frobbed {knob} successfully", knob=knob)
++
++        This method is meant to capture unexpected exceptions from application
++        code; an exception that is caught and handled somehow should be logged,
++        if appropriate, via L{Logger.error} instead.  If some unknown exception
++        occurs and your code doesn't know how to handle it, as in the above
++        example, then this method provides a means to describe the failure.
++        This is done at L{LogLevel.critical} by default, since no corrective
++        guidance can be offered to an user/administrator, and the impact of the
++        condition is unknown.
++
++        @param format: a message format using new-style (PEP 3101) formatting.
++            The logging event (which is a L{dict}) is used to render this
++            format string.
++
++        @param level: a L{LogLevel} to use.
++
++        @param kwargs: additional key/value pairs to include in the event, if
++            it is emitted.  Note that values which are later mutated may result
++            in non-deterministic behavior from observers that schedule work for
++            later execution.
++
++        @see: L{Logger.failure}
++        @see: L{Logger.failureHandler}
++
++        @return: A context manager which yields an L{Operation} which will have
++            either its C{succeeded} or C{failed} attribute set to C{True} upon
++            completion of the code within the code within the C{with} block.
++        """
++        return _FailCtxMgr(lambda f: self.failure(format, f, level, **kwargs))
++
++    def failureHandler(
++        self,
++        staticMessage: str,
++        level: LogLevel = LogLevel.critical,
++    ) -> ContextManager[None]:
++        """
++        For performance-sensitive frameworks that needs to handle potential
++        failures from frequently-called application code, and do not need to
++        include detailed structured information about the failure nor inspect
++        the result of the operation, this method returns a context manager that
++        will log exceptions and continue, that can be shared across multiple
++        invocations.  It should be instantiated at module scope to avoid
++        additional object creations.
++
++        For example::
++
++            log = Logger(...)
++            ignoringFrobErrors = log.failureHandler("while frobbing:")
++
++            def hotLoop() -> None:
++                with ignoringFrobErrors:
++                    frob()
++
++        This method is meant to capture unexpected exceptions from application
++        code; an exception that is caught and handled somehow should be logged,
++        if appropriate, via L{Logger.error} instead.  If some unknown exception
++        occurs and your code doesn't know how to handle it, as in the above
++        example, then this method provides a means to describe the failure in
++        nerd-speak.  This is done at L{LogLevel.critical} by default, since no
++        corrective guidance can be offered to an user/administrator, and the
++        impact of the condition is unknown.
++
++        @param format: a message format using new-style (PEP 3101) formatting.
++            The logging event (which is a L{dict}) is used to render this
++            format string.
++
++        @param level: a L{LogLevel} to use.
++
++        @see: L{Logger.failure}
++
++        @return: A context manager which does not return a value, but will
++            always exit from exceptions.
++        """
++        return _FastFailCtxMgr(lambda f: self.failure(staticMessage, f, level))
++
+ 
+ _log = Logger()
+-_loggerFor = lambda obj: _log.__get__(obj, obj.__class__)
++
++
++def _loggerFor(obj: object) -> Logger:
++    """
++    Get a L{Logger} instance attached to the given class.
++    """
++    return _log.__get__(obj, obj.__class__)
+diff --git a/src/twisted/logger/test/test_logger.py b/src/twisted/logger/test/test_logger.py
+index 5c24e8715a2..b7af9fc1739 100644
+--- a/src/twisted/logger/test/test_logger.py
++++ b/src/twisted/logger/test/test_logger.py
+@@ -11,6 +11,7 @@
+ 
+ from constantly import NamedConstant
+ 
++from twisted.python.failure import Failure
+ from twisted.trial import unittest
+ from .._format import formatEvent
+ from .._global import globalLogPublisher
+@@ -274,3 +275,80 @@ def observer(event: LogEvent) -> None:
+ 
+         log = TestLogger(observer=publisher)
+         log.info("Hello.", log_trace=[])
++
++    def test_failuresHandled(self) -> None:
++        """
++        The L{Logger.failuresHandled} context manager catches any
++        L{BaseException} and converts it into a logged L{Failure}.
++        """
++        events = []
++
++        @implementer(ILogObserver)
++        def logged(event: LogEvent) -> None:
++            events.append(event)
++
++        log = TestLogger(observer=logged)
++        reprd = 0
++
++        class Reprable:
++            def __repr__(self) -> str:
++                nonlocal reprd
++                reprd += 1
++                return f"<repr {reprd}>"
++
++        with log.failuresHandled(
++            "while testing failure handling for {value}", value=Reprable()
++        ) as operation:
++            1 / 0
++        self.assertEqual(operation.succeeded, False)
++        self.assertEqual(operation.failed, True)
++        self.assertEqual(len(events), 1)
++        [logged] = events
++        events[:] = []
++        f: Failure = logged["log_failure"]
++        self.assertEqual(reprd, 0)
++        self.assertEqual(
++            formatEvent(logged), "while testing failure handling for <repr 1>"
++        )
++        self.assertEqual(reprd, 1)
++        self.assertEqual(f.type, ZeroDivisionError)
++        with log.failuresHandled("succeeding for {value}", value=Reprable()) as op2:
++            self.assertEqual(op2.succeeded, False)
++            self.assertEqual(op2.failed, False)
++        self.assertEqual(reprd, 1)
++        self.assertEqual(op2.succeeded, True)
++        self.assertEqual(op2.failed, False)
++
++    def test_failureHandler(self) -> None:
++        """
++        The L{Logger.failureHandler} context manager can safely be shared
++        amongst multiple invocations and converts L{BaseException} into logged
++        L{Failure}s.
++        """
++        events = []
++
++        @implementer(ILogObserver)
++        def logged(event: LogEvent) -> None:
++            events.append(event)
++
++        log = TestLogger(observer=logged)
++
++        failureHandler = log.failureHandler("hello")
++        success = False
++        with failureHandler as fh:
++            success = True
++        self.assertIs(fh, None)
++        self.assertEqual(success, True)
++        self.assertEqual(events, [])
++        success = False
++
++        def raisebase() -> None:
++            raise KeyboardInterrupt()
++
++        with failureHandler as fh:
++            raisebase()
++
++        self.assertEqual(len(events), 1)
++        [logged] = events
++        f = logged["log_failure"]
++        self.assertEqual(f.type, KeyboardInterrupt)
+diff --git a/src/twisted/newsfragments/12188.feature b/src/twisted/newsfragments/12188.feature
+new file mode 100644
+index 00000000000..8c6353a4fab
+--- /dev/null
++++ b/src/twisted/newsfragments/12188.feature
+@@ -0,0 +1 @@
++Added two new methods, twisted.logger.Logger.failuresHandled and twisted.logger.Logger.failureHandler, which allow for more concise and convenient handling of exceptions when dispatching out to application code.  The former can arbitrarily customize failure handling at the call site, and the latter can be used for performance-sensitive cases where no additional information needs to be logged.
+diff --git a/src/twisted/newsfragments/12195.misc b/src/twisted/newsfragments/12195.misc
+new file mode 100644
+index 00000000000..e69de29bb2d
+diff --git a/src/twisted/protocols/amp.py b/src/twisted/protocols/amp.py
+index ac28a92bfa4..8b80982d2ac 100644
+--- a/src/twisted/protocols/amp.py
++++ b/src/twisted/protocols/amp.py
+@@ -222,8 +222,9 @@ def trapZero(result):
+ from twisted.internet.interfaces import IFileDescriptorReceiver
+ from twisted.internet.main import CONNECTION_LOST
+ from twisted.internet.protocol import Protocol
++from twisted.logger import Logger
+ from twisted.protocols.basic import Int16StringReceiver, StatefulStringProtocol
+-from twisted.python import filepath, log
++from twisted.python import filepath
+ from twisted.python._tzhelper import (
+     UTC as utc,
+     FixedOffsetTimeZone as _FixedOffsetTZInfo,
+@@ -301,7 +302,7 @@ def trapZero(result):
+     "parseString",
+ ]
+ 
+-
++_log = Logger()
+ _T_Callable = TypeVar("_T_Callable", bound=Callable[..., object])
+ 
+ 
+@@ -997,7 +998,8 @@ def formatAnswer(answerBox):
+             answerBox[ANSWER] = box[ASK]
+             return answerBox
+ 
+-        def formatError(error):
++        def formatError(error: Failure) -> AmpBox:
++            errorBox: AmpBox
+             if error.check(RemoteAmpError):
+                 code = error.value.errorCode
+                 desc = error.value.description
+@@ -1009,7 +1011,7 @@ def formatError(error):
+                     errorBox = AmpBox()
+             else:
+                 errorBox = QuitBox()
+-                log.err(error)  # here is where server-side logging happens
++                _log.failure("while receiving response to command", error)
+                 # if the error isn't handled
+                 code = UNKNOWN_ERROR_CODE
+                 desc = b"Unknown Error"
+@@ -2512,16 +2514,16 @@ def peerCertificate(self):
+             return None
+         return Certificate.peerFromTransport(self.transport)
+ 
+-    def unhandledError(self, failure):
++    def unhandledError(self, failure: Failure) -> None:
+         """
+         The buck stops here.  This error was completely unhandled, time to
+         terminate the connection.
+         """
+-        log.err(
+-            failure,
++        _log.failure(
+             "Amp server or network failure unhandled by client application.  "
+             "Dropping connection!  To avoid, add errbacks to ALL remote "
+             "commands!",
++            failure,
+         )
+         if self.transport is not None:
+             self.transport.loseConnection()
+@@ -2600,9 +2602,11 @@ def makeConnection(self, transport):
+         # Save these so we can emit a similar log message in L{connectionLost}.
+         self._transportPeer = transport.getPeer()
+         self._transportHost = transport.getHost()
+-        log.msg(
+-            "%s connection established (HOST:%s PEER:%s)"
+-            % (self.__class__.__name__, self._transportHost, self._transportPeer)
++        _log.info(
++            "{cls} connection established (HOST:{host} PEER:{peer})",
++            cls=self.__class__.__name__,
++            host=self._transportHost,
++            peer=self._transportPeer,
+         )
+         BinaryBoxProtocol.makeConnection(self, transport)
+ 
+@@ -2610,9 +2614,11 @@ def connectionLost(self, reason):
+         """
+         Emit a helpful log message when the connection is lost.
+         """
+-        log.msg(
+-            "%s connection lost (HOST:%s PEER:%s)"
+-            % (self.__class__.__name__, self._transportHost, self._transportPeer)
++        _log.info(
++            "{cls} connection lost (HOST:{host} PEER:{peer})",
++            cls=self.__class__.__name__,
++            host=self._transportHost,
++            peer=self._transportPeer,
+         )
+         BinaryBoxProtocol.connectionLost(self, reason)
+         self.transport = None
+diff --git a/src/twisted/protocols/test/test_tls.py b/src/twisted/protocols/test/test_tls.py
+index 4db669cd2ff..de40706ec49 100644
+--- a/src/twisted/protocols/test/test_tls.py
++++ b/src/twisted/protocols/test/test_tls.py
+@@ -1752,7 +1752,7 @@ def test_resumeProducingRaises(self):
+         """
+         consumer = StringTransport()
+         done = self.resumeProducingRaises(
+-            consumer, [(ZeroDivisionError, "failed, producing will be stopped")]
++            consumer, [(ZeroDivisionError, "while calling resumeProducing on")]
+         )
+ 
+         def cleanShutdown(ignore):
+@@ -1778,8 +1778,8 @@ def raiser():
+         return self.resumeProducingRaises(
+             consumer,
+             [
+-                (ZeroDivisionError, "failed, producing will be stopped"),
+-                (RuntimeError, "failed to unregister producer"),
++                (ZeroDivisionError, "while calling resumeProducing"),
++                (RuntimeError, "while calling unregisterProducer"),
+             ],
+         )
+ 
+diff --git a/src/twisted/test/stdio_test_halfclose.py b/src/twisted/test/stdio_test_halfclose.py
+index 434a6723486..164499eaef9 100644
+--- a/src/twisted/test/stdio_test_halfclose.py
++++ b/src/twisted/test/stdio_test_halfclose.py
+@@ -4,9 +4,8 @@
+ 
+ """
+ Main program for the child process run by
+-L{twisted.test.test_stdio.StandardInputOutputTests.test_readConnectionLost}
+-to test that IHalfCloseableProtocol.readConnectionLost works for process
+-transports.
++L{twisted.test.test_stdio.StandardInputOutputTests.test_readConnectionLost} to
++test that IHalfCloseableProtocol.readConnectionLost works for stdio transports.
+ """
+ 
+ 
+diff --git a/src/twisted/test/stdio_test_halfclose_buggy.py b/src/twisted/test/stdio_test_halfclose_buggy.py
+new file mode 100644
+index 00000000000..0c055f573ff
+--- /dev/null
++++ b/src/twisted/test/stdio_test_halfclose_buggy.py
+@@ -0,0 +1,67 @@
++# -*- test-case-name: twisted.test.test_stdio.StandardInputOutputTests.test_buggyReadConnectionLost -*-
++# Copyright (c) Twisted Matrix Laboratories.
++# See LICENSE for details.
++
++"""
++Main program for the child process run by
++L{twisted.test.test_stdio.StandardInputOutputTests.test_readConnectionLost} to
++test that IHalfCloseableProtocol.readConnectionLost works for stdio transports.
++"""
++
++
++import sys
++
++from zope.interface import implementer
++
++from twisted.internet import protocol, stdio
++from twisted.internet.interfaces import IHalfCloseableProtocol, IReactorCore, ITransport
++from twisted.python import log, reflect
++
++
++@implementer(IHalfCloseableProtocol)
++class HalfCloseProtocol(protocol.Protocol):
++    """
++    A protocol to hook up to stdio and observe its transport being
++    half-closed.  If all goes as expected, C{exitCode} will be set to C{0};
++    otherwise it will be set to C{1} to indicate failure.
++    """
++
++    exitCode = None
++    transport: ITransport
++
++    def connectionMade(self) -> None:
++        """
++        Signal the parent process that we're ready.
++        """
++        self.transport.write(b"x")
++
++    def readConnectionLost(self) -> None:
++        """
++        This is the desired event.  Once it has happened, stop the reactor so
++        the process will exit.
++        """
++        raise ValueError("something went wrong")
++
++    def connectionLost(self, reason: object = None) -> None:
++        """
++        This may only be invoked after C{readConnectionLost}.  If it happens
++        otherwise, mark it as an error and shut down.
++        """
++        self.exitCode = 0
++        reactor.stop()
++
++    def writeConnectionLost(self) -> None:
++        # IHalfCloseableProtocol.writeConnectionLost
++        pass
++
++
++if __name__ == "__main__":  # pragma: no branch
++    reflect.namedAny(sys.argv[1]).install()
++    log.startLogging(open(sys.argv[2], "w"))
++    reactor: IReactorCore
++    from twisted.internet import reactor  # type:ignore[assignment]
++
++    halfCloseProtocol = HalfCloseProtocol()
++    stdio.StandardIO(halfCloseProtocol)
++    reactor.run()
++    sys.exit(halfCloseProtocol.exitCode)
+diff --git a/src/twisted/test/stdio_test_halfclose_buggy_write.py b/src/twisted/test/stdio_test_halfclose_buggy_write.py
+new file mode 100644
+index 00000000000..d22e41f2be4
+--- /dev/null
++++ b/src/twisted/test/stdio_test_halfclose_buggy_write.py
+@@ -0,0 +1,69 @@
++# -*- test-case-name: twisted.test.test_stdio.StandardInputOutputTests.test_buggyWriteConnectionLost -*-
++# Copyright (c) Twisted Matrix Laboratories.
++# See LICENSE for details.
++
++"""
++Main program for the child process run by
++L{twisted.test.test_stdio.StandardInputOutputTests.test_buggyWriteConnectionLost}
++to test that IHalfCloseableProtocol.writeConnectionLost works for stdio
++transports.
++"""
++
++
++import sys
++
++from zope.interface import implementer
++
++from twisted.internet import protocol, stdio
++from twisted.internet.interfaces import IHalfCloseableProtocol, IReactorCore, ITransport
++from twisted.python import log, reflect
++
++
++@implementer(IHalfCloseableProtocol)
++class HalfCloseProtocol(protocol.Protocol):
++    """
++    A protocol to hook up to stdio and observe its transport being
++    half-closed.  If all goes as expected, C{exitCode} will be set to C{0};
++    otherwise it will be set to C{1} to indicate failure.
++    """
++
++    exitCode = 9
++    wasWriteConnectionLost = False
++    transport: ITransport
++
++    def connectionMade(self) -> None:
++        """
++        Signal the parent process that we're ready.
++        """
++        self.transport.write(b"x")
++
++    def readConnectionLost(self) -> None:
++        """
++        This is the desired event.  Once it has happened, stop the reactor so
++        the process will exit.
++        """
++
++    def connectionLost(self, reason: object = None) -> None:
++        """
++        This may only be invoked after C{readConnectionLost}.  If it happens
++        otherwise, mark it as an error and shut down.
++        """
++        if self.wasWriteConnectionLost:  # pragma: no branch
++            self.exitCode = 0
++        reactor.stop()
++
++    def writeConnectionLost(self) -> None:
++        self.wasWriteConnectionLost = True
++        raise ValueError("something went wrong")
++
++
++if __name__ == "__main__":  # pragma: no branch
++    reflect.namedAny(sys.argv[1]).install()
++    log.startLogging(open(sys.argv[2], "w"))
++    reactor: IReactorCore
++    from twisted.internet import reactor  # type:ignore[assignment]
++
++    halfCloseProtocol = HalfCloseProtocol()
++    stdio.StandardIO(halfCloseProtocol)
++    reactor.run()
++    sys.exit(halfCloseProtocol.exitCode)
+diff --git a/src/twisted/test/test_stdio.py b/src/twisted/test/test_stdio.py
+index 22da2ccfd11..03ba70a2d9b 100644
+--- a/src/twisted/test/test_stdio.py
++++ b/src/twisted/test/test_stdio.py
+@@ -7,15 +7,19 @@
+ @var properEnv: A copy of L{os.environ} which has L{bytes} keys/values on POSIX
+     platforms and native L{str} keys/values on Windows.
+ """
+-
++from __future__ import annotations
+ 
+ import itertools
+ import os
+ import sys
++from typing import Any, Callable
+ from unittest import skipIf
+ 
+ from twisted.internet import defer, error, protocol, reactor, stdio
++from twisted.internet.interfaces import IProcessTransport, IReactorProcess
++from twisted.internet.protocol import ProcessProtocol
+ from twisted.python import filepath, log
++from twisted.python.failure import Failure
+ from twisted.python.reflect import requireModule
+ from twisted.python.runtime import platform
+ from twisted.test.test_tcp import ConnectionLostNotifyingProtocol
+@@ -51,12 +55,13 @@ class StandardIOTestProcessProtocol(protocol.ProcessProtocol):
+     bytes received from the child process on each file descriptor.
+     """
+ 
+-    onDataReceived = None
++    onDataReceived: defer.Deferred[None] | None = None
++    transport: IProcessTransport
+ 
+-    def __init__(self):
+-        self.onConnection = defer.Deferred()
+-        self.onCompletion = defer.Deferred()
+-        self.data = {}
++    def __init__(self) -> None:
++        self.onConnection: defer.Deferred[None] = defer.Deferred()
++        self.onCompletion: defer.Deferred[None] = defer.Deferred()
++        self.data: dict[str, bytes] = {}
+ 
+     def connectionMade(self):
+         self.onConnection.callback(None)
+@@ -82,33 +87,41 @@ class StandardInputOutputTests(TestCase):
+             "absence of win32process."
+         )
+ 
+-    def _spawnProcess(self, proto, sibling, *args, **kw):
++    def _spawnProcess(
++        self, proto: ProcessProtocol, sibling: str | bytes, *args: str, **kw: Any
++    ) -> IProcessTransport:
+         """
+-        Launch a child Python process and communicate with it using the
+-        given ProcessProtocol.
++        Launch a child Python process and communicate with it using the given
++        ProcessProtocol.
+ 
+-        @param proto: A L{ProcessProtocol} instance which will be connected
+-        to the child process.
++        @param proto: A L{ProcessProtocol} instance which will be connected to
++            the child process.
+ 
+-        @param sibling: The basename of a file containing the Python program
+-        to run in the child process.
++        @param sibling: The basename of a file containing the Python program to
++            run in the child process.
+ 
+-        @param *args: strings which will be passed to the child process on
+-        the command line as C{argv[2:]}.
++        @param *args: strings which will be passed to the child process on the
++            command line as C{argv[2:]}.
+ 
+         @param **kw: additional arguments to pass to L{reactor.spawnProcess}.
+ 
+         @return: The L{IProcessTransport} provider for the spawned process.
+         """
+-        args = [
++        if isinstance(sibling, bytes):
++            sibling = sibling.decode()
++        procargs = [
+             sys.executable,
+-            b"-m",
+-            b"twisted.test." + sibling,
++            "-m",
++            "twisted.test." + sibling,
+             reactor.__class__.__module__,
+         ] + list(args)
+-        return reactor.spawnProcess(proto, sys.executable, args, env=properEnv, **kw)
++        return IReactorProcess(reactor).spawnProcess(
++            proto, sys.executable, procargs, env=properEnv, **kw
++        )
+ 
+-    def _requireFailure(self, d, callback):
++    def _requireFailure(
++        self, d: defer.Deferred[None], callback: Callable[[Failure], object]
++    ) -> defer.Deferred[None]:
+         def cb(result):
+             self.fail(f"Process terminated with non-Failure: {result!r}")
+ 
+@@ -139,20 +152,19 @@ def processEnded(reason):
+ 
+         return self._requireFailure(d, processEnded)
+ 
+-    def test_readConnectionLost(self):
+-        """
+-        When stdin is closed and the protocol connected to it implements
+-        L{IHalfCloseableProtocol}, the protocol's C{readConnectionLost} method
+-        is called.
+-        """
++    def exampleOutputsAndZeroExitCode(
++        self, example: str, out: bool = False
++    ) -> defer.Deferred[None]:
+         errorLogFile = self.mktemp()
+-        log.msg("Child process logging to " + errorLogFile)
+         p = StandardIOTestProcessProtocol()
+         p.onDataReceived = defer.Deferred()
+ 
+-        def cbBytes(ignored):
++        def cbBytes(ignored: None) -> defer.Deferred[None]:
+             d = p.onCompletion
+-            p.transport.closeStdin()
++            if out:
++                p.transport.closeStdout()
++            else:
++                p.transport.closeStdin()
+             return d
+ 
+         p.onDataReceived.addCallback(cbBytes)
+@@ -162,9 +174,35 @@ def processEnded(reason):
+ 
+         d = self._requireFailure(p.onDataReceived, processEnded)
+ 
+-        self._spawnProcess(p, b"stdio_test_halfclose", errorLogFile)
++        self._spawnProcess(p, example, errorLogFile)
+         return d
+ 
++    def test_readConnectionLost(self) -> defer.Deferred[None]:
++        """
++        When stdin is closed and the protocol connected to it implements
++        L{IHalfCloseableProtocol}, the protocol's C{readConnectionLost} method
++        is called.
++        """
++        return self.exampleOutputsAndZeroExitCode("stdio_test_halfclose")
++
++    def test_buggyReadConnectionLost(self) -> defer.Deferred[None]:
++        """
++        When stdin is closed and the protocol connnected to it implements
++        L{IHalfCloseableProtocol} but its C{readConnectionLost} method raises
++        an exception its regular C{connectionLost} method will be called.
++        """
++        return self.exampleOutputsAndZeroExitCode("stdio_test_halfclose_buggy")
++
++    def test_buggyWriteConnectionLost(self) -> defer.Deferred[None]:
++        """
++        When stdin is closed and the protocol connnected to it implements
++        L{IHalfCloseableProtocol} but its C{readConnectionLost} method raises
++        an exception its regular C{connectionLost} method will be called.
++        """
++        return self.exampleOutputsAndZeroExitCode(
++            "stdio_test_halfclose_buggy_write", out=True
++        )
++
+     def test_lastWriteReceived(self):
+         """
+         Verify that a write made directly to stdout using L{os.write}
+diff --git a/src/twisted/web/_newclient.py b/src/twisted/web/_newclient.py
+index ddd5515ffcc..a151bdae05c 100644
+--- a/src/twisted/web/_newclient.py
++++ b/src/twisted/web/_newclient.py
+@@ -26,8 +26,10 @@
+     response.
+ """
+ 
++from __future__ import annotations
++
+ import re
+-from typing import Optional
++from typing import TYPE_CHECKING, Optional
+ 
+ from zope.interface import implementer
+ 
+@@ -40,7 +42,6 @@
+ from twisted.python.compat import networkString
+ from twisted.python.components import proxyForInterface
+ from twisted.python.failure import Failure
+-from twisted.python.reflect import fullyQualifiedName
+ from twisted.web.http import (
+     NO_CONTENT,
+     NOT_MODIFIED,
+@@ -178,21 +179,6 @@ class RequestNotSent(Exception):
+     """
+ 
+ 
+-def _callAppFunction(function):
+-    """
+-    Call C{function}.  If it raises an exception, log it with a minimal
+-    description of the source.
+-
+-    @return: L{None}
+-    """
+-    try:
+-        function()
+-    except BaseException:
+-        _moduleLog.failure(
+-            "Unexpected exception from {name}", name=fullyQualifiedName(function)
+-        )
+-
+-
+ class HTTPParser(LineReceiver):
+     """
+     L{HTTPParser} handles the parsing side of HTTP processing. With a suitable
+@@ -341,6 +327,15 @@ def allHeadersReceived(self):
+         self.switchToBodyMode(None)
+ 
+ 
++_ignoreDecoderErrors = _moduleLog.failureHandler("while interacting with body decoder:")
++_ignoreStopProducerStopWriting = _moduleLog.failureHandler(
++    "while calling stopProducing() in stopWriting():"
++)
++_ignoreStopProducerWrite = _moduleLog.failureHandler(
++    "while calling stopProducing() in write():"
++)
++
++
+ class HTTPClientParser(HTTPParser):
+     """
+     An HTTP parser which only handles HTTP responses.
+@@ -366,7 +361,7 @@ class HTTPClientParser(HTTPParser):
+         b"chunked": _ChunkedTransferDecoder,
+     }
+ 
+-    bodyDecoder = None
++    bodyDecoder: _IdentityTransferDecoder | None = None
+     _log = Logger()
+ 
+     def __init__(self, request, finisher):
+@@ -534,9 +529,14 @@ def allHeadersReceived(self):
+         self._responseDeferred.callback(self.response)
+         del self._responseDeferred
+ 
+-    def connectionLost(self, reason):
++    def connectionLost(self, reason: Failure | None = None) -> None:
+         if self.bodyDecoder is not None:
+-            try:
++            # Handle exceptions from both the body decoder itself and the
++            # various invocations of _bodyDataFinished; treat them all as
++            # application code.  The response is part of the HTTP server and
++            # really shouldn't raise exceptions, but maybe there's some buggy
++            # application code somewhere making things difficult.
++            with _ignoreDecoderErrors:
+                 try:
+                     self.bodyDecoder.noMoreData()
+                 except PotentialDataLoss:
+@@ -547,12 +547,6 @@ def connectionLost(self, reason):
+                     )
+                 else:
+                     self.response._bodyDataFinished()
+-            except BaseException:
+-                # Handle exceptions from both the except suites and the else
+-                # suite.  Those functions really shouldn't raise exceptions,
+-                # but maybe there's some buggy application code somewhere
+-                # making things difficult.
+-                self._log.failure("")
+         elif self.state != DONE:
+             if self._everReceivedData:
+                 exceptionClass = ResponseFailed
+@@ -1001,7 +995,7 @@ def writeTo(self, transport):
+         else:
+             return self._writeToBodyProducerContentLength(transport)
+ 
+-    def stopWriting(self):
++    def stopWriting(self) -> None:
+         """
+         Stop writing this request to the transport.  This can only be called
+         after C{writeTo} and before the L{Deferred} returned by C{writeTo}
+@@ -1011,7 +1005,8 @@ def stopWriting(self):
+         """
+         # If bodyProducer is None, then the Deferred returned by writeTo has
+         # fired already and this method cannot be called.
+-        _callAppFunction(self.bodyProducer.stopProducing)
++        with _ignoreStopProducerStopWriting:
++            self.bodyProducer.stopProducing()
+ 
+ 
+ class LengthEnforcingConsumer:
+@@ -1068,7 +1063,8 @@ def write(self, bytes):
+             # we still have _finished which we can use to report the error to a
+             # better place than the direct caller of this method (some
+             # arbitrary application code).
+-            _callAppFunction(self._producer.stopProducing)
++            with _ignoreStopProducerWrite:
++                self._producer.stopProducing()
+             self._finished.errback(WrongBodyLength("too many bytes written"))
+             self._allowNoMoreWrites()
+ 
+@@ -1101,9 +1097,10 @@ def makeStatefulDispatcher(name, template):
+ 
+     @return: The dispatcher function.
+     """
++    pfx = f"_{name}_"
+ 
+     def dispatcher(self, *args, **kwargs):
+-        func = getattr(self, "_" + name + "_" + self._state, None)
++        func = getattr(self, f"{pfx}{self._state}", None)
+         if func is None:
+             raise RuntimeError(f"{self!r} has no {name} method in state {self._state}")
+         return func(*args, **kwargs)
+@@ -1539,11 +1536,11 @@ class HTTP11ClientProtocol(Protocol):
+     """
+ 
+     _state = "QUIESCENT"
+-    _parser = None
+-    _finishedRequest = None
+-    _currentRequest = None
++    _parser: HTTPClientParser | None = None
++    _finishedRequest: Deferred[Response] | None = None
++    _currentRequest: Request | None = None
+     _transportProxy = None
+-    _responseDeferred = None
++    _responseDeferred: Deferred[Response] | None = None
+     _log = Logger()
+ 
+     def __init__(self, quiescentCallback=lambda c: None):
+@@ -1624,7 +1621,7 @@ def ebRequestWriting(err):
+ 
+         return self._finishedRequest
+ 
+-    def _finishResponse(self, rest):
++    def _finishResponse(self, rest: bytes) -> None:
+         """
+         Called by an L{HTTPClientParser} to indicate that it has parsed a
+         complete response.
+@@ -1636,10 +1633,16 @@ def _finishResponse(self, rest):
+ 
+     _finishResponse = makeStatefulDispatcher("finishResponse", _finishResponse)
+ 
+-    def _finishResponse_WAITING(self, rest):
++    def _finishResponse_WAITING(self, rest: bytes) -> None:
+         # Currently the rest parameter is ignored. Don't forget to use it if
+         # we ever add support for pipelining. And maybe check what trailers
+         # mean.
++        if TYPE_CHECKING:
++            assert self._responseDeferred is not None
++            assert self._finishedRequest is not None
++            assert self._currentRequest is not None
++            assert self.transport is not None
++
+         if self._state == "WAITING":
+             self._state = "QUIESCENT"
+         else:
+@@ -1668,16 +1671,16 @@ def _finishResponse_WAITING(self, rest):
+         else:
+             # Just in case we had paused the transport, resume it before
+             # considering it quiescent again.
+-            self.transport.resumeProducing()
++            producer: IPushProducer = self.transport  # type:ignore[assignment]
++            producer.resumeProducing()
+ 
+             # We call the quiescent callback first, to ensure connection gets
+             # added back to connection pool before we finish the request.
+-            try:
++            with _moduleLog.failuresHandled("while invoking quiescent callback:") as op:
+                 self._quiescentCallback(self)
+-            except BaseException:
++            if op.failed:
+                 # If callback throws exception, just log it and disconnect;
+                 # keeping persistent connections around is an optimisation:
+-                self._log.failure("")
+                 self.transport.loseConnection()
+             self._disconnectParser(reason)
+ 

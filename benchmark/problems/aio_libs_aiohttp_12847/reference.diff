@@ -1,0 +1,96 @@
+diff --git a/CHANGES/12835.bugfix.rst b/CHANGES/12835.bugfix.rst
+new file mode 100644
+index 00000000000..84a8ae00677
+--- /dev/null
++++ b/CHANGES/12835.bugfix.rst
+@@ -0,0 +1 @@
++Included the per-request ``server_hostname`` override in the :class:`~aiohttp.TCPConnector` connection pool key, so a pooled TLS connection is no longer reused for a request that sets ``server_hostname`` to a different value -- by :user:`bdraco`.
+diff --git a/aiohttp/client_reqrep.py b/aiohttp/client_reqrep.py
+index 4aeae08ac19..c77213e3ed2 100644
+--- a/aiohttp/client_reqrep.py
++++ b/aiohttp/client_reqrep.py
+@@ -244,6 +244,7 @@ class ConnectionKey(NamedTuple):
+     proxy: URL | None
+     proxy_auth: BasicAuth | None
+     proxy_headers_hash: int | None  # hash(CIMultiDict)
++    server_hostname: str | None = None
+ 
+ 
+ def _is_expected_content_type(
+@@ -982,6 +983,7 @@ def connection_key(self) -> ConnectionKey:
+                 self.proxy,
+                 self.proxy_auth,
+                 h,
++                self.server_hostname,
+             ),
+         )
+ 
+diff --git a/tests/test_client_functional.py b/tests/test_client_functional.py
+index aa3a6925c2f..6bd57bee612 100644
+--- a/tests/test_client_functional.py
++++ b/tests/test_client_functional.py
+@@ -722,6 +722,37 @@ async def handler(request):
+     assert txt == "Test message"
+ 
+ 
++async def test_server_hostname_override_not_reused(
++    aiohttp_server: AiohttpServer,
++) -> None:
++    """A pooled TLS connection must not be reused for a different server_hostname."""
++    trustme = pytest.importorskip("trustme")
++
++    ca = trustme.CA()
++    cert = ca.issue_cert("first.example")
++    server_ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
++    cert.configure_cert(server_ctx)
++    client_ctx = ssl.create_default_context(purpose=ssl.Purpose.SERVER_AUTH)
++    ca.configure_trust(client_ctx)
++
++    async def handler(request: web.Request) -> web.Response:
++        return web.Response(text="ok")
++
++    app = web.Application()
++    app.router.add_route("GET", "/", handler)
++    server = await aiohttp_server(app, ssl=server_ctx)
++    url = server.make_url("/")
++
++    connector = aiohttp.TCPConnector(ssl=client_ctx, limit=1, limit_per_host=1)
++    async with aiohttp.ClientSession(connector=connector) as session:
++        async with session.get(url, server_hostname="first.example") as resp:
++            assert resp.status == 200
++            await resp.read()
++
++        with pytest.raises(aiohttp.ClientConnectorCertificateError):
++            await session.get(url, server_hostname="second.example")
++
++
+ @pytest.mark.skipif(
+     sys.version_info < (3, 11), reason="ssl_shutdown_timeout requires Python 3.11+"
+ )
+diff --git a/tests/test_client_request.py b/tests/test_client_request.py
+index 66240258620..90ffcecb5d8 100644
+--- a/tests/test_client_request.py
++++ b/tests/test_client_request.py
+@@ -1614,6 +1614,22 @@ async def test_connection_key_without_proxy() -> None:
+     await req.close()
+ 
+ 
++async def test_connection_key_includes_server_hostname(
++    make_request: _RequestMaker,
++) -> None:
++    """A server_hostname override must be part of the connection reuse key."""
++    url = URL("https://127.0.0.1:8443/")
++    none_req = make_request("GET", url)
++    first = make_request("GET", url, server_hostname="first.example")
++    first_again = make_request("GET", url, server_hostname="first.example")
++    second = make_request("GET", url, server_hostname="second.example")
++
++    assert first.connection_key.server_hostname == "first.example"
++    assert first.connection_key != none_req.connection_key
++    assert first.connection_key != second.connection_key
++    assert first.connection_key == first_again.connection_key
++
++
+ def test_request_info_back_compat() -> None:
+     """Test RequestInfo can be created without real_url."""
+     url = URL("http://example.com")

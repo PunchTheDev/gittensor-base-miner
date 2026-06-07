@@ -1,0 +1,270 @@
+diff --git a/client/src/components/mana/ManaPaymentUI.tsx b/client/src/components/mana/ManaPaymentUI.tsx
+index 99d380afc0..8cd45700ab 100644
+--- a/client/src/components/mana/ManaPaymentUI.tsx
++++ b/client/src/components/mana/ManaPaymentUI.tsx
+@@ -250,7 +250,7 @@ export function ManaPaymentUI() {
+   return (
+     <AnimatePresence>
+       <motion.div
+-        className="fixed inset-x-0 bottom-0 z-40 flex justify-center pb-4"
++        className="pointer-events-none fixed inset-x-0 bottom-0 z-40 flex justify-center pb-4"
+         initial={{ y: 80, opacity: 0 }}
+         animate={{ y: 0, opacity: 1 }}
+         exit={{ y: 80, opacity: 0 }}
+diff --git a/client/src/components/mana/__tests__/ManaPaymentUI.test.tsx b/client/src/components/mana/__tests__/ManaPaymentUI.test.tsx
+index 07f4fde962..dc4dac05af 100644
+--- a/client/src/components/mana/__tests__/ManaPaymentUI.test.tsx
++++ b/client/src/components/mana/__tests__/ManaPaymentUI.test.tsx
+@@ -147,9 +147,12 @@ describe("ManaPaymentUI", () => {
+       });
+     });
+ 
+-    render(<ManaPaymentUI />);
++    const { container } = render(<ManaPaymentUI />);
+ 
+     expect(screen.getByText("Tap creatures to help pay.")).toBeInTheDocument();
++    const outerShell = container.querySelector(".pointer-events-none.fixed");
++    expect(outerShell).not.toBeNull();
++    expect(outerShell?.querySelector(".pointer-events-auto")).not.toBeNull();
+   });
+ 
+   // CR 107.4f + CR 601.2f: When the engine reports PhyrexianPayment, clicking Pay
+diff --git a/client/src/game/__tests__/sessionCleanup.test.ts b/client/src/game/__tests__/sessionCleanup.test.ts
+new file mode 100644
+index 0000000000..84342ccb7d
+--- /dev/null
++++ b/client/src/game/__tests__/sessionCleanup.test.ts
+@@ -0,0 +1,54 @@
++import { beforeEach, describe, expect, it } from "vitest";
++
++import type { GameState } from "../../adapter/types";
++import { clearPromptOverlayState } from "../sessionCleanup";
++import { useGameStore } from "../../stores/gameStore";
++import { useUiStore } from "../../stores/uiStore";
++
++describe("clearPromptOverlayState", () => {
++  beforeEach(() => {
++    useGameStore.getState().reset();
++    useUiStore.setState({
++      pendingAbilityChoice: null,
++      enchantmentsDialogPlayer: null,
++    });
++  });
++
++  it("clears convoke ManaPayment and UI dialogs without disposing the adapter", () => {
++    const adapter = { dispose: () => {} };
++    useGameStore.setState({
++      adapter: adapter as never,
++      waitingFor: {
++        type: "ManaPayment",
++        data: { player: 0, convoke_mode: "Convoke" },
++      },
++      legalActions: [{ type: "PassPriority" }],
++      autoPassRecommended: true,
++      spellCosts: { "1": { type: "Cost", shards: ["G"], generic: 0 } },
++      legalActionsByObject: { 1: [{ type: "TapForConvoke", data: { object_id: 1, mana_type: "Green" } }] },
++      resolutionProgress: { resolved: 2, total: 5 },
++      gameState: { waiting_for: { type: "ManaPayment", data: { player: 0, convoke_mode: "Convoke" } } } as GameState,
++    });
++    useUiStore.setState({
++      pendingAbilityChoice: {
++        objectId: 1,
++        actions: [{ type: "TapForConvoke", data: { object_id: 1, mana_type: "Green" } }],
++      },
++      enchantmentsDialogPlayer: 0,
++    });
++
++    clearPromptOverlayState();
++
++    const state = useGameStore.getState();
++    expect(state.waitingFor).toBeNull();
++    expect(state.legalActions).toEqual([]);
++    expect(state.autoPassRecommended).toBe(false);
++    expect(state.spellCosts).toEqual({});
++    expect(state.legalActionsByObject).toEqual({});
++    expect(state.resolutionProgress).toBeNull();
++    expect(state.adapter).toBe(adapter);
++    expect(state.gameState).not.toBeNull();
++    expect(useUiStore.getState().pendingAbilityChoice).toBeNull();
++    expect(useUiStore.getState().enchantmentsDialogPlayer).toBeNull();
++  });
++});
+diff --git a/client/src/game/sessionCleanup.ts b/client/src/game/sessionCleanup.ts
+new file mode 100644
+index 0000000000..c556e2d82b
+--- /dev/null
++++ b/client/src/game/sessionCleanup.ts
+@@ -0,0 +1,21 @@
++import { useGameStore } from "../stores/gameStore.ts";
++import { useUiStore } from "../stores/uiStore.ts";
++
++/**
++ * Drop engine prompt + UI-dialog overlay state without disposing the WASM
++ * adapter. Used on game-session boundaries (concede, provider unmount/remount)
++ * so deferred store resets or async `initGame` cannot leave `ManaPayment` /
++ * `pendingAbilityChoice` bleed into the next session (issue #2369).
++ */
++export function clearPromptOverlayState(): void {
++  useGameStore.setState({
++    waitingFor: null,
++    legalActions: [],
++    autoPassRecommended: false,
++    spellCosts: {},
++    legalActionsByObject: {},
++    resolutionProgress: null,
++  });
++  useUiStore.getState().setPendingAbilityChoice(null);
++  useUiStore.getState().setEnchantmentsDialogPlayer(null);
++}
+diff --git a/client/src/hooks/__tests__/useConcedeHandler.test.tsx b/client/src/hooks/__tests__/useConcedeHandler.test.tsx
+index e7a23cdd10..a4626f3997 100644
+--- a/client/src/hooks/__tests__/useConcedeHandler.test.tsx
++++ b/client/src/hooks/__tests__/useConcedeHandler.test.tsx
+@@ -16,12 +16,17 @@ import { useConcedeHandler } from "../useConcedeHandler";
+ // ---- Mocks -----------------------------------------------------------------
+ 
+ const dispatchMock = vi.fn();
+-const clearGameMock = vi.fn();
++const clearGameMock = vi.fn().mockResolvedValue(undefined);
++const clearPromptOverlayStateMock = vi.fn();
+ const recordMatchResultMock = vi.fn();
+ const reportActiveMatchConcessionMock = vi.fn();
+ const sendConcedeMock = vi.fn();
+ const navigateMock = vi.fn();
+ 
++vi.mock("../../game/sessionCleanup", () => ({
++  clearPromptOverlayState: () => clearPromptOverlayStateMock(),
++}));
++
+ vi.mock("../../stores/gameStore", () => ({
+   useGameStore: {
+     getState: () => ({
+@@ -65,6 +70,8 @@ function wrapper({ children }: { children: ReactNode }) {
+ beforeEach(() => {
+   dispatchMock.mockReset();
+   clearGameMock.mockReset();
++  clearGameMock.mockResolvedValue(undefined);
++  clearPromptOverlayStateMock.mockReset();
+   recordMatchResultMock.mockReset();
+   reportActiveMatchConcessionMock.mockReset();
+   sendConcedeMock.mockReset();
+@@ -106,6 +113,7 @@ describe("useConcedeHandler", () => {
+       type: "Concede",
+       data: { player_id: 0 },
+     });
++    expect(clearPromptOverlayStateMock).toHaveBeenCalledTimes(1);
+     expect(clearGameMock).toHaveBeenCalledWith("g1");
+     expect(navigateMock).toHaveBeenCalledWith("/");
+ 
+@@ -113,8 +121,10 @@ describe("useConcedeHandler", () => {
+     // Without the await, a future refactor would silently regress and the
+     // WasmAdapter singleton would retain the conceded game.
+     const dispatchOrder = dispatchMock.mock.invocationCallOrder[0];
++    const overlayOrder = clearPromptOverlayStateMock.mock.invocationCallOrder[0];
+     const clearOrder = clearGameMock.mock.invocationCallOrder[0];
+-    expect(dispatchOrder).toBeLessThan(clearOrder);
++    expect(dispatchOrder).toBeLessThan(overlayOrder);
++    expect(overlayOrder).toBeLessThan(clearOrder);
+   });
+ 
+   it("isDraft branch records match loss then clears + navigates to draft resume", async () => {
+diff --git a/client/src/hooks/useConcedeHandler.ts b/client/src/hooks/useConcedeHandler.ts
+index c794402523..22f52e913a 100644
+--- a/client/src/hooks/useConcedeHandler.ts
++++ b/client/src/hooks/useConcedeHandler.ts
+@@ -1,6 +1,7 @@
+ import { useCallback } from "react";
+ import { useNavigate } from "react-router";
+ 
++import { clearPromptOverlayState } from "../game/sessionCleanup";
+ import { clearGame, useGameStore } from "../stores/gameStore";
+ import { useDraftStore } from "../stores/draftStore";
+ import { useMultiplayerDraftStore } from "../stores/multiplayerDraftStore";
+@@ -109,14 +110,16 @@ export function useConcedeHandler({
+     void useGameStore
+       .getState()
+       .dispatch({ type: "Concede", data: { player_id: getPlayerId() } })
+-      .then(() => {
+-        clearGame(gameId);
++      .then(async () => {
++        clearPromptOverlayState();
++        await clearGame(gameId);
+         navigate("/");
+       })
+-      .catch((err) => {
++      .catch(async (err) => {
+         console.error("[useConcedeHandler] concede dispatch failed:", err);
+         // Still clear + navigate on failure — the user has decided to leave.
+-        clearGame(gameId);
++        clearPromptOverlayState();
++        await clearGame(gameId);
+         navigate("/");
+       });
+   }, [gameId, isDraft, isDraftPodMatch, navigate]);
+diff --git a/client/src/pages/GamePage.tsx b/client/src/pages/GamePage.tsx
+index 7baa627e59..1e1c182c63 100644
+--- a/client/src/pages/GamePage.tsx
++++ b/client/src/pages/GamePage.tsx
+@@ -109,6 +109,7 @@ import { MANA_PAYMENT_WAITING_FOR_TYPES } from "../game/waitingForRegistry.ts";
+ import { useGameDispatch } from "../hooks/useGameDispatch.ts";
+ import { useInspectHoverProps } from "../hooks/useInspectHoverProps.ts";
+ import { useKeyboardShortcuts } from "../hooks/useKeyboardShortcuts.ts";
++import { clearPromptOverlayState } from "../game/sessionCleanup.ts";
+ import { clearGame, loadActiveGame, useGameStore } from "../stores/gameStore.ts";
+ import { useUiStore } from "../stores/uiStore.ts";
+ import { usePreferencesStore } from "../stores/preferencesStore.ts";
+@@ -308,7 +309,8 @@ export function GamePage() {
+         // If WE conceded, navigate to menu immediately
+         if (event.player === useMultiplayerStore.getState().activePlayerId) {
+           hasConcededRef.current = true;
+-          if (gameId) clearGame(gameId);
++          clearPromptOverlayState();
++          if (gameId) void clearGame(gameId);
+           navigate("/");
+         }
+         break;
+@@ -835,8 +837,9 @@ function GamePageContent({
+       handleConcede();
+       return;
+     }
++    clearPromptOverlayState();
+     if (gameId) {
+-      clearGame(gameId);
++      void clearGame(gameId);
+     }
+     navigate("/");
+   }, [isOnlineMode, gameId, handleConcede, navigate]);
+diff --git a/client/src/providers/GameProvider.tsx b/client/src/providers/GameProvider.tsx
+index 3f8c74d440..5b08d1b0af 100644
+--- a/client/src/providers/GameProvider.tsx
++++ b/client/src/providers/GameProvider.tsx
+@@ -19,6 +19,7 @@ import { AI_DECK_RANDOM, usePreferencesStore } from "../stores/preferencesStore"
+ import { effectiveAiDifficulty } from "../services/cedhLock";
+ import { createGameLoopController } from "../game/controllers/gameLoopController";
+ import { dispatchAction, processRemoteUpdate } from "../game/dispatch";
++import { clearPromptOverlayState } from "../game/sessionCleanup";
+ import { usePhaseStopsSync } from "../hooks/usePhaseStopsSync";
+ import { hostRoom, joinRoom } from "../network/connection";
+ import type { BrokerClient } from "../services/brokerClient";
+@@ -502,6 +503,11 @@ export function GameProvider({
+     // is about to populate the store via initGame/resumeGame, and a fire from
+     // the previous cleanup would null out the state we just wrote.
+     cancelPendingStoreReset();
++    // Issue #2369: convoke ManaPayment + pendingAbilityChoice must not survive
++    // across sessions while initGame/resumeGame is still in flight — canceling
++    // the deferred reset alone leaves stale overlays clickable until the engine
++    // responds.
++    clearPromptOverlayState();
+ 
+     const { initGame, resumeGame, resumeP2PHost, reset, setGameMode } = useGameStore.getState();
+     setGameMode(mode);
+@@ -1253,6 +1259,9 @@ export function GameProvider({
+       cancelled = true;
+       if (controller) controller.dispose();
+       audioManager.setContext("menu");
++      // Issue #2369: drop prompt overlays synchronously so the next mount's
++      // `cancelPendingStoreReset` cannot resurrect convoke payment UI.
++      clearPromptOverlayState();
+       // Clear store state but keep the shared WASM worker alive — its V8
+       // TurboFan-compiled code, card database, and AI pool persist for reuse.
+       const adapter = useGameStore.getState().adapter;

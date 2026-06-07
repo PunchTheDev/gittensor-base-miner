@@ -1,0 +1,116 @@
+diff --git a/src/signals/engine.ts b/src/signals/engine.ts
+index daca84d5..15082ec6 100644
+--- a/src/signals/engine.ts
++++ b/src/signals/engine.ts
+@@ -1796,6 +1796,34 @@ type RepoOutcomePullRequest = {
+   changesRequested: boolean;
+ };
+ 
++// Normalize a recent_merged_pull_requests record into a decided/merged outcome PR.
++// These records live in a separate table from `pull_requests` and carry no
++// `authorAssociation` column, so maintainer-lane / author-role are derived from the
++// stored GitHub payload's `author_association` when present (else outside/external).
++function normalizeRecentMergedOutcome(
++  record: RecentMergedPullRequestRecord,
++  filesByNumber: Map<number, PullRequestFileRecord[]>,
++  reviewsByNumber: Map<number, PullRequestReviewRecord[]>,
++): RepoOutcomePullRequest {
++  const association = typeof record.payload.author_association === "string" ? (record.payload.author_association as string) : undefined;
++  const fileRecords = filesByNumber.get(record.number) ?? [];
++  const reviewRecords = reviewsByNumber.get(record.number) ?? [];
++  return {
++    number: record.number,
++    bucket: "merged",
++    decided: true,
++    merged: true,
++    maintainerLane: isMaintainerAssociation(association),
++    linked: record.linkedIssues.length > 0,
++    labels: [...new Set(record.labels)].sort(),
++    filePaths: [...new Set([...fileRecords.map((file) => file.path), ...record.changedFiles])].sort(),
++    changedLineCount: fileRecords.reduce((sum, file) => sum + file.additions + file.deletions, 0),
++    authorRole: association === "CONTRIBUTOR" ? "returning_contributor" : "first_time_or_external",
++    hasReview: reviewRecords.length > 0,
++    changesRequested: reviewRecords.some((review) => review.state === "CHANGES_REQUESTED"),
++  };
++}
++
+ export function buildRepoOutcomePatterns(args: {
+   repo: RepositoryRecord | null;
+   repoFullName: string;
+@@ -1829,11 +1857,16 @@ export function buildRepoOutcomePatterns(args: {
+   const lane = buildLaneAdvice(args.repo, args.repoFullName).lane;
+   const primaryLanguage = args.syncState?.primaryLanguage ?? null;
+ 
+-  const analyzed: RepoOutcomePullRequest[] = args.pullRequests
++  const seenNumbers = new Set<number>();
++  const analyzedFromPullRequests: RepoOutcomePullRequest[] = args.pullRequests
+     .filter((pr) => pr.repoFullName.toLowerCase() === repoKey)
+     .map((pr) => {
++      seenNumbers.add(pr.number);
+       const mergedDetail = mergedDetailByNumber.get(pr.number);
+-      const merged = Boolean(pr.mergedAt) || pr.state === "merged";
++      // A PR with a recent_merged_pull_requests record (carrying a mergedAt) actually merged,
++      // even when the open-PR reconciliation only saw it disappear and flipped it to closed
++      // without a mergedAt of its own.
++      const merged = Boolean(pr.mergedAt) || pr.state === "merged" || Boolean(mergedDetail?.mergedAt);
+       const closedUnmerged = !merged && pr.state === "closed";
+       const open = !merged && !closedUnmerged;
+       const stale = open && daysSince(pr.updatedAt ?? pr.createdAt) >= REPO_OUTCOME_STALE_OPEN_DAYS;
+@@ -1856,6 +1889,12 @@ export function buildRepoOutcomePatterns(args: {
+         changesRequested: reviewRecords.some((review) => review.state === "CHANGES_REQUESTED"),
+       };
+     });
++  // Merged PRs that live only in recent_merged_pull_requests (the open-PR backfill never
++  // upserts them into pull_requests) must still be counted in the outcome analysis.
++  const mergedOnly: RepoOutcomePullRequest[] = (args.recentMergedPullRequests ?? [])
++    .filter((record) => record.repoFullName.toLowerCase() === repoKey && Boolean(record.mergedAt) && !seenNumbers.has(record.number))
++    .map((record) => normalizeRecentMergedOutcome(record, filesByNumber, reviewsByNumber));
++  const analyzed: RepoOutcomePullRequest[] = [...analyzedFromPullRequests, ...mergedOnly];
+ 
+   const decided = analyzed.filter((pr) => pr.decided);
+   const maintainer = analyzed.filter((pr) => pr.maintainerLane);
+diff --git a/test/unit/repo-outcome-patterns.test.ts b/test/unit/repo-outcome-patterns.test.ts
+index 9d436144..e4aa1b95 100644
+--- a/test/unit/repo-outcome-patterns.test.ts
++++ b/test/unit/repo-outcome-patterns.test.ts
+@@ -247,6 +247,40 @@ describe("buildRepoOutcomePatterns", () => {
+     expect(sizeKeys).toContain("medium");
+   });
+ 
++  it("counts merged PRs that exist only in recent_merged_pull_requests toward the merge rate", () => {
++    // The open-PR backfill leaves only closed shells in pull_requests; the merged history
++    // lives in a separate recent_merged_pull_requests table and must still be counted.
++    const pullRequests = [closedPr(50), closedPr(51), closedPr(52)];
++    const mergedOnly = (number: number, overrides: Partial<RecentMergedPullRequestRecord> = {}): RecentMergedPullRequestRecord => ({
++      repoFullName: REPO,
++      number,
++      title: `PR ${number}`,
++      authorLogin: "dev",
++      mergedAt: "2026-05-01T00:00:00.000Z",
++      labels: ["bug"],
++      linkedIssues: [number + 100],
++      changedFiles: ["src/a.ts"],
++      payload: { author_association: "NONE" },
++      ...overrides,
++    });
++    const recentMergedPullRequests: RecentMergedPullRequestRecord[] = [
++      // Different repo -> excluded (covers the repo-mismatch branch).
++      mergedOnly(999, { repoFullName: "other/repo" }),
++      // Returning contributor.
++      mergedOnly(1, { payload: { author_association: "CONTRIBUTOR" } }),
++      // No author_association, unlinked, with a file record + review (covers files/review branches).
++      mergedOnly(2, { payload: {}, linkedIssues: [] }),
++      ...[3, 4, 5, 6, 7, 8, 9].map((number) => mergedOnly(number)),
++    ];
++    const files = [file(2, "src/b.ts")];
++    const reviews = [review(2, "CHANGES_REQUESTED")];
++    const result = buildRepoOutcomePatterns({ repo: repo(), repoFullName: REPO, pullRequests, recentMergedPullRequests, files, reviews });
++    // 9 merged (numbers 1-9) + 3 closed outside-contributor PRs -> 9/12 = 0.75 merge rate -> "merge well".
++    expect(result.totals.merged).toBe(9);
++    expect(result.successPatterns.some((pattern) => pattern.title === "Outside contributors merge well here")).toBe(true);
++    expect(result.riskPatterns.some((pattern) => pattern.title === "Outside contributor PRs rarely merge here")).toBe(false);
++  });
++
+   it("reports a low-sample finding when there are too few decided PRs", () => {
+     const result = buildRepoOutcomePatterns({ repo: repo(), repoFullName: REPO, pullRequests: [mergedPr(1)] });
+     expect(result.findings.some((f) => f.code === "low_outcome_sample")).toBe(true);

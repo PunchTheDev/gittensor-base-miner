@@ -1,0 +1,134 @@
+diff --git a/celery/canvas.py b/celery/canvas.py
+index 9f4d2f0ce74..da395c1390e 100644
+--- a/celery/canvas.py
++++ b/celery/canvas.py
+@@ -2307,6 +2307,13 @@ def link_error(self, errback):
+                 CPendingDeprecationWarning
+             )
+ 
++        # Edge case for nested chords in the header
++        for task in maybe_list(self.tasks) or []:
++            if isinstance(task, chord):
++                # Let the nested chord do the error linking itself on its
++                # header and body where needed, based on the current configuration
++                task.link_error(errback)
++
+         self.body.link_error(errback)
+         return errback
+ 
+diff --git a/t/integration/test_canvas.py b/t/integration/test_canvas.py
+index d2474fa2351..ed838dc6730 100644
+--- a/t/integration/test_canvas.py
++++ b/t/integration/test_canvas.py
+@@ -2862,6 +2862,60 @@ def test_chord_body_chain_child_replaced_with_chain_last(self, manager):
+         res_obj = orig_sig.delay()
+         assert res_obj.get(timeout=TIMEOUT) == [42]
+ 
++    def test_nested_chord_header_link_error(self, manager, subtests):
++        try:
++            manager.app.backend.ensure_chords_allowed()
++        except NotImplementedError as e:
++            raise pytest.skip(e.args[0])
++
++        if not manager.app.conf.result_backend.startswith("redis"):
++            raise pytest.skip("Requires redis result backend.")
++        redis_connection = get_redis_connection()
++
++        errback_msg = "errback called"
++        errback_key = "echo_errback"
++        errback_sig = redis_echo.si(errback_msg, redis_key=errback_key)
++
++        body_msg = "chord body called"
++        body_key = "echo_body"
++        body_sig = redis_echo.si(body_msg, redis_key=body_key)
++
++        redis_connection.delete(errback_key, body_key)
++
++        manager.app.conf.task_allow_error_cb_on_chord_header = False
++
++        chord_inner = chord(
++            [identity.si("t1"), fail.si()],
++            identity.si("t2 (body)"),
++        )
++        chord_outer = chord(
++            group(
++                [
++                    identity.si("t3"),
++                    chord_inner,
++                ],
++            ),
++            body_sig,
++        )
++        chord_outer.link_error(errback_sig)
++        chord_outer.delay()
++
++        with subtests.test(msg="Confirm the body was not executed"):
++            with pytest.raises(TimeoutError):
++                # confirm the chord body was not called
++                await_redis_echo((body_msg,), redis_key=body_key, timeout=10)
++            # Double check
++            assert not redis_connection.exists(body_key), "Chord body was called when it should have not"
++
++        with subtests.test(msg="Confirm only one errback was called"):
++            await_redis_echo((errback_msg,), redis_key=errback_key, timeout=10)
++            with pytest.raises(TimeoutError):
++                # Double check
++                await_redis_echo((errback_msg,), redis_key=errback_key, timeout=10)
++
++        # Cleanup
++        redis_connection.delete(errback_key)
++
+     def test_enabling_flag_allow_error_cb_on_chord_header(self, manager, subtests):
+         """
+         Test that the flag allow_error_callback_on_chord_header works as
+diff --git a/t/unit/tasks/test_canvas.py b/t/unit/tasks/test_canvas.py
+index 1f901376205..6d287848c31 100644
+--- a/t/unit/tasks/test_canvas.py
++++ b/t/unit/tasks/test_canvas.py
+@@ -1746,7 +1746,7 @@ def test_flag_allow_error_cb_on_chord_header_various_header_types(self):
+             group(signature('t'), signature('t'))
+         ]
+         for chord_header in headers:
+-            c = chord(chord_header, signature('t'))
++            c = chord(chord_header, signature('t'), app=self.app)
+             sig = signature('t')
+             errback = c.link_error(sig)
+             assert errback == sig
+@@ -1754,7 +1754,7 @@ def test_flag_allow_error_cb_on_chord_header_various_header_types(self):
+     @pytest.mark.usefixtures('depends_on_current_app')
+     def test_flag_allow_error_cb_on_chord_header_with_dict_callback(self):
+         self.app.conf.task_allow_error_cb_on_chord_header = True
+-        c = chord(group(signature('th1'), signature('th2')), signature('tbody'))
++        c = chord(group(signature('th1'), signature('th2')), signature('tbody'), app=self.app)
+         errback_dict = dict(signature('tcb'))
+         errback = c.link_error(errback_dict)
+         assert errback == errback_dict
+@@ -1783,7 +1783,7 @@ def test_chord_upgrade_on_chaining(self):
+     def test_link_error_on_chord_header(self, header):
+         """ Test that link_error on a chord also links the header """
+         self.app.conf.task_allow_error_cb_on_chord_header = True
+-        c = chord(header, signature('body'))
++        c = chord(header, signature('body'), app=self.app)
+         err = signature('err')
+         errback = c.link_error(err)
+         assert errback == err
+diff --git a/t/unit/tasks/test_stamping.py b/t/unit/tasks/test_stamping.py
+index 3d139abb9e9..1c8da859dd7 100644
+--- a/t/unit/tasks/test_stamping.py
++++ b/t/unit/tasks/test_stamping.py
+@@ -1300,13 +1300,13 @@ def tasks():
+ 
+         with subtests.test("chord header"):
+             self.app.conf.task_allow_error_cb_on_chord_header = True
+-            canvas = chord(tasks(), self.identity.si("body"))
++            canvas = chord(tasks(), self.identity.si("body"), app=self.app)
+             canvas.link_error(s("group_link_error"))
+             canvas.stamp(CustomStampingVisitor())
+ 
+         with subtests.test("chord body"):
+             self.app.conf.task_allow_error_cb_on_chord_header = False
+-            canvas = chord(tasks(), self.identity.si("body"))
++            canvas = chord(tasks(), self.identity.si("body"), app=self.app)
+             canvas.link_error(s("group_link_error"))
+             canvas.stamp(CustomStampingVisitor())
+ 

@@ -1,0 +1,187 @@
+diff --git a/app/controllers/transactions_controller.rb b/app/controllers/transactions_controller.rb
+index 2fd63e4be3..9387d75504 100644
+--- a/app/controllers/transactions_controller.rb
++++ b/app/controllers/transactions_controller.rb
+@@ -9,9 +9,7 @@ def new
+     prefill_params_from_duplicate!
+     super
+     apply_duplicate_attributes!
+-    @income_categories = Current.family.categories.incomes.alphabetically
+-    @expense_categories = Current.family.categories.expenses.alphabetically
+-    @categories = Current.family.categories.alphabetically
++    set_new_transaction_form_options
+   end
+ 
+   def index
+@@ -117,6 +115,7 @@ def create
+         format.turbo_stream { stream_redirect_back_or_to(account_path(@entry.account)) }
+       end
+     else
++      set_new_transaction_form_options
+       render :new, status: :unprocessable_entity
+     end
+   end
+@@ -489,6 +488,21 @@ def set_entry_for_tags
+       set_entry
+     end
+ 
++    def set_new_transaction_form_options
++      accessible_accounts_scope = accessible_accounts
++
++      @account_currencies = accessible_accounts_scope.pluck(:id, :currency).to_h
++      @manual_accounts = accessible_accounts_scope
++        .manual
++        .active
++        .alphabetically
++        .includes(:account_providers, logo_attachment: :blob)
++        .to_a
++      @categories = Current.family.categories.alphabetically.to_a
++      @merchants = Current.family.available_merchants_for(Current.user).alphabetically.to_a
++      @tags = Current.family.tags.alphabetically.to_a
++    end
++
+     # Filters entry_params based on the user's permission on the account.
+     # read_write users can only annotate (category, tags, notes, merchant).
+     # read_only users cannot update anything.
+diff --git a/app/views/transactions/_form.html.erb b/app/views/transactions/_form.html.erb
+index 1064da60f0..acf69714fe 100644
+--- a/app/views/transactions/_form.html.erb
++++ b/app/views/transactions/_form.html.erb
+@@ -1,7 +1,6 @@
+-<%# locals: (entry:, categories:) %>
++<%# locals: (entry:, account_currencies:, manual_accounts:, categories:, merchants:, tags:) %>
+ 
+-<% account_currencies = Current.family.accounts.map { |a| [a.id, a.currency] }.to_h.to_json %>
+-<%= styled_form_with model: entry, url: transactions_path, class: "space-y-4", data: { controller: "transaction-form", transaction_form_exchange_rate_url_value: exchange_rate_path, transaction_form_account_currencies_value: account_currencies } do |f| %>
++<%= styled_form_with model: entry, url: transactions_path, class: "space-y-4", data: { controller: "transaction-form", transaction_form_exchange_rate_url_value: exchange_rate_path, transaction_form_account_currencies_value: account_currencies.to_json } do |f| %>
+   <% if entry.errors.any? %>
+     <%= render "shared/form_errors", model: entry %>
+   <% end %>
+@@ -19,7 +18,7 @@
+     <% if @entry.account_id %>
+       <%= f.hidden_field :account_id, data: { transaction_form_target: "account" } %>
+     <% else %>
+-      <%= f.collection_select :account_id, accessible_accounts.manual.active.alphabetically, :id, :name, { prompt: t(".account_prompt"), label: t(".account"), selected: Current.user.default_account_for_transactions&.id, variant: :logo }, required: true, class: "form-field__input text-ellipsis", data: { transaction_form_target: "account", action: "change->transaction-form#checkCurrencyDifference" } %>
++      <%= f.collection_select :account_id, manual_accounts, :id, :name, { prompt: t(".account_prompt"), label: t(".account"), selected: Current.user.default_account_for_transactions&.id, variant: :logo }, required: true, class: "form-field__input text-ellipsis", data: { transaction_form_target: "account", action: "change->transaction-form#checkCurrencyDifference" } %>
+     <% end %>
+ 
+     <%= f.money_field :amount,
+@@ -87,7 +86,7 @@
+     <section class="space-y-2">
+       <%= f.fields_for :entryable do |ef| %>
+         <%= ef.collection_select :merchant_id,
+-                  Current.family.available_merchants_for(Current.user).alphabetically,
++                  merchants,
+                   :id, :name,
+                   { include_blank: t(".none"),
+                     label: t(".merchant_label"),
+@@ -96,7 +95,7 @@
+                     menu_placement: :auto } %>
+         <%= render DS::TagSelect.new(
+               form: ef,
+-              tags: Current.family.tags.alphabetically,
++              tags: tags,
+               selected_ids: ef.object.tag_ids
+             ) %>
+       <% end %>
+diff --git a/app/views/transactions/new.html.erb b/app/views/transactions/new.html.erb
+index 3d612c0a8d..1e13162cd2 100644
+--- a/app/views/transactions/new.html.erb
++++ b/app/views/transactions/new.html.erb
+@@ -1,6 +1,12 @@
+ <%= render DS::Dialog.new(scrollable: false, content_class: "lg:max-h-none lg:overflow-y-auto") do |dialog| %>
+   <% dialog.with_header(title: t(".new_transaction")) %>
+   <% dialog.with_body do %>
+-    <%= render "form", entry: @entry, categories: @categories %>
++    <%= render "form",
++               entry: @entry,
++               account_currencies: @account_currencies,
++               manual_accounts: @manual_accounts,
++               categories: @categories,
++               merchants: @merchants,
++               tags: @tags %>
+   <% end %>
+ <% end %>
+diff --git a/test/controllers/transactions_controller_test.rb b/test/controllers/transactions_controller_test.rb
+index 3fa6149fce..73158ecd18 100644
+--- a/test/controllers/transactions_controller_test.rb
++++ b/test/controllers/transactions_controller_test.rb
+@@ -462,6 +462,56 @@ class TransactionsControllerTest < ActionDispatch::IntegrationTest
+     end
+   end
+ 
++  test "new preloads transaction form option data" do
++    family = families(:empty)
++    user = users(:empty)
++    sign_in user
++
++    manual_account_ids = []
++    4.times do |idx|
++      account = family.accounts.create!(
++        name: "Manual Account #{idx}",
++        balance: 0,
++        currency: "USD",
++        accountable: Depository.new
++      )
++      assert Account.manual.active.exists?(id: account.id), "Account should be included in the manual active scope"
++      manual_account_ids << account.id
++      family.categories.create!(
++        name: "Category #{idx}",
++        color: "#000000",
++        lucide_icon: "shapes"
++      )
++      family.merchants.create!(name: "Merchant #{idx}")
++      family.tags.create!(name: "Tag #{idx}")
++    end
++
++    inaccessible_account = families(:dylan_family).accounts.create!(
++      name: "Other Family Account",
++      balance: 0,
++      currency: "EUR",
++      accountable: Depository.new
++    )
++
++    queries = capture_sql_queries { get new_transaction_url }
++
++    assert_response :success
++    assert_select "input[name='entry[account_id]']"
++    assert_select "input[name='entry[entryable_attributes][category_id]']"
++    assert_select "input[name='entry[entryable_attributes][merchant_id]']"
++    assert_select "form[data-transaction-form-account-currencies-value]" do |forms|
++      account_currencies = JSON.parse(forms.first["data-transaction-form-account-currencies-value"])
++      manual_account_ids.each do |account_id|
++        assert_equal "USD", account_currencies[account_id.to_s]
++      end
++      assert_nil account_currencies[inaccessible_account.id.to_s]
++    end
++
++    assert_empty queries.grep(/FROM "account_providers" WHERE "account_providers"\."account_id" =/)
++    assert_operator queries.grep(/FROM "active_storage_attachments" WHERE "active_storage_attachments"\."record_id" =/).size, :<=, 1
++    assert_operator queries.grep(/SELECT "categories"\.\* FROM "categories" WHERE "categories"\."family_id" =/).size, :<=, 1
++  end
++
+   test "unlock clears import_locked flag" do
+     family = families(:empty)
+     sign_in users(:empty)
+@@ -634,4 +684,21 @@ class TransactionsControllerTest < ActionDispatch::IntegrationTest
+     created_entry = Entry.order(:created_at).last
+     assert_nil created_entry.transaction.extra["exchange_rate"]
+   end
++
++  private
++    def capture_sql_queries
++      queries = []
++      callback = lambda do |_name, _started, _finished, _unique_id, payload|
++        next if payload[:cached]
++        next if %w[SCHEMA TRANSACTION].include?(payload[:name])
++
++        queries << payload[:sql].squish
++      end
++
++      ActiveSupport::Notifications.subscribed(callback, "sql.active_record") do
++        yield
++      end
++
++      queries
++    end
+ end

@@ -1,0 +1,453 @@
+diff --git a/apps/gittensory-ui/public/openapi.json b/apps/gittensory-ui/public/openapi.json
+index f89b5cb1..6137cc4c 100644
+--- a/apps/gittensory-ui/public/openapi.json
++++ b/apps/gittensory-ui/public/openapi.json
+@@ -14027,6 +14027,39 @@
+           }
+         ]
+       }
++    },
++    "/v1/repos/{owner}/{repo}/onboarding-pack/preview": {
++      "get": {
++        "responses": {
++          "200": {
++            "description": "Preview-only repo onboarding pack for accepted repositories",
++            "content": {
++              "application/json": {
++                "schema": {
++                  "type": "object",
++                  "additionalProperties": {
++                    "nullable": true
++                  }
++                }
++              }
++            }
++          },
++          "403": {
++            "description": "Insufficient role"
++          },
++          "404": {
++            "description": "Repository is not accepted or preview unavailable"
++          }
++        },
++        "security": [
++          {
++            "GittensoryBearer": []
++          },
++          {
++            "GittensorySessionCookie": []
++          }
++        ]
++      }
+     }
+   },
+   "servers": [
+diff --git a/src/api/routes.ts b/src/api/routes.ts
+index 4f0110bd..211f8287 100644
+--- a/src/api/routes.ts
++++ b/src/api/routes.ts
+@@ -181,6 +181,7 @@ import { buildPullRequestReviewability, type PullRequestReviewability } from "..
+ import { buildLocalBranchAnalysis, findCurrentBranchPullRequest } from "../signals/local-branch";
+ import { MAX_LOCAL_SCORER_WARNING_CHARS, MAX_LOCAL_SCORER_WARNING_COUNT } from "../signals/local-scorer-diagnostics";
+ import { loadRepoFocusManifest } from "../signals/focus-manifest-loader";
++import { buildRepoOnboardingPackPreviewForRepo } from "../services/repo-onboarding-pack";
+ import { buildRepoSettingsPreview, type PublicSurfaceSkipReason } from "../signals/settings-preview";
+ import { buildGittensorConfigRecommendation, buildRegistrationReadiness, type InstallationHealthSummary } from "../signals/registration-readiness";
+ import { fileUpstreamDriftIssues, loadUpstreamStatus, refreshUpstreamDrift, registryHyperparameterDriftWarningsForRepo } from "../upstream/ruleset";
+@@ -1479,6 +1480,19 @@ export function createApp() {
+     return c.json(await buildGittensorConfigRecommendationResponse(c.env, fullName));
+   });
+ 
++  app.get("/v1/repos/:owner/:repo/onboarding-pack/preview", async (c) => {
++    const fullName = `${c.req.param("owner")}/${c.req.param("repo")}`;
++    const forbidden = await requireAppRole(c, ["maintainer", "owner", "operator"]);
++    if (forbidden) return forbidden;
++    const response = await buildRepoOnboardingPackPreviewForRepo(c.env, fullName, {
++      refreshManifest: c.req.query("refresh") === "true",
++    });
++    if ("error" in response) {
++      return c.json(response, 404);
++    }
++    return c.json(response);
++  });
++
+   app.get("/v1/repos/:owner/:repo/settings", async (c) => {
+     const fullName = `${c.req.param("owner")}/${c.req.param("repo")}`;
+     return c.json(await getRepositorySettings(c.env, fullName));
+diff --git a/src/openapi/spec.ts b/src/openapi/spec.ts
+index 9b7e109c..b173894d 100644
+--- a/src/openapi/spec.ts
++++ b/src/openapi/spec.ts
+@@ -373,6 +373,15 @@ export function buildOpenApiSpec() {
+       200: { description: "Private Gittensor config recommendation for repo owners", content: { "application/json": { schema: GittensorConfigRecommendationSchema } } },
+     },
+   });
++  registry.registerPath({
++    method: "get",
++    path: "/v1/repos/{owner}/{repo}/onboarding-pack/preview",
++    responses: {
++      200: { description: "Preview-only repo onboarding pack for accepted repositories", content: { "application/json": { schema: z.record(z.string(), z.unknown()) } } },
++      403: { description: "Insufficient role" },
++      404: { description: "Repository is not accepted or preview unavailable" },
++    },
++  });
+   registry.registerPath({
+     method: "get",
+     path: "/v1/repos/{owner}/{repo}/settings",
+diff --git a/src/services/repo-onboarding-pack.ts b/src/services/repo-onboarding-pack.ts
+new file mode 100644
+index 00000000..ae956ba0
+--- /dev/null
++++ b/src/services/repo-onboarding-pack.ts
+@@ -0,0 +1,52 @@
++import { getRepository } from "../db/repositories";
++import type { FocusManifest } from "../signals/focus-manifest";
++import { loadRepoFocusManifest } from "../signals/focus-manifest-loader";
++import {
++  buildRepoOnboardingPackPreview,
++  type RepoOnboardingPackPreview,
++  type RepoPolicyCompilerOutput,
++} from "../signals/onboarding-pack";
++import { compileRepoPolicyCompilerOutput } from "../signals/repo-policy-compiler";
++
++export type RepoOnboardingPackPreviewResponse = {
++  repoFullName: string;
++  accepted: boolean;
++  preview: RepoOnboardingPackPreview;
++  policySource: "policy_compiler";
++};
++
++export function buildRepoOnboardingPackPreviewFromManifest(
++  repoFullName: string,
++  manifest: FocusManifest,
++): { preview: RepoOnboardingPackPreview; policyOutput: RepoPolicyCompilerOutput } {
++  const policyOutput = compileRepoPolicyCompilerOutput({ repoFullName, manifest });
++  const preview = buildRepoOnboardingPackPreview(policyOutput);
++  return { preview, policyOutput };
++}
++
++/**
++ * Build a sanitized onboarding-pack preview for an accepted (registered) repository.
++ */
++export async function buildRepoOnboardingPackPreviewForRepo(
++  env: Env,
++  repoFullName: string,
++  options: { refreshManifest?: boolean } = {},
++): Promise<RepoOnboardingPackPreviewResponse | { error: string; repoFullName: string }> {
++  const repo = await getRepository(env, repoFullName);
++  if (!repo?.isRegistered) {
++    return {
++      error: "repo_not_accepted",
++      repoFullName,
++    };
++  }
++
++  const manifest = await loadRepoFocusManifest(env, repoFullName, { refresh: options.refreshManifest === true });
++  const { preview } = buildRepoOnboardingPackPreviewFromManifest(repoFullName, manifest);
++
++  return {
++    repoFullName,
++    accepted: true,
++    preview,
++    policySource: "policy_compiler",
++  };
++}
+diff --git a/src/signals/repo-policy-compiler.ts b/src/signals/repo-policy-compiler.ts
+new file mode 100644
+index 00000000..1fc70cf4
+--- /dev/null
++++ b/src/signals/repo-policy-compiler.ts
+@@ -0,0 +1,113 @@
++import {
++  compileFocusManifestPolicy,
++  isFocusManifestPublicSafe,
++  type FocusManifest,
++  type FocusManifestLanePreference,
++} from "./focus-manifest";
++import type { RepoPolicyCompilerOutput, RepoPolicyContributionLane } from "./onboarding-pack";
++import { nowIso } from "../utils/json";
++
++export type RepoPolicyCompilerInput = {
++  repoFullName: string;
++  manifest: FocusManifest;
++  generatedAt?: string | undefined;
++};
++
++/**
++ * Compile a normalized focus manifest into policy output consumed by onboarding-pack generation (#277 → #248).
++ */
++export function compileRepoPolicyCompilerOutput(input: RepoPolicyCompilerInput): RepoPolicyCompilerOutput {
++  const policy = compileFocusManifestPolicy(input.manifest);
++  const contributionLanes: RepoPolicyContributionLane[] = [];
++
++  if (policy.present) {
++    contributionLanes.push(buildDirectPrLane(policy.publicSafe.contributionLanes.directPrLane, policy));
++    contributionLanes.push(buildIssueDiscoveryLane(policy.publicSafe.contributionLanes.issueDiscoveryLane, policy));
++  }
++
++  const publicReadinessWarnings = policy.authenticated.readinessWarnings.filter(isFocusManifestPublicSafe);
++  const publicParseWarnings = policy.authenticated.parseWarnings.filter(isFocusManifestPublicSafe);
++
++  return {
++    repoFullName: input.repoFullName,
++    generatedAt: input.generatedAt ?? nowIso(),
++    contributionLanes,
++    labelPolicy: {
++      preferredLabels: policy.publicSafe.labelExpectations.preferredLabels,
++      requiredLabels: [],
++      discouragedLabels: [],
++      note: labelPolicyNote(policy.publicSafe.labelExpectations.linkedIssuePolicy),
++    },
++    validationExpectations: policy.publicSafe.validationExpectations.testExpectations,
++    readinessWarnings: [
++      ...publicReadinessWarnings,
++      ...publicParseWarnings,
++      "Confirm contribution guidance stays previewable before publication.",
++      "Keep public material separated from maintainer-only context.",
++    ].filter(isFocusManifestPublicSafe),
++    maintainerExpectations: [
++      "Keep pull requests narrow and tied to accepted repository policy.",
++      "Shape PR descriptions around maintainer public notes and validation expectations.",
++    ],
++    publicOutputBoundaries: [
++      "Keep sensitive credentials, account secrets, compensation estimates, private maintainer evidence, and local paths out of public contribution text.",
++      "Keep the pack as guidance for accepted work, not as automated GitHub action.",
++      ...input.manifest.publicNotes.filter(isFocusManifestPublicSafe),
++    ],
++    privateOwnerContext: policy.authenticated.maintainerContext,
++  };
++}
++
++function buildDirectPrLane(
++  preference: FocusManifestLanePreference,
++  policy: ReturnType<typeof compileFocusManifestPolicy>,
++): RepoPolicyContributionLane {
++  return {
++    id: "direct-pr",
++    title: laneTitle("Direct pull request lane", preference),
++    summary: directPrSummary(preference, policy.publicSafe.summary),
++    preferredPaths: policy.publicSafe.contributionLanes.preferredEntryPaths,
++    discouragedPaths: policy.publicSafe.discouragedWork.blockedEntryPaths,
++    validationExpectations: policy.publicSafe.validationExpectations.testExpectations,
++    publicNotes: policy.publicSafe.entryGuidance,
++  };
++}
++
++function buildIssueDiscoveryLane(
++  preference: FocusManifestLanePreference,
++  policy: ReturnType<typeof compileFocusManifestPolicy>,
++): RepoPolicyContributionLane {
++  return {
++    id: "issue-discovery",
++    title: laneTitle("Issue discovery lane", preference),
++    summary: issueDiscoverySummary(preference, policy.publicSafe.summary),
++    preferredPaths: policy.publicSafe.contributionLanes.preferredEntryPaths,
++    discouragedPaths: policy.publicSafe.discouragedWork.blockedEntryPaths,
++    validationExpectations: policy.publicSafe.validationExpectations.testExpectations,
++    publicNotes: policy.publicSafe.entryGuidance.filter((note) => !note.toLowerCase().includes("direct")),
++  };
++}
++
++function laneTitle(base: string, preference: FocusManifestLanePreference): string {
++  if (preference === "preferred") return `${base} (preferred)`;
++  if (preference === "discouraged") return `${base} (discouraged)`;
++  return base;
++}
++
++function directPrSummary(preference: FocusManifestLanePreference, summary: string): string {
++  if (preference === "discouraged") return "Direct pull requests are discouraged for this repository.";
++  if (preference === "preferred") return summary;
++  return "Direct pull requests are accepted when they stay inside maintainer-wanted scope.";
++}
++
++function issueDiscoverySummary(preference: FocusManifestLanePreference, summary: string): string {
++  if (preference === "discouraged") return "Prefer direct fixes over new issue reports.";
++  if (preference === "preferred") return summary;
++  return "Issue discovery is optional; confirm maintainer scope before filing new issues.";
++}
++
++function labelPolicyNote(linkedIssuePolicy: string): string {
++  if (linkedIssuePolicy === "required") return "Link a tracked issue before opening a pull request.";
++  if (linkedIssuePolicy === "preferred") return "Link a tracked issue when one exists.";
++  return "Use labels to explain accepted scope, not to promise outcomes.";
++}
+diff --git a/test/unit/onboarding-pack.test.ts b/test/unit/onboarding-pack.test.ts
+index c38c32e0..9d582d31 100644
+--- a/test/unit/onboarding-pack.test.ts
++++ b/test/unit/onboarding-pack.test.ts
+@@ -1,4 +1,12 @@
+ import { describe, expect, it } from "vitest";
++import {
++  buildRepoOnboardingPackPreviewForRepo,
++  buildRepoOnboardingPackPreviewFromManifest,
++} from "../../src/services/repo-onboarding-pack";
++import { createTestEnv } from "../helpers/d1";
++import { upsertRepositoryFromGitHub } from "../../src/db/repositories";
++import { parseFocusManifestContent } from "../../src/signals/focus-manifest";
++import { compileRepoPolicyCompilerOutput } from "../../src/signals/repo-policy-compiler";
+ import {
+   buildRepoOnboardingPackPreview,
+   isRepoOnboardingPackPublicSafe,
+@@ -200,6 +208,26 @@ describe("buildRepoOnboardingPackPreview", () => {
+     expect(isRepoOnboardingPackPublicSafe(preview)).toBe(true);
+   });
+ 
++  it("compiler fixture pipeline matches buildRepoOnboardingPackPreviewFromManifest", () => {
++    const manifest = parseFocusManifestContent(
++      JSON.stringify({
++        wantedPaths: ["src/"],
++        testExpectations: ["npm run test:ci"],
++        publicNotes: ["Stay advisory."],
++      }),
++      "repo_file",
++    );
++    const compiled = compileRepoPolicyCompilerOutput({
++      repoFullName: "JSONbored/gittensory",
++      manifest,
++    });
++    const fromCompiler = buildRepoOnboardingPackPreview(compiled);
++    const fromService = buildRepoOnboardingPackPreviewFromManifest("JSONbored/gittensory", manifest);
++    expect(fromService.preview.contributionLanes.length).toBe(fromCompiler.contributionLanes.length);
++    expect(fromService.preview.publication.status).toBe("preview_only");
++    expect(isRepoOnboardingPackPublicSafe(fromService.preview)).toBe(true);
++  });
++
+   it("uses stable defaults when optional policy sections are omitted", () => {
+     const preview = buildRepoOnboardingPackPreview(
+       {
+@@ -235,3 +263,35 @@ describe("buildRepoOnboardingPackPreview", () => {
+     expect(isRepoOnboardingPackPublicSafe(preview)).toBe(true);
+   });
+ });
++
++describe("buildRepoOnboardingPackPreviewForRepo", () => {
++  it("returns preview_only pack for accepted registered repos", async () => {
++    const env = createTestEnv();
++    await upsertRepositoryFromGitHub(
++      env,
++      { name: "gittensory", full_name: "JSONbored/gittensory", private: false, owner: { login: "JSONbored" } },
++      1,
++    );
++    await env.DB.prepare("UPDATE repositories SET is_registered = 1 WHERE full_name = ?")
++      .bind("JSONbored/gittensory")
++      .run();
++    const response = await buildRepoOnboardingPackPreviewForRepo(env, "JSONbored/gittensory");
++    expect("error" in response).toBe(false);
++    if ("error" in response) return;
++    expect(response.accepted).toBe(true);
++    expect(response.preview.previewOnly).toBe(true);
++    expect(response.preview.publication.allowed).toBe(false);
++    expect(isRepoOnboardingPackPublicSafe(response.preview)).toBe(true);
++  });
++
++  it("rejects onboarding pack preview for unregistered repos", async () => {
++    const env = createTestEnv();
++    await upsertRepositoryFromGitHub(
++      env,
++      { name: "unregistered", full_name: "owner/unregistered", private: false, owner: { login: "owner" } },
++      1,
++    );
++    const response = await buildRepoOnboardingPackPreviewForRepo(env, "owner/unregistered");
++    expect(response).toMatchObject({ error: "repo_not_accepted", repoFullName: "owner/unregistered" });
++  });
++});
+diff --git a/test/unit/repo-policy-compiler.test.ts b/test/unit/repo-policy-compiler.test.ts
+new file mode 100644
+index 00000000..41617231
+--- /dev/null
++++ b/test/unit/repo-policy-compiler.test.ts
+@@ -0,0 +1,94 @@
++import { describe, expect, it } from "vitest";
++
++import { parseFocusManifest } from "../../src/signals/focus-manifest";
++import {
++  compileRepoPolicyCompilerOutput,
++  type RepoPolicyCompilerInput,
++} from "../../src/signals/repo-policy-compiler";
++import type { RepoPolicyCompilerOutput } from "../../src/signals/onboarding-pack";
++
++function lanes(output: RepoPolicyCompilerOutput, min = 1) {
++  expect(output.contributionLanes).toBeDefined();
++  expect(output.contributionLanes!.length).toBeGreaterThanOrEqual(min);
++  return output.contributionLanes!;
++}
++
++function labelPolicy(output: RepoPolicyCompilerOutput) {
++  expect(output.labelPolicy).toBeDefined();
++  return output.labelPolicy!;
++}
++
++function compile(input: RepoPolicyCompilerInput) {
++  return compileRepoPolicyCompilerOutput(input);
++}
++
++describe("compileRepoPolicyCompilerOutput", () => {
++  it("returns empty lanes when manifest is absent", () => {
++    const output = compile({
++      repoFullName: "owner/repo",
++      manifest: parseFocusManifest(null),
++      generatedAt: "2026-06-01T00:00:00.000Z",
++    });
++    expect(output.contributionLanes).toEqual([]);
++    expect(labelPolicy(output).note).toMatch(/accepted scope/i);
++  });
++
++  it("covers direct-PR and issue-discovery lane preference branches", () => {
++    const discouraged = compile({
++      repoFullName: "owner/discouraged",
++      manifest: parseFocusManifest({
++        wantedPaths: ["src/"],
++        issueDiscoveryPolicy: "discouraged",
++      }),
++      generatedAt: "2026-06-01T00:00:00.000Z",
++    });
++    expect(lanes(discouraged, 2)[0]!.summary).toMatch(/discouraged/i);
++    expect(lanes(discouraged, 2)[1]!.summary).toMatch(/direct fixes/i);
++
++    const preferred = compile({
++      repoFullName: "owner/preferred",
++      manifest: parseFocusManifest({
++        wantedPaths: ["src/"],
++        issueDiscoveryPolicy: "encouraged",
++        linkedIssuePolicy: "required",
++      }),
++      generatedAt: "2026-06-01T00:00:00.000Z",
++    });
++    expect(lanes(preferred, 2)[0]!.title).toMatch(/discouraged/i);
++    expect(lanes(preferred, 2)[1]!.title).toMatch(/preferred/i);
++    expect(labelPolicy(preferred).note).toMatch(/tracked issue before opening/i);
++
++    const linkedPreferred = compile({
++      repoFullName: "owner/neutral",
++      manifest: parseFocusManifest({ wantedPaths: ["src/"], linkedIssuePolicy: "preferred" }),
++      generatedAt: "2026-06-01T00:00:00.000Z",
++    });
++    expect(labelPolicy(linkedPreferred).note).toMatch(/when one exists/i);
++
++    const neutralLanes = compile({
++      repoFullName: "owner/neutral-lanes",
++      manifest: parseFocusManifest({ preferredLabels: ["bug"] }),
++      generatedAt: "2026-06-01T00:00:00.000Z",
++    });
++    const neutral = lanes(neutralLanes, 2);
++    expect(neutral[0]!.summary).toMatch(/accepted when they stay inside/i);
++    expect(neutral[1]!.summary).toMatch(/optional/i);
++    expect(neutral[0]!.title).toBe("Direct pull request lane");
++    expect(neutral[1]!.title).toBe("Issue discovery lane");
++  });
++
++  it("filters unsafe public notes from boundaries", () => {
++    const output = compile({
++      repoFullName: "owner/repo",
++      manifest: parseFocusManifest({
++        wantedPaths: ["src/"],
++        publicNotes: ["Stay focused.", "wallet hotkey payout"],
++      }),
++      generatedAt: "2026-06-01T00:00:00.000Z",
++    });
++    expect(output.publicOutputBoundaries).toEqual(
++      expect.arrayContaining([expect.stringContaining("Stay focused.")]),
++    );
++    expect(output.publicOutputBoundaries!.join(" ")).not.toMatch(/wallet|payout/i);
++  });
++});

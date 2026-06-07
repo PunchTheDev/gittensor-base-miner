@@ -1,0 +1,214 @@
+diff --git a/changelog/13896.bugfix.rst b/changelog/13896.bugfix.rst
+new file mode 100644
+index 00000000000..187be00cc4d
+--- /dev/null
++++ b/changelog/13896.bugfix.rst
+@@ -0,0 +1,5 @@
++The terminal progress feature added in pytest 9.0.0 has been disabled by default, except on Windows, due to compatibility issues with some terminal emulators.
++
++You may enable it again by passing ``-p terminalprogress``. We may enable it by default again once compatibility improves in the future.
++
++Additionally, when the environment variable ``TERM`` is ``dumb``, the escape codes are no longer emitted, even if the plugin is enabled.
+diff --git a/doc/en/changelog.rst b/doc/en/changelog.rst
+index 1de9afaaa66..d9e9928db00 100644
+--- a/doc/en/changelog.rst
++++ b/doc/en/changelog.rst
+@@ -178,6 +178,10 @@ New features
+ 
+ 
+ - `#13072 <https://github.com/pytest-dev/pytest/issues/13072>`_: Added support for displaying test session **progress in the terminal tab** using the `OSC 9;4; <https://conemu.github.io/en/AnsiEscapeCodes.html#ConEmu_specific_OSC>`_ ANSI sequence.
++
++  **Note**: *This feature has been disabled by default in version 9.0.2, except on Windows, due to compatibility issues with some terminal emulators.
++  You may enable it again by passing* ``-p terminalprogress``. *We may enable it by default again once compatibility improves in the future.*
++
+   When pytest runs in a supported terminal emulator like ConEmu, Gnome Terminal, Ptyxis, Windows Terminal, Kitty or Ghostty,
+   you'll see the progress in the terminal tab or window,
+   allowing you to monitor pytest's progress at a glance.
+diff --git a/src/_pytest/config/__init__.py b/src/_pytest/config/__init__.py
+index 39817aaa523..6b02e160e1a 100644
+--- a/src/_pytest/config/__init__.py
++++ b/src/_pytest/config/__init__.py
+@@ -299,6 +299,7 @@ def directory_arg(path: str, optname: str) -> str:
+     *default_plugins,
+     "pytester",
+     "pytester_assertions",
++    "terminalprogress",
+ }
+ 
+ 
+diff --git a/src/_pytest/terminal.py b/src/_pytest/terminal.py
+index 4517b05bdee..e66e4f48dd6 100644
+--- a/src/_pytest/terminal.py
++++ b/src/_pytest/terminal.py
+@@ -16,7 +16,6 @@
+ import datetime
+ from functools import partial
+ import inspect
+-import os
+ from pathlib import Path
+ import platform
+ import sys
+@@ -299,16 +298,10 @@ def mywriter(tags, args):
+ 
+         config.trace.root.setprocessor("pytest:config", mywriter)
+ 
+-    if reporter.isatty():
+-        # Some terminals interpret OSC 9;4 as desktop notification,
+-        # skip on those we know (#13896).
+-        should_skip_terminal_progress = (
+-            # iTerm2 (reported on version 3.6.5).
+-            "ITERM_SESSION_ID" in os.environ
+-        )
+-        if not should_skip_terminal_progress:
+-            plugin = TerminalProgressPlugin(reporter)
+-            config.pluginmanager.register(plugin, "terminalprogress")
++    # See terminalprogress.py.
++    # On Windows it's safe to load by default.
++    if sys.platform == "win32":
++        config.pluginmanager.import_plugin("terminalprogress")
+ 
+ 
+ def getreportopt(config: Config) -> str:
+diff --git a/src/_pytest/terminalprogress.py b/src/_pytest/terminalprogress.py
+new file mode 100644
+index 00000000000..287f0d569ff
+--- /dev/null
++++ b/src/_pytest/terminalprogress.py
+@@ -0,0 +1,30 @@
++# A plugin to register the TerminalProgressPlugin plugin.
++#
++# This plugin is not loaded by default due to compatibility issues (#13896),
++# but can be enabled in one of these ways:
++# - The terminal plugin enables it in a few cases where it's safe, and not
++#   blocked by the user (using e.g. `-p no:terminalprogress`).
++# - The user explicitly requests it, e.g. using `-p terminalprogress`.
++#
++# In a few years, if it's safe, we can consider enabling it by default. Then,
++# this file will become unnecessary and can be inlined into terminal.py.
++
++from __future__ import annotations
++
++import os
++
++from _pytest.config import Config
++from _pytest.config import hookimpl
++from _pytest.terminal import TerminalProgressPlugin
++from _pytest.terminal import TerminalReporter
++
++
++@hookimpl(trylast=True)
++def pytest_configure(config: Config) -> None:
++    reporter: TerminalReporter | None = config.pluginmanager.get_plugin(
++        "terminalreporter"
++    )
++
++    if reporter is not None and reporter.isatty() and os.environ.get("TERM") != "dumb":
++        plugin = TerminalProgressPlugin(reporter)
++        config.pluginmanager.register(plugin, name="terminalprogress-plugin")
+diff --git a/testing/test_terminal.py b/testing/test_terminal.py
+index a981e14f0a2..3053f5ef9a1 100644
+--- a/testing/test_terminal.py
++++ b/testing/test_terminal.py
+@@ -12,8 +12,7 @@
+ from typing import cast
+ from typing import Literal
+ from typing import NamedTuple
+-from unittest.mock import Mock
+-from unittest.mock import patch
++from unittest import mock
+ 
+ import pluggy
+ 
+@@ -3419,40 +3418,57 @@ def mock_file(self) -> StringIO:
+ 
+     @pytest.fixture
+     def mock_tr(self, mock_file: StringIO) -> pytest.TerminalReporter:
+-        tr = Mock(spec=pytest.TerminalReporter)
++        tr: pytest.TerminalReporter = mock.create_autospec(pytest.TerminalReporter)
+ 
+-        def write_raw(s: str, *, flush: bool = False) -> None:
+-            mock_file.write(s)
++        def write_raw(content: str, *, flush: bool = False) -> None:
++            mock_file.write(content)
+ 
+-        tr.write_raw = write_raw
++        tr.write_raw = write_raw  # type: ignore[method-assign]
+         tr._progress_nodeids_reported = set()
+         return tr
+ 
+-    def test_plugin_registration(self, pytester: pytest.Pytester) -> None:
+-        """Test that the plugin is registered correctly on TTY output."""
++    @pytest.mark.skipif(sys.platform != "win32", reason="#13896")
++    def test_plugin_registration_enabled_by_default(
++        self, pytester: pytest.Pytester, monkeypatch: MonkeyPatch
++    ) -> None:
++        """Test that the plugin registration is enabled by default.
++
++        Currently only on Windows (#13896).
++        """
++        monkeypatch.setattr(sys.stdout, "isatty", lambda: True)
+         # The plugin module should be registered as a default plugin.
+-        with patch.object(sys.stdout, "isatty", return_value=True):
+-            config = pytester.parseconfigure()
+-            plugin = config.pluginmanager.get_plugin("terminalprogress")
+-            assert plugin is not None
++        config = pytester.parseconfigure()
++        plugin = config.pluginmanager.get_plugin("terminalprogress")
++        assert plugin is not None
+ 
+-    def test_disabled_for_non_tty(self, pytester: pytest.Pytester) -> None:
++    def test_plugin_registred_on_all_platforms_when_explicitly_requested(
++        self, pytester: pytest.Pytester, monkeypatch: MonkeyPatch
++    ) -> None:
++        """Test that the plugin is registered on any platform if explicitly requested."""
++        monkeypatch.setattr(sys.stdout, "isatty", lambda: True)
++        # The plugin module should be registered as a default plugin.
++        config = pytester.parseconfigure("-p", "terminalprogress")
++        plugin = config.pluginmanager.get_plugin("terminalprogress")
++        assert plugin is not None
++
++    def test_disabled_for_non_tty(
++        self, pytester: pytest.Pytester, monkeypatch: MonkeyPatch
++    ) -> None:
+         """Test that plugin is disabled for non-TTY output."""
+-        with patch.object(sys.stdout, "isatty", return_value=False):
+-            config = pytester.parseconfigure()
+-            plugin = config.pluginmanager.get_plugin("terminalprogress")
+-            assert plugin is None
+-
+-    def test_disabled_for_iterm2(self, pytester: pytest.Pytester, monkeypatch) -> None:
+-        """Should not register the plugin on iTerm2 terminal since it interprets
+-        OSC 9;4 as desktop notifications, not progress (#13896)."""
+-        monkeypatch.setenv(
+-            "ITERM_SESSION_ID", "w0t1p0:3DB6DF06-FE11-40C3-9A66-9E10A193A632"
+-        )
+-        with patch.object(sys.stdout, "isatty", return_value=True):
+-            config = pytester.parseconfigure()
+-            plugin = config.pluginmanager.get_plugin("terminalprogress")
+-            assert plugin is None
++        monkeypatch.setattr(sys.stdout, "isatty", lambda: False)
++        config = pytester.parseconfigure("-p", "terminalprogress")
++        plugin = config.pluginmanager.get_plugin("terminalprogress-plugin")
++        assert plugin is None
++
++    def test_disabled_for_dumb_terminal(
++        self, pytester: pytest.Pytester, monkeypatch: MonkeyPatch
++    ) -> None:
++        """Test that plugin is disabled when TERM=dumb."""
++        monkeypatch.setenv("TERM", "dumb")
++        monkeypatch.setattr(sys.stdout, "isatty", lambda: True)
++        config = pytester.parseconfigure("-p", "terminalprogress")
++        plugin = config.pluginmanager.get_plugin("terminalprogress-plugin")
++        assert plugin is None
+ 
+     @pytest.mark.parametrize(
+         ["state", "progress", "expected"],
+@@ -3484,7 +3500,7 @@ def test_session_lifecycle(
+         """Test progress updates during session lifecycle."""
+         plugin = TerminalProgressPlugin(mock_tr)
+ 
+-        session = Mock(spec=pytest.Session)
++        session = mock.create_autospec(pytest.Session)
+         session.testscollected = 3
+ 
+         # Session start - should emit indeterminate progress.

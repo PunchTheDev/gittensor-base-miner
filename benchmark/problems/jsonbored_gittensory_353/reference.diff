@@ -1,0 +1,125 @@
+diff --git a/src/db/repositories.ts b/src/db/repositories.ts
+index d15c2202..f0a66fe4 100644
+--- a/src/db/repositories.ts
++++ b/src/db/repositories.ts
+@@ -2053,7 +2053,9 @@ export async function upsertRecentMergedPullRequest(env: Env, pr: RecentMergedPu
+         mergedAt: pr.mergedAt,
+         labelsJson: jsonString(pr.labels),
+         linkedIssuesJson: jsonString(pr.linkedIssues),
+-        changedFilesJson: jsonString(pr.changedFiles),
++        // Keep a previously-hydrated file list instead of clobbering it with an empty
++        // one (e.g. a files-less upsert or a failed file fetch).
++        changedFilesJson: pr.changedFiles.length > 0 ? jsonString(pr.changedFiles) : sql`${recentMergedPullRequests.changedFilesJson}`,
+         payloadJson: jsonString(pr.payload),
+         updatedAt: nowIso(),
+       },
+diff --git a/src/github/backfill.ts b/src/github/backfill.ts
+index 582262cf..d7816346 100644
+--- a/src/github/backfill.ts
++++ b/src/github/backfill.ts
+@@ -1074,8 +1074,12 @@ async function backfillRecentMergedSegment(
+     totals?.mergedPullRequestsTotal,
+     async (payloads) => {
+       const merged = payloads.filter((pr) => Boolean(pr.merged_at));
++      // Hydrate each merged PR's changed files (like the monolithic backfill path) so
++      // recent_merged_pull_requests.changedFiles is populated instead of always empty.
++      const warnings: string[] = [];
+       await mapWithConcurrency(merged, 8, async (pr) => {
+-        await upsertRecentMergedPullRequest(env, toRecentMergedPullRequest(repo.fullName, pr, []));
++        const changedFiles = await fetchPullRequestFiles(env, repo.fullName, pr.number, token, warnings).catch(() => []);
++        await upsertRecentMergedPullRequest(env, toRecentMergedPullRequest(repo.fullName, pr, changedFiles));
+       });
+       return merged.length;
+     },
+diff --git a/test/unit/backfill.test.ts b/test/unit/backfill.test.ts
+index 750a1368..b02a39d3 100644
+--- a/test/unit/backfill.test.ts
++++ b/test/unit/backfill.test.ts
+@@ -9,6 +9,7 @@ import {
+   listPullRequests,
+   listPullRequestDetailSyncStates,
+   listRecentMergedPullRequests,
++  upsertRecentMergedPullRequest,
+   listLatestGitHubRateLimitObservations,
+   listRepoLabels,
+   listRepoSyncSegments,
+@@ -729,6 +730,79 @@ describe("GitHub backfill", () => {
+     expect(await listRepoLabels(env, "JSONbored/gittensory")).toEqual([expect.objectContaining({ name: "signal" })]);
+   });
+ 
++  it("hydrates merged PR changed files in the recent-merged segment backfill", async () => {
++    const env = createTestEnv({ GITHUB_PUBLIC_TOKEN: "public-token" });
++    await seedRegisteredRepo(env);
++    vi.stubGlobal("fetch", async (input: RequestInfo | URL) => {
++      const url = input.toString();
++      if (url === "https://api.github.com/graphql") {
++        return githubTotalsResponse({ openIssues: 0, openPullRequests: 0, mergedPullRequests: 1, closedPullRequests: 1, labels: 0 });
++      }
++      if (url.includes("/pulls?state=closed")) {
++        return Response.json([
++          { number: 9, title: "Fix webhook processing", state: "closed", merged_at: "2026-05-22T00:00:00.000Z", user: { login: "oktofeesh1" }, labels: [{ name: "bug" }], body: "Fixes #1" },
++        ]);
++      }
++      if (url.includes("/pulls/9/files")) {
++        return Response.json([{ filename: "src/github/webhook.ts", status: "modified", additions: 12, deletions: 3, changes: 15 }]);
++      }
++      return new Response("not found", { status: 404 });
++    });
++
++    const result = await backfillRepositorySegment(env, { repoFullName: "JSONbored/gittensory", segment: "recent_merged_pull_requests", mode: "full" });
++
++    expect(result).toMatchObject({ status: "complete" });
++    // The segment path must hydrate changed files like the monolithic path (previously stored []).
++    expect(await listRecentMergedPullRequests(env, "JSONbored/gittensory")).toEqual(
++      expect.arrayContaining([expect.objectContaining({ number: 9, changedFiles: expect.arrayContaining(["src/github/webhook.ts"]) })]),
++    );
++  });
++
++  it("preserves previously-hydrated merged PR files when a later upsert has none", async () => {
++    const env = createTestEnv();
++    await upsertRecentMergedPullRequest(env, {
++      repoFullName: "JSONbored/gittensory",
++      number: 9,
++      title: "Fix webhook",
++      authorLogin: "dev",
++      mergedAt: "2026-05-22T00:00:00.000Z",
++      labels: ["bug"],
++      linkedIssues: [1],
++      changedFiles: ["src/a.ts", "src/b.ts"],
++      payload: {},
++    });
++    // A later files-less upsert (e.g. a failed file fetch) must not erase the stored files.
++    await upsertRecentMergedPullRequest(env, {
++      repoFullName: "JSONbored/gittensory",
++      number: 9,
++      title: "Fix webhook (reconciled)",
++      authorLogin: "dev",
++      mergedAt: "2026-05-22T00:00:00.000Z",
++      labels: ["bug"],
++      linkedIssues: [1],
++      changedFiles: [],
++      payload: {},
++    });
++    expect(await listRecentMergedPullRequests(env, "JSONbored/gittensory")).toEqual(
++      expect.arrayContaining([expect.objectContaining({ number: 9, title: "Fix webhook (reconciled)", changedFiles: ["src/a.ts", "src/b.ts"] })]),
++    );
++    // A later upsert that does carry files updates the stored list.
++    await upsertRecentMergedPullRequest(env, {
++      repoFullName: "JSONbored/gittensory",
++      number: 9,
++      title: "Fix webhook",
++      authorLogin: "dev",
++      mergedAt: "2026-05-22T00:00:00.000Z",
++      labels: ["bug"],
++      linkedIssues: [1],
++      changedFiles: ["src/c.ts"],
++      payload: {},
++    });
++    expect(await listRecentMergedPullRequests(env, "JSONbored/gittensory")).toEqual(
++      expect.arrayContaining([expect.objectContaining({ number: 9, changedFiles: ["src/c.ts"] })]),
++    );
++  });
++
+   it("does not let unauthenticated fallback rate limits poison the authenticated REST backoff", async () => {
+     const env = createTestEnv({ GITHUB_PUBLIC_TOKEN: "public-token" });
+     await upsertRepositoryFromGitHub(env, {

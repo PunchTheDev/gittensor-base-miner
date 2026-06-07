@@ -1,0 +1,274 @@
+diff --git a/docs/core/howto/testing.rst b/docs/core/howto/testing.rst
+index 9b2f046d2ae..32361a4c566 100644
+--- a/docs/core/howto/testing.rst
++++ b/docs/core/howto/testing.rst
+@@ -215,34 +215,33 @@ errors.  However, if called outside of a test method (for example, at module
+ scope in a test module or a module imported by a test module) then it
+ *will* raise an exception.
+ 
++Test parallelization
++~~~~~~~~~~~~~~~~~~~~
+ 
+-
+-
+-
+-Parallel test
+-~~~~~~~~~~~~~
+-
+-
+-
+-In many situations, your unit tests may run faster if they are allowed to
+-run in parallel, such that blocking I/O calls allow other tests to continue.
+-Trial, like unittest, supports the -j parameter.  Run ``trial -j 3``
+-to run 3 test runners at the same time.
+-
+-
+-
++In many situations, your unit tests may run faster if they run in parallel,
++such that blocking I/O calls allow other tests to continue.
++Trial, unlike unittest, supports the ``-j`` parameter.
++Run ``trial -j 3`` to run 3 test runners at the same time,
++or ``trial -j auto`` to run a number of test runners based on the number of available CPUs.
+ 
+ This requires care in your test creation.  Obviously, you need to ensure that
+ your code is otherwise content to work in a parallel fashion while working within
+ Twisted... and if you are using weird global variables in places, parallel tests
+ might reveal this.
+ 
+-
+-
+-
+ However, if you have a test that fires up a schema on an external database
+ in the ``setUp`` function, does some operations on it in the test, and
+-then deletes that schema in the tearDown function, your tests will behave in an
++then deletes that schema in the ``tearDown`` function, your tests will behave in an
+ unpredictable fashion as they tromp upon each other if they have their own
+ schema.  And this won't actually indicate a real error in your code, merely a
+ testing-specific race-condition.
++
++Some caveats apply in parallel mode:
++
++* Anything written to standard out or standard error,
++  such as by the ``print()`` function,
++  is captured in separate text files.
++  The console output is suppressed.
++* Trial's ``--debug`` flag doesn't work,
++  nor does the ``breakpoint()`` built-in.
++* Parallel mode doesn't work on Windows. See `GitHub Issue 10152 <https://github.com/twisted/twisted/issues/10152>`_ if you want to help with support for Windows.
+diff --git a/src/twisted/scripts/trial.py b/src/twisted/scripts/trial.py
+index 531fe46ce17..f3259ed21b7 100644
+--- a/src/twisted/scripts/trial.py
++++ b/src/twisted/scripts/trial.py
+@@ -36,6 +36,39 @@
+ }
+ 
+ 
++def _autoJobs() -> int:
++    """
++    Heuristically guess the number of job workers to run.
++
++    When ``os.process_cpu_count()`` is available (Python 3.13+),
++    return the number of logical CPUs usable by the current
++    process. This respects the ``PYTHON_CPU_COUNT`` environment
++    variable and/or ``python -X cpu_count`` flag.
++
++    Otherwise, if ``os.sched_getaffinity()`` is available (on some
++    Unixes) this returns the number of CPUs this process is
++    restricted to, under the assumption that this affinity will
++    be inherited.
++
++    Otherwise, consult ``os.cpu_count()`` to get the number of
++    logical CPUs.
++
++    Failing all else, return 1.
++
++    @returns: A strictly positive integer.
++    """
++    number: Optional[int]
++    if getattr(os, "process_cpu_count", None) is not None:
++        number = os.process_cpu_count()  # type: ignore[attr-defined]
++    elif getattr(os, "sched_getaffinity", None) is not None:
++        number = len(os.sched_getaffinity(0))
++    else:
++        number = os.cpu_count()
++    if number is None or number < 1:
++        return 1
++    return number
++
++
+ def _parseLocalVariables(line):
+     """
+     Accepts a single line in Emacs local variable declaration format and
+@@ -477,18 +510,22 @@ class Options(_BasicOptions, usage.Options, app.ReactorSelectionMixin):
+ 
+     def opt_jobs(self, number):
+         """
+-        Number of local workers to run, a strictly positive integer.
++        Number of local workers to run, a strictly positive integer or 'auto'
++        to spawn one worker for each available CPU.
+         """
+-        try:
+-            number = int(number)
+-        except ValueError:
+-            raise usage.UsageError(
+-                "Expecting integer argument to jobs, got '%s'" % number
+-            )
+-        if number <= 0:
+-            raise usage.UsageError(
+-                "Argument to jobs must be a strictly positive integer"
+-            )
++        if number == "auto":
++            number = _autoJobs()
++        else:
++            try:
++                number = int(number)
++            except ValueError:
++                raise usage.UsageError(
++                    "Expecting integer argument to jobs, got '%s'" % number
++                )
++            if number <= 0:
++                raise usage.UsageError(
++                    "Argument to jobs must be a strictly positive integer or 'auto'"
++                )
+         self["jobs"] = number
+ 
+     def _getWorkerArguments(self):
+diff --git a/src/twisted/trial/newsfragments/5824.feature b/src/twisted/trial/newsfragments/5824.feature
+new file mode 100644
+index 00000000000..808acebfce4
+--- /dev/null
++++ b/src/twisted/trial/newsfragments/5824.feature
+@@ -0,0 +1 @@
++Trial's ``-j`` flag now accepts an ``auto`` keyword to spawn a number of workers based on the available CPUs.
+diff --git a/src/twisted/trial/test/test_script.py b/src/twisted/trial/test/test_script.py
+index 278cbf2cb19..3c6c558d1c5 100644
+--- a/src/twisted/trial/test/test_script.py
++++ b/src/twisted/trial/test/test_script.py
+@@ -3,12 +3,14 @@
+ from __future__ import annotations
+ 
+ import gc
++import os
+ import re
+ import sys
+ import textwrap
+ import types
+ from io import StringIO
+ from typing import List
++from unittest import skipIf
+ 
+ from hamcrest import assert_that, contains_string
+ from hypothesis import given
+@@ -502,6 +504,60 @@ def test_disableAlreadyImportedModule(self) -> None:
+         self.assertRaises(ImportError, self._checkSMTP)
+ 
+ 
++class AutoJobsTests(unittest.SynchronousTestCase):
++    """
++    Test {twisted.scripts.trial._autoJobs}
++    """
++
++    hasProcessCpuCount = sys.version_info[:2] >= (3, 13)
++    hasSchedGetaffinity = getattr(os, "sched_getaffinity", None) is not None
++
++    @skipIf(not hasProcessCpuCount, "Requires os.process_cpu_count()")
++    def test_processCpuCount(self) -> None:
++        """
++        When `os.process_cpu_count()` is available (Python 3.13+), `_autoJobs`
++        returns its result.
++        """
++        count = os.process_cpu_count()  # type: ignore
++        self.assertEqual(trial._autoJobs(), count)
++
++    @skipIf(
++        hasProcessCpuCount or not hasSchedGetaffinity,
++        "Requires os.sched_getaffinity() without os.process_cpu_count()",
++    )
++    def test_schedGetAffinity(self) -> None:
++        """
++        When `os.sched_getaffinity()` is available but `os.process_cpu_count()`
++        is not (Python 3.3 through Python 3.12 on "some Unix platforms"),
++        `_autoJobs` uses it to returns the number of CPUs that the current
++        process is restricted to.
++        """
++        self.assertEqual(trial._autoJobs(), len(os.sched_getaffinity(0)))
++
++    def test_cpuCount(self) -> None:
++        """
++        When only `os.cpu_count()` is available, `_autoJobs` returns
++        its result.
++        """
++        self.assertEqual(trial._autoJobs(), os.cpu_count())
++
++    def test_cpuCountUnknown(self) -> None:
++        """
++        When `os.cpu_count()` returns L{None}, `_autoJobs`
++        rounds up to 1.
++
++        This test relies on patching because all platforms currently
++        supported by Twisted provide a functioning `os.cpu_count()`.
++        """
++        if self.hasProcessCpuCount:
++            self.patch(os, "process_cpu_count", lambda: None)
++        if self.hasSchedGetaffinity:
++            self.patch(os, "sched_getaffinity", lambda pid: set())
++        self.patch(os, "cpu_count", lambda: None)
++
++        self.assertEqual(trial._autoJobs(), 1)
++
++
+ class CoverageTests(unittest.SynchronousTestCase):
+     """
+     Tests for the I{coverage} option.
+@@ -656,6 +712,38 @@ def test_jobs(self) -> None:
+         self.assertEqual(4, runner._maxWorkers)
+         self.assertEqual(["--force-gc"], runner._workerArguments)
+ 
++    def test_jobsNotANumber(self) -> None:
++        """
++        C{parseOptions} raises a C{UsageError} when C{--jobs} is passed a non-integer.
++        """
++        exc = self.assertRaises(
++            UsageError, self.options.parseOptions, ["--jobs", "nan"]
++        )
++        self.assertEqual("Expecting integer argument to jobs, got 'nan'", str(exc))
++
++    def test_jobsNonPositive(self) -> None:
++        """
++        C{parseOptions} raises a C{UsageError} when C{--jobs} is passed a non-positive
++        integer.
++        """
++        exc = self.assertRaises(UsageError, self.options.parseOptions, ["--jobs", "0"])
++        self.assertEqual(
++            "Argument to jobs must be a strictly positive integer or 'auto'", str(exc)
++        )
++
++    def test_autoDetectAvailableCpusForJobs(self) -> None:
++        """
++        C{--jobs auto} guesses the number of workers to use.
++        """
++        self.patch(trial, "_autoJobs", lambda: 77)
++
++        options = trial.Options()
++        options.parseOptions(["--jobs", "auto"])
++        runner = trial._makeRunner(options)
++
++        assert isinstance(runner, DistTrialRunner)
++        self.assertEqual(77, runner._maxWorkers)
++
+     def test_dryRunWithJobs(self) -> None:
+         """
+         L{_makeRunner} returns a L{TrialRunner} instance in C{DRY_RUN} mode
+diff --git a/tox.ini b/tox.ini
+index 3e76a1e17f8..bf90d5ca75d 100644
+--- a/tox.ini
++++ b/tox.ini
+@@ -121,7 +121,7 @@ commands =
+     posix: python -c "print('Running on POSIX (no special dependencies)')"
+ 
+     ; Run tests without wrapping them using coverage.
+-    nocov: python -m twisted.trial --temp-directory={envtmpdir}/_trial_temp --reporter={env:TRIAL_REPORTER:verbose} {env:TRIAL_ARGS:-j8} {posargs:twisted}
++    nocov: python -m twisted.trial --temp-directory={envtmpdir}/_trial_temp --reporter={env:TRIAL_REPORTER:verbose} {env:TRIAL_ARGS:-jauto} {posargs:twisted}
+ 
+     ; Run the tests wrapped using coverage.
+     withcov: python {toxinidir}/admin/_copy.py {toxinidir}/admin/zz_coverage.pth {envsitepackagesdir}/zz_coverage.pth

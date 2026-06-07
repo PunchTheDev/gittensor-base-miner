@@ -1,0 +1,1225 @@
+diff --git a/crates/engine/src/database/synthesis.rs b/crates/engine/src/database/synthesis.rs
+index eb9a8b508..e2a63bb4e 100644
+--- a/crates/engine/src/database/synthesis.rs
++++ b/crates/engine/src/database/synthesis.rs
+@@ -10,8 +10,8 @@ use crate::parser::oracle_util::{apply_bracket_mode, strip_reminder_text, Bracke
+ use crate::types::ability::{
+     AbilityCondition, AbilityCost, AbilityDefinition, AbilityKind, AbilityTag,
+     ActivationRestriction, AdditionalCost, AdditionalCostPaymentSource, AggregateFunction,
+-    CardPlayMode, CastManaObjectScope, CastManaSpentMetric, CastVariantPaid, ChoiceType,
+-    Comparator, ContinuousModification, ControllerRef, CopyRetargetPermission,
++    CardPlayMode, CastFromZoneDriver, CastManaObjectScope, CastManaSpentMetric, CastVariantPaid,
++    ChoiceType, Comparator, ContinuousModification, ControllerRef, CopyRetargetPermission,
+     CounterTriggerFilter, DamageKindFilter, Duration, Effect, FilterProp, KickerVariant,
+     ManaContribution, ManaProduction, ModalSelectionCondition, ModalSelectionConstraint,
+     NinjutsuVariant, ObjectScope, ParsedCondition, PlayerFilter, PlayerScope, PtStat, PtValue,
+@@ -3860,6 +3860,10 @@ fn build_suspend_last_counter_cast_trigger() -> TriggerDefinition {
+             alt_ability_cost: None,
+             constraint: None,
+             duration: None,
++            // CR 702.62a + CR 608.2g: cast the suspended card AS this trigger
++            // resolves, not via a lingering permission — this arms the
++            // sorcery-speed timing bypass for an upkeep recast (issue #1520).
++            driver: CastFromZoneDriver::DuringResolution,
+         },
+     )
+     .optional();
+@@ -5791,6 +5795,13 @@ pub fn synthesize_siege_intrinsics(face: &mut CardFace) {
+                 alt_ability_cost: None,
+                 constraint: None,
+                 duration: None,
++                // CR 310.11b + CR 608.2g: the Siege victory ability casts the
++                // exiled back face AS this trigger resolves — a self-free-cast
++                // during resolution, structurally identical to Suspend's
++                // last-counter cast. (Pre-`driver`, the `duration.is_none()`
++                // router already routed this shape through during-resolution;
++                // the explicit discriminator preserves that.)
++                driver: CastFromZoneDriver::DuringResolution,
+             },
+         )
+         .optional();
+diff --git a/crates/engine/src/game/ability_utils.rs b/crates/engine/src/game/ability_utils.rs
+index 28e1836d8..010e92ef4 100644
+--- a/crates/engine/src/game/ability_utils.rs
++++ b/crates/engine/src/game/ability_utils.rs
+@@ -5728,6 +5728,7 @@ mod tests {
+                 alt_ability_cost: None,
+                 constraint: None,
+                 duration: None,
++                driver: crate::types::ability::CastFromZoneDriver::LingeringPermission,
+             },
+             Vec::new(),
+             ObjectId(1),
+@@ -5765,6 +5766,7 @@ mod tests {
+                 alt_ability_cost: None,
+                 constraint: None,
+                 duration: None,
++                driver: crate::types::ability::CastFromZoneDriver::LingeringPermission,
+             },
+             Vec::new(),
+             ObjectId(1),
+@@ -5796,6 +5798,7 @@ mod tests {
+                 alt_ability_cost: None,
+                 constraint: None,
+                 duration: None,
++                driver: crate::types::ability::CastFromZoneDriver::LingeringPermission,
+             },
+             Vec::new(),
+             ObjectId(1),
+diff --git a/crates/engine/src/game/casting.rs b/crates/engine/src/game/casting.rs
+index 8e86e0c1d..89422fb23 100644
+--- a/crates/engine/src/game/casting.rs
++++ b/crates/engine/src/game/casting.rs
+@@ -1109,6 +1109,31 @@ pub(super) fn selected_exile_alt_cost_permission_accepts_resulting_mv(
+     exile_alt_cost_permission_supports_cast(state, obj, player, permission, Some(resulting_mv))
+ }
+ 
++pub(super) fn selected_exile_alt_cost_permission_casts_transformed(
++    state: &GameState,
++    object_id: ObjectId,
++    player: PlayerId,
++) -> bool {
++    let Some(obj) = state.objects.get(&object_id) else {
++        return false;
++    };
++
++    obj.casting_permissions
++        .iter()
++        .find(|permission| {
++            exile_alt_cost_permission_supports_cast(state, obj, player, permission, None)
++        })
++        .is_some_and(|permission| {
++            matches!(
++                permission,
++                crate::types::ability::CastingPermission::ExileWithAltCost {
++                    cast_transformed: true,
++                    ..
++                }
++            )
++        })
++}
++
+ pub(super) fn exile_alt_cost_permissions_accept_resulting_mv(
+     state: &GameState,
+     object_id: ObjectId,
+@@ -5545,29 +5570,46 @@ pub fn handle_cast_spell_as_madness_with_payment_mode(
+ /// cast-during-resolution `ExileWithAltCost` permission and drives the cast.
+ ///
+ /// Pushes a cost-zeroing `ExileWithAltCost` permission carrying `constraint`
+-/// (the resulting-MV gate, evaluated at finalization once X is known) and
+-/// `cleanup` (the misses + reject disposition, so a cast-time rejection can
+-/// still bottom/hand the hit). Then prepares and continues the cast on the
+-/// `Auto` payment mode. The returned `WaitingFor` falls through
++/// (the resulting-MV gate, evaluated at finalization once X is known),
++/// `cast_transformed` (for Siege victory casts), and `cleanup` (the misses +
++/// reject disposition, so a cast-time rejection can still bottom/hand the hit).
++/// Then prepares and continues the cast on the `Auto` payment mode. The
++/// returned `WaitingFor` falls through
+ /// `run_post_action_pipeline` normally, which fires the hit's own cast-triggers
+ /// (CR 702.85a, etc.) and returns priority to the active player — satisfying CR
+ /// 608.2g's "no player receives priority after it's cast" without any explicit
+ /// suppression (the opponent only gets priority later via normal passing).
++///
++/// Every during-resolution caster passes a `cleanup` — it is the marker that
++/// arms the CR 608.2g timing bypass in `restrictions::check_spell_timing`, so a
++/// sorcery cast while its trigger is still on the stack is not blocked by the
++/// sorcery-speed / empty-stack / active-player gates. Cascade/Discover carry
++/// the dig misses + an MV-reject disposition that bottoms/hands the hit. Suspend
++/// (CR 702.62a) carries an empty-misses / `RemainExiled` cleanup whose sole
++/// purpose is to arm that timing bypass — it has no dig and no MV gate, so it
++/// never enters the cascade reject path.
+ pub(super) fn initiate_cast_during_resolution(
+     state: &mut GameState,
+     player: PlayerId,
+     hit_card: ObjectId,
+     constraint: Option<crate::types::ability::CastPermissionConstraint>,
++    cast_transformed: bool,
+     cleanup: crate::types::ability::ResolutionCastCleanup,
+     events: &mut Vec<GameEvent>,
+ ) -> Result<WaitingFor, EngineError> {
+     if let Some(obj) = state.objects.get_mut(&hit_card) {
+         // CR 601.2a + CR 601.2i: zero-cost permission consumed by
+         // `prepare_spell_cast_with_variant_override`'s exile alt-cost scan.
++        // `resolution_cleanup` is always `Some` here: it is the
++        // cast-during-resolution discriminator that arms the CR 608.2g timing
++        // bypass. Cascade/Discover carry their dig misses + MV-reject
++        // disposition; Suspend (CR 702.62a) carries an empty-misses /
++        // `RemainExiled` cleanup that has no dig and no MV gate, so it never
++        // enters the cascade reject path.
+         obj.casting_permissions
+             .push(CastingPermission::ExileWithAltCost {
+                 cost: ManaCost::zero(),
+-                cast_transformed: false,
++                cast_transformed,
+                 constraint,
+                 granted_to: Some(player),
+                 resolution_cleanup: Some(cleanup),
+@@ -15474,9 +15516,13 @@ mod tests {
+         // Resolve the synthesized last-counter trigger's `CastFromZone` body
+         // directly. This is the exact effect the suspend last-counter trigger
+         // synthesis (`build_suspend_last_counter_cast_trigger`) executes when
+-        // the final time counter is removed (CR 702.62a). Resolving it
+-        // installs `CastingPermission::ExileWithAltCost { cost: zero, .. }`
+-        // on the exiled card via `cast_from_zone::resolve`.
++        // the final time counter is removed (CR 702.62a). Per CR 702.62a/d +
++        // CR 608.2g the cast now happens DURING resolution: `cast_from_zone`'s
++        // self-free-cast branch drives `initiate_cast_during_resolution`, which
++        // detects the granted off-zone Suspend keyword (CR 604.1) and casts the
++        // spell at zero cost, placing it on the stack — rather than leaving a
++        // lingering `ExileWithAltCost` permission for a later priority window
++        // (issue #1520).
+         let cast_trigger_ability = ResolvedAbility::new(
+             Effect::CastFromZone {
+                 target: TargetFilter::SelfRef,
+@@ -15486,6 +15532,7 @@ mod tests {
+                 alt_ability_cost: None,
+                 constraint: None,
+                 duration: None,
++                driver: crate::types::ability::CastFromZoneDriver::DuringResolution,
+             },
+             vec![TargetRef::Object(suspended)],
+             suspended,
+@@ -15498,33 +15545,40 @@ mod tests {
+             &mut events,
+             0,
+         )
+-        .expect("CastFromZone must install ExileWithAltCost on the suspended card");
++        .expect("CastFromZone must cast the suspended card during resolution");
+ 
+-        assert!(
+-            state.objects[&suspended]
+-                .casting_permissions
+-                .iter()
+-                .any(|p| matches!(
+-                    p,
+-                    CastingPermission::ExileWithAltCost { cost, .. } if *cost == ManaCost::zero()
+-                )),
+-            "CastFromZone must grant a zero-cost ExileWithAltCost permission \
+-             on the exiled card (CR 702.62a synthesized trigger body)"
+-        );
+-
+-        // The discriminator: ask the casting pipeline what variant would be
+-        // selected. With the fix the granted off-zone Suspend keyword feeds
+-        // both `casting_variant_candidates` and
+-        // `prepare_spell_cast_with_variant_override_inner` through
+-        // `object_has_effective_keyword_kind`, so the variant is Suspend.
+-        let prepared =
+-            prepare_spell_cast_with_variant_override(&state, PlayerId(0), suspended, None)
+-                .expect("prepare_spell_cast must succeed with granted Suspend + ExileWithAltCost");
++        // CR 608.2g: the spell is cast during the trigger's resolution and
++        // becomes the topmost object on the stack.
+         assert_eq!(
+-            prepared.casting_variant,
++            state.stack.len(),
++            1,
++            "suspend last-counter cast (CR 702.62a) must put the spell on the \
++             stack during resolution, not stamp a lingering permission"
++        );
++        assert_eq!(
++            state.objects[&suspended].zone,
++            Zone::Stack,
++            "the suspended card must move to the stack when cast for free"
++        );
++
++        // The discriminator (issue #863): the granted off-zone Suspend keyword
++        // (CR 604.1) must be visible to the casting pipeline so the cast is
++        // tagged `CastingVariant::Suspend`, not `Normal`. With both predicates
++        // reading `obj.keywords` instead of `object_has_effective_keyword_kind`
++        // the granted Suspend is invisible and the cast misroutes to Normal.
++        // Read the variant off the stack entry (stamped at announcement, before
++        // resolution writes `cast_variant_paid`).
++        let stack_variant = match &state.stack.back().expect("spell on stack").kind {
++            crate::types::game_state::StackEntryKind::Spell {
++                casting_variant, ..
++            } => *casting_variant,
++            other => panic!("expected a Spell stack entry, got {other:?}"),
++        };
++        assert_eq!(
++            stack_variant,
+             CastingVariant::Suspend,
+-            "granted Suspend (CR 604.1) must produce CastingVariant::Suspend, \
+-             not Normal — the off-zone effective keyword set must be consulted"
++            "granted Suspend (CR 604.1) must produce a CastingVariant::Suspend \
++             cast — the off-zone effective keyword set must be consulted"
+         );
+     }
+ 
+@@ -15545,7 +15599,6 @@ mod tests {
+     // apply to granted-Suspend casts (CR 604.1) too.
+     #[test]
+     fn jhoira_granted_suspend_creature_cast_gains_haste() {
+-        use super::super::engine::apply_as_current;
+         use crate::types::ability::{
+             CardPlayMode, ContinuousModification, Duration, Effect, ResolvedAbility, TargetRef,
+         };
+@@ -15595,8 +15648,13 @@ mod tests {
+             None,
+         );
+ 
+-        // Resolve the synthesized last-counter trigger body to install
+-        // `ExileWithAltCost { cost: zero, .. }` on the exiled creature.
++        // Resolve the synthesized last-counter trigger body. Per CR 702.62a/d +
++        // CR 608.2g this casts the creature DURING resolution: `cast_from_zone`'s
++        // self-free-cast branch drives `initiate_cast_during_resolution`, which
++        // picks `CastingVariant::Suspend` (the discriminator covered by the
++        // cast-variant test above), puts the spell on the stack at zero cost,
++        // and tags `cast_variant_paid` so `stack::resolve_top`'s Suspend branch
++        // installs the haste TCE for creatures.
+         let cast_trigger_ability = ResolvedAbility::new(
+             Effect::CastFromZone {
+                 target: TargetFilter::SelfRef,
+@@ -15606,6 +15664,7 @@ mod tests {
+                 alt_ability_cost: None,
+                 constraint: None,
+                 duration: None,
++                driver: crate::types::ability::CastFromZoneDriver::DuringResolution,
+             },
+             vec![TargetRef::Object(suspended)],
+             suspended,
+@@ -15618,28 +15677,12 @@ mod tests {
+             &mut events,
+             0,
+         )
+-        .expect("CastFromZone must install ExileWithAltCost on the suspended card");
+-
+-        // Cast the spell through the real pipeline. The casting pipeline must
+-        // pick `CastingVariant::Suspend` (the discriminator covered by the
+-        // cast-variant test above), the spell goes to the stack at zero cost,
+-        // and resolution enters `stack::resolve_top`'s Suspend branch which
+-        // tags `cast_variant_paid` and installs the haste TCE for creatures.
+-        let card_id = state.objects[&suspended].card_id;
+-        apply_as_current(
+-            &mut state,
+-            GameAction::CastSpell {
+-                object_id: suspended,
+-                card_id,
+-                targets: vec![],
+-            },
+-        )
+-        .expect("granted-Suspend creature must cast at zero cost through the real pipeline");
++        .expect("CastFromZone must cast the suspended creature during resolution");
+ 
+         assert_eq!(
+             state.stack.len(),
+             1,
+-            "Suspend cast must place the spell on the stack"
++            "Suspend cast must place the spell on the stack during resolution"
+         );
+ 
+         let mut events = Vec::new();
+diff --git a/crates/engine/src/game/casting_costs.rs b/crates/engine/src/game/casting_costs.rs
+index b4549d8a2..8feff7596 100644
+--- a/crates/engine/src/game/casting_costs.rs
++++ b/crates/engine/src/game/casting_costs.rs
+@@ -3500,16 +3500,17 @@ pub(super) fn finalize_cast_with_phyrexian_choices(
+         .objects
+         .get(&object_id)
+         .map(|obj| obj.mana_cost.mana_value() + ability.chosen_x.unwrap_or(0));
++    let mut cascade_cast_transformed = false;
+     if let Some(resulting_mv) = cascade_resulting_mv {
+-        let cascade_accepted = match evaluate_cascade_constraint_with_resulting_mv(
++        let cascade_check = match evaluate_cascade_constraint_with_resulting_mv(
+             state,
+             object_id,
+             player,
+             resulting_mv,
+             events,
+         ) {
+-            CascadeCheck::NotApplicable => false,
+-            CascadeCheck::Accepted => true,
++            CascadeCheck::NotApplicable => None,
++            CascadeCheck::Accepted { cast_transformed } => Some(cast_transformed),
+             CascadeCheck::Rejected {
+                 exiled_misses,
+                 reject_action,
+@@ -3524,7 +3525,7 @@ pub(super) fn finalize_cast_with_phyrexian_choices(
+                 );
+             }
+         };
+-        if !cascade_accepted
++        if cascade_check.is_none()
+             && !super::casting::selected_exile_alt_cost_permission_accepts_resulting_mv(
+                 state,
+                 object_id,
+@@ -3538,7 +3539,7 @@ pub(super) fn finalize_cast_with_phyrexian_choices(
+                 "Spell mana value does not satisfy the cast permission".to_string(),
+             ));
+         }
+-        if !cascade_accepted
++        if cascade_check.is_none()
+             && !super::casting::exile_alt_cost_permissions_accept_resulting_mv(
+                 state,
+                 object_id,
+@@ -3552,6 +3553,7 @@ pub(super) fn finalize_cast_with_phyrexian_choices(
+                 "Spell mana value does not satisfy the cast permission".to_string(),
+             ));
+         }
++        cascade_cast_transformed = cascade_check == Some(true);
+     }
+ 
+     // CR 700.14: Snapshot pool size before payment to compute actual mana spent.
+@@ -3561,6 +3563,10 @@ pub(super) fn finalize_cast_with_phyrexian_choices(
+         .find(|p| p.id == player)
+         .map(|p| p.mana_pool.produced_mana_total())
+         .unwrap_or(0);
++    let cast_transformed = cascade_cast_transformed
++        || super::casting::selected_exile_alt_cost_permission_casts_transformed(
++            state, object_id, player,
++        );
+ 
+     super::casting::pay_mana_cost_with_choices(
+         state,
+@@ -3771,6 +3777,7 @@ pub(super) fn finalize_cast_with_phyrexian_choices(
+             additional_cost_payment_count,
+             additional_cost_paid,
+             casting_variant,
++            cast_transformed,
+             convoked_creatures: convoked_creature_count,
+         },
+     );
+@@ -3893,7 +3900,7 @@ enum CascadeCheck {
+     /// The constraint passed (Cascade: resulting MV < source MV; Discover:
+     /// resulting MV <= N). The cast proceeds; the misses have already been
+     /// bottom-shuffled as a side effect.
+-    Accepted,
++    Accepted { cast_transformed: bool },
+     /// The constraint failed. The cast must be aborted; the caller should
+     /// unwind the announcement stack entry and route through
+     /// `handle_resolution_cast_rejection`, which sends the hit to its
+@@ -3958,12 +3965,18 @@ fn evaluate_cascade_constraint_with_resulting_mv(
+         .expect("object present above")
+         .casting_permissions
+         .remove(index);
+-    let (constraint, exiled_misses, reject_action) = match permission {
++    let (constraint, cast_transformed, exiled_misses, reject_action) = match permission {
+         CastingPermission::ExileWithAltCost {
+             constraint,
++            cast_transformed,
+             resolution_cleanup: Some(cleanup),
+             ..
+-        } => (constraint, cleanup.exiled_misses, cleanup.reject_action),
++        } => (
++            constraint,
++            cast_transformed,
++            cleanup.exiled_misses,
++            cleanup.reject_action,
++        ),
+         _ => unreachable!("position() already filtered to this variant"),
+     };
+ 
+@@ -3981,7 +3994,7 @@ fn evaluate_cascade_constraint_with_resulting_mv(
+         // CR 702.85a: "cards exiled this way that weren't cast" — the hit is
+         // being cast, so only the misses bottom-shuffle.
+         crate::game::effects::cascade::shuffle_to_bottom(state, &exiled_misses, events);
+-        CascadeCheck::Accepted
++        CascadeCheck::Accepted { cast_transformed }
+     } else {
+         CascadeCheck::Rejected {
+             exiled_misses,
+@@ -4024,6 +4037,11 @@ fn handle_resolution_cast_rejection(
+             crate::game::effects::cascade::shuffle_to_bottom(state, &exiled_misses, events);
+             super::zones::move_to_zone(state, object_id, Zone::Hand, events);
+         }
++        // CR 702.62a / CR 702.88a: Suspend / Rebound — no dig misses and no
++        // resulting-MV gate, so this path is unreachable in practice. "If you
++        // don't [cast it], it remains exiled": the card simply stays in exile
++        // (the announcement-time stack entry was already removed above).
++        ResolutionMvRejectAction::RemainExiled => {}
+     }
+ 
+     // CR 601.2a: Priority returns to the would-be caster.
+@@ -8500,7 +8518,12 @@ mod tests {
+                 resulting_mv,
+                 &mut events,
+             );
+-            assert!(matches!(outcome, CascadeCheck::Accepted));
++            assert!(matches!(
++                outcome,
++                CascadeCheck::Accepted {
++                    cast_transformed: false
++                }
++            ));
+ 
+             let hit_obj = state.objects.get(&hit).unwrap();
+             assert!(
+@@ -8932,7 +8955,7 @@ mod tests {
+         fn matches_name(check: &CascadeCheck) -> &'static str {
+             match check {
+                 CascadeCheck::NotApplicable => "NotApplicable",
+-                CascadeCheck::Accepted => "Accepted",
++                CascadeCheck::Accepted { .. } => "Accepted",
+                 CascadeCheck::Rejected { .. } => "Rejected",
+             }
+         }
+diff --git a/crates/engine/src/game/effects/cast_from_zone.rs b/crates/engine/src/game/effects/cast_from_zone.rs
+index ef7da4ea6..9a6844d51 100644
+--- a/crates/engine/src/game/effects/cast_from_zone.rs
++++ b/crates/engine/src/game/effects/cast_from_zone.rs
+@@ -23,26 +23,35 @@ pub fn resolve(
+     ability: &ResolvedAbility,
+     events: &mut Vec<GameEvent>,
+ ) -> Result<(), EffectError> {
+-    let (target_filter, without_paying, cast_transformed, alt_ability_cost, constraint, duration) =
+-        match &ability.effect {
+-            Effect::CastFromZone {
+-                target,
+-                without_paying_mana_cost,
+-                cast_transformed,
+-                alt_ability_cost,
+-                constraint,
+-                duration,
+-                ..
+-            } => (
+-                target,
+-                *without_paying_mana_cost,
+-                *cast_transformed,
+-                alt_ability_cost.clone(),
+-                constraint.clone(),
+-                duration.clone(),
+-            ),
+-            _ => return Err(EffectError::MissingParam("CastFromZone".to_string())),
+-        };
++    let (
++        target_filter,
++        without_paying,
++        cast_transformed,
++        alt_ability_cost,
++        constraint,
++        duration,
++        driver,
++    ) = match &ability.effect {
++        Effect::CastFromZone {
++            target,
++            without_paying_mana_cost,
++            cast_transformed,
++            alt_ability_cost,
++            constraint,
++            duration,
++            driver,
++            ..
++        } => (
++            target,
++            *without_paying_mana_cost,
++            *cast_transformed,
++            alt_ability_cost.clone(),
++            constraint.clone(),
++            duration.clone(),
++            *driver,
++        ),
++        _ => return Err(EffectError::MissingParam("CastFromZone".to_string())),
++    };
+ 
+     // Collect target object IDs from the resolved ability's targets.
+     let mut target_ids: Vec<_> = ability
+@@ -81,6 +90,93 @@ pub fn resolve(
+         return Ok(());
+     }
+ 
++    // CR 702.62a + CR 608.2g: Suspend's last-time-counter ability casts the
++    // card it is attached to, for free, AS THE TRIGGER RESOLVES. The card casts
++    // itself (the single resolved target IS the ability's source), there is no
++    // mana cost (`without_paying`), and no replacement alt-cost
++    // (`alt_ability_cost == None`). Per CR 702.62a/702.62d the cast happens
++    // during resolution — it must NOT be deferred to a lingering permission the
++    // player acts on at a later priority window (issue #1520: accepting the
++    // optional "cast it?" prompt appeared to do nothing because only a
++    // permission was stamped — the spell was never put on the stack, and a
++    // sorcery like Treasure Cruise was additionally blocked by the
++    // sorcery-speed timing gate at upkeep). Drive the cast immediately through
++    // the same cast-during-resolution authority Cascade/Discover use
++    // (`initiate_cast_during_resolution`).
++    //
++    // The router reads the EXPLICIT `driver` discriminator
++    // (`CastFromZoneDriver::DuringResolution`, set by
++    // `build_suspend_last_counter_cast_trigger`), NOT `duration`. `duration` is
++    // CR 611.2a permission-expiry and says nothing about the casting mechanism;
++    // routing on it conflated two axes. The structural-shape guard
++    // (`without_paying` + no alt-cost + single self target) is retained as a
++    // defense-in-depth invariant — a `DuringResolution` body must always be a
++    // self-free-cast, since `initiate_cast_during_resolution` casts the single
++    // card object itself at zero cost.
++    //
++    // FOLLOW-UP (#1520 twin): Rebound (CR 702.88a) is still a
++    // `LingeringPermission` driver because its recast permission legitimately
++    // needs `duration: Some(UntilEndOfTurn)` to prune on decline (see the
++    // `consuming_vapors_rebound` suite). A rebounding SORCERY recast at upkeep
++    // therefore still passes through the lingering path; whether it hits the
++    // sorcery-speed gate is tracked separately. Routing Rebound through
++    // `DuringResolution` would regress that durational-prune contract, so it is
++    // intentionally left on the permission path under the explicit `driver`
++    // signal rather than forced through during-resolution here.
++    //
++    // Nashi/Jeleva-style "you may cast [other] exiled cards" (target != source,
++    // `ExiledBySource` filter, or an `alt_ability_cost`) are also
++    // `LingeringPermission`: the controller casts them during the granting
++    // effect's own priority window.
++    let self_free_cast = driver.is_during_resolution()
++        && without_paying
++        && alt_ability_cost.is_none()
++        && target_ids.len() == 1
++        && target_ids[0] == ability.source_id;
++    if self_free_cast {
++        let card = target_ids[0];
++        // CR 601.2a: ensure the card is in exile before the cast (it already is
++        // for Suspend/Rebound; this mirrors the permission path's invariant).
++        if state.objects.get(&card).map(|o| o.zone) != Some(Zone::Exile) {
++            zones::move_to_zone(state, card, Zone::Exile, events);
++        }
++        events.push(GameEvent::EffectResolved {
++            kind: EffectKind::CastFromZone,
++            source_id: ability.source_id,
++        });
++        // CR 702.62d / CR 601.2b: casting as an effect follows the alternative-
++        // cost rules. `initiate_cast_during_resolution` grants the zero-cost
++        // `ExileWithAltCost` permission, prepares the cast (the Suspend variant
++        // is detected by `prepare_spell_cast`'s effective-keyword scan), and
++        // continues it on `Auto` payment. The returned `WaitingFor` (target
++        // selection if the spell targets, else priority with the spell on the
++        // stack) becomes the resolution's pending prompt.
++        //
++        // CR 608.2g: the cast happens DURING resolution, so the sorcery-speed /
++        // empty-stack / active-player timing gates must NOT apply (Treasure
++        // Cruise is a sorcery cast at upkeep, with the trigger still on the
++        // stack). The during-resolution `ResolutionCastCleanup` marker keys that
++        // timing bypass in `restrictions::check_spell_timing`. There are no dig
++        // misses, and CR 702.62a's "if you don't, it remains exiled" disposition
++        // is `RemainExiled` (only reached if a future free-cast adds an MV gate;
++        // Suspend carries none).
++        let cleanup = crate::types::ability::ResolutionCastCleanup {
++            exiled_misses: Vec::new(),
++            reject_action: crate::types::ability::ResolutionMvRejectAction::RemainExiled,
++        };
++        state.waiting_for = crate::game::casting::initiate_cast_during_resolution(
++            state,
++            ability.controller,
++            card,
++            constraint.clone(),
++            cast_transformed,
++            cleanup,
++            events,
++        )
++        .map_err(|e| EffectError::InvalidParam(e.to_string()))?;
++        return Ok(());
++    }
++
+     for &obj_id in &target_ids {
+         // CR 601.2a: If the card is not in exile, move it there first.
+         // The casting pipeline gates on Zone::Exile for permission-based casts,
+@@ -180,6 +276,95 @@ mod tests {
+         obj_id
+     }
+ 
++    /// Issue #1520 — suspend last-time-counter free cast must actually CAST the
++    /// card as the trigger resolves (CR 702.62a), not merely grant a lingering
++    /// `ExileWithAltCost` permission that the player has to act on later. The
++    /// reported bug: removing the last time counter from a suspended Treasure
++    /// Cruise prompts "cast it?", but accepting does nothing — the spell is
++    /// never put on the stack because the resolver only stamped a permission.
++    ///
++    /// Discriminator: drive the synthesized last-counter `CastFromZone` body
++    /// (self-targeting, `without_paying_mana_cost`) on a suspended sorcery and
++    /// assert the spell lands on the stack at zero cost. Pre-fix the stack is
++    /// empty (the card sits in exile holding only a permission); post-fix the
++    /// cast-during-resolution path puts it on the stack.
++    #[test]
++    fn suspend_last_counter_free_cast_puts_spell_on_stack() {
++        use crate::types::keywords::Keyword;
++        use crate::types::mana::ManaCost as MC;
++        use crate::types::phase::Phase;
++
++        let mut state = GameState::new_two_player(42);
++        state.turn_number = 2;
++        state.phase = Phase::Upkeep;
++        state.active_player = PlayerId(0);
++        state.priority_player = PlayerId(0);
++
++        // A suspended sorcery owned/controlled by PlayerId(0) — Treasure Cruise
++        // is a sorcery with no targets ("Draw three cards"). It sits in exile
++        // with the Suspend keyword; its last time counter has just been removed.
++        let suspended = create_object(
++            &mut state,
++            CardId(7001),
++            PlayerId(0),
++            "Treasure Cruise".to_string(),
++            Zone::Exile,
++        );
++        {
++            let obj = state.objects.get_mut(&suspended).unwrap();
++            obj.card_types.core_types.push(CoreType::Sorcery);
++            obj.base_card_types = obj.card_types.clone();
++            obj.mana_cost = MC::generic(7);
++            obj.keywords.push(Keyword::Suspend {
++                count: 0,
++                cost: MC::zero(),
++            });
++            obj.base_keywords = obj.keywords.clone();
++        }
++
++        // The synthesized last-counter cast trigger body (CR 702.62a):
++        // `build_suspend_last_counter_cast_trigger` executes this exact effect
++        // when the final time counter is removed.
++        let cast_ability = ResolvedAbility::new(
++            Effect::CastFromZone {
++                target: TargetFilter::SelfRef,
++                without_paying_mana_cost: true,
++                mode: CardPlayMode::Cast,
++                cast_transformed: false,
++                alt_ability_cost: None,
++                constraint: None,
++                duration: None,
++                driver: crate::types::ability::CastFromZoneDriver::DuringResolution,
++            },
++            vec![TargetRef::Object(suspended)],
++            suspended,
++            PlayerId(0),
++        );
++
++        let mut events = Vec::new();
++        resolve(&mut state, &cast_ability, &mut events).unwrap();
++
++        // CR 702.62a: the player accepted the optional cast — the spell must be
++        // cast as the trigger resolves and placed on the stack. A bare
++        // permission grant (card still in exile, empty stack) is the bug.
++        assert_eq!(
++            state.stack.len(),
++            1,
++            "suspend last-counter cast (CR 702.62a) must put the spell on the \
++             stack, not just grant a lingering ExileWithAltCost permission"
++        );
++        assert_eq!(
++            state.objects.get(&suspended).map(|o| o.zone),
++            Some(Zone::Stack),
++            "the suspended card must move to the stack when cast for free"
++        );
++        // CR 702.62a: cast WITHOUT paying its mana cost — no mana was spent.
++        assert!(
++            state.players.iter().all(|p| p.mana_pool.total() == 0),
++            "the free cast must not require or consume mana"
++        );
++    }
++
+     #[test]
+     fn grants_zero_cost_permission_on_exiled_card() {
+         let mut state = make_test_state();
+@@ -194,6 +379,7 @@ mod tests {
+                 alt_ability_cost: None,
+                 constraint: None,
+                 duration: None,
++                driver: crate::types::ability::CastFromZoneDriver::LingeringPermission,
+             },
+             vec![TargetRef::Object(obj_id)],
+             ObjectId(999),
+@@ -229,6 +415,7 @@ mod tests {
+                 alt_ability_cost: None,
+                 constraint: None,
+                 duration: None,
++                driver: crate::types::ability::CastFromZoneDriver::LingeringPermission,
+             },
+             vec![TargetRef::Object(obj_id)],
+             ObjectId(999),
+@@ -261,6 +448,7 @@ mod tests {
+                 alt_ability_cost: None,
+                 constraint: None,
+                 duration: None,
++                driver: crate::types::ability::CastFromZoneDriver::LingeringPermission,
+             },
+             vec![TargetRef::Object(obj_id)],
+             ObjectId(999),
+@@ -329,6 +517,7 @@ mod tests {
+                 alt_ability_cost: None,
+                 constraint: None,
+                 duration: None,
++                driver: crate::types::ability::CastFromZoneDriver::LingeringPermission,
+             },
+             vec![],
+             source,
+@@ -364,6 +553,7 @@ mod tests {
+                 alt_ability_cost: None,
+                 constraint: None,
+                 duration: None,
++                driver: crate::types::ability::CastFromZoneDriver::LingeringPermission,
+             },
+             vec![],
+             ObjectId(999),
+@@ -401,6 +591,7 @@ mod tests {
+                 alt_ability_cost: None,
+                 constraint: Some(constraint.clone()),
+                 duration: None,
++                driver: crate::types::ability::CastFromZoneDriver::LingeringPermission,
+             },
+             vec![TargetRef::Object(obj_id)],
+             ObjectId(999),
+diff --git a/crates/engine/src/game/effects/exile_from_top_until.rs b/crates/engine/src/game/effects/exile_from_top_until.rs
+index a85984a75..ec2ba302c 100644
+--- a/crates/engine/src/game/effects/exile_from_top_until.rs
++++ b/crates/engine/src/game/effects/exile_from_top_until.rs
+@@ -436,6 +436,7 @@ mod tests {
+                 alt_ability_cost: None,
+                 constraint: None,
+                 duration: None,
++                driver: crate::types::ability::CastFromZoneDriver::LingeringPermission,
+             },
+             vec![],
+             source,
+@@ -539,6 +540,7 @@ mod tests {
+                 alt_ability_cost: None,
+                 constraint: None,
+                 duration: None,
++                driver: crate::types::ability::CastFromZoneDriver::LingeringPermission,
+             },
+             vec![],
+             source,
+@@ -776,6 +778,7 @@ mod tests {
+                 alt_ability_cost: None,
+                 constraint: None,
+                 duration: None,
++                driver: crate::types::ability::CastFromZoneDriver::LingeringPermission,
+             },
+             vec![],
+             source,
+diff --git a/crates/engine/src/game/effects/rebound.rs b/crates/engine/src/game/effects/rebound.rs
+index e714c9bc1..5dfc9f30a 100644
+--- a/crates/engine/src/game/effects/rebound.rs
++++ b/crates/engine/src/game/effects/rebound.rs
+@@ -44,6 +44,7 @@ pub fn arm_rebound(state: &mut GameState, exiled_id: ObjectId, controller: Playe
+             // cast, so a leftover Rebound permission cannot leak into a later
+             // turn.
+             duration: Some(Duration::UntilEndOfTurn),
++            driver: crate::types::ability::CastFromZoneDriver::LingeringPermission,
+         },
+         vec![TargetRef::Object(exiled_id)],
+         exiled_id,
+@@ -174,6 +175,7 @@ mod tests {
+                 alt_ability_cost: None,
+                 constraint: None,
+                 duration: Some(Duration::UntilEndOfTurn),
++                driver: crate::types::ability::CastFromZoneDriver::LingeringPermission,
+             },
+             vec![TargetRef::Object(exiled)],
+             exiled,
+diff --git a/crates/engine/src/game/engine_resolution_choices.rs b/crates/engine/src/game/engine_resolution_choices.rs
+index 2674085af..f5b3efb3d 100644
+--- a/crates/engine/src/game/engine_resolution_choices.rs
++++ b/crates/engine/src/game/engine_resolution_choices.rs
+@@ -412,6 +412,7 @@ pub(super) fn handle_resolution_choice(
+                             value: discover_value as i32,
+                         },
+                     }),
++                    false,
+                     cleanup,
+                     events,
+                 )?;
+@@ -544,6 +545,7 @@ pub(super) fn handle_resolution_choice(
+                             value: source_mv as i32,
+                         },
+                     }),
++                    false,
+                     cleanup,
+                     events,
+                 )?;
+diff --git a/crates/engine/src/game/exile_links.rs b/crates/engine/src/game/exile_links.rs
+index 788b0cd36..e3dac3224 100644
+--- a/crates/engine/src/game/exile_links.rs
++++ b/crates/engine/src/game/exile_links.rs
+@@ -189,6 +189,7 @@ mod tests {
+                 alt_ability_cost: None,
+                 constraint: None,
+                 duration: None,
++                driver: crate::types::ability::CastFromZoneDriver::LingeringPermission,
+             },
+             vec![],
+             ObjectId(1),
+diff --git a/crates/engine/src/game/restrictions.rs b/crates/engine/src/game/restrictions.rs
+index eac9cd5d0..b7bbaf435 100644
+--- a/crates/engine/src/game/restrictions.rs
++++ b/crates/engine/src/game/restrictions.rs
+@@ -37,12 +37,14 @@ pub fn check_spell_timing(
+         return Ok(());
+     }
+ 
+-    // CR 608.2g + CR 702.85a / CR 701.57a: A cascade/discover hit is cast DURING
+-    // the resolution of its source ability, following the 601.2a-i cast steps but
+-    // bypassing normal timing — sorcery-speed, empty-stack, and active-player
+-    // gates do not apply (the stack is necessarily non-empty mid-resolution). Such
+-    // a cast is driven by `initiate_cast_during_resolution`, which marks the
+-    // exiled hit with an `ExileWithAltCost` permission carrying `resolution_cleanup`.
++    // CR 608.2g + CR 702.85a / CR 701.57a + CR 702.62a/d: A spell cast DURING
++    // the resolution of its source ability — a Cascade/Discover hit, or
++    // Suspend's last-time-counter free cast — follows the 601.2a-i cast steps
++    // but bypasses normal timing: sorcery-speed, empty-stack, and active-player
++    // gates do not apply (Treasure Cruise is a sorcery cast at upkeep with the
++    // trigger still on the stack). Such a cast is driven by
++    // `initiate_cast_during_resolution`, which marks the card with an
++    // `ExileWithAltCost` permission carrying `resolution_cleanup`.
+     if obj.casting_permissions.iter().any(|p| {
+         matches!(
+             p,
+diff --git a/crates/engine/src/game/stack.rs b/crates/engine/src/game/stack.rs
+index 966c308e8..4833f3a32 100644
+--- a/crates/engine/src/game/stack.rs
++++ b/crates/engine/src/game/stack.rs
+@@ -1,6 +1,6 @@
+ use crate::types::ability::{
+-    CastingPermission, ContinuousModification, Duration, Effect, EffectKind, KeywordAction,
+-    ResolvedAbility, TargetFilter, TargetRef,
++    ContinuousModification, Duration, Effect, EffectKind, KeywordAction, ResolvedAbility,
++    TargetFilter, TargetRef,
+ };
+ use crate::types::card_type::CoreType;
+ use crate::types::counter::CounterType;
+@@ -100,7 +100,7 @@ pub fn resolve_top(state: &mut GameState, events: &mut Vec<GameEvent>) {
+         Some(e) => e,
+         None => return,
+     };
+-    state.stack_paid_facts.remove(&entry.id);
++    let paid_snapshot = state.stack_paid_facts.remove(&entry.id);
+ 
+     // CR 113.3b: Activated keyword abilities (Equip / Crew / Saddle / Station)
+     // resolve via their typed payload — they have no ResolvedAbility/targets
+@@ -458,21 +458,17 @@ pub fn resolve_top(state: &mut GameState, events: &mut Vec<GameEvent>) {
+                     *enter_tapped = crate::types::proposed_event::EtbTapState::Tapped;
+                 }
+             }
+-            // CR 712.14a + CR 310.11b: If this spell was cast via an
+-            // ExileWithAltCost permission with `cast_transformed`, the
+-            // permanent enters the battlefield transformed (resolving to its
+-            // back face). Used by the Siege victory trigger.
++            // CR 712.14a + CR 310.11b: If this spell was finalized from an
++            // ExileWithAltCost permission with `cast_transformed`, the permanent
++            // enters the battlefield transformed (resolving to its back face).
++            // The finalized stack-paid snapshot is authoritative here; the
++            // mutable permission list is casting-time authorization, not
++            // resolution-time cast metadata.
+             if let Some(obj) = state.objects.get(&entry.id) {
+-                let cast_transformed = obj.casting_permissions.iter().any(|p| {
+-                    matches!(
+-                        p,
+-                        CastingPermission::ExileWithAltCost {
+-                            cast_transformed: true,
+-                            ..
+-                        }
+-                    )
+-                });
+-                if cast_transformed {
++                if paid_snapshot
++                    .as_ref()
++                    .is_some_and(|snapshot| snapshot.cast_transformed)
++                {
+                     if let crate::types::proposed_event::ProposedEvent::ZoneChange {
+                         enter_transformed,
+                         ..
+diff --git a/crates/engine/src/game/triggers.rs b/crates/engine/src/game/triggers.rs
+index e4d29f2de..736f6ebf5 100644
+--- a/crates/engine/src/game/triggers.rs
++++ b/crates/engine/src/game/triggers.rs
+@@ -9901,6 +9901,7 @@ pub mod tests {
+             alt_ability_cost: None,
+             constraint: None,
+             duration: None,
++            driver: crate::types::ability::CastFromZoneDriver::LingeringPermission,
+         };
+         assert!(
+             extract_target_filter_from_effect(&effect).is_none(),
+@@ -9931,6 +9932,7 @@ pub mod tests {
+             alt_ability_cost: None,
+             constraint: None,
+             duration: None,
++            driver: crate::types::ability::CastFromZoneDriver::LingeringPermission,
+         };
+         assert!(
+             extract_target_filter_from_effect(&effect).is_some(),
+diff --git a/crates/engine/src/parser/oracle_effect/mod.rs b/crates/engine/src/parser/oracle_effect/mod.rs
+index df7775896..08d9635d3 100644
+--- a/crates/engine/src/parser/oracle_effect/mod.rs
++++ b/crates/engine/src/parser/oracle_effect/mod.rs
+@@ -10863,6 +10863,7 @@ fn try_parse_cast_effect(lower: &str) -> Option<Effect> {
+             alt_ability_cost: None,
+             constraint,
+             duration: None,
++            driver: crate::types::ability::CastFromZoneDriver::LingeringPermission,
+         });
+     }
+ 
+@@ -10897,6 +10898,7 @@ fn try_parse_cast_effect(lower: &str) -> Option<Effect> {
+             alt_ability_cost: None,
+             constraint,
+             duration: None,
++            driver: crate::types::ability::CastFromZoneDriver::LingeringPermission,
+         });
+     }
+     // CR 610.3 + CR 118.9 + CR 608.2c + CR 701.13a: "Cast [quantifier] [filter]
+@@ -10918,6 +10920,7 @@ fn try_parse_cast_effect(lower: &str) -> Option<Effect> {
+             alt_ability_cost: None,
+             constraint,
+             duration: None,
++            driver: crate::types::ability::CastFromZoneDriver::LingeringPermission,
+         });
+     }
+     if scan_contains_phrase(rest, "from among them")
+@@ -10933,6 +10936,7 @@ fn try_parse_cast_effect(lower: &str) -> Option<Effect> {
+             alt_ability_cost: None,
+             constraint,
+             duration: None,
++            driver: crate::types::ability::CastFromZoneDriver::LingeringPermission,
+         });
+     }
+ 
+@@ -10985,6 +10989,7 @@ fn try_parse_cast_effect(lower: &str) -> Option<Effect> {
+             alt_ability_cost: None,
+             constraint,
+             duration: None,
++            driver: crate::types::ability::CastFromZoneDriver::LingeringPermission,
+         });
+     }
+ 
+@@ -11011,6 +11016,7 @@ fn try_parse_cast_effect(lower: &str) -> Option<Effect> {
+             alt_ability_cost: None,
+             constraint,
+             duration: None,
++            driver: crate::types::ability::CastFromZoneDriver::LingeringPermission,
+         });
+     }
+ 
+@@ -11023,6 +11029,7 @@ fn try_parse_cast_effect(lower: &str) -> Option<Effect> {
+         alt_ability_cost: None,
+         constraint,
+         duration: None,
++        driver: crate::types::ability::CastFromZoneDriver::LingeringPermission,
+     })
+ }
+ 
+diff --git a/crates/engine/src/types/ability.rs b/crates/engine/src/types/ability.rs
+index be1e1d158..bf89b946c 100644
+--- a/crates/engine/src/types/ability.rs
++++ b/crates/engine/src/types/ability.rs
+@@ -545,6 +545,47 @@ impl std::str::FromStr for CardPlayMode {
+     }
+ }
+ 
++/// CR 608.2g vs CR 118.9: Which casting *mechanism* an `Effect::CastFromZone`
++/// drives — i.e. *when* relative to the granting ability's resolution the card
++/// is cast. This is orthogonal to `duration` (CR 611.2a permission-expiry),
++/// `mode` (CR 601.2 cast vs CR 305.1 play), and `alt_ability_cost` (CR 118.9
++/// cost-substitution); none of those describe the casting mechanism, so the
++/// router must read this field rather than inferring the mechanism from them.
++#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Hash, Serialize, Deserialize)]
++pub enum CastFromZoneDriver {
++    /// CR 118.9: Grant a lingering `CastingPermission` on the target card(s)
++    /// and return — the controller casts the card later, during the granting
++    /// effect's own (or a future) priority window. The default for every
++    /// permission-granting cast-from-zone effect: Discover/Nashi/Jeleva-style
++    /// "you may cast those exiled cards" and Rebound's next-upkeep recast offer
++    /// (CR 702.88a), whose `duration: Some(UntilEndOfTurn)` then prunes the
++    /// unused permission.
++    #[default]
++    LingeringPermission,
++    /// CR 608.2g: Cast the card *as the granting ability resolves* — the card
++    /// goes onto the stack immediately via `initiate_cast_during_resolution`,
++    /// and the CR 608.2g timing bypass (sorcery-speed / empty-stack /
++    /// active-player gates do not apply) is armed. Set by Suspend's
++    /// last-time-counter trigger (CR 702.62a) so a suspended sorcery recast at
++    /// upkeep is not blocked by the sorcery-speed gate (issue #1520).
++    DuringResolution,
++}
++
++impl CastFromZoneDriver {
++    /// Serde skip predicate — the `LingeringPermission` default is the common
++    /// case and is elided from serialized `Effect::CastFromZone` bodies.
++    pub fn is_default(&self) -> bool {
++        matches!(self, CastFromZoneDriver::LingeringPermission)
++    }
++
++    /// CR 608.2g: true iff this effect casts the card as the granting ability
++    /// resolves (Suspend's last-counter cast), rather than granting a lingering
++    /// permission.
++    pub fn is_during_resolution(&self) -> bool {
++        matches!(self, CastFromZoneDriver::DuringResolution)
++    }
++}
++
+ /// CR 702.104a + CR 702.104b: The outcome of the Tribute choice the chosen opponent
+ /// made as the creature entered the battlefield. Persisted as a `ChosenAttribute` on
+ /// the Tribute creature so the companion "if tribute wasn't paid" trigger (CR
+@@ -1489,7 +1530,7 @@ pub enum CastingPermission {
+         /// Cascade/Discover hit *during resolution* of the source spell. It
+         /// carries the rejection-cleanup state (exiled misses + where the hit
+         /// goes if the cast-time MV check fails). `None` for all standing
+-        /// permissions (Airbending, Suspend, Maralen, Beseech, etc.) which are
++        /// permissions (Airbending, Maralen, Beseech, etc.) which are
+         /// cast later via a normal `CastSpell` and never need resolution-time
+         /// cleanup. `resolution_cleanup.is_some()` is the discriminator that
+         /// distinguishes a cast-during-resolution permission from a plain
+@@ -1650,22 +1691,27 @@ pub enum CastPermissionConstraint {
+ }
+ 
+ /// CR 608.2g: Rejection-cleanup state carried by a cast-during-resolution
+-/// `ExileWithAltCost` permission (Cascade / Discover). When the cast-time
+-/// resulting-mana-value check fails at finalization, the source spell's
+-/// `WaitingFor::CastOffer` has already been consumed, so the misses ride
+-/// inside the permission and the engine still knows where the rejected hit
+-/// goes (`reject_action`).
++/// `ExileWithAltCost` permission. Its presence is the engine's marker that the
++/// cast happens *during the resolution* of its source ability (CR 608.2g —
++/// normal timing/empty-stack/active-player gates do not apply). For Cascade /
++/// Discover, when the cast-time resulting-mana-value check fails at
++/// finalization the source spell's `WaitingFor::CastOffer` has already been
++/// consumed, so the misses ride inside the permission and the engine still
++/// knows where the rejected hit goes (`reject_action`). Suspend's last-counter
++/// free cast (CR 702.62a/d) has no dig, so it carries an empty `exiled_misses`
++/// and `RemainExiled` — the marker still arms the CR 608.2g timing bypass.
+ #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+ pub struct ResolutionCastCleanup {
+     /// Cards exiled during the dig that were not the hit; they go to the
+     /// bottom of the library in a random order on resolution completion.
++    /// Empty for Suspend's self-free-cast (no dig).
+     pub exiled_misses: Vec<super::identifiers::ObjectId>,
+     /// Where the hit goes if the player declines or the cast-time MV check
+     /// rejects the cast.
+     pub reject_action: ResolutionMvRejectAction,
+ }
+ 
+-/// CR 608.2g: Disposition of a Cascade/Discover hit that is not cast.
++/// CR 608.2g: Disposition of a during-resolution card that is not cast.
+ #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+ #[serde(tag = "type")]
+ pub enum ResolutionMvRejectAction {
+@@ -1673,6 +1719,11 @@ pub enum ResolutionMvRejectAction {
+     BottomWithMisses,
+     /// CR 701.57a: discover — hit goes to its owner's hand; misses to bottom.
+     ToHand,
++    /// CR 702.62a: Suspend's last-counter free cast — the card has no dig
++    /// misses and no resulting-MV gate, so this reject disposition is only
++    /// reached if a future during-resolution free cast adds a constraint. "If
++    /// you don't [cast it], it remains exiled" — the card stays in exile.
++    RemainExiled,
+ }
+ 
+ /// When a delayed triggered ability fires (CR 603.7).
+@@ -6608,6 +6659,16 @@ pub enum Effect {
+         /// grants (Discover, Suspend, Nashi, etc.).
+         #[serde(default, skip_serializing_if = "Option::is_none")]
+         duration: Option<Duration>,
++        /// CR 608.2g vs CR 118.9: Which casting mechanism this effect drives —
++        /// cast the card as the granting ability resolves (`DuringResolution`,
++        /// Suspend's last-counter cast per CR 702.62a) versus grant a lingering
++        /// permission the controller acts on at a later priority window
++        /// (`LingeringPermission`, the default for Discover/Nashi/Rebound). The
++        /// router in `cast_from_zone::resolve` reads THIS field, not `duration`
++        /// (which is CR 611.2a permission-expiry and means nothing about the
++        /// casting mechanism). See issue #1520.
++        #[serde(default, skip_serializing_if = "CastFromZoneDriver::is_default")]
++        driver: CastFromZoneDriver,
+     },
+     /// CR 615: Prevent damage to a target.
+     PreventDamage {
+diff --git a/crates/engine/src/types/game_state.rs b/crates/engine/src/types/game_state.rs
+index bdd4f1d59..48d85e2f2 100644
+--- a/crates/engine/src/types/game_state.rs
++++ b/crates/engine/src/types/game_state.rs
+@@ -4023,6 +4023,10 @@ pub struct StackPaidSnapshot {
+     pub additional_cost_paid: bool,
+     #[serde(default, skip_serializing_if = "CastingVariant::is_normal")]
+     pub casting_variant: CastingVariant,
++    /// CR 310.11b + CR 712.14a: Exile alt-cost casts that were explicitly cast
++    /// transformed resolve onto the battlefield back face up.
++    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
++    pub cast_transformed: bool,
+     #[serde(default, skip_serializing_if = "is_zero_usize")]
+     pub convoked_creatures: usize,
+ }
+diff --git a/crates/engine/tests/integration/rules/battle.rs b/crates/engine/tests/integration/rules/battle.rs
+index f1f8dc5de..144b87ea4 100644
+--- a/crates/engine/tests/integration/rules/battle.rs
++++ b/crates/engine/tests/integration/rules/battle.rs
+@@ -63,6 +63,91 @@ fn battle_has_defense_equal_to_counters() {
+     assert_eq!(obj.counters.get(&CounterType::Defense).copied(), Some(4));
+ }
+ 
++/// CR 310.11b + CR 712.14a: Accepting a Siege victory cast during trigger
++/// resolution must preserve `cast_transformed`, so the permanent resolves onto
++/// the battlefield back face up.
++#[test]
++fn siege_victory_cast_during_resolution_enters_transformed() {
++    use engine::game::game_object::BackFaceData;
++    use engine::types::ability::{
++        CardPlayMode, CastFromZoneDriver, Effect, ResolvedAbility, TargetFilter, TargetRef,
++    };
++    use engine::types::card_type::CardType;
++    use engine::types::mana::ManaCost;
++
++    let (mut runner, battle) = prime_siege(P0, P1, "Invasion of Test", 3);
++    {
++        let obj = runner.state_mut().objects.get_mut(&battle).unwrap();
++        obj.back_face = Some(BackFaceData {
++            name: "Test Back Face".to_string(),
++            power: Some(4),
++            toughness: Some(4),
++            loyalty: None,
++            defense: None,
++            card_types: CardType {
++                supertypes: Vec::new(),
++                core_types: vec![CoreType::Creature],
++                subtypes: vec!["Spirit".to_string()],
++            },
++            mana_cost: ManaCost::default(),
++            keywords: Vec::new(),
++            abilities: Vec::new(),
++            trigger_definitions: Default::default(),
++            replacement_definitions: Default::default(),
++            static_definitions: Default::default(),
++            color: Vec::new(),
++            printed_ref: None,
++            modal: None,
++            additional_cost: None,
++            strive_cost: None,
++            casting_restrictions: Vec::new(),
++            casting_options: Vec::new(),
++            layout_kind: None,
++        });
++    }
++
++    let cast_victory_back_face = ResolvedAbility::new(
++        Effect::CastFromZone {
++            target: TargetFilter::SelfRef,
++            without_paying_mana_cost: true,
++            mode: CardPlayMode::Cast,
++            cast_transformed: true,
++            alt_ability_cost: None,
++            constraint: None,
++            duration: None,
++            driver: CastFromZoneDriver::DuringResolution,
++        },
++        vec![TargetRef::Object(battle)],
++        battle,
++        P0,
++    );
++    let mut events = Vec::new();
++    engine::game::effects::resolve_ability_chain(
++        runner.state_mut(),
++        &cast_victory_back_face,
++        &mut events,
++        0,
++    )
++    .expect("Siege victory CastFromZone should cast during resolution");
++
++    assert_eq!(
++        runner.state().objects[&battle].zone,
++        Zone::Stack,
++        "victory cast should put the Siege on the stack during resolution"
++    );
++
++    runner.resolve_top();
++
++    let obj = &runner.state().objects[&battle];
++    assert_eq!(obj.zone, Zone::Battlefield);
++    assert!(
++        obj.transformed,
++        "victory cast must preserve cast_transformed through the during-resolution permission"
++    );
++    assert_eq!(obj.name, "Test Back Face");
++    assert!(obj.card_types.core_types.contains(&CoreType::Creature));
++}
++
+ /// CR 704.5v + CR 310.7: A battle with 0 defense is put into its owner's
+ /// graveyard by state-based actions.
+ #[test]

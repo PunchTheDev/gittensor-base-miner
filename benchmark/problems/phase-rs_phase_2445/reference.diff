@@ -1,0 +1,524 @@
+diff --git a/crates/engine/src/game/casting.rs b/crates/engine/src/game/casting.rs
+index d3d8c7734..5311913ae 100644
+--- a/crates/engine/src/game/casting.rs
++++ b/crates/engine/src/game/casting.rs
+@@ -2554,10 +2554,12 @@ fn prepare_spell_cast_with_variant_override_inner(
+         ));
+     }
+ 
+-    // CR 604.3 + CR 101.2: "Can't" beats "can" — check CantCastFrom statics.
++    // CR 601.3 + CR 101.2 + CR 109.5: "Can't" beats "can" — check CantCastFrom statics.
+     // Grafdigger's Cage: "Players can't cast spells from graveyards or libraries."
+-    // This overrides graveyard/library casting permissions (Escape, Lurrus, etc.).
+-    if mode == CastingMode::Actual && is_blocked_from_casting_from_zone(state, obj) {
++    // Drannith Magistrate: "Your opponents can't cast spells from anywhere other
++    // than their hands." This overrides graveyard/library/exile/command casting
++    // permissions (Escape, Lurrus, flashback, foretell, commander, etc.).
++    if mode == CastingMode::Actual && is_blocked_from_casting_from_zone(state, obj, player) {
+         return Err(EngineError::ActionNotAllowed(
+             "A static ability prevents casting from this zone".to_string(),
+         ));
+@@ -10876,25 +10878,36 @@ fn casting_prohibition_scope_matches(
+     super::static_abilities::prohibition_scope_matches_player(who, caster, source_obj.id, state)
+ }
+ 
+-/// CR 604.3 + CR 101.2: Check if any active CantCastFrom static prevents casting
+-/// the given object from its current zone.
+-/// e.g., Grafdigger's Cage: "Players can't cast spells from graveyards or libraries."
++/// CR 601.3 + CR 101.2 + CR 109.5: Check if any active CantCastFrom static prevents
++/// `caster` from casting the given object out of its current zone.
++/// - Grafdigger's Cage ("Players can't cast spells from graveyards or libraries"):
++///   `who = AllPlayers`, prohibited zones = {Graveyard, Library}.
++/// - Drannith Magistrate ("Your opponents can't cast spells from anywhere other
++///   than their hands"): `who = Opponents`, prohibited zones = every cast-capable
++///   zone except the hand. The `who` axis means the static's own controller is
++///   unaffected and only opponents are locked out of graveyard/exile/command casts.
+ fn is_blocked_from_casting_from_zone(
+     state: &GameState,
+     obj: &crate::game::game_object::GameObject,
++    caster: PlayerId,
+ ) -> bool {
+-    // Only applies to non-hand, non-command zones (graveyard, library, exile)
+-    if obj.zone == Zone::Hand || obj.zone == Zone::Command {
++    // CR 601.2a: Casting from hand is never restricted by this class — the hand is
++    // every printed allowed zone. Guard it before any filter evaluation.
++    if obj.zone == Zone::Hand {
+         return false;
+     }
+ 
+     let object_id = obj.id;
+     // CR 702.26b + CR 604.1: Functioning gate owned by `battlefield_active_statics`.
+     for (bf_obj, def) in super::functioning_abilities::battlefield_active_statics(state) {
+-        if def.mode != StaticMode::CantCastFrom {
++        let StaticMode::CantCastFrom { ref who } = def.mode else {
++            continue;
++        };
++        // CR 109.5: The player axis — is the caster within the static's scope?
++        if !casting_prohibition_scope_matches(who, caster, bf_obj, state) {
+             continue;
+         }
+-        // The affected filter encodes zone restrictions via InAnyZone.
++        // CR 601.3: The affected filter encodes the prohibited zones via InAnyZone.
+         if let Some(ref filter) = def.affected {
+             if super::filter::matches_target_filter(
+                 state,
+@@ -25589,6 +25602,159 @@ mod tests {
+         source
+     }
+ 
++    /// Install a `CantCastFrom` static permanent controlled by `controller` whose
++    /// prohibited-zone list covers every cast-capable zone except the hand (the
++    /// Drannith Magistrate shape). `who` scopes the player axis.
++    fn add_cant_cast_from_hand_only_permanent(
++        state: &mut GameState,
++        controller: PlayerId,
++        who: ProhibitionScope,
++    ) -> ObjectId {
++        let id = create_object(
++            state,
++            CardId(state.next_object_id),
++            controller,
++            "Drannith Magistrate".to_string(),
++            Zone::Battlefield,
++        );
++        state.objects.get_mut(&id).unwrap().static_definitions.push(
++            StaticDefinition::new(StaticMode::CantCastFrom { who }).affected(TargetFilter::Typed(
++                crate::types::ability::TypedFilter {
++                    properties: vec![FilterProp::InAnyZone {
++                        zones: vec![Zone::Graveyard, Zone::Library, Zone::Exile, Zone::Command],
++                    }],
++                    ..crate::types::ability::TypedFilter::default()
++                },
++            )),
++        );
++        id
++    }
++
++    /// Place a castable card object owned by `owner` into `zone` and return its id.
++    fn add_card_in_zone(state: &mut GameState, owner: PlayerId, zone: Zone) -> ObjectId {
++        create_object(
++            state,
++            CardId(state.next_object_id),
++            owner,
++            "Some Spell".to_string(),
++            zone,
++        )
++    }
++
++    /// CR 601.3 + CR 109.5: Drannith Magistrate — an opponent of the static's
++    /// controller can't cast a spell from their graveyard.
++    #[test]
++    fn drannith_magistrate_opponent_blocked_from_graveyard() {
++        let mut state = setup_game_at_main_phase();
++        add_cant_cast_from_hand_only_permanent(
++            &mut state,
++            PlayerId(0),
++            ProhibitionScope::Opponents,
++        );
++        let card = add_card_in_zone(&mut state, PlayerId(1), Zone::Graveyard);
++        let obj = state.objects.get(&card).unwrap();
++        assert!(is_blocked_from_casting_from_zone(&state, obj, PlayerId(1)));
++    }
++
++    /// CR 601.3 + CR 109.5: Drannith Magistrate restricts only opponents — its own
++    /// controller may still cast from their graveyard (escape, flashback, etc.).
++    #[test]
++    fn drannith_magistrate_controller_can_cast_from_graveyard() {
++        let mut state = setup_game_at_main_phase();
++        add_cant_cast_from_hand_only_permanent(
++            &mut state,
++            PlayerId(0),
++            ProhibitionScope::Opponents,
++        );
++        let card = add_card_in_zone(&mut state, PlayerId(0), Zone::Graveyard);
++        let obj = state.objects.get(&card).unwrap();
++        assert!(!is_blocked_from_casting_from_zone(&state, obj, PlayerId(0)));
++    }
++
++    /// CR 601.2a: The hand is the one allowed zone — opponents may still cast from
++    /// hand under Drannith Magistrate.
++    #[test]
++    fn drannith_magistrate_opponent_can_cast_from_hand() {
++        let mut state = setup_game_at_main_phase();
++        add_cant_cast_from_hand_only_permanent(
++            &mut state,
++            PlayerId(0),
++            ProhibitionScope::Opponents,
++        );
++        let card = add_card_in_zone(&mut state, PlayerId(1), Zone::Hand);
++        let obj = state.objects.get(&card).unwrap();
++        assert!(!is_blocked_from_casting_from_zone(&state, obj, PlayerId(1)));
++    }
++
++    /// CR 601.3 + CR 113.6: Drannith Magistrate also locks opponents out of
++    /// command-zone casts (commander, foretell, adventure-from-exile, etc.).
++    #[test]
++    fn drannith_magistrate_opponent_blocked_from_command_zone() {
++        let mut state = setup_game_at_main_phase();
++        add_cant_cast_from_hand_only_permanent(
++            &mut state,
++            PlayerId(0),
++            ProhibitionScope::Opponents,
++        );
++        let card = add_card_in_zone(&mut state, PlayerId(1), Zone::Command);
++        let obj = state.objects.get(&card).unwrap();
++        assert!(is_blocked_from_casting_from_zone(&state, obj, PlayerId(1)));
++    }
++
++    /// Regression: Grafdigger's Cage (`who = AllPlayers`, zones = {Graveyard,
++    /// Library}) still blocks every player from graveyard casts, and never the
++    /// command zone (its filter omits Command).
++    #[test]
++    fn grafdiggers_cage_blocks_all_players_from_graveyard_not_command() {
++        let mut state = setup_game_at_main_phase();
++        let cage_card = CardId(state.next_object_id);
++        let cage = create_object(
++            &mut state,
++            cage_card,
++            PlayerId(0),
++            "Grafdigger's Cage".to_string(),
++            Zone::Battlefield,
++        );
++        state
++            .objects
++            .get_mut(&cage)
++            .unwrap()
++            .static_definitions
++            .push(
++                StaticDefinition::new(StaticMode::CantCastFrom {
++                    who: ProhibitionScope::AllPlayers,
++                })
++                .affected(TargetFilter::Typed(
++                    crate::types::ability::TypedFilter {
++                        properties: vec![FilterProp::InAnyZone {
++                            zones: vec![Zone::Graveyard, Zone::Library],
++                        }],
++                        ..crate::types::ability::TypedFilter::default()
++                    },
++                )),
++            );
++        // Both the controller and the opponent are blocked from graveyard casts.
++        let gy_owner = add_card_in_zone(&mut state, PlayerId(0), Zone::Graveyard);
++        let gy_opp = add_card_in_zone(&mut state, PlayerId(1), Zone::Graveyard);
++        assert!(is_blocked_from_casting_from_zone(
++            &state,
++            state.objects.get(&gy_owner).unwrap(),
++            PlayerId(0)
++        ));
++        assert!(is_blocked_from_casting_from_zone(
++            &state,
++            state.objects.get(&gy_opp).unwrap(),
++            PlayerId(1)
++        ));
++        // Command-zone casts are unaffected (Cage's filter omits Command).
++        let cmd = add_card_in_zone(&mut state, PlayerId(1), Zone::Command);
++        assert!(!is_blocked_from_casting_from_zone(
++            &state,
++            state.objects.get(&cmd).unwrap(),
++            PlayerId(1)
++        ));
++    }
++
+     #[test]
+     fn cant_cast_during_runtime_opponent_blocked_on_controllers_turn() {
+         let mut state = setup_game_at_main_phase();
+diff --git a/crates/engine/src/game/coverage.rs b/crates/engine/src/game/coverage.rs
+index 72c9d0d82..cf3119f97 100644
+--- a/crates/engine/src/game/coverage.rs
++++ b/crates/engine/src/game/coverage.rs
+@@ -45,6 +45,10 @@ fn is_data_carrying_static(mode: &StaticMode) -> bool {
+             | StaticMode::DefilerCostReduction { .. }
+             | StaticMode::CantPayCost { .. }
+             | StaticMode::CantBeCast { .. }
++            // CR 601.3 + CR 109.5: CantCastFrom carries `who`; the prohibited-zone
++            // list rides `affected`. Runtime enforcement is in
++            // casting.rs::is_blocked_from_casting_from_zone().
++            | StaticMode::CantCastFrom { .. }
+             | StaticMode::CantCastDuring { .. }
+             | StaticMode::PerTurnCastLimit { .. }
+             | StaticMode::PerTurnDrawLimit { .. }
+@@ -6655,7 +6659,7 @@ fn audit_card_lines(oracle_text: &str, face: &CardFace) -> Vec<SemanticFinding>
+             StaticMode::CantBeCast { .. } => {
+                 effective_lower.contains("can't cast") && !effective_lower.contains("during")
+             }
+-            StaticMode::CantCastFrom => effective_lower.contains("can't cast"),
++            StaticMode::CantCastFrom { .. } => effective_lower.contains("can't cast"),
+             StaticMode::RevealTopOfLibrary { .. } => {
+                 effective_lower.contains("play with the top card")
+                     || effective_lower.contains("play with the top")
+diff --git a/crates/engine/src/game/static_abilities.rs b/crates/engine/src/game/static_abilities.rs
+index bf0bcba91..79ddd5165 100644
+--- a/crates/engine/src/game/static_abilities.rs
++++ b/crates/engine/src/game/static_abilities.rs
+@@ -235,10 +235,13 @@ pub fn build_static_registry() -> HashMap<StaticMode, StaticAbilityHandler> {
+ 
+     // CR 614.1d: Zone-based restriction handlers.
+     // Enforcement happens in zones.rs (CantEnterBattlefieldFrom) and casting.rs (CantCastFrom),
+-    // not through the standard handler flow, but we register them as rule_mod so that
+-    // `check_static_ability` queries work.
++    // not through the standard handler flow, but we register CantEnterBattlefieldFrom as
++    // rule_mod so that `check_static_ability` queries work.
+     registry.insert(StaticMode::CantEnterBattlefieldFrom, handle_rule_mod);
+-    registry.insert(StaticMode::CantCastFrom, handle_rule_mod);
++    // Note: CantCastFrom is a data-carrying variant (carries `who` + the prohibited-zone
++    // list on `affected`) — parameterized, so no registry entry. Runtime enforcement is in
++    // casting.rs::is_blocked_from_casting_from_zone(). Coverage support is via
++    // is_data_carrying_static().
+     // Note: CantCastDuring is a data-carrying variant — runtime enforcement will be in
+     // casting.rs. Coverage support is via is_data_carrying_static().
+     // Note: CantActivateDuring is a data-carrying variant — runtime enforcement is in
+diff --git a/crates/engine/src/parser/oracle_static/dispatch.rs b/crates/engine/src/parser/oracle_static/dispatch.rs
+index dba0d3fb0..ee5ac40ed 100644
+--- a/crates/engine/src/parser/oracle_static/dispatch.rs
++++ b/crates/engine/src/parser/oracle_static/dispatch.rs
+@@ -1532,23 +1532,34 @@ pub(crate) fn parse_static_line_inner(
+         );
+     }
+ 
+-    // --- CR 604.3: "Players can't cast spells from [zones]" ---
+-    // e.g., Grafdigger's Cage: "Players can't cast spells from graveyards or libraries."
++    // --- CR 601.3 + CR 101.2 + CR 109.5: "[subject] can't cast spells from [zones]" ---
++    // Two phrasings collapse here, discriminated by the zone clause:
++    // - Explicit list (Grafdigger's Cage): "Players can't cast spells from
++    //   graveyards or libraries." → prohibited = the listed zones.
++    // - Inverse "anywhere other than" (Drannith Magistrate): "Your opponents
++    //   can't cast spells from anywhere other than their hands." → prohibited =
++    //   every cast-capable zone except the named allowed zone.
++    // The subject prefix rides the `who` scope axis via the shared building block.
+     if nom_primitives::scan_contains(tp.lower, "can't cast spells from") {
+-        let zones = parse_zone_names_from_tp(&tp);
+-        let affected = if zones.is_empty() {
+-            TargetFilter::Any
+-        } else {
+-            TargetFilter::Typed(TypedFilter {
++        let who = strip_casting_prohibition_subject(tp.lower)
++            .map(|(scope, _)| scope)
++            .unwrap_or(ProhibitionScope::AllPlayers);
++        // CR 601.2a: Prefer the "anywhere other than" complement; fall back to the
++        // explicit zone list. An empty list (no recognized zone) yields no static —
++        // returning `TargetFilter::Any` here would over-block every zone.
++        let zones = parse_cast_from_anywhere_other_than_tp(&tp)
++            .unwrap_or_else(|| parse_zone_names_from_tp(&tp));
++        if !zones.is_empty() {
++            let affected = TargetFilter::Typed(TypedFilter {
+                 properties: vec![FilterProp::InAnyZone { zones }],
+                 ..TypedFilter::default()
+-            })
+-        };
+-        return Some(
+-            StaticDefinition::new(StaticMode::CantCastFrom)
+-                .affected(affected)
+-                .description(text.to_string()),
+-        );
++            });
++            return Some(
++                StaticDefinition::new(StaticMode::CantCastFrom { who })
++                    .affected(affected)
++                    .description(text.to_string()),
++            );
++        }
+     }
+ 
+     // --- CR 101.2: Blanket casting prohibition ("can't cast [type] spells") ---
+diff --git a/crates/engine/src/parser/oracle_static/grammar.rs b/crates/engine/src/parser/oracle_static/grammar.rs
+index 95232c31e..c3b12bab8 100644
+--- a/crates/engine/src/parser/oracle_static/grammar.rs
++++ b/crates/engine/src/parser/oracle_static/grammar.rs
+@@ -188,6 +188,49 @@ pub(crate) fn parse_zone_names_from_tp(tp: &TextPair) -> Vec<Zone> {
+     zones
+ }
+ 
++/// CR 601.3 + CR 601.2a: Parse a "from anywhere other than <zone>" casting
++/// restriction into the explicit list of *prohibited* zones.
++///
++/// "Anywhere other than [hand]" is the inverse of `parse_zone_names_from_tp`'s
++/// "from [zone-list]" form: it names the single zone a spell *may* be cast from,
++/// so the prohibited set is "every cast-capable zone except that one". The only
++/// zones a spell can be cast from are Hand, Graveyard, Library, Exile, and
++/// Command (Stack/Battlefield are never cast-from zones — CR 601.2a moves a card
++/// "from where it is to the stack"), so the complement of `allowed` over that set
++/// is the prohibited list. Drannith Magistrate ("anywhere other than their
++/// hands") and the static half of the Avatar's Wrath class collapse here.
++///
++/// Returns `None` when the restriction is not of the "anywhere other than" form,
++/// so the caller falls back to the explicit zone-list parser.
++pub(crate) fn parse_cast_from_anywhere_other_than_tp(tp: &TextPair) -> Option<Vec<Zone>> {
++    if !nom_primitives::scan_contains(tp.lower, "from anywhere other than") {
++        return None;
++    }
++    // CR 601.2a: The full set of zones a spell can be cast from.
++    const CAST_CAPABLE_ZONES: [Zone; 5] = [
++        Zone::Hand,
++        Zone::Graveyard,
++        Zone::Library,
++        Zone::Exile,
++        Zone::Command,
++    ];
++    // Currently only the "their hand(s)" allowed-zone phrasing is printed. The
++    // allowed zone is the hand; the prohibited set is its complement.
++    let allowed = if nom_primitives::scan_contains(tp.lower, "their hand")
++        || nom_primitives::scan_contains(tp.lower, "your hand")
++    {
++        Zone::Hand
++    } else {
++        return None;
++    };
++    Some(
++        CAST_CAPABLE_ZONES
++            .into_iter()
++            .filter(|zone| *zone != allowed)
++            .collect(),
++    )
++}
++
+ /// Parse a color name from Oracle text, delegating to the shared nom color combinator.
+ ///
+ /// Accepts leading/trailing whitespace and requires complete consumption (no trailing text
+diff --git a/crates/engine/src/parser/oracle_static/tests.rs b/crates/engine/src/parser/oracle_static/tests.rs
+index 90a52d763..0c1ce1c2f 100644
+--- a/crates/engine/src/parser/oracle_static/tests.rs
++++ b/crates/engine/src/parser/oracle_static/tests.rs
+@@ -8195,9 +8195,24 @@ fn static_cant_cast_players_during_combat() {
+ 
+ #[test]
+ fn static_cant_cast_from_still_works() {
+-    // Regression: CantCastFrom (zone-based) must not be affected
++    // Regression: CantCastFrom (zone-based) must not be affected. "Players" → AllPlayers.
+     let def = parse_static_line("Players can't cast spells from graveyards or libraries.").unwrap();
+-    assert_eq!(def.mode, StaticMode::CantCastFrom);
++    assert_eq!(
++        def.mode,
++        StaticMode::CantCastFrom {
++            who: ProhibitionScope::AllPlayers,
++        }
++    );
++    // The prohibited zones ride the affected filter via InAnyZone.
++    assert!(matches!(
++        def.affected,
++        Some(TargetFilter::Typed(ref tf))
++            if tf.properties.iter().any(|p| matches!(
++                p,
++                FilterProp::InAnyZone { zones }
++                    if zones.contains(&Zone::Graveyard) && zones.contains(&Zone::Library)
++            ))
++    ));
+ }
+ 
+ #[test]
+@@ -8506,7 +8521,46 @@ fn per_turn_cast_limit_does_not_affect_cant_cast_during() {
+ fn per_turn_cast_limit_does_not_affect_cant_cast_from() {
+     // Regression: CantCastFrom must still parse correctly
+     let def = parse_static_line("Players can't cast spells from graveyards or libraries.").unwrap();
+-    assert_eq!(def.mode, StaticMode::CantCastFrom);
++    assert_eq!(
++        def.mode,
++        StaticMode::CantCastFrom {
++            who: ProhibitionScope::AllPlayers,
++        }
++    );
++}
++
++#[test]
++fn static_cant_cast_from_anywhere_other_than_hand_drannith_magistrate() {
++    // CR 601.3 + CR 109.5: Drannith Magistrate — "Your opponents can't cast spells
++    // from anywhere other than their hands." Subject → Opponents scope; the inverse
++    // "anywhere other than [hand]" clause expands to every cast-capable zone except
++    // the hand (graveyard, library, exile, command) on the affected filter.
++    let def =
++        parse_static_line("Your opponents can't cast spells from anywhere other than their hands.")
++            .unwrap();
++    assert_eq!(
++        def.mode,
++        StaticMode::CantCastFrom {
++            who: ProhibitionScope::Opponents,
++        }
++    );
++    let Some(TargetFilter::Typed(ref tf)) = def.affected else {
++        panic!("expected typed affected filter, got {:?}", def.affected);
++    };
++    let zones = tf
++        .properties
++        .iter()
++        .find_map(|p| match p {
++            FilterProp::InAnyZone { zones } => Some(zones.clone()),
++            _ => None,
++        })
++        .expect("expected InAnyZone prohibited-zone list");
++    // Hand is the only allowed zone; every other cast-capable zone is prohibited.
++    assert!(!zones.contains(&Zone::Hand));
++    assert!(zones.contains(&Zone::Graveyard));
++    assert!(zones.contains(&Zone::Library));
++    assert!(zones.contains(&Zone::Exile));
++    assert!(zones.contains(&Zone::Command));
+ }
+ 
+ // --- MustAttack / MustBlock additional combat requirement tests ---
+diff --git a/crates/engine/src/types/statics.rs b/crates/engine/src/types/statics.rs
+index 3d97eb37e..6c71d1f4d 100644
+--- a/crates/engine/src/types/statics.rs
++++ b/crates/engine/src/types/statics.rs
+@@ -886,8 +886,28 @@ pub enum StaticMode {
+     CantBeCopied,
+     /// CR 604.3: Cards in specified zones can't enter the battlefield.
+     CantEnterBattlefieldFrom,
+-    /// CR 604.3: Players can't cast spells from specified zones.
+-    CantCastFrom,
++    /// CR 601.3 + CR 101.2 + CR 109.5: The scoped player(s) can't cast spells from
++    /// the zones encoded in `StaticDefinition::affected` (via `FilterProp::InAnyZone`).
++    /// CR 601.3: a player can cast a spell only if no effect prohibits it; CR 101.2:
++    /// this "can't" overrides any cast-from-zone permission (escape, flashback,
++    /// foretell, commander).
++    ///
++    /// Two phrasings collapse onto this one variant:
++    /// - Grafdigger's Cage ("Players can't cast spells from graveyards or
++    ///   libraries"): `who = AllPlayers`, `affected = InAnyZone { [Graveyard, Library] }`.
++    /// - Drannith Magistrate ("Your opponents can't cast spells from anywhere
++    ///   other than their hands"): `who = Opponents`, `affected = InAnyZone {
++    ///   [Graveyard, Library, Exile, Command] }` — every cast-capable zone except
++    ///   the hand. The parser inverts "anywhere other than [hand]" into the
++    ///   explicit prohibited-zone list so the runtime check stays a single
++    ///   `InAnyZone` membership test.
++    ///
++    /// `who` rides the player axis (CR 109.5); the prohibited zones ride the
++    /// `affected` filter. Enforcement is in
++    /// `casting.rs::is_blocked_from_casting_from_zone`.
++    CantCastFrom {
++        who: ProhibitionScope,
++    },
+     /// CR 101.2: Continuous casting prohibition — prevents players from casting
+     /// spells under specified conditions (turn/phase-scoped).
+     /// E.g., "Your opponents can't cast spells during your turn."
+@@ -1464,7 +1484,7 @@ impl fmt::Display for StaticMode {
+             StaticMode::CantBeCountered => write!(f, "CantBeCountered"),
+             StaticMode::CantBeCopied => write!(f, "CantBeCopied"),
+             StaticMode::CantEnterBattlefieldFrom => write!(f, "CantEnterBattlefieldFrom"),
+-            StaticMode::CantCastFrom => write!(f, "CantCastFrom"),
++            StaticMode::CantCastFrom { who } => write!(f, "CantCastFrom({who})"),
+             StaticMode::CantCastDuring { who, when } => {
+                 write!(f, "CantCastDuring({who},{when})")
+             }
+@@ -1847,7 +1867,6 @@ impl FromStr for StaticMode {
+             "CantBeCountered" => StaticMode::CantBeCountered,
+             "CantBeCopied" => StaticMode::CantBeCopied,
+             "CantEnterBattlefieldFrom" => StaticMode::CantEnterBattlefieldFrom,
+-            "CantCastFrom" => StaticMode::CantCastFrom,
+             // Tier 1
+             "CantBeBlocked" => StaticMode::CantBeBlocked,
+             "Protection" => StaticMode::Protection,
+@@ -1920,6 +1939,16 @@ impl FromStr for StaticMode {
+                         return Ok(StaticMode::CantBeCast { who });
+                     }
+                     return Ok(StaticMode::Other(other.to_string()));
++                } else if let Some(inner) = other
++                    .strip_prefix("CantCastFrom(")
++                    .and_then(|s| s.strip_suffix(')'))
++                {
++                    // CR 601.3 + CR 109.5: Round-trip of the scope identifier;
++                    // the prohibited-zone list is data-carrying (`affected`).
++                    if let Ok(who) = ProhibitionScope::from_str(inner) {
++                        return Ok(StaticMode::CantCastFrom { who });
++                    }
++                    return Ok(StaticMode::Other(other.to_string()));
+                 } else if let Some(inner) = other
+                     .strip_prefix("CantBeActivated(")
+                     .and_then(|s| s.strip_suffix(')'))

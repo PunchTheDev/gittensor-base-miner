@@ -1,0 +1,106 @@
+diff --git a/celery/canvas.py b/celery/canvas.py
+index cf322f3b8a1..9f4d2f0ce74 100644
+--- a/celery/canvas.py
++++ b/celery/canvas.py
+@@ -974,9 +974,7 @@ def __or__(self, other):
+                 tasks, other), app=self._app)
+         elif isinstance(other, _chain):
+             # chain | chain -> chain
+-            # use type(self) for _chain subclasses
+-            return type(self)(seq_concat_seq(
+-                self.unchain_tasks(), other.unchain_tasks()), app=self._app)
++            return reduce(operator.or_, other.unchain_tasks(), self)
+         elif isinstance(other, Signature):
+             if self.tasks and isinstance(self.tasks[-1], group):
+                 # CHAIN [last item is group] | TASK -> chord
+diff --git a/t/integration/test_canvas.py b/t/integration/test_canvas.py
+index bb5b80ffa67..d2474fa2351 100644
+--- a/t/integration/test_canvas.py
++++ b/t/integration/test_canvas.py
+@@ -1108,6 +1108,25 @@ def test_group_in_center_of_chain(self, manager):
+         res = t3.apply_async()  # should not raise
+         assert res.get(timeout=TIMEOUT) == 60
+ 
++    def test_upgrade_to_chord_inside_chains(self, manager):
++        if not manager.app.conf.result_backend.startswith("redis"):
++            raise pytest.skip("Requires redis result backend.")
++        try:
++            manager.app.backend.ensure_chords_allowed()
++        except NotImplementedError as e:
++            raise pytest.skip(e.args[0])
++
++        redis_key = str(uuid.uuid4())
++        group1 = group(redis_echo.si('a', redis_key), redis_echo.si('a', redis_key))
++        group2 = group(redis_echo.si('a', redis_key), redis_echo.si('a', redis_key))
++        chord1 = group1 | group2
++        chain1 = chain(chord1, (redis_echo.si('a', redis_key) | redis_echo.si('b', redis_key)))
++        chain1.apply_async().get(timeout=TIMEOUT)
++        redis_connection = get_redis_connection()
++        actual = redis_connection.lrange(redis_key, 0, -1)
++        assert actual.count(b'b') == 1
++        redis_connection.delete(redis_key)
++
+ 
+ class test_result_set:
+ 
+diff --git a/t/smoke/tests/test_canvas.py b/t/smoke/tests/test_canvas.py
+index 7ecf838af90..6590315f024 100644
+--- a/t/smoke/tests/test_canvas.py
++++ b/t/smoke/tests/test_canvas.py
+@@ -1,8 +1,11 @@
++import uuid
++
+ import pytest
+ from pytest_celery import RESULT_TIMEOUT, CeleryTestSetup
+ 
+ from celery.canvas import chain, chord, group, signature
+-from t.integration.tasks import ExpectedException, add, fail, identity
++from t.integration.conftest import get_redis_connection
++from t.integration.tasks import ExpectedException, add, fail, identity, redis_echo
+ 
+ 
+ class test_signature:
+@@ -52,6 +55,22 @@ def test_chain_gets_last_task_id_with_failing_tasks_in_chain(self, celery_setup:
+         with pytest.raises(ExpectedException):
+             res.get(timeout=RESULT_TIMEOUT)
+ 
++    def test_upgrade_to_chord_inside_chains(self, celery_setup: CeleryTestSetup):
++        redis_key = str(uuid.uuid4())
++        queue = celery_setup.worker.worker_queue
++        group1 = group(redis_echo.si("a", redis_key), redis_echo.si("a", redis_key))
++        group2 = group(redis_echo.si("a", redis_key), redis_echo.si("a", redis_key))
++        chord1 = group1 | group2
++        chain1 = chain(
++            chord1, (redis_echo.si("a", redis_key) | redis_echo.si("b", redis_key).set(queue=queue))
++        )
++        chain1.apply_async(queue=queue).get(timeout=RESULT_TIMEOUT)
++        redis_connection = get_redis_connection()
++        actual = redis_connection.lrange(redis_key, 0, -1)
++        assert actual.count(b"a") == 5
++        assert actual.count(b"b") == 1
++        redis_connection.delete(redis_key)
++
+ 
+ class test_chord:
+     def test_sanity(self, celery_setup: CeleryTestSetup):
+diff --git a/t/unit/tasks/test_canvas.py b/t/unit/tasks/test_canvas.py
+index 9bd4f6b75dd..1f901376205 100644
+--- a/t/unit/tasks/test_canvas.py
++++ b/t/unit/tasks/test_canvas.py
+@@ -825,6 +825,16 @@ def test_group_in_center_of_chain(self):
+         t2 = chord([self.add.si(1, 1), self.add.si(1, 1)], t1)
+         t2.freeze()  # should not raise
+ 
++    def test_upgrade_to_chord_on_chain(self):
++        group1 = group(self.add.si(10, 10), self.add.si(10, 10))
++        group2 = group(self.xsum.s(), self.xsum.s())
++        chord1 = group1 | group2
++        chain1 = (self.xsum.si([5]) | self.add.s(1))
++        final_task = chain(chord1, chain1)
++        assert len(final_task.tasks) == 1 and isinstance(final_task.tasks[0], chord)
++        assert isinstance(final_task.tasks[0].body, chord)
++        assert final_task.tasks[0].body.body == chain1
++
+ 
+ class test_group(CanvasCase):
+     def test_repr(self):

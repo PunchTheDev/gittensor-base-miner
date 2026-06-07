@@ -1,0 +1,914 @@
+diff --git a/pyproject.toml b/pyproject.toml
+index eaeee3b7cf5..e9717875bf7 100644
+--- a/pyproject.toml
++++ b/pyproject.toml
+@@ -387,8 +387,6 @@ module = [
+ allow_untyped_defs = true
+ check_untyped_defs = false
+ module = [
+-    'twisted._threads.test.test_team',
+-    'twisted._threads.test.test_threadworker',
+     'twisted.application.app',
+     'twisted.application.internet',
+     'twisted.application.service',
+@@ -785,10 +783,6 @@ module = [
+ [[tool.mypy.overrides]]
+ allow_untyped_defs = true
+ module = [
+-    'twisted._threads._convenience',
+-    'twisted._threads._ithreads',
+-    'twisted._threads._memory',
+-    'twisted._threads._threadworker',
+     'twisted.conch.avatar',
+     'twisted.conch.checkers',
+     'twisted.conch.client.connect',
+diff --git a/src/twisted/_threads/_convenience.py b/src/twisted/_threads/_convenience.py
+index deff5764624..3d8c6682f01 100644
+--- a/src/twisted/_threads/_convenience.py
++++ b/src/twisted/_threads/_convenience.py
+@@ -18,13 +18,13 @@ class Quit:
+     @type isSet: L{bool}
+     """
+ 
+-    def __init__(self):
++    def __init__(self) -> None:
+         """
+         Create a L{Quit} un-set.
+         """
+         self.isSet = False
+ 
+-    def set(self):
++    def set(self) -> None:
+         """
+         Set the flag if it has not been set.
+ 
+@@ -33,7 +33,7 @@ def set(self):
+         self.check()
+         self.isSet = True
+ 
+-    def check(self):
++    def check(self) -> None:
+         """
+         Check if the flag has been set.
+ 
+diff --git a/src/twisted/_threads/_ithreads.py b/src/twisted/_threads/_ithreads.py
+index cab9135f874..b2e01752e52 100644
+--- a/src/twisted/_threads/_ithreads.py
++++ b/src/twisted/_threads/_ithreads.py
+@@ -45,7 +45,7 @@ def do(task: Callable[[], None]) -> None:
+         @raise AlreadyQuit: if C{quit} has been called.
+         """
+ 
+-    def quit():
++    def quit() -> None:
+         """
+         Free any resources associated with this L{IWorker} and cause it to
+         reject all future work.
+diff --git a/src/twisted/_threads/_memory.py b/src/twisted/_threads/_memory.py
+index 4c56db02ae9..5483b8e5770 100644
+--- a/src/twisted/_threads/_memory.py
++++ b/src/twisted/_threads/_memory.py
+@@ -6,16 +6,25 @@
+ Implementation of an in-memory worker that defers execution.
+ """
+ 
++from __future__ import annotations
++
++from enum import Enum, auto
++from typing import Callable, Literal
+ 
+ from zope.interface import implementer
+ 
+-from . import IWorker
+ from ._convenience import Quit
++from ._ithreads import IExclusiveWorker
++
++
++class NoMore(Enum):
++    Work = auto()
++
+ 
+-NoMoreWork = object()
++NoMoreWork = NoMore.Work
+ 
+ 
+-@implementer(IWorker)
++@implementer(IExclusiveWorker)
+ class MemoryWorker:
+     """
+     An L{IWorker} that queues work for later performance.
+@@ -24,14 +33,17 @@ class MemoryWorker:
+     @type _quit: L{Quit}
+     """
+ 
+-    def __init__(self, pending=list):
++    def __init__(
++        self,
++        pending: Callable[[], list[Callable[[], object] | Literal[NoMore.Work]]] = list,
++    ) -> None:
+         """
+         Create a L{MemoryWorker}.
+         """
+         self._quit = Quit()
+         self._pending = pending()
+ 
+-    def do(self, work):
++    def do(self, work: Callable[[], object]) -> None:
+         """
+         Queue some work for to perform later; see L{createMemoryWorker}.
+ 
+@@ -40,7 +52,7 @@ def do(self, work):
+         self._quit.check()
+         self._pending.append(work)
+ 
+-    def quit(self):
++    def quit(self) -> None:
+         """
+         Quit this worker.
+         """
+@@ -48,22 +60,23 @@ def quit(self):
+         self._pending.append(NoMoreWork)
+ 
+ 
+-def createMemoryWorker():
++def createMemoryWorker() -> tuple[MemoryWorker, Callable[[], bool]]:
+     """
+     Create an L{IWorker} that does nothing but defer work, to be performed
+     later.
+ 
+     @return: a worker that will enqueue work to perform later, and a callable
+         that will perform one element of that work.
+-    @rtype: 2-L{tuple} of (L{IWorker}, L{callable})
+     """
+ 
+-    def perform():
++    def perform() -> bool:
+         if not worker._pending:
+             return False
+-        if worker._pending[0] is NoMoreWork:
++        peek = worker._pending[0]
++        if peek is NoMoreWork:
+             return False
+-        worker._pending.pop(0)()
++        worker._pending.pop(0)
++        peek()
+         return True
+ 
+     worker = MemoryWorker()
+diff --git a/src/twisted/_threads/_team.py b/src/twisted/_threads/_team.py
+index d15ae04242d..95e40cffa95 100644
+--- a/src/twisted/_threads/_team.py
++++ b/src/twisted/_threads/_team.py
+@@ -158,7 +158,7 @@ def _quitIdlers(self, n: Optional[int] = None) -> None:
+         if self._shouldQuitCoordinator and self._busyCount == 0:
+             self._coordinator.quit()
+ 
+-    def do(self, task: Callable[[], None]) -> None:
++    def do(self, task: Callable[[], object]) -> None:
+         """
+         Perform some work in a worker created by C{createWorker}.
+ 
+diff --git a/src/twisted/_threads/_threadworker.py b/src/twisted/_threads/_threadworker.py
+index e7ffc097580..a4617a1974c 100644
+--- a/src/twisted/_threads/_threadworker.py
++++ b/src/twisted/_threads/_threadworker.py
+@@ -5,16 +5,41 @@
+ """
+ Implementation of an L{IWorker} based on native threads and queues.
+ """
++from __future__ import annotations
+ 
++from enum import Enum, auto
++from typing import TYPE_CHECKING, Callable, Iterator, Literal, Protocol, TypeVar
+ 
+-from typing import Callable
++if TYPE_CHECKING:
++    import threading
+ 
+ from zope.interface import implementer
+ 
+ from ._convenience import Quit
+ from ._ithreads import IExclusiveWorker
+ 
+-_stop = object()
++
++class Stop(Enum):
++    Thread = auto()
++
++
++StopThread = Stop.Thread
++
++T = TypeVar("T")
++U = TypeVar("U")
++
++
++class SimpleQueue(Protocol[T]):
++    def put(self, item: T) -> None:
++        ...
++
++    def get(self) -> T:
++        ...
++
++
++# when the sentinel value is a literal in a union, this is how iter works
++smartiter: Callable[[Callable[[], T | U], U], Iterator[T]]
++smartiter = iter  # type:ignore[assignment]
+ 
+ 
+ @implementer(IExclusiveWorker)
+@@ -27,25 +52,26 @@ class ThreadWorker:
+     thread.
+     """
+ 
+-    def __init__(self, startThread, queue):
++    def __init__(
++        self,
++        startThread: Callable[[Callable[[], object]], object],
++        queue: SimpleQueue[Callable[[], object] | Literal[Stop.Thread]],
++    ):
+         """
+         Create a L{ThreadWorker} with a function to start a thread and a queue
+         to use to communicate with that thread.
+ 
+         @param startThread: a callable that takes a callable to run in another
+             thread.
+-        @type startThread: callable taking a 0-argument callable and returning
+-            nothing.
+ 
+         @param queue: A L{Queue} to use to give tasks to the thread created by
+             C{startThread}.
+-        @type queue: L{Queue}
+         """
+         self._q = queue
+         self._hasQuit = Quit()
+ 
+-        def work():
+-            for task in iter(queue.get, _stop):
++        def work() -> None:
++            for task in smartiter(queue.get, StopThread):
+                 task()
+ 
+         startThread(work)
+@@ -59,14 +85,22 @@ def do(self, task: Callable[[], None]) -> None:
+         self._hasQuit.check()
+         self._q.put(task)
+ 
+-    def quit(self):
++    def quit(self) -> None:
+         """
+         Reject all future work and stop the thread started by C{__init__}.
+         """
+         # Reject all future work.  Set this _before_ enqueueing _stop, so
+         # that no work is ever enqueued _after_ _stop.
+         self._hasQuit.set()
+-        self._q.put(_stop)
++        self._q.put(StopThread)
++
++
++class SimpleLock(Protocol):
++    def acquire(self) -> bool:
++        ...
++
++    def release(self) -> None:
++        ...
+ 
+ 
+ @implementer(IExclusiveWorker)
+@@ -75,7 +109,7 @@ class LockWorker:
+     An L{IWorker} implemented based on a mutual-exclusion lock.
+     """
+ 
+-    def __init__(self, lock, local):
++    def __init__(self, lock: SimpleLock, local: threading.local):
+         """
+         @param lock: A mutual-exclusion lock, with C{acquire} and C{release}
+             methods.
+@@ -85,7 +119,7 @@ def __init__(self, lock, local):
+         @type local: L{threading.local}
+         """
+         self._quit = Quit()
+-        self._lock = lock
++        self._lock: SimpleLock | None = lock
+         self._local = local
+ 
+     def do(self, work: Callable[[], None]) -> None:
+@@ -101,6 +135,7 @@ def do(self, work: Callable[[], None]) -> None:
+         self._quit.check()
+         working = getattr(local, "working", None)
+         if working is None:
++            assert lock is not None, "LockWorker used after quit()"
+             working = local.working = []
+             working.append(work)
+             lock.acquire()
+@@ -113,7 +148,7 @@ def do(self, work: Callable[[], None]) -> None:
+         else:
+             working.append(work)
+ 
+-    def quit(self):
++    def quit(self) -> None:
+         """
+         Quit this L{LockWorker}.
+         """
+diff --git a/src/twisted/_threads/test/test_convenience.py b/src/twisted/_threads/test/test_convenience.py
+index 8c57abb6170..5ed6d975ce3 100644
+--- a/src/twisted/_threads/test/test_convenience.py
++++ b/src/twisted/_threads/test/test_convenience.py
+@@ -36,7 +36,8 @@ def test_checkDoesNothing(self) -> None:
+         L{Quit.check} initially does nothing and returns L{None}.
+         """
+         quit = Quit()
+-        self.assertIs(quit.check(), None)
++        checked = quit.check()  # type:ignore[func-returns-value]
++        self.assertIs(checked, None)
+ 
+     def test_checkAfterSetRaises(self) -> None:
+         """
+diff --git a/src/twisted/_threads/test/test_team.py b/src/twisted/_threads/test/test_team.py
+index 5515e5ee28a..8365b163aff 100644
+--- a/src/twisted/_threads/test/test_team.py
++++ b/src/twisted/_threads/test/test_team.py
+@@ -5,6 +5,9 @@
+ Tests for L{twisted._threads._team}.
+ """
+ 
++from __future__ import annotations
++
++from typing import Callable
+ 
+ from twisted.python.components import proxyForInterface
+ from twisted.python.context import call, get
+@@ -18,14 +21,14 @@ class ContextualWorker(proxyForInterface(IWorker, "_realWorker")):  # type: igno
+     A worker implementation that supplies a context.
+     """
+ 
+-    def __init__(self, realWorker, **ctx):
++    def __init__(self, realWorker: IWorker, **ctx: object) -> None:
+         """
+         Create with a real worker and a context.
+         """
+         self._realWorker = realWorker
+         self._context = ctx
+ 
+-    def do(self, work):
++    def do(self, work: Callable[[], object]) -> None:
+         """
+         Perform the given work with the context given to __init__.
+ 
+@@ -39,20 +42,20 @@ class TeamTests(SynchronousTestCase):
+     Tests for L{Team}
+     """
+ 
+-    def setUp(self):
++    def setUp(self) -> None:
+         """
+         Set up a L{Team} with inspectable, synchronous workers that can be
+         single-stepped.
+         """
+         coordinator, self.coordinateOnce = createMemoryWorker()
+         self.coordinator = ContextualWorker(coordinator, worker="coordinator")
+-        self.workerPerformers = []
+-        self.allWorkersEver = []
+-        self.allUnquitWorkers = []
+-        self.activePerformers = []
++        self.workerPerformers: list[Callable[[], object]] = []
++        self.allWorkersEver: list[ContextualWorker] = []
++        self.allUnquitWorkers: list[ContextualWorker] = []
++        self.activePerformers: list[Callable[[], object]] = []
+         self.noMoreWorkers = lambda: False
+ 
+-        def createWorker():
++        def createWorker() -> ContextualWorker | None:
+             if self.noMoreWorkers():
+                 return None
+             worker, performer = createMemoryWorker()
+@@ -63,7 +66,7 @@ def createWorker():
+             self.allUnquitWorkers.append(cw)
+             realQuit = cw.quit
+ 
+-            def quitAndRemove():
++            def quitAndRemove() -> None:
+                 realQuit()
+                 self.allUnquitWorkers.remove(cw)
+                 self.activePerformers.remove(performer)
+@@ -71,28 +74,27 @@ def quitAndRemove():
+             cw.quit = quitAndRemove
+             return cw
+ 
+-        self.failures = []
++        self.failures: list[Failure] = []
+ 
+-        def logException():
++        def logException() -> None:
+             self.failures.append(Failure())
+ 
+         self.team = Team(coordinator, createWorker, logException)
+ 
+-    def coordinate(self):
++    def coordinate(self) -> bool:
+         """
+         Perform all work currently scheduled in the coordinator.
+ 
+         @return: whether any coordination work was performed; if the
+             coordinator was idle when this was called, return L{False}
+             (otherwise L{True}).
+-        @rtype: L{bool}
+         """
+         did = False
+         while self.coordinateOnce():
+             did = True
+         return did
+ 
+-    def performAllOutstandingWork(self):
++    def performAllOutstandingWork(self) -> None:
+         """
+         Perform all work on the coordinator and worker performers that needs to
+         be done.
+@@ -105,23 +107,25 @@ def performAllOutstandingWork(self):
+                     performer()
+             continuing = continuing or self.coordinate()
+ 
+-    def test_doDoesWorkInWorker(self):
++    def test_doDoesWorkInWorker(self) -> None:
+         """
+         L{Team.do} does the work in a worker created by the createWorker
+         callable.
+         """
++        who = None
+ 
+-        def something():
+-            something.who = get("worker")
++        def something() -> None:
++            nonlocal who
++            who = get("worker")
+ 
+         self.team.do(something)
+         self.coordinate()
+         self.assertEqual(self.team.statistics().busyWorkerCount, 1)
+         self.performAllOutstandingWork()
+-        self.assertEqual(something.who, 1)
++        self.assertEqual(who, 1)
+         self.assertEqual(self.team.statistics().busyWorkerCount, 0)
+ 
+-    def test_initialStatistics(self):
++    def test_initialStatistics(self) -> None:
+         """
+         L{Team.statistics} returns an object with idleWorkerCount,
+         busyWorkerCount, and backloggedWorkCount integer attributes.
+@@ -131,7 +135,7 @@ def test_initialStatistics(self):
+         self.assertEqual(stats.busyWorkerCount, 0)
+         self.assertEqual(stats.backloggedWorkCount, 0)
+ 
+-    def test_growCreatesIdleWorkers(self):
++    def test_growCreatesIdleWorkers(self) -> None:
+         """
+         L{Team.grow} increases the number of available idle workers.
+         """
+@@ -139,7 +143,7 @@ def test_growCreatesIdleWorkers(self):
+         self.performAllOutstandingWork()
+         self.assertEqual(len(self.workerPerformers), 5)
+ 
+-    def test_growCreateLimit(self):
++    def test_growCreateLimit(self) -> None:
+         """
+         L{Team.grow} increases the number of available idle workers until the
+         C{createWorker} callable starts returning None.
+@@ -150,7 +154,7 @@ def test_growCreateLimit(self):
+         self.assertEqual(len(self.allWorkersEver), 3)
+         self.assertEqual(self.team.statistics().idleWorkerCount, 3)
+ 
+-    def test_shrinkQuitsWorkers(self):
++    def test_shrinkQuitsWorkers(self) -> None:
+         """
+         L{Team.shrink} will quit the given number of workers.
+         """
+@@ -160,7 +164,7 @@ def test_shrinkQuitsWorkers(self):
+         self.performAllOutstandingWork()
+         self.assertEqual(len(self.allUnquitWorkers), 2)
+ 
+-    def test_shrinkToZero(self):
++    def test_shrinkToZero(self) -> None:
+         """
+         L{Team.shrink} with no arguments will stop all outstanding workers.
+         """
+@@ -172,18 +176,19 @@ def test_shrinkToZero(self):
+         self.performAllOutstandingWork()
+         self.assertEqual(len(self.allUnquitWorkers), 0)
+ 
+-    def test_moreWorkWhenNoWorkersAvailable(self):
++    def test_moreWorkWhenNoWorkersAvailable(self) -> None:
+         """
+         When no additional workers are available, the given work is backlogged,
+         and then performed later when the work was.
+         """
+         self.team.grow(3)
+         self.coordinate()
++        times = 0
+ 
+-        def something():
+-            something.times += 1
++        def something() -> None:
++            nonlocal times
++            times += 1
+ 
+-        something.times = 0
+         self.assertEqual(self.team.statistics().idleWorkerCount, 3)
+         for i in range(3):
+             self.team.do(something)
+@@ -198,9 +203,9 @@ def something():
+         self.assertEqual(self.team.statistics().backloggedWorkCount, 1)
+         self.performAllOutstandingWork()
+         self.assertEqual(self.team.statistics().backloggedWorkCount, 0)
+-        self.assertEqual(something.times, 4)
++        self.assertEqual(times, 4)
+ 
+-    def test_exceptionInTask(self):
++    def test_exceptionInTask(self) -> None:
+         """
+         When an exception is raised in a task passed to L{Team.do}, the
+         C{logException} given to the L{Team} at construction is invoked in the
+@@ -211,7 +216,7 @@ def test_exceptionInTask(self):
+         self.assertEqual(len(self.failures), 1)
+         self.assertEqual(self.failures[0].type, ZeroDivisionError)
+ 
+-    def test_quit(self):
++    def test_quit(self) -> None:
+         """
+         L{Team.quit} causes future invocations of L{Team.do} and L{Team.quit}
+         to raise L{AlreadyQuit}.
+@@ -220,7 +225,7 @@ def test_quit(self):
+         self.assertRaises(AlreadyQuit, self.team.quit)
+         self.assertRaises(AlreadyQuit, self.team.do, list)
+ 
+-    def test_quitQuits(self):
++    def test_quitQuits(self) -> None:
+         """
+         L{Team.quit} causes all idle workers, as well as the coordinator
+         worker, to quit.
+@@ -233,7 +238,7 @@ def test_quitQuits(self):
+         self.assertEqual(len(self.allUnquitWorkers), 0)
+         self.assertRaises(AlreadyQuit, self.coordinator.quit)
+ 
+-    def test_quitQuitsLaterWhenBusy(self):
++    def test_quitQuitsLaterWhenBusy(self) -> None:
+         """
+         L{Team.quit} causes all busy workers to be quit once they've finished
+         the work they've been given.
+@@ -249,7 +254,7 @@ def test_quitQuitsLaterWhenBusy(self):
+         self.assertEqual(len(self.allUnquitWorkers), 0)
+         self.assertRaises(AlreadyQuit, self.coordinator.quit)
+ 
+-    def test_quitConcurrentWithWorkHappening(self):
++    def test_quitConcurrentWithWorkHappening(self) -> None:
+         """
+         If work happens after L{Team.quit} sets its C{Quit} flag, but before
+         any other work takes place, the L{Team} should still exit gracefully.
+@@ -257,16 +262,16 @@ def test_quitConcurrentWithWorkHappening(self):
+         self.team.do(list)
+         originalSet = self.team._quit.set
+ 
+-        def performWorkConcurrently():
++        def performWorkConcurrently() -> None:
+             originalSet()
+             self.performAllOutstandingWork()
+ 
+-        self.team._quit.set = performWorkConcurrently
++        self.team._quit.set = performWorkConcurrently  # type:ignore[method-assign]
+         self.team.quit()
+         self.assertRaises(AlreadyQuit, self.team.quit)
+         self.assertRaises(AlreadyQuit, self.team.do, list)
+ 
+-    def test_shrinkWhenBusy(self):
++    def test_shrinkWhenBusy(self) -> None:
+         """
+         L{Team.shrink} will wait for busy workers to finish being busy and then
+         quit them.
+diff --git a/src/twisted/_threads/test/test_threadworker.py b/src/twisted/_threads/test/test_threadworker.py
+index cfb6e82a39d..abd91c82924 100644
+--- a/src/twisted/_threads/test/test_threadworker.py
++++ b/src/twisted/_threads/test/test_threadworker.py
+@@ -5,13 +5,18 @@
+ Tests for L{twisted._threads._threadworker}.
+ """
+ 
++from __future__ import annotations
+ 
+ import gc
+ import weakref
+ from threading import ThreadError, local
++from typing import Callable, Generic, TypeVar
+ 
+ from twisted.trial.unittest import SynchronousTestCase
+ from .. import AlreadyQuit, LockWorker, ThreadWorker
++from .._threadworker import SimpleLock
++
++T = TypeVar("T")
+ 
+ 
+ class FakeQueueEmpty(Exception):
+@@ -32,27 +37,26 @@ class FakeThread:
+     A fake L{threading.Thread}.
+ 
+     @ivar target: A target function to run.
+-    @type target: L{callable}
+ 
+     @ivar started: Has this thread been started?
+     @type started: L{bool}
+     """
+ 
+-    def __init__(self, target):
++    def __init__(self, target: Callable[[], object]) -> None:
+         """
+         Create a L{FakeThread} with a target.
+         """
+         self.target = target
+         self.started = False
+ 
+-    def start(self):
++    def start(self) -> None:
+         """
+         Set the "started" flag.
+         """
+         self.started = True
+ 
+ 
+-class FakeQueue:
++class FakeQueue(Generic[T]):
+     """
+     A fake L{Queue} implementing C{put} and C{get}.
+ 
+@@ -61,13 +65,13 @@ class FakeQueue:
+     @type items: L{list}
+     """
+ 
+-    def __init__(self):
++    def __init__(self) -> None:
+         """
+         Create a L{FakeQueue}.
+         """
+-        self.items = []
++        self.items: list[T] = []
+ 
+-    def put(self, item):
++    def put(self, item: T) -> None:
+         """
+         Put an item into the queue for later retrieval by L{FakeQueue.get}.
+ 
+@@ -75,7 +79,7 @@ def put(self, item):
+         """
+         self.items.append(item)
+ 
+-    def get(self):
++    def get(self) -> T:
+         """
+         Get an item.
+ 
+@@ -93,21 +97,22 @@ class FakeLock:
+     @ivar acquired: Whether this lock is presently acquired.
+     """
+ 
+-    def __init__(self):
++    def __init__(self) -> None:
+         """
+         Create a lock in the un-acquired state.
+         """
+         self.acquired = False
+ 
+-    def acquire(self):
++    def acquire(self) -> bool:
+         """
+         Acquire the lock.  Raise an exception if the lock is already acquired.
+         """
+         if self.acquired:
+             raise WouldDeadlock()
+         self.acquired = True
++        return True
+ 
+-    def release(self):
++    def release(self) -> None:
+         """
+         Release the lock.  Raise an exception if the lock is not presently
+         acquired.
+@@ -122,22 +127,21 @@ class ThreadWorkerTests(SynchronousTestCase):
+     Tests for L{ThreadWorker}.
+     """
+ 
+-    def setUp(self):
++    def setUp(self) -> None:
+         """
+         Create a worker with fake threads.
+         """
+-        self.fakeThreads = []
+-        self.fakeQueue = FakeQueue()
++        self.fakeThreads: list[FakeThread] = []
+ 
+-        def startThread(target):
++        def startThread(target: Callable[[], object]) -> FakeThread:
+             newThread = FakeThread(target=target)
+             newThread.start()
+             self.fakeThreads.append(newThread)
+             return newThread
+ 
+-        self.worker = ThreadWorker(startThread, self.fakeQueue)
++        self.worker = ThreadWorker(startThread, FakeQueue())
+ 
+-    def test_startsThreadAndPerformsWork(self):
++    def test_startsThreadAndPerformsWork(self) -> None:
+         """
+         L{ThreadWorker} calls its C{createThread} callable to create a thread,
+         its C{createQueue} callable to create a queue, and then the thread's
+@@ -146,16 +150,18 @@ def test_startsThreadAndPerformsWork(self):
+         self.assertEqual(len(self.fakeThreads), 1)
+         self.assertEqual(self.fakeThreads[0].started, True)
+ 
+-        def doIt():
+-            doIt.done = True
++        done = False
++
++        def doIt() -> None:
++            nonlocal done
++            done = True
+ 
+-        doIt.done = False
+         self.worker.do(doIt)
+-        self.assertEqual(doIt.done, False)
++        self.assertEqual(done, False)
+         self.assertRaises(FakeQueueEmpty, self.fakeThreads[0].target)
+-        self.assertEqual(doIt.done, True)
++        self.assertEqual(done, True)
+ 
+-    def test_quitPreventsFutureCalls(self):
++    def test_quitPreventsFutureCalls(self) -> None:
+         """
+         L{ThreadWorker.quit} causes future calls to L{ThreadWorker.do} and
+         L{ThreadWorker.quit} to raise L{AlreadyQuit}.
+@@ -170,7 +176,7 @@ class LockWorkerTests(SynchronousTestCase):
+     Tests for L{LockWorker}.
+     """
+ 
+-    def test_fakeDeadlock(self):
++    def test_fakeDeadlock(self) -> None:
+         """
+         The L{FakeLock} test fixture will alert us if there's a potential
+         deadlock.
+@@ -179,7 +185,7 @@ def test_fakeDeadlock(self):
+         lock.acquire()
+         self.assertRaises(WouldDeadlock, lock.acquire)
+ 
+-    def test_fakeDoubleRelease(self):
++    def test_fakeDoubleRelease(self) -> None:
+         """
+         The L{FakeLock} test fixture will alert us if there's a potential
+         double-release.
+@@ -187,10 +193,11 @@ def test_fakeDoubleRelease(self):
+         lock = FakeLock()
+         self.assertRaises(ThreadError, lock.release)
+         lock.acquire()
+-        self.assertEqual(None, lock.release())
++        noResult = lock.release()  # type:ignore[func-returns-value]
++        self.assertIs(None, noResult)
+         self.assertRaises(ThreadError, lock.release)
+ 
+-    def test_doExecutesImmediatelyWithLock(self):
++    def test_doExecutesImmediatelyWithLock(self) -> None:
+         """
+         L{LockWorker.do} immediately performs the work it's given, while the
+         lock is acquired.
+@@ -198,18 +205,20 @@ def test_doExecutesImmediatelyWithLock(self):
+         storage = local()
+         lock = FakeLock()
+         worker = LockWorker(lock, storage)
++        done = False
++        acquired = False
+ 
+-        def work():
+-            work.done = True
+-            work.acquired = lock.acquired
++        def work() -> None:
++            nonlocal done, acquired
++            done = True
++            acquired = lock.acquired
+ 
+-        work.done = False
+         worker.do(work)
+-        self.assertEqual(work.done, True)
+-        self.assertEqual(work.acquired, True)
++        self.assertEqual(done, True)
++        self.assertEqual(acquired, True)
+         self.assertEqual(lock.acquired, False)
+ 
+-    def test_doUnwindsReentrancy(self):
++    def test_doUnwindsReentrancy(self) -> None:
+         """
+         If L{LockWorker.do} is called recursively, it postpones the inner call
+         until the outer one is complete.
+@@ -218,21 +227,22 @@ def test_doUnwindsReentrancy(self):
+         worker = LockWorker(lock, local())
+         levels = []
+         acquired = []
++        level = 0
+ 
+-        def work():
+-            work.level += 1
+-            levels.append(work.level)
++        def work() -> None:
++            nonlocal level
++            level += 1
++            levels.append(level)
+             acquired.append(lock.acquired)
+             if len(levels) < 2:
+                 worker.do(work)
+-            work.level -= 1
++            level -= 1
+ 
+-        work.level = 0
+         worker.do(work)
+         self.assertEqual(levels, [1, 1])
+         self.assertEqual(acquired, [True, True])
+ 
+-    def test_quit(self):
++    def test_quit(self) -> None:
+         """
+         L{LockWorker.quit} frees the resources associated with its lock and
+         causes further calls to C{do} and C{quit} to fail.
+@@ -240,7 +250,7 @@ def test_quit(self):
+         lock = FakeLock()
+         ref = weakref.ref(lock)
+         worker = LockWorker(lock, local())
+-        lock = None
++        del lock
+         self.assertIsNot(ref(), None)
+         worker.quit()
+         gc.collect()
+@@ -248,7 +258,7 @@ def test_quit(self):
+         self.assertRaises(AlreadyQuit, worker.quit)
+         self.assertRaises(AlreadyQuit, worker.do, list)
+ 
+-    def test_quitWhileWorking(self):
++    def test_quitWhileWorking(self) -> None:
+         """
+         If L{LockWorker.quit} is invoked during a call to L{LockWorker.do}, all
+         recursive work scheduled with L{LockWorker.do} will be completed and
+@@ -258,28 +268,31 @@ def test_quitWhileWorking(self):
+         ref = weakref.ref(lock)
+         worker = LockWorker(lock, local())
+ 
+-        def phase1():
++        phase1complete = False
++        phase2complete = False
++        phase2acquired = None
++
++        def phase1() -> None:
++            nonlocal phase1complete
+             worker.do(phase2)
+             worker.quit()
+             self.assertRaises(AlreadyQuit, worker.do, list)
+-            phase1.complete = True
+-
+-        phase1.complete = False
++            phase1complete = True
+ 
+-        def phase2():
+-            phase2.complete = True
+-            phase2.acquired = lock.acquired
++        def phase2() -> None:
++            nonlocal phase2complete, phase2acquired, lock
++            phase2complete = True
++            phase2acquired = lock.acquired
+ 
+-        phase2.complete = False
+         worker.do(phase1)
+-        self.assertEqual(phase1.complete, True)
+-        self.assertEqual(phase2.complete, True)
++        self.assertEqual(phase1complete, True)
++        self.assertEqual(phase2complete, True)
+         self.assertEqual(lock.acquired, False)
+-        lock = None
++        del lock
+         gc.collect()
+         self.assertIs(ref(), None)
+ 
+-    def test_quitWhileGettingLock(self):
++    def test_quitWhileGettingLock(self) -> None:
+         """
+         If L{LockWorker.do} is called concurrently with L{LockWorker.quit}, and
+         C{quit} wins the race before C{do} gets the lock attribute, then
+@@ -288,12 +301,13 @@ def test_quitWhileGettingLock(self):
+ 
+         class RacyLockWorker(LockWorker):
+             @property
+-            def _lock(self):
++            def _lock(self) -> SimpleLock | None:
+                 self.quit()
+-                return self.__dict__["_lock"]
++                it: SimpleLock = self.__dict__["_lock"]
++                return it
+ 
+             @_lock.setter
+-            def _lock(self, value):
++            def _lock(self, value: SimpleLock | None) -> None:
+                 self.__dict__["_lock"] = value
+ 
+         worker = RacyLockWorker(FakeLock(), local())
+diff --git a/src/twisted/newsfragments/12331.misc b/src/twisted/newsfragments/12331.misc
+new file mode 100644
+index 00000000000..e69de29bb2d

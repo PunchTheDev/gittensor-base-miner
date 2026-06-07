@@ -1,0 +1,414 @@
+diff --git a/crates/engine/src/game/coverage.rs b/crates/engine/src/game/coverage.rs
+index f2ce2db521..16e7d83355 100644
+--- a/crates/engine/src/game/coverage.rs
++++ b/crates/engine/src/game/coverage.rs
+@@ -6595,6 +6595,9 @@ fn audit_card_lines(oracle_text: &str, face: &CardFace) -> Vec<SemanticFinding>
+             StaticMode::CantAttack => effective_lower.contains("can't attack"),
+             StaticMode::CantBlock => effective_lower.contains("can't block"),
+             StaticMode::CantAttackOrBlock => effective_lower.contains("can't attack or block"),
++            StaticMode::CantCrew => {
++                effective_lower.contains("can't crew") || effective_lower.contains("cannot crew")
++            }
+             StaticMode::CastWithFlash => {
+                 effective_lower.contains("as though it had flash")
+                     || effective_lower.contains("as though they had flash")
+diff --git a/crates/engine/src/game/engine.rs b/crates/engine/src/game/engine.rs
+index e7190bc9fd..dd517af09b 100644
+--- a/crates/engine/src/game/engine.rs
++++ b/crates/engine/src/game/engine.rs
+@@ -5085,8 +5085,7 @@ fn handle_crew_activation(
+         ));
+     }
+ 
+-    // Find eligible creatures: untapped creatures controlled by player, excluding the Vehicle
+-    // TODO: CR 702.122c — filter out creatures with "can't crew Vehicles" restriction when implemented
++    // CR 702.122c: Exclude creatures with "can't crew Vehicles".
+     let eligible_creatures: Vec<ObjectId> = state
+         .battlefield
+         .iter()
+@@ -5102,6 +5101,7 @@ fn handle_crew_activation(
+                             && o.card_types
+                                 .core_types
+                                 .contains(&crate::types::card_type::CoreType::Creature)
++                            && !super::static_abilities::object_has_cant_crew(state, id)
+                     })
+                     .unwrap_or(false)
+         })
+@@ -5210,6 +5210,11 @@ fn handle_crew_announcement(
+                 "Creature is no longer eligible for crewing".to_string(),
+             ));
+         }
++        if super::static_abilities::object_has_cant_crew(state, cid) {
++            return Err(EngineError::InvalidAction(
++                "Creature can't crew Vehicles".to_string(),
++            ));
++        }
+         total_power += obj.power.unwrap_or(0).max(0);
+     }
+ 
+@@ -19046,7 +19051,9 @@ mod crew_tests {
+     use crate::types::card_type::CoreType;
+     use crate::types::identifiers::{CardId, ObjectId};
+     use crate::types::player::PlayerId;
++    use crate::types::statics::StaticMode;
+     use crate::types::zones::Zone;
++    use crate::types::StaticDefinition;
+ 
+     fn setup_game_at_main_phase() -> GameState {
+         let mut state = new_game(42);
+@@ -19237,6 +19244,52 @@ mod crew_tests {
+         assert!(state.objects.get(&creature_b).unwrap().tapped);
+     }
+ 
++    #[test]
++    fn test_crew_excludes_creature_with_cant_crew() {
++        let (mut state, vehicle_id, creature_a, creature_b) = setup_crew_scenario();
++        state
++            .objects
++            .get_mut(&creature_b)
++            .unwrap()
++            .static_definitions
++            .push(StaticDefinition::new(StaticMode::CantCrew));
++        assert!(!crate::game::static_abilities::object_has_cant_crew(
++            &state, creature_a
++        ));
++        assert!(crate::game::static_abilities::object_has_cant_crew(
++            &state, creature_b
++        ));
++
++        let result = apply_as_current(
++            &mut state,
++            GameAction::CrewVehicle {
++                vehicle_id,
++                creature_ids: vec![],
++            },
++        )
++        .unwrap();
++
++        match result.waiting_for {
++            WaitingFor::CrewVehicle {
++                eligible_creatures, ..
++            } => {
++                assert!(eligible_creatures.contains(&creature_a));
++                assert!(!eligible_creatures.contains(&creature_b));
++            }
++            other => panic!("Expected CrewVehicle, got {:?}", other),
++        }
++
++        let err = apply_as_current(
++            &mut state,
++            GameAction::CrewVehicle {
++                vehicle_id,
++                creature_ids: vec![creature_b],
++            },
++        )
++        .unwrap_err();
++        assert!(matches!(err, EngineError::InvalidAction(_)));
++    }
++
+     #[test]
+     fn test_crew_fails_insufficient_power() {
+         let (mut state, vehicle_id, _creature_a, creature_b) = setup_crew_scenario();
+diff --git a/crates/engine/src/game/static_abilities.rs b/crates/engine/src/game/static_abilities.rs
+index d4cb6e4e78..278bff095b 100644
+--- a/crates/engine/src/game/static_abilities.rs
++++ b/crates/engine/src/game/static_abilities.rs
+@@ -157,6 +157,8 @@ pub fn build_static_registry() -> HashMap<StaticMode, StaticAbilityHandler> {
+     registry.insert(StaticMode::Goaded, handle_rule_mod);
+     registry.insert(StaticMode::CantAttackAlone, handle_rule_mod);
+     registry.insert(StaticMode::CantBlockAlone, handle_rule_mod);
++    // CR 702.122c: CantCrew — creature can't be tapped to pay a crew cost.
++    registry.insert(StaticMode::CantCrew, handle_rule_mod);
+     registry.insert(StaticMode::MayLookAtTopOfLibrary, handle_rule_mod);
+     // CR 104.3b: CantLoseTheGame — player can't lose the game (Platinum Angel).
+     // Runtime enforcement is in sba.rs::player_has_cant_lose().
+@@ -1068,6 +1070,14 @@ fn static_condition_matches_context(
+     })
+ }
+ 
++/// CR 702.122c: Returns true when the creature has an active "can't crew Vehicles" static.
++pub fn object_has_cant_crew(state: &GameState, object_id: ObjectId) -> bool {
++    state.objects.get(&object_id).is_some_and(|obj| {
++        super::functioning_abilities::active_static_definitions(state, obj)
++            .any(|def| def.mode == StaticMode::CantCrew)
++    })
++}
++
+ /// Check if a static ability named `name` applies to a specific object
+ /// (target-scoped query). Used for object-targeted prohibitions like
+ /// `CantBeSacrificed`, `CantBeEnchanted`, `CantTransform`, etc.
+diff --git a/crates/engine/src/parser/oracle_effect/subject.rs b/crates/engine/src/parser/oracle_effect/subject.rs
+index 4a7ba6f69a..6cf344485f 100644
+--- a/crates/engine/src/parser/oracle_effect/subject.rs
++++ b/crates/engine/src/parser/oracle_effect/subject.rs
+@@ -2492,6 +2492,7 @@ pub(crate) fn static_mode_needs_grant_propagation(mode: &StaticMode) -> bool {
+         StaticMode::CantBlock
+             | StaticMode::CantAttack
+             | StaticMode::CantAttackOrBlock
++            | StaticMode::CantCrew
+             | StaticMode::CantBeBlocked
+             | StaticMode::CantBeBlockedBy { .. }
+             | StaticMode::CantBeBlockedExceptBy { .. }
+@@ -2583,6 +2584,26 @@ pub(crate) fn parse_restriction_modes(lower: &str) -> Option<Vec<StaticMode>> {
+     if lower == "can't attack or block" || lower == "cannot attack or block" {
+         return Some(vec![StaticMode::CantAttack, StaticMode::CantBlock]);
+     }
++    // CR 702.122c: "~ can't crew [Vehicles]"
++    if lower == "can't crew"
++        || lower == "cannot crew"
++        || lower == "can't crew vehicles"
++        || lower == "cannot crew vehicles"
++    {
++        return Some(vec![StaticMode::CantCrew]);
++    }
++    // CR 508.1d + CR 509.1a + CR 702.122c: Bound in Gold / Intercessor's Arrest
++    if lower == "can't attack, block, or crew vehicles"
++        || lower == "cannot attack, block, or crew vehicles"
++        || lower == "can't attack, block, or crew"
++        || lower == "cannot attack, block, or crew"
++    {
++        return Some(vec![
++            StaticMode::CantAttack,
++            StaticMode::CantBlock,
++            StaticMode::CantCrew,
++        ]);
++    }
+     // CR 509.1a + "can't be blocked": Compound "can't block or be blocked"
+     if lower == "can't block or be blocked" || lower == "cannot block or be blocked" {
+         return Some(vec![StaticMode::CantBlock, StaticMode::CantBeBlocked]);
+@@ -3905,6 +3926,30 @@ mod tests {
+         );
+     }
+ 
++    #[test]
++    fn parse_restriction_modes_cant_crew_variants() {
++        assert_eq!(
++            parse_restriction_modes("can't crew"),
++            Some(vec![StaticMode::CantCrew])
++        );
++        assert_eq!(
++            parse_restriction_modes("cannot crew vehicles"),
++            Some(vec![StaticMode::CantCrew])
++        );
++    }
++
++    #[test]
++    fn parse_restriction_modes_cant_attack_block_or_crew_vehicles_compound() {
++        assert_eq!(
++            parse_restriction_modes("can't attack, block, or crew vehicles"),
++            Some(vec![
++                StaticMode::CantAttack,
++                StaticMode::CantBlock,
++                StaticMode::CantCrew,
++            ])
++        );
++    }
++
+     #[test]
+     fn parse_restriction_modes_cant_be_regenerated_variants() {
+         let expected = Some(vec![StaticMode::CantBeRegenerated]);
+diff --git a/crates/engine/src/parser/oracle_static/evasion.rs b/crates/engine/src/parser/oracle_static/evasion.rs
+index 816656dc35..f8e056f940 100644
+--- a/crates/engine/src/parser/oracle_static/evasion.rs
++++ b/crates/engine/src/parser/oracle_static/evasion.rs
+@@ -212,7 +212,7 @@ pub(crate) fn parse_compound_subject_rule_static(
+         nom_primitives::scan_preceded(lower, parse_rule_static_predicate_nom)?;
+     let (rest, mut predicates) = many0(preceded(
+         parse_rule_static_separator_nom,
+-        parse_rule_static_predicate_nom,
++        parse_rule_static_tail_predicate_nom,
+     ))
+     .parse(after_first)
+     .ok()?;
+@@ -294,8 +294,10 @@ pub(crate) fn parse_rule_static_separator_nom(input: &str) -> OracleResult<'_, (
+     value(
+         (),
+         alt((
++            tag::<_, _, OracleError<'_>>(", or "),
+             tag::<_, _, OracleError<'_>>(", and "),
+             tag(", "),
++            tag(" or "),
+             tag(" and "),
+         )),
+     )
+diff --git a/crates/engine/src/parser/oracle_static/grammar.rs b/crates/engine/src/parser/oracle_static/grammar.rs
+index 4042c2211a..e9038fa9c5 100644
+--- a/crates/engine/src/parser/oracle_static/grammar.rs
++++ b/crates/engine/src/parser/oracle_static/grammar.rs
+@@ -26,6 +26,18 @@ pub(crate) fn lower_rule_static(
+                 .affected(affected)
+                 .description(description.to_string())
+         }
++        RuleStaticPredicate::CantCrew => StaticDefinition::new(StaticMode::CantCrew)
++            .affected(affected)
++            .description(description.to_string()),
++        RuleStaticPredicate::CantBeActivated => {
++            StaticDefinition::new(StaticMode::CantBeActivated {
++                who: ProhibitionScope::AllPlayers,
++                source_filter: TargetFilter::SelfRef,
++                exemption: ActivationExemption::None,
++            })
++            .affected(affected)
++            .description(description.to_string())
++        }
+         RuleStaticPredicate::CantBeSacrificed => {
+             StaticDefinition::new(StaticMode::Other("CantBeSacrificed".to_string()))
+                 .affected(affected)
+diff --git a/crates/engine/src/parser/oracle_static/keyword_grant.rs b/crates/engine/src/parser/oracle_static/keyword_grant.rs
+index d2faf07d1f..16d8c52d1c 100644
+--- a/crates/engine/src/parser/oracle_static/keyword_grant.rs
++++ b/crates/engine/src/parser/oracle_static/keyword_grant.rs
+@@ -11,6 +11,8 @@ pub(crate) enum RuleStaticPredicate {
+     CantAttack,
+     CantBlock,
+     CantAttackOrBlock,
++    CantCrew,
++    CantBeActivated,
+     CantBeSacrificed,
+     MustAttack,
+     MustBlock,
+diff --git a/crates/engine/src/parser/oracle_static/shared.rs b/crates/engine/src/parser/oracle_static/shared.rs
+index a86880012a..138a1921bc 100644
+--- a/crates/engine/src/parser/oracle_static/shared.rs
++++ b/crates/engine/src/parser/oracle_static/shared.rs
+@@ -2062,6 +2062,10 @@ pub(crate) fn parse_combat_rule_static_predicate_nom(
+         ),
+         parse_cant_attack_rule_static_predicate_nom,
+         value(RuleStaticPredicate::CantBlock, tag("can't block")),
++        value(
++            RuleStaticPredicate::CantCrew,
++            (tag("can't crew"), opt(preceded(space1, tag("vehicles")))),
++        ),
+         value(
+             RuleStaticPredicate::MustAttack,
+             alt((
+@@ -2099,6 +2103,27 @@ pub(crate) fn parse_combat_rule_static_predicate_nom(
+     .parse(input)
+ }
+ 
++pub(crate) fn parse_rule_static_tail_predicate_nom(
++    input: &str,
++) -> OracleResult<'_, RuleStaticPredicate> {
++    alt((
++        parse_rule_static_predicate_nom,
++        value(RuleStaticPredicate::CantBlock, tag("block")),
++        value(
++            RuleStaticPredicate::CantCrew,
++            (tag("crew"), opt(preceded(space1, tag("vehicles")))),
++        ),
++        value(
++            RuleStaticPredicate::CantBeActivated,
++            alt((
++                tag("have its activated abilities activated"),
++                tag("have their activated abilities activated"),
++            )),
++        ),
++    ))
++    .parse(input)
++}
++
+ pub(crate) fn parse_rule_static_tail_predicates(rest: &str) -> Option<Vec<RuleStaticPredicate>> {
+     let mut remaining = rest;
+     let mut predicates = Vec::new();
+@@ -2109,7 +2134,8 @@ pub(crate) fn parse_rule_static_tail_predicates(rest: &str) -> Option<Vec<RuleSt
+             return Some(predicates);
+         }
+         let (after_separator, _) = parse_rule_static_separator_nom(trimmed).ok()?;
+-        let (after_predicate, predicate) = parse_rule_static_predicate_nom(after_separator).ok()?;
++        let (after_predicate, predicate) =
++            parse_rule_static_tail_predicate_nom(after_separator).ok()?;
+         predicates.push(predicate);
+         remaining = after_predicate;
+     }
+diff --git a/crates/engine/src/parser/oracle_static/tests.rs b/crates/engine/src/parser/oracle_static/tests.rs
+index fd473fd4ea..bc03bfec93 100644
+--- a/crates/engine/src/parser/oracle_static/tests.rs
++++ b/crates/engine/src/parser/oracle_static/tests.rs
+@@ -10837,6 +10837,38 @@ fn cant_be_activated_compound_aura_mana_exemption_suffix() {
+     }
+ }
+ 
++#[test]
++fn cant_be_activated_compound_aura_with_cant_crew() {
++    let defs = parse_static_line_multi(
++        "Enchanted permanent can't attack, block, crew Vehicles, or have its activated abilities activated.",
++    );
++    let modes: Vec<&StaticMode> = defs.iter().map(|def| &def.mode).collect();
++
++    assert!(
++        modes.contains(&&StaticMode::CantAttack),
++        "compound Aura text should emit CantAttack"
++    );
++    assert!(
++        modes.contains(&&StaticMode::CantBlock),
++        "compound Aura text should emit CantBlock"
++    );
++    assert!(
++        modes.contains(&&StaticMode::CantCrew),
++        "compound Aura text should emit CantCrew"
++    );
++    assert!(
++        defs.iter()
++            .any(|def| matches!(def.mode, StaticMode::CantBeActivated { .. })),
++        "compound Aura text should emit CantBeActivated"
++    );
++    assert!(defs.iter().all(|def| {
++        def.affected
++            == Some(TargetFilter::Typed(
++                TypedFilter::permanent().properties(vec![FilterProp::EnchantedBy]),
++            ))
++    }));
++}
++
+ #[test]
+ fn cant_be_activated_clarion_multi_type_filter() {
+     // CR 602.5 + CR 603.2a: Clarion Conqueror — "Activated abilities of artifacts,
+diff --git a/crates/engine/src/types/statics.rs b/crates/engine/src/types/statics.rs
+index 3519f49e76..08c6f4856e 100644
+--- a/crates/engine/src/types/statics.rs
++++ b/crates/engine/src/types/statics.rs
+@@ -887,6 +887,8 @@ pub enum StaticMode {
+     Goaded,
+     CantAttackAlone,
+     CantBlockAlone,
++    /// CR 702.122c: This creature can't crew Vehicles.
++    CantCrew,
+     MayLookAtTopOfLibrary,
+ 
+     // -- Tier 3: Parser-produced statics --
+@@ -1292,6 +1294,7 @@ impl fmt::Display for StaticMode {
+             StaticMode::Goaded => write!(f, "Goaded"),
+             StaticMode::CantAttackAlone => write!(f, "CantAttackAlone"),
+             StaticMode::CantBlockAlone => write!(f, "CantBlockAlone"),
++            StaticMode::CantCrew => write!(f, "CantCrew"),
+             StaticMode::MayLookAtTopOfLibrary => write!(f, "MayLookAtTopOfLibrary"),
+             // Tier 3
+             StaticMode::MayChooseNotToUntap => write!(f, "MayChooseNotToUntap"),
+@@ -1595,6 +1598,7 @@ impl FromStr for StaticMode {
+             "Goaded" => StaticMode::Goaded,
+             "CantAttackAlone" => StaticMode::CantAttackAlone,
+             "CantBlockAlone" => StaticMode::CantBlockAlone,
++            "CantCrew" => StaticMode::CantCrew,
+             "MayLookAtTopOfLibrary" => StaticMode::MayLookAtTopOfLibrary,
+             // Tier 3
+             "MayChooseNotToUntap" => StaticMode::MayChooseNotToUntap,
+@@ -1998,6 +2002,7 @@ mod tests {
+             StaticMode::MustBeBlocked,
+             StaticMode::CantAttackAlone,
+             StaticMode::CantBlockAlone,
++            StaticMode::CantCrew,
+             StaticMode::MayLookAtTopOfLibrary,
+             // Tier 3: parser-produced statics
+             StaticMode::MayChooseNotToUntap,
+diff --git a/crates/mtgish-import/src/convert/static_effect.rs b/crates/mtgish-import/src/convert/static_effect.rs
+index 821eb90876..5710784dd8 100644
+--- a/crates/mtgish-import/src/convert/static_effect.rs
++++ b/crates/mtgish-import/src/convert/static_effect.rs
+@@ -292,6 +292,7 @@ pub fn convert_permanent_rule(
+         // CR 509.1b: Attack/block bare prohibitions/requirements.
+         P::CantAttack => StaticMode::CantAttack,
+         P::CantBlock => StaticMode::CantBlock,
++        P::CantCrew => StaticMode::CantCrew,
+         P::CantAttackAlone => StaticMode::CantAttackAlone,
+         P::CantBlockAlone => StaticMode::CantBlockAlone,
+         P::MustAttack => StaticMode::MustAttack,

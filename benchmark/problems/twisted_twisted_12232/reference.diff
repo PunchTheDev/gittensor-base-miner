@@ -1,0 +1,374 @@
+diff --git a/src/twisted/newsfragments/12230.feature b/src/twisted/newsfragments/12230.feature
+new file mode 100644
+index 00000000000..0371d187c26
+--- /dev/null
++++ b/src/twisted/newsfragments/12230.feature
+@@ -0,0 +1 @@
++twisted.python.failure.Failure creation no longer records the place where it was created. This reduces creation time by 60% at least, thereby speeding up Deferred error handling.
+\ No newline at end of file
+diff --git a/src/twisted/python/failure.py b/src/twisted/python/failure.py
+index d253ffad743..67766b1318c 100644
+--- a/src/twisted/python/failure.py
++++ b/src/twisted/python/failure.py
+@@ -25,8 +25,10 @@
+ from typing import Callable, NoReturn, TypeVar
+ 
+ import opcode
++from incremental import Version
+ 
+ from twisted.python import reflect
++from twisted.python.deprecate import deprecatedProperty
+ 
+ _T_Callable = TypeVar("_T_Callable", bound=Callable[..., object])
+ 
+@@ -84,8 +86,7 @@ def format_frames(frames, write, detail="default"):
+                 w(f"  {name} : {repr(val)}\n")
+ 
+ 
+-# slyphon: i have a need to check for this value in trial
+-#          so I made it a module-level constant
++# Unused, here for backwards compatibility.
+ EXCEPTION_CAUGHT_HERE = "--- <exception caught here> ---"
+ 
+ 
+@@ -96,28 +97,20 @@ class NoCurrentExceptionError(Exception):
+     """
+ 
+ 
+-def _Traceback(stackFrames, tbFrames):
++def _Traceback(tbFrames):
+     """
+     Construct a fake traceback object using a list of frames.
+ 
+     It should have the same API as stdlib to allow interaction with
+     other tools.
+ 
+-    @param stackFrames: [(methodname, filename, lineno, locals, globals), ...]
+     @param tbFrames: [(methodname, filename, lineno, locals, globals), ...]
+     """
+     assert len(tbFrames) > 0, "Must pass some frames"
+     # We deliberately avoid using recursion here, as the frames list may be
+     # long.
+ 
+-    # 'stackFrames' is a list of frames above (ie, older than) the point the
+-    # exception was caught, with oldest at the start. Start by building these
+-    # into a linked list of _Frame objects (with the f_back links pointing back
+-    # towards the oldest frame).
+     stack = None
+-    for sf in stackFrames:
+-        stack = _Frame(sf, stack)
+-
+     # 'tbFrames' is a list of frames from the point the exception was caught,
+     # down to where it was thrown, with the oldest at the start. Add these to
+     # the linked list of _Frames, but also wrap each one with a _Traceback
+@@ -237,20 +230,27 @@ class Failure(BaseException):
+     This is necessary because Python's built-in error mechanisms are
+     inconvenient for asynchronous communication.
+ 
+-    The C{stack} and C{frame} attributes contain frames.  Each frame is a tuple
++    The C{frame} attribute contain the traceback frames.  Each frame is a tuple
+     of (funcName, fileName, lineNumber, localsItems, globalsItems), where
+     localsItems and globalsItems are the contents of
+     C{locals().items()}/C{globals().items()} for that frame, or an empty tuple
+     if those details were not captured.
+ 
++    Local/global variables in C{frame} will only be captured if
++    C{captureVars=True} when constructing the L{Failure}.
++
+     @ivar value: The exception instance responsible for this failure.
++
+     @ivar type: The exception's class.
+-    @ivar stack: list of frames, innermost last, excluding C{Failure.__init__}.
++
++    @ivar stack: Deprecated, always an empty list.  Equivalent information can
++        be extracted from C{import traceback;
++        traceback.extract_stack(your_failure.tb)}
++
+     @ivar frames: list of frames, innermost first.
+     """
+ 
+     pickled = 0
+-    stack = None
+     _parents = None
+ 
+     # The opcode of "yield" in Python bytecode. We need this in
+@@ -337,7 +337,6 @@ def __init__(self, exc_value=None, exc_type=None, exc_tb=None, captureVars=False
+                 tb = self.value.__traceback__
+ 
+         frames = self.frames = []
+-        stack = self.stack = []
+ 
+         # Added 2003-06-23 by Chris Armstrong. Yes, I actually have a
+         # use case where I need this traceback object, and I've made
+@@ -358,39 +357,6 @@ def __init__(self, exc_value=None, exc_type=None, exc_tb=None, captureVars=False
+             f = f.f_back
+             stackOffset -= 1
+ 
+-        # Keeps the *full* stack.  Formerly in spread.pb.print_excFullStack:
+-        #
+-        #   The need for this function arises from the fact that several
+-        #   PB classes have the peculiar habit of discarding exceptions
+-        #   with bareword "except:"s.  This premature exception
+-        #   catching means tracebacks generated here don't tend to show
+-        #   what called upon the PB object.
+-        while f:
+-            if captureVars:
+-                localz = f.f_locals.copy()
+-                if f.f_locals is f.f_globals:
+-                    globalz = {}
+-                else:
+-                    globalz = f.f_globals.copy()
+-                for d in globalz, localz:
+-                    if "__builtins__" in d:
+-                        del d["__builtins__"]
+-                localz = localz.items()
+-                globalz = globalz.items()
+-            else:
+-                localz = globalz = ()
+-            stack.insert(
+-                0,
+-                (
+-                    f.f_code.co_name,
+-                    f.f_code.co_filename,
+-                    f.f_lineno,
+-                    localz,
+-                    globalz,
+-                ),
+-            )
+-            f = f.f_back
+-
+         while tb is not None:
+             f = tb.tb_frame
+             if captureVars:
+@@ -417,6 +383,14 @@ def __init__(self, exc_value=None, exc_type=None, exc_tb=None, captureVars=False
+             )
+             tb = tb.tb_next
+ 
++    @deprecatedProperty(Version("Twisted", "NEXT", 0, 0))
++    def stack(self):
++        return []
++
++    @stack.setter  # type: ignore[no-redef]
++    def stack(self, stack):
++        del stack
++
+     @property
+     def parents(self):
+         if self._parents is not None:
+@@ -476,7 +450,6 @@ def _withoutTraceback(value: BaseException) -> Failure:
+         result.captureVars = False
+         result.count = count
+         result.frames = []
+-        result.stack = []  # type: ignore
+         result.value = value
+         result.type = value.__class__
+         result.tb = None
+@@ -618,6 +591,8 @@ def __str__(self) -> str:
+         return "[Failure instance: %s]" % self.getBriefTraceback()
+ 
+     def __setstate__(self, state):
++        if "stack" in state:
++            state.pop("stack")
+         state["_parents"] = state.pop("parents")
+         self.__dict__.update(state)
+ 
+@@ -636,6 +611,7 @@ def __getstate__(self):
+ 
+         # Backwards compatibility with old code, e.g. for Perspective Broker:
+         c["parents"] = c.pop("_parents")
++        c["stack"] = []
+ 
+         if self.captureVars:
+             c["frames"] = [
+@@ -652,21 +628,6 @@ def __getstate__(self):
+         # Added 2003-06-23. See comment above in __init__
+         c["tb"] = None
+ 
+-        if self.stack is not None:
+-            # XXX: This is a band-aid.  I can't figure out where these
+-            # (failure.stack is None) instances are coming from.
+-            if self.captureVars:
+-                c["stack"] = [
+-                    [
+-                        v[0],
+-                        v[1],
+-                        v[2],
+-                        _safeReprVars(v[3]),
+-                        _safeReprVars(v[4]),
+-                    ]
+-                    for v in self.stack
+-                ]
+-
+         c["pickled"] = 1
+         return c
+ 
+@@ -700,7 +661,7 @@ def getTracebackObject(self):
+         if self.tb is not None:
+             return self.tb
+         elif len(self.frames) > 0:
+-            return _Traceback(self.stack, self.frames)
++            return _Traceback(self.frames)
+         else:
+             return None
+ 
+@@ -731,9 +692,7 @@ def printTraceback(self, file=None, elideFrameworkCode=False, detail="default"):
+         @param file: If specified, a file-like object to which to write the
+             traceback.
+ 
+-        @param elideFrameworkCode: A flag indicating whether to attempt to
+-            remove uninteresting frames from within Twisted itself from the
+-            output.
++        @param elideFrameworkCode: Deprecated, ignored.
+ 
+         @param detail: A string indicating how much information to include
+             in the traceback.  Must be one of C{'brief'}, C{'default'}, or
+@@ -773,9 +732,6 @@ def printTraceback(self, file=None, elideFrameworkCode=False, detail="default"):
+ 
+         # Frames, formatted in appropriate style
+         if self.frames:
+-            if not elideFrameworkCode:
+-                format_frames(self.stack[-traceupLength:], w, formatDetail)
+-                w(f"{EXCEPTION_CAUGHT_HERE}\n")
+             format_frames(self.frames, w, formatDetail)
+         elif not detail == "brief":
+             # Yeah, it's not really a traceback, despite looking like one...
+diff --git a/src/twisted/test/test_failure.py b/src/twisted/test/test_failure.py
+index e280d148100..3c543d44f22 100644
+--- a/src/twisted/test/test_failure.py
++++ b/src/twisted/test/test_failure.py
+@@ -38,6 +38,12 @@ def getDivisionFailure(*, captureVars: bool = False) -> failure.Failure:
+     """
+     Make a C{Failure} of a divide-by-zero error.
+     """
++    if captureVars:
++        exampleLocalVar = "xyz"
++        # Silence the linter as this variable is checked via
++        # the traceback.
++        exampleLocalVar
++
+     try:
+         1 / 0
+     except BaseException:
+@@ -154,9 +160,6 @@ def assertDetailedTraceback(
+ 
+         The body contains the stacktrace::
+ 
+-          /twisted/trial/_synctest.py:1180: _run(...)
+-          /twisted/python/util.py:1076: runWithWarningsSuppressed(...)
+-          --- <exception caught here> ---
+           /twisted/test/test_failure.py:39: getDivisionFailure(...)
+ 
+         If C{captureVars} is enabled the body also includes a list of
+@@ -185,12 +188,6 @@ def assertDetailedTraceback(
+         @param cleanFailure: Enables L{Failure.cleanFailure}.
+         @type cleanFailure: C{bool}
+         """
+-        if captureVars:
+-            exampleLocalVar = "xyz"
+-            # Silence the linter as this variable is checked via
+-            # the traceback.
+-            exampleLocalVar
+-
+         f = getDivisionFailure(captureVars=captureVars)
+         out = StringIO()
+         if cleanFailure:
+@@ -235,14 +232,8 @@ def assertBriefTraceback(self, captureVars: bool = False) -> None:
+ 
+           Traceback: <type 'exceptions.ZeroDivisionError'>: float division
+ 
+-        The body with the stacktrace::
+-
+-          /twisted/trial/_synctest.py:1180:_run
+-          /twisted/python/util.py:1076:runWithWarningsSuppressed
+-
+         And the footer::
+ 
+-          --- <exception caught here> ---
+           /twisted/test/test_failure.py:39:getDivisionFailure
+ 
+         @param captureVars: Enables L{Failure.captureVars}.
+@@ -266,7 +257,7 @@ def assertBriefTraceback(self, captureVars: bool = False) -> None:
+         self.assertTracebackFormat(
+             tb,
+             f"Traceback: {zde}: ",
+-            f"{failure.EXCEPTION_CAUGHT_HERE}\n{stack}",
++            f"{stack}",
+         )
+ 
+         if captureVars:
+@@ -280,14 +271,8 @@ def assertDefaultTraceback(self, captureVars: bool = False) -> None:
+ 
+           Traceback (most recent call last):
+ 
+-        The body with traceback::
+-
+-          File "/twisted/trial/_synctest.py", line 1180, in _run
+-             runWithWarningsSuppressed(suppress, method)
+-
+         And the footer::
+ 
+-          --- <exception caught here> ---
+             File "twisted/test/test_failure.py", line 39, in getDivisionFailure
+               1 / 0
+             exceptions.ZeroDivisionError: float division
+@@ -313,9 +298,8 @@ def assertDefaultTraceback(self, captureVars: bool = False) -> None:
+         self.assertTracebackFormat(
+             tb,
+             "Traceback (most recent call last):",
+-            "%s\n%s%s: %s\n"
++            "%s%s: %s\n"
+             % (
+-                failure.EXCEPTION_CAUGHT_HERE,
+                 stack,
+                 reflect.qual(f.type),
+                 reflect.safe_str(f.value),
+@@ -519,6 +503,20 @@ def test_repr(self) -> None:
+             "<twisted.python.failure.Failure " "%s: division by zero>" % (typeName,),
+         )
+ 
++    def test_stackDeprecation(self) -> None:
++        """
++        C{Failure.stack} is gettable and settable, but depreacted.
++        """
++        f = getDivisionFailure()
++        f.stack = f.stack  # type: ignore[method-assign]
++        warnings = self.flushWarnings()
++        self.assertTrue(len(warnings) >= 1)
++        for w in warnings[-2:]:
++            self.assertEqual(
++                "twisted.python.failure.Failure.stack was deprecated in Twisted NEXT",
++                w["message"],
++            )
++
+     def test_failureWithoutTraceback(self) -> None:
+         """
+         C{Failure._withoutTraceback(exc)} gives the same result as
+@@ -780,7 +778,7 @@ def test_singleFrame(self) -> None:
+         to be passed to L{traceback.extract_tb}, and we should get a singleton
+         list containing a (filename, lineno, methodname, line) tuple.
+         """
+-        tb = failure._Traceback([], [["method", "filename.py", 123, {}, {}]])
++        tb = failure._Traceback([["method", "filename.py", 123, {}, {}]])
+         # Note that we don't need to test that extract_tb correctly extracts
+         # the line's contents. In this case, since filename.py doesn't exist,
+         # it will just use None.
+@@ -795,10 +793,6 @@ def test_manyFrames(self) -> None:
+         containing a tuple for each frame.
+         """
+         tb = failure._Traceback(
+-            [
+-                ["caller1", "filename.py", 7, {}, {}],
+-                ["caller2", "filename.py", 8, {}, {}],
+-            ],
+             [
+                 ["method1", "filename.py", 123, {}, {}],
+                 ["method2", "filename.py", 235, {}, {}],
+@@ -816,8 +810,6 @@ def test_manyFrames(self) -> None:
+         self.assertEqual(
+             traceback.extract_stack(tb.tb_frame),
+             [
+-                _tb("filename.py", 7, "caller1", None),
+-                _tb("filename.py", 8, "caller2", None),
+                 _tb("filename.py", 123, "method1", None),
+             ],
+         )

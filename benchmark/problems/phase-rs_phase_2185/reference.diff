@@ -1,0 +1,571 @@
+diff --git a/crates/engine/src/game/casting.rs b/crates/engine/src/game/casting.rs
+index 71f21243e..802368f7e 100644
+--- a/crates/engine/src/game/casting.rs
++++ b/crates/engine/src/game/casting.rs
+@@ -458,6 +458,14 @@ pub fn spell_objects_available_to_cast(state: &GameState, player: PlayerId) -> V
+         objects.extend(permission_ids);
+     }
+ 
++    // CR 601.2a + CR 611.2a: Graveyard objects with a timed `ExileWithAltCost`
++    // grant from `CastFromZone` (Emry class).
++    objects.extend(player_data.graveyard.iter().copied().filter(|&obj_id| {
++        state.objects.get(&obj_id).is_some_and(|obj| {
++            obj.owner == player && has_graveyard_timed_alt_cost_permission(state, obj, player)
++        })
++    }));
++
+     // CR 601.2a + CR 113.6b + CR 118.9: Cards in exile castable via a
+     // `StaticMode::ExileCastPermission` static from a battlefield permanent
+     // (Maralen, Fae Ascendant). Restricted to cards exiled "with" the source
+@@ -1298,6 +1306,19 @@ fn has_alt_cost_permission_for(
+     })
+ }
+ 
++/// CR 601.2a: Object-level timed alt-cost grants that allow casting from the
++/// graveyard without exiling first (Emry, Lurker in the Loch).
++fn has_graveyard_timed_alt_cost_permission(
++    state: &GameState,
++    obj: &crate::game::game_object::GameObject,
++    player: PlayerId,
++) -> bool {
++    obj.zone == Zone::Graveyard
++        && obj.casting_permissions.iter().any(|permission| {
++            exile_alt_cost_permission_supports_cast(state, obj, player, permission, None)
++        })
++}
++
+ /// CR 604.3 + CR 601.2a: Find graveyard objects castable via static permission
+ /// from functioning static abilities (Lurrus, Karador, Gravecrawler, etc.).
+ /// Returns (graveyard_object_id, source_permanent_id) pairs.
+@@ -2365,6 +2386,9 @@ fn casting_variant_candidates(
+                 graveyard_destination_replacement: source.graveyard_destination_replacement,
+             });
+         }
++        if has_graveyard_timed_alt_cost_permission(state, obj, player) {
++            candidates.push(CastingVariant::Normal);
++        }
+     }
+ 
+     if obj.zone == Zone::Exile {
+@@ -2473,6 +2497,7 @@ fn prepare_spell_cast_with_variant_override_inner(
+         None
+     };
+     let has_graveyard_permission = graveyard_permission_src.is_some();
++    let has_graveyard_alt_cost = has_graveyard_timed_alt_cost_permission(state, obj, player);
+ 
+     // CR 401.5 + CR 118.9 + CR 601.2a: Top-of-library cast via static permission
+     // (Realmwalker, Future Sight, Bolas's Citadel, etc.). The card must be the
+@@ -2509,6 +2534,7 @@ fn prepare_spell_cast_with_variant_override_inner(
+                 || has_madness
+                 || has_graveyard_cast_keyword
+                 || has_graveyard_permission
++                || has_graveyard_alt_cost
+                 || has_top_of_library_permission));
+     if !castable_zone {
+         return Err(EngineError::InvalidAction(
+@@ -2583,7 +2609,7 @@ fn prepare_spell_cast_with_variant_override_inner(
+     // (ExileWithAltAbilityCost) zeroes the mana cost — its `AbilityCost` is
+     // routed through `pay_additional_cost` in `check_additional_cost_or_pay`
+     // (CR 118.9 + CR 119.4).
+-    let alt_cost_from_exile = if obj.zone == Zone::Exile {
++    let alt_cost_from_exile = if obj.zone == Zone::Exile || has_graveyard_alt_cost {
+         // CR 611.2a: When a permission carries `granted_to: Some(p)`, only
+         // player `p` may consume its cost override. Skip alt-cost permissions
+         // bound to a different player so a non-grantee casting from the same
+@@ -20020,6 +20046,50 @@ mod tests {
+         ));
+     }
+ 
++    /// Issue #2027 — Emry, Lurker in the Loch: targeted graveyard artifact may
++    /// be cast this turn via `CastFromZone` without exiling first.
++    #[test]
++    fn graveyard_timed_alt_cost_grant_is_castable_in_place() {
++        use crate::game::effects::cast_from_zone;
++        use crate::types::ability::{CardPlayMode, Effect, ResolvedAbility, TargetRef};
++
++        let mut state = setup_game_at_main_phase();
++        let bauble = create_object(
++            &mut state,
++            CardId(2027),
++            PlayerId(0),
++            "Mishra's Bauble".to_string(),
++            Zone::Graveyard,
++        );
++        {
++            let obj = state.objects.get_mut(&bauble).unwrap();
++            obj.card_types.core_types.push(CoreType::Artifact);
++            obj.mana_cost = ManaCost::zero();
++        }
++
++        let ability = ResolvedAbility::new(
++            Effect::CastFromZone {
++                target: TargetFilter::ParentTarget,
++                without_paying_mana_cost: false,
++                mode: CardPlayMode::Cast,
++                cast_transformed: false,
++                alt_ability_cost: None,
++                constraint: None,
++                duration: Some(Duration::UntilEndOfTurn),
++                driver: crate::types::ability::CastFromZoneDriver::LingeringPermission,
++            },
++            vec![TargetRef::Object(bauble)],
++            ObjectId(9001),
++            PlayerId(0),
++        );
++        cast_from_zone::resolve(&mut state, &ability, &mut Vec::new()).unwrap();
++
++        assert_eq!(state.objects[&bauble].zone, Zone::Graveyard);
++        assert!(spell_objects_available_to_cast(&state, PlayerId(0)).contains(&bauble));
++        prepare_spell_cast(&state, PlayerId(0), bauble)
++            .expect("bauble must be castable from graveyard");
++    }
++
+     fn add_borrowed_exile_sorcery_with_mana_value(
+         state: &mut GameState,
+         card_id: CardId,
+diff --git a/crates/engine/src/game/effects/cast_from_zone.rs b/crates/engine/src/game/effects/cast_from_zone.rs
+index 9a6844d51..8028c0673 100644
+--- a/crates/engine/src/game/effects/cast_from_zone.rs
++++ b/crates/engine/src/game/effects/cast_from_zone.rs
+@@ -1,6 +1,6 @@
+ use crate::game::zones;
+ use crate::types::ability::{
+-    CastingPermission, Effect, EffectError, EffectKind, ResolvedAbility, TargetRef,
++    CastingPermission, Duration, Effect, EffectError, EffectKind, ResolvedAbility, TargetRef,
+ };
+ use crate::types::events::GameEvent;
+ use crate::types::game_state::GameState;
+@@ -178,11 +178,12 @@ pub fn resolve(
+     }
+ 
+     for &obj_id in &target_ids {
+-        // CR 601.2a: If the card is not in exile, move it there first.
+-        // The casting pipeline gates on Zone::Exile for permission-based casts,
+-        // so the card must be in exile before we grant the permission.
++        // CR 601.2a: Impulse-draw and similar grants move non-exile cards to
++        // exile before attaching `ExileWithAltCost`. Targeted graveyard grants
++        // (Emry, Lurker in the Loch) keep the card in the graveyard and grant
++        // a durational permission the casting pipeline consumes in place.
+         let current_zone = state.objects.get(&obj_id).map(|o| o.zone);
+-        if current_zone.is_some_and(|z| z != Zone::Exile) {
++        if current_zone.is_some_and(|z| z != Zone::Exile && z != Zone::Graveyard) {
+             zones::move_to_zone(state, obj_id, Zone::Exile, events);
+         }
+ 
+@@ -230,7 +231,11 @@ pub fn resolve(
+                     // recast offer) are pruned at the correct boundary.
+                     // `None` (the common case) preserves the standing
+                     // semantics used by Discover, Suspend, Nashi, etc.
+-                    duration: duration.clone(),
++                    // Emry-class graveyard grants default to UntilEndOfTurn
++                    // when the parser did not carry an explicit duration.
++                    duration: duration.clone().or_else(|| {
++                        (current_zone == Some(Zone::Graveyard)).then_some(Duration::UntilEndOfTurn)
++                    }),
+                 }
+             };
+             if !obj.casting_permissions.contains(&permission) {
+@@ -276,6 +281,55 @@ mod tests {
+         obj_id
+     }
+ 
++    fn add_card_to_graveyard(state: &mut GameState, owner: PlayerId, card_id: CardId) -> ObjectId {
++        let obj_id = create_object(
++            state,
++            card_id,
++            owner,
++            "Graveyard Artifact".to_string(),
++            Zone::Graveyard,
++        );
++        state.objects.get_mut(&obj_id).unwrap().mana_cost = ManaCost::zero();
++        obj_id
++    }
++
++    #[test]
++    fn graveyard_target_grant_stays_in_graveyard_with_timed_permission() {
++        let mut state = make_test_state();
++        let obj_id = add_card_to_graveyard(&mut state, PlayerId(0), CardId(400));
++
++        let ability = ResolvedAbility::new(
++            Effect::CastFromZone {
++                target: TargetFilter::ParentTarget,
++                without_paying_mana_cost: false,
++                mode: CardPlayMode::Cast,
++                cast_transformed: false,
++                alt_ability_cost: None,
++                constraint: None,
++                duration: Some(Duration::UntilEndOfTurn),
++                driver: crate::types::ability::CastFromZoneDriver::LingeringPermission,
++            },
++            vec![TargetRef::Object(obj_id)],
++            ObjectId(999),
++            PlayerId(0),
++        );
++
++        let mut events = vec![];
++        resolve(&mut state, &ability, &mut events).unwrap();
++
++        let obj = state.objects.get(&obj_id).unwrap();
++        assert_eq!(obj.zone, Zone::Graveyard);
++        assert!(obj.casting_permissions.iter().any(|p| matches!(
++            p,
++            CastingPermission::ExileWithAltCost {
++                cost,
++                duration: Some(Duration::UntilEndOfTurn),
++                granted_to: Some(PlayerId(0)),
++                ..
++            } if *cost == ManaCost::zero()
++        )));
++    }
++
+     /// Issue #1520 — suspend last-time-counter free cast must actually CAST the
+     /// card as the trigger resolves (CR 702.62a), not merely grant a lingering
+     /// `ExileWithAltCost` permission that the player has to act on later. The
+diff --git a/crates/engine/src/parser/oracle_effect/mod.rs b/crates/engine/src/parser/oracle_effect/mod.rs
+index 18a0dc3fa..197a498ae 100644
+--- a/crates/engine/src/parser/oracle_effect/mod.rs
++++ b/crates/engine/src/parser/oracle_effect/mod.rs
+@@ -3175,7 +3175,9 @@ fn parse_effect_clause(text: &str, ctx: &mut ParseContext) -> ParsedEffectClause
+     if scan_contains_phrase(&original_lower, "this turn")
+         || scan_contains_phrase(&original_lower, "until ")
+     {
+-        if let Some(mut clause) = try_parse_play_from_exile(TextPair::new(text, &original_lower)) {
++        if let Some(mut clause) =
++            try_parse_play_from_exile(TextPair::new(text, &original_lower), ctx)
++        {
+             if !matches!(clause.effect, Effect::GrantCastingPermission { .. }) {
+                 peel_ctx.apply_optional(&mut clause.optional);
+             }
+@@ -4211,7 +4213,7 @@ fn parse_effect_clause_inner(text: &str, ctx: &mut ParseContext) -> ParsedEffect
+     }
+ 
+     // CR 400.7i: "you may play/cast that card [this turn]" — impulse draw permission.
+-    if let Some(clause) = try_parse_play_from_exile(tp) {
++    if let Some(clause) = try_parse_play_from_exile(tp, ctx) {
+         return clause;
+     }
+ 
+@@ -5680,7 +5682,7 @@ fn try_parse_exile_play_grant_with_any_mana(tp: TextPair<'_>) -> Option<ParsedEf
+ }
+ 
+ /// CR 400.7i: Parse "you may play/cast that card [this turn]" — impulse draw permission.
+-fn try_parse_play_from_exile(tp: TextPair) -> Option<ParsedEffectClause> {
++fn try_parse_play_from_exile(tp: TextPair, ctx: &ParseContext) -> Option<ParsedEffectClause> {
+     let tp = tp.trim_end_matches('.');
+ 
+     // CR 611.2a + CR 108.3: Per-object grant clauses from compound-exile chains.
+@@ -5767,6 +5769,25 @@ fn try_parse_play_from_exile(tp: TextPair) -> Option<ParsedEffectClause> {
+         }
+     }
+ 
++    // CR 601.2a + CR 608.2c: Distinguish a targeted graveyard grant from an
++    // impulse-draw grant by the anaphor's referent, not by the clause's wording.
++    // When an earlier clause in this chain SELECTED a target (Emry's "Choose
++    // target artifact card in your graveyard" → `Effect::TargetOnly`), the
++    // "that card"/"that spell" anaphor binds to that chosen card — defer to
++    // `try_parse_cast_effect` → `CastFromZone { target: ParentTarget }`. When the
++    // referent is an exile/impulse publisher instead (`Exile the top card... you
++    // may play that card this turn`, or `ExileFromTopUntil` as in Territorial
++    // Bruntar), the anaphor is the tracked exile set — fall through to the
++    // `PlayFromExile { TrackedSet }` grant below. `parent_target_is_chosen` is a
++    // strict subset of `parent_target_available` set by the chain loop via
++    // `chain_prior_referent_is_chosen_target`, so the two classes split here
++    // without inspecting clause text (a lexical "that card this turn" guard would
++    // misroute the entire impulse class and silently drop its `PlayFromExile`
++    // shape).
++    if ctx.parent_target_is_chosen {
++        return None;
++    }
++
+     // Duration: extract from trailing text, defaulting to UntilEndOfTurn for impulse draw
+     let (_, dur) = strip_trailing_duration(tp.original);
+     let duration = dur.unwrap_or(Duration::UntilEndOfTurn);
+@@ -9473,6 +9494,44 @@ fn chain_has_prior_typed_referent(clauses: &[ClauseIr]) -> bool {
+     false
+ }
+ 
++/// CR 608.2c + CR 601.2a: Does the chain's prior referent come from an explicit
++/// target SELECTION (`Effect::TargetOnly`) rather than an exile/impulse publisher
++/// (`ExileTop`, `ExileFromTopUntil`, `ChangeZone`, token creation)? Emry, Lurker
++/// in the Loch — "Choose target artifact card in your graveyard. You may cast
++/// that card this turn." — selects its referent, so the anaphor binds to that
++/// chosen card (`CastFromZone { ParentTarget }`). An impulse publisher's anaphor
++/// is the tracked exile set and must stay a `PlayFromExile { TrackedSet }` grant
++/// (Territorial Bruntar's `ExileFromTopUntil` referent is whitelisted by
++/// `has_typed_target_widened`, so this stricter check is what excludes it). The
++/// walk mirrors `chain_has_prior_typed_referent`: it skips `ParentTarget`-carrier
++/// clauses (which continue the same chosen referent) and stops at the first
++/// conditional clause or non-carrier referent.
++fn chain_prior_referent_is_chosen_target(clauses: &[ClauseIr]) -> bool {
++    for prev in clauses.iter().rev() {
++        if prev.condition.is_some() {
++            return false;
++        }
++        if matches!(prev.parsed.effect, Effect::TargetOnly { .. }) {
++            return true;
++        }
++        if has_typed_target_widened(&prev.parsed.effect) {
++            // A typed referent that is not a bare target selection (an exile/
++            // zone publisher, or pump/destroy/etc. of a target) is not an
++            // Emry-style chosen graveyard pick — its "that card" anaphor keeps
++            // the impulse/tracked-set grant.
++            return false;
++        }
++        if matches!(
++            prev.parsed.effect.target_filter(),
++            Some(TargetFilter::ParentTarget)
++        ) {
++            continue;
++        }
++        return false;
++    }
++    false
++}
++
+ fn chain_has_prior_player_target_referent(clauses: &[ClauseIr]) -> bool {
+     for prev in clauses.iter().rev() {
+         if prev.condition.is_some() {
+@@ -10862,6 +10921,16 @@ fn try_parse_cast_as_though_flash_permission(tp: TextPair<'_>) -> Option<ParsedE
+ fn try_parse_cast_effect(lower: &str) -> Option<Effect> {
+     type E<'a> = OracleError<'a>;
+ 
++    // CR 117.3a: Optional "you may " is peeled by `clause_shell` for generic
++    // imperatives but left attached for specialized cast/play grants (Emry,
++    // impulse-draw siblings). Strip here so "you may cast that card this
++    // turn" reaches the anaphoric `CastFromZone` arms.
++    let lower = opt(tag::<_, _, E>("you may "))
++        .parse(lower)
++        .ok()
++        .map(|(rest, _)| rest)
++        .unwrap_or(lower);
++
+     // CR 305.1: "play" means cast if spell, play as land if land.
+     let (rest, mode) = alt((
+         value(CardPlayMode::Cast, tag::<_, _, E>("cast ")),
+@@ -10904,6 +10973,10 @@ fn try_parse_cast_effect(lower: &str) -> Option<Effect> {
+     .parse(rest)
+     .is_ok()
+     {
++        let (_, dur) = strip_trailing_duration(lower);
++        let duration = dur.or_else(|| {
++            scan_contains_phrase(lower, "this turn").then_some(Duration::UntilEndOfTurn)
++        });
+         return Some(Effect::CastFromZone {
+             target: TargetFilter::ParentTarget,
+             without_paying_mana_cost: without_paying,
+@@ -10911,7 +10984,7 @@ fn try_parse_cast_effect(lower: &str) -> Option<Effect> {
+             cast_transformed: false,
+             alt_ability_cost: None,
+             constraint,
+-            duration: None,
++            duration,
+             driver: crate::types::ability::CastFromZoneDriver::LingeringPermission,
+         });
+     }
+@@ -11397,7 +11470,7 @@ fn parse_imperative_effect_inner(tp: TextPair, ctx: &mut ParseContext) -> Parsed
+     // Duration-scoped "play the exiled card" grants permission to the object
+     // just exiled by the preceding clause. It is not an immediate cast/play
+     // instruction, so it must win before the generic CastFromZone parser.
+-    if let Some(clause) = try_parse_play_from_exile(tp) {
++    if let Some(clause) = try_parse_play_from_exile(tp, ctx) {
+         return clause;
+     }
+ 
+@@ -14636,6 +14709,12 @@ pub(crate) fn parse_effect_chain_ir(
+         };
+         let parent_target_available =
+             if_you_do_anchor.is_some() || chain_has_prior_typed_referent(&clauses);
++        // CR 608.2c + CR 601.2a: a strict subset of `parent_target_available`
++        // restricted to chosen-target referents (Emry), excluding impulse
++        // publishers (Territorial Bruntar's `ExileFromTopUntil`). An "if you
++        // do" object anchor is a created/tracked referent, not a target
++        // selection, so it does not count here.
++        let parent_target_is_chosen = chain_prior_referent_is_chosen_target(&clauses);
+         let mut chunk_ctx = ParseContext {
+             subject: chunk_subject,
+             card_name: ctx.card_name.clone(),
+@@ -14673,6 +14752,7 @@ pub(crate) fn parse_effect_chain_ir(
+             // disambiguates to `CostPaidObject` (Jhoira of the Ghitu).
+             current_ability_exile_cost_zone: ctx.current_ability_exile_cost_zone,
+             parent_target_available,
++            parent_target_is_chosen,
+             ..Default::default()
+         };
+         let ctx = &mut chunk_ctx;
+@@ -27205,17 +27285,130 @@ mod tests {
+ 
+     #[test]
+     fn parse_play_from_exile_this_turn() {
++        // CR 400.7i + CR 608.2c: A standalone "you may play that card this turn"
++        // clause has no prior typed referent, so the anaphor binds to the impulse
++        // tracked exile set — `GrantCastingPermission { PlayFromExile }`, NOT a
++        // `CastFromZone` parent-target grant. This is the impulse-draw default
++        // shared by Dark-Dweller Oracle, Bell Borca, Count on Luck, et al.
+         let def = parse_effect_chain("You may play that card this turn.", AbilityKind::Spell);
+-        assert!(matches!(
+-            &*def.effect,
+-            Effect::GrantCastingPermission {
+-                permission: CastingPermission::PlayFromExile {
+-                    duration: Duration::UntilEndOfTurn,
++        assert!(
++            matches!(
++                &*def.effect,
++                Effect::GrantCastingPermission {
++                    permission: CastingPermission::PlayFromExile {
++                        duration: Duration::UntilEndOfTurn,
++                        ..
++                    },
+                     ..
+-                },
++                }
++            ),
++            "expected PlayFromExile(UntilEndOfTurn), got {:?}",
++            def.effect
++        );
++    }
++
++    /// Issue #2027 — Emry, Lurker in the Loch. Within a chain whose prior clause
++    /// chose a typed graveyard target ("Choose target artifact card in your
++    /// graveyard"), "you may cast that card this turn" binds to that target:
++    /// `CastFromZone { target: ParentTarget }`, NOT the impulse `PlayFromExile`
++    /// tracked-set grant. The discriminator is the prior typed referent
++    /// (`ParseContext::parent_target_available`), not the clause wording — so the
++    /// grant must be parsed in the full chain, not in isolation.
++    #[test]
++    fn parse_emry_cast_that_card_this_turn_is_cast_from_zone() {
++        let def = parse_effect_chain(
++            "Choose target artifact card in your graveyard. You may cast that card this turn.",
++            AbilityKind::Spell,
++        );
++        let sub = def
++            .sub_ability
++            .as_ref()
++            .expect("Emry chain must produce a cast sub-ability");
++        match &*sub.effect {
++            Effect::CastFromZone {
++                target: TargetFilter::ParentTarget,
++                without_paying_mana_cost: false,
++                mode: CardPlayMode::Cast,
++                ..
++            } => {}
++            other => panic!("expected CastFromZone ParentTarget, got {other:?}"),
++        }
++    }
++
++    /// Regression for PR #2185: an impulse-draw chain ("Exile the top card... you
++    /// may play that card this turn") has NO chosen target — the "that card"
++    /// anaphor refers to the prior exile's tracked set. It must keep its
++    /// `GrantCastingPermission { PlayFromExile, TrackedSet }` shape and must NOT be
++    /// rerouted into `CastFromZone` by the Emry graveyard-grant handling. Fails if
++    /// the parent-vs-impulse split keys on clause wording instead of
++    /// `parent_target_available`.
++    #[test]
++    fn parse_impulse_play_that_card_this_turn_stays_play_from_exile() {
++        let def = parse_effect_chain(
++            "Exile the top card of your library. You may play that card this turn.",
++            AbilityKind::Spell,
++        );
++        let sub = def
++            .sub_ability
++            .as_ref()
++            .expect("impulse chain must produce a permission sub-ability");
++        match &*sub.effect {
++            Effect::GrantCastingPermission {
++                permission:
++                    CastingPermission::PlayFromExile {
++                        duration: Duration::UntilEndOfTurn,
++                        ..
++                    },
++                target,
+                 ..
++            } => {
++                assert_eq!(
++                    *target,
++                    TargetFilter::TrackedSet {
++                        id: TrackedSetId(0)
++                    },
++                    "impulse grant must bind to the tracked exile set"
++                );
+             }
+-        ));
++            other => panic!("expected GrantCastingPermission/PlayFromExile, got {other:?}"),
++        }
++    }
++
++    /// Regression for PR #2185 (tightening): Territorial Bruntar — "exile cards
++    /// from the top of your library until you exile a nonland card. You may cast
++    /// that card this turn." The prior clause is `ExileFromTopUntil`, an impulse
++    /// publisher whose anaphor is the just-exiled tracked card — NOT a chosen
++    /// target like Emry's `TargetOnly`. It must keep `PlayFromExile { TrackedSet }`.
++    /// `ExileFromTopUntil` is whitelisted by `has_typed_target_widened`, so this
++    /// fails if the parent-vs-impulse split keys on `parent_target_available`
++    /// rather than the stricter `parent_target_is_chosen`.
++    #[test]
++    fn parse_exile_until_nonland_play_that_card_stays_play_from_exile() {
++        let def = parse_effect_chain(
++            "Exile cards from the top of your library until you exile a nonland card. \
++             You may cast that card this turn.",
++            AbilityKind::Spell,
++        );
++        let sub = def
++            .sub_ability
++            .as_ref()
++            .expect("exile-until chain must produce a permission sub-ability");
++        match &*sub.effect {
++            Effect::GrantCastingPermission {
++                permission: CastingPermission::PlayFromExile { .. },
++                target,
++                ..
++            } => {
++                assert_eq!(
++                    *target,
++                    TargetFilter::TrackedSet {
++                        id: TrackedSetId(0)
++                    },
++                    "exile-until grant must bind to the tracked exile set, not a chosen target"
++                );
++            }
++            other => panic!("expected GrantCastingPermission/PlayFromExile, got {other:?}"),
++        }
+     }
+ 
+     #[test]
+diff --git a/crates/engine/src/parser/oracle_ir/ast.rs b/crates/engine/src/parser/oracle_ir/ast.rs
+index 60dc1b972..ab6f686b5 100644
+--- a/crates/engine/src/parser/oracle_ir/ast.rs
++++ b/crates/engine/src/parser/oracle_ir/ast.rs
+@@ -1223,6 +1223,12 @@ pub(crate) fn with_clause_duration(
+         } => {
+             *perm_dur = duration;
+         }
++        Effect::CastFromZone {
++            duration: ref mut effect_duration,
++            ..
++        } => {
++            *effect_duration = Some(duration);
++        }
+         _ => {}
+     }
+     clause
+diff --git a/crates/engine/src/parser/oracle_ir/context.rs b/crates/engine/src/parser/oracle_ir/context.rs
+index a57cfb2b6..ddf82b8ca 100644
+--- a/crates/engine/src/parser/oracle_ir/context.rs
++++ b/crates/engine/src/parser/oracle_ir/context.rs
+@@ -81,6 +81,17 @@ pub(crate) struct ParseContext {
+     /// parsing leaves this false so bare "it" defaults to SelfRef instead of
+     /// inventing a parent target.
+     pub parent_target_available: bool,
++    /// CR 608.2c + CR 601.2a: The chain's prior referent is an explicit target
++    /// SELECTION (`Effect::TargetOnly`, e.g. Emry's "Choose target artifact
++    /// card in your graveyard"), as distinct from an exile/impulse publisher
++    /// (`ExileTop`, `ExileFromTopUntil`, …) whose "that card" anaphor is a
++    /// tracked exile set. Only a chosen-target referent reroutes a "you may
++    /// cast/play that card this turn" grant to `CastFromZone { ParentTarget }`;
++    /// impulse publishers keep their `PlayFromExile { TrackedSet }` grant. This
++    /// is a strict subset of `parent_target_available` — it stays false for the
++    /// `ExileFromTopUntil` referent (Territorial Bruntar) that
++    /// `parent_target_available` would otherwise include.
++    pub parent_target_is_chosen: bool,
+ }
+ 
+ impl ParseContext {

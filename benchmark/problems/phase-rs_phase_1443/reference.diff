@@ -1,0 +1,371 @@
+diff --git a/crates/engine/src/parser/oracle_effect/imperative.rs b/crates/engine/src/parser/oracle_effect/imperative.rs
+index ddc1bb51e5..93403b5899 100644
+--- a/crates/engine/src/parser/oracle_effect/imperative.rs
++++ b/crates/engine/src/parser/oracle_effect/imperative.rs
+@@ -4442,7 +4442,7 @@ pub(super) fn parse_exile_ast(
+     })
+ }
+ 
+-fn that_player_library_filter(ctx: &ParseContext) -> TargetFilter {
++pub(super) fn that_player_library_filter(ctx: &ParseContext) -> TargetFilter {
+     if matches!(ctx.relative_player_scope, Some(ControllerRef::ScopedPlayer)) {
+         return TargetFilter::ScopedPlayer;
+     }
+diff --git a/crates/engine/src/parser/oracle_effect/mod.rs b/crates/engine/src/parser/oracle_effect/mod.rs
+index d341f14385..af9c43cd3e 100644
+--- a/crates/engine/src/parser/oracle_effect/mod.rs
++++ b/crates/engine/src/parser/oracle_effect/mod.rs
+@@ -11072,7 +11072,22 @@ fn contains_implicit_tracked_set_pronoun(lower: &str) -> bool {
+         .parse(lower)
+         .is_ok();
+ 
+-    battlefield_recall || hand_recall || copy_token_recall
++    // CR 400.7i + CR 603.7: Play-from-exile grant — "[you may] play/cast {that
++    // card, that spell, it, those cards, them} for as long as {it,that card,...}
++    // remains exiled". The "that card" anaphor refers to the card the preceding
++    // exile published into the tracked set. Gated on the "remains exiled"
++    // duration phrase (the impulse-grant fingerprint) plus a play/cast verb so
++    // it never matches an unrelated "that card" mention. This caller is itself
++    // only consulted when the previous clause is an exile that publishes a
++    // tracked set, so the gate is doubly scoped (Gonti, Canny Acquisitor).
++    let play_from_exile_grant = (scan_contains_phrase(lower, "remains exiled")
++        || scan_contains_phrase(lower, "remain exiled"))
++        && (scan_contains_phrase(lower, "may play")
++            || scan_contains_phrase(lower, "may cast")
++            || tag::<_, _, OracleError<'_>>("play ").parse(lower).is_ok()
++            || tag::<_, _, OracleError<'_>>("cast ").parse(lower).is_ok());
++
++    battlefield_recall || hand_recall || copy_token_recall || play_from_exile_grant
+ }
+ 
+ fn mark_uses_tracked_set(def: &mut AbilityDefinition) {
+@@ -11184,6 +11199,22 @@ fn rewrite_parent_targets_to_tracked_set(effect: &mut Effect) {
+                 }
+             }
+         }
++        // CR 603.7 + CR 400.7i: "You may play that card for as long as it
++        // remains exiled" — the "that card" anaphor refers to the card the
++        // preceding exile published into the tracked set. A bare
++        // play-from-exile grant parses with `target: Any` (or `ParentTarget`),
++        // which `grant_permission::resolve` would otherwise bind to the source
++        // object rather than the exiled card. Re-target it to the tracked set so
++        // the permission attaches to the just-exiled card (Gonti, Canny
++        // Acquisitor). Scoped to `PlayFromExile` so non-impulse grants are
++        // untouched.
++        Effect::GrantCastingPermission {
++            target,
++            permission: CastingPermission::PlayFromExile { .. },
++            ..
++        } if matches!(target, TargetFilter::Any | TargetFilter::ParentTarget) => {
++            *target = tracked_set_filter();
++        }
+         _ => {}
+     }
+ }
+@@ -25832,6 +25863,79 @@ mod tests {
+         );
+     }
+ 
++    /// CR 406.3 + CR 701.16a: "look at the top card of <player>'s library, then
++    /// exile it face down" is the Gonti, Canny Acquisitor impulse idiom. The
++    /// private `Dig` look step (CR 701.16a) only inspects the top card; the
++    /// "then exile it face down" clause must rewrite it into a face-down
++    /// `Effect::ExileTop` so the card actually leaves the library (issue #1316).
++    /// Building-block coverage independent of any trigger context — a bare chain
++    /// resolves "that player's library" to `ParentTarget`.
++    #[test]
++    fn look_at_top_then_exile_it_face_down_rewrites_dig_to_exile_top() {
++        let def = parse_effect_chain(
++            "Look at the top card of that player's library, then exile it face down.",
++            AbilityKind::Spell,
++        );
++        assert!(
++            matches!(
++                &*def.effect,
++                Effect::ExileTop {
++                    player: TargetFilter::ParentTarget,
++                    count: QuantityExpr::Fixed { value: 1 },
++                    face_down: true,
++                }
++            ),
++            "Expected the look-then-exile idiom to lower to a face-down ExileTop, got {:?}",
++            def.effect
++        );
++    }
++
++    /// CR 400.7i + CR 603.7: The Gonti impulse-play grant ("You may play that
++    /// card for as long as it remains exiled, and mana of any type can be spent
++    /// to cast that spell") must bind to the card the preceding face-down
++    /// `ExileTop` published into the tracked set — without it the grant would
++    /// attach `PlayFromExile` to the source object and the exiled card would
++    /// stay unplayable (issue #1316).
++    #[test]
++    fn exile_then_play_from_exile_grant_binds_to_tracked_set() {
++        let def = parse_effect_chain(
++            "Look at the top card of that player's library, then exile it face down. You may play that card for as long as it remains exiled, and mana of any type can be spent to cast that spell.",
++            AbilityKind::Spell,
++        );
++        assert!(
++            matches!(
++                &*def.effect,
++                Effect::ExileTop {
++                    face_down: true,
++                    ..
++                }
++            ),
++            "Expected a face-down ExileTop head, got {:?}",
++            def.effect
++        );
++        let grant = def
++            .sub_ability
++            .as_ref()
++            .expect("the impulse-play grant must chain after the exile");
++        assert!(
++            matches!(
++                &*grant.effect,
++                Effect::GrantCastingPermission {
++                    permission: CastingPermission::PlayFromExile {
++                        mana_spend_permission: Some(ManaSpendPermission::AnyTypeOrColor),
++                        ..
++                    },
++                    target: TargetFilter::TrackedSet {
++                        id: TrackedSetId(0),
++                    },
++                    ..
++                }
++            ),
++            "Expected PlayFromExile grant bound to the tracked exiled card, got {:?}",
++            grant.effect
++        );
++    }
++
+     #[test]
+     fn put_counter_where_x_is_lowers_to_speed_quantity() {
+         let def = parse_effect_chain_with_context(
+diff --git a/crates/engine/src/parser/oracle_effect/sequence.rs b/crates/engine/src/parser/oracle_effect/sequence.rs
+index 8b2af5b156..f3c33c3c14 100644
+--- a/crates/engine/src/parser/oracle_effect/sequence.rs
++++ b/crates/engine/src/parser/oracle_effect/sequence.rs
+@@ -408,6 +408,42 @@ fn parse_exile_rest_after_dig(lower: &str) -> bool {
+         .is_ok()
+ }
+ 
++/// CR 406.3 + CR 701.16a: Recognize the "[then] exile it/them/that card/those
++/// cards/the card [face down]" clause that follows a private `Dig` look step —
++/// the Gonti, Canny Acquisitor impulse idiom. Returns `Some(face_down)` when the
++/// whole clause matches (`face_down = true` only for the explicit hidden-
++/// information suffix). Composes the (pronoun × optional "face down") axes with
++/// nom combinators rather than enumerating the permutations as match-arm
++/// literals; the clause-boundary splitter has already stripped the leading
++/// "then" connector.
++fn parse_exile_looked_at_card(lower: &str) -> Option<bool> {
++    let trimmed = lower.trim().trim_end_matches('.').trim_end();
++    let (rest, _) = tag::<_, _, OracleError<'_>>("exile ").parse(trimmed).ok()?;
++    let (rest, _) = alt((
++        tag::<_, _, OracleError<'_>>("it"),
++        tag("them"),
++        tag("that card"),
++        tag("those cards"),
++        tag("the card"),
++    ))
++    .parse(rest)
++    .ok()?;
++    let (rest, face_down) = alt((
++        value(
++            true,
++            preceded(
++                multispace1::<_, OracleError<'_>>,
++                tag::<_, _, OracleError<'_>>("face down"),
++            ),
++        ),
++        value(false, eof::<_, OracleError<'_>>),
++    ))
++    .parse(rest)
++    .ok()?;
++    eof::<_, OracleError<'_>>(rest).ok()?;
++    Some(face_down)
++}
++
+ pub(super) fn split_clause_sequence(text: &str) -> Vec<ClauseChunk> {
+     let mut chunks = Vec::new();
+     let mut current = String::new();
+@@ -2083,6 +2119,33 @@ pub(super) fn apply_clause_continuation(
+                 *rest_destination = destination;
+             }
+         }
++        // CR 406.3 + CR 701.16a: Rewrite the preceding private `Dig` (the
++        // "look at the top N cards of <player>'s library" look step) into an
++        // `Effect::ExileTop` so the looked-at card(s) actually leave the
++        // library — the Gonti, Canny Acquisitor impulse idiom. `player`/`count`
++        // were lifted from the `Dig` (with `ParentTarget` re-bound to the
++        // triggering player) during recognition; `face_down` carries the
++        // hidden-information suffix. ExileTop publishes a tracked set the
++        // following `GrantCastingPermission(PlayFromExile)` binds to, so the
++        // exiled card becomes playable.
++        ContinuationAst::ExileLookedAtCard {
++            player,
++            count,
++            face_down,
++        } => {
++            let Some(previous) = defs
++                .iter_mut()
++                .rev()
++                .find(|d| matches!(&*d.effect, Effect::Dig { .. }))
++            else {
++                return;
++            };
++            *previous.effect = Effect::ExileTop {
++                player,
++                count,
++                face_down,
++            };
++        }
+     }
+ }
+ 
+@@ -2176,6 +2239,10 @@ pub(super) fn continuation_absorbs_current(
+         ContinuationAst::GrantExtraTurnAfterControlledTurn => true,
+         ContinuationAst::RevealUntilKept { .. } => true,
+         ContinuationAst::RevealUntilAllToZone { .. } => true,
++        // Recognition was already gated on a preceding `Dig` in
++        // parse_followup_continuation_ast; the "exile it [face down]" clause is
++        // folded into that Dig (rewritten to ExileTop) and emits no sibling def.
++        ContinuationAst::ExileLookedAtCard { .. } => true,
+     }
+ }
+ 
+@@ -2901,6 +2968,43 @@ pub(super) fn parse_followup_continuation_ast(
+                 reorder_all: false,
+             })
+         }
++        // CR 406.3 + CR 701.16a: "[then] exile it/them [face down]" after a
++        // private `Dig` (the "look at the top N cards of <player>'s library"
++        // look step). This is the Gonti, Canny Acquisitor impulse idiom —
++        // "look at the top card of that player's library, then exile it face
++        // down. You may play that card ...". Plain `Dig` only inspects the top
++        // cards (CR 701.16a); without a destination they stay in the library,
++        // so the exile clause must rewrite the `Dig` into an `Effect::ExileTop`
++        // (the face-down impulse-exile primitive shared with Cunning Rhetoric /
++        // Bomat Courier) for the looked-at card to actually leave the library.
++        //
++        // `reveal: false` scopes this to the private "look at" form — a public
++        // "reveal the top card ... then exile it" is a different visibility
++        // class and is not the impulse idiom. `parse_exile_looked_at_card`
++        // composes the pronoun and optional "face down" axes with combinators.
++        Effect::Dig {
++            player: dig_player,
++            count,
++            reveal: false,
++            ..
++        } if parse_exile_looked_at_card(&lower).is_some() => {
++            // CR 406.3: hidden-information suffix → the card is exiled face down.
++            let face_down = parse_exile_looked_at_card(&lower).unwrap_or(false);
++            // CR 608.2c: "that player's library" parsed to `ParentTarget` at the
++            // Dig site; re-resolve it through the shared library-owner combinator
++            // so a damage/attack trigger binds to `TriggeringPlayer` (the proven
++            // Cunning Rhetoric path) rather than the blocked-attacker object that
++            // `ParentTarget` resolves to in a combat-damage context.
++            let player = match dig_player {
++                TargetFilter::ParentTarget => super::imperative::that_player_library_filter(ctx),
++                other => other.clone(),
++            };
++            Some(ContinuationAst::ExileLookedAtCard {
++                player,
++                count: count.clone(),
++                face_down,
++            })
++        }
+         // "put the rest on the bottom" / "put those cards into your graveyard"
+         // after Dig — sets rest_destination on the preceding Dig effect.
+         Effect::Dig { .. }
+diff --git a/crates/engine/src/parser/oracle_ir/ast.rs b/crates/engine/src/parser/oracle_ir/ast.rs
+index bd7d11c940..587ccf977a 100644
+--- a/crates/engine/src/parser/oracle_ir/ast.rs
++++ b/crates/engine/src/parser/oracle_ir/ast.rs
+@@ -319,6 +319,20 @@ pub(crate) enum ContinuationAst {
+     /// and Destroy the Evidence where "those cards" refers to all cards revealed
+     /// during the RevealUntil resolution, not only the non-matching ones.
+     RevealUntilAllToZone { destination: Zone },
++    /// CR 406.3 + CR 701.16a: "[then] exile it/them [face down]" after a private
++    /// `Dig` (the "look at the top N cards of <player>'s library" look step).
++    /// Rewrites the preceding `Dig` into an `Effect::ExileTop` so the looked-at
++    /// card(s) actually leave the library — the Gonti, Canny Acquisitor impulse
++    /// idiom ("look at the top card of that player's library, then exile it face
++    /// down. You may play that card ..."). `player`/`count` are lifted from the
++    /// `Dig` (with `ParentTarget` re-bound to the triggering player via
++    /// `that_player_library_filter`); `face_down` reflects the explicit
++    /// hidden-information suffix.
++    ExileLookedAtCard {
++        player: TargetFilter,
++        count: QuantityExpr,
++        face_down: bool,
++    },
+ }
+ 
+ #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+diff --git a/crates/engine/src/parser/oracle_trigger.rs b/crates/engine/src/parser/oracle_trigger.rs
+index c5e6dcb811..bd5a043a8f 100644
+--- a/crates/engine/src/parser/oracle_trigger.rs
++++ b/crates/engine/src/parser/oracle_trigger.rs
+@@ -10903,6 +10903,61 @@ mod tests {
+         );
+     }
+ 
++    /// CR 406.3 + CR 701.16a + CR 400.7i: Gonti, Canny Acquisitor. "look at the
++    /// top card of that player's library, then exile it face down" must rewrite
++    /// the private `Dig` look step into a face-down `ExileTop` (issue #1316: the
++    /// card was looked at but never left the library), and the follow-on "You may
++    /// play that card for as long as it remains exiled, and mana of any type can
++    /// be spent" grant must bind to the exiled card via the tracked set.
++    #[test]
++    fn trigger_combat_damage_look_then_exile_face_down_grants_impulse_play() {
++        use crate::types::identifiers::TrackedSetId;
++
++        let def = parse_trigger_line(
++            "Whenever one or more creatures you control deal combat damage to a player, look at the top card of that player's library, then exile it face down. You may play that card for as long as it remains exiled, and mana of any type can be spent to cast that spell.",
++            "Gonti, Canny Acquisitor",
++        );
++        assert_eq!(def.mode, TriggerMode::DamageDoneOnceByController);
++        assert_eq!(def.damage_kind, DamageKindFilter::CombatOnly);
++
++        let execute = def.execute.as_ref().expect("trigger should have execute");
++        assert!(
++            matches!(
++                *execute.effect,
++                Effect::ExileTop {
++                    player: TargetFilter::TriggeringPlayer,
++                    count: QuantityExpr::Fixed { value: 1 },
++                    face_down: true,
++                }
++            ),
++            "expected face-down ExileTop from the triggering player's library, got: {:?}",
++            execute.effect
++        );
++
++        let grant = execute
++            .sub_ability
++            .as_ref()
++            .expect("the impulse-play grant must chain after the exile");
++        assert!(
++            matches!(
++                &*grant.effect,
++                Effect::GrantCastingPermission {
++                    permission: CastingPermission::PlayFromExile {
++                        duration: Duration::Permanent,
++                        mana_spend_permission: Some(ManaSpendPermission::AnyTypeOrColor),
++                        ..
++                    },
++                    target: TargetFilter::TrackedSet {
++                        id: TrackedSetId(0),
++                    },
++                    ..
++                }
++            ),
++            "expected PlayFromExile grant bound to the tracked exiled card, got: {:?}",
++            grant.effect
++        );
++    }
++
+     #[test]
+     fn trigger_upkeep() {
+         let def = parse_trigger_line(

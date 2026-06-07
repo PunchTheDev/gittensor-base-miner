@@ -1,0 +1,242 @@
+diff --git a/celery/bin/worker.py b/celery/bin/worker.py
+index 52f09f3a83d..f16dafba94f 100644
+--- a/celery/bin/worker.py
++++ b/celery/bin/worker.py
+@@ -189,7 +189,8 @@ def detach(path, argv, logfile=None, pidfile=None, uid=None,
+               value: ctx.obj.app.conf.worker_disable_prefetch if value is None else value,
+               cls=CeleryOption,
+               help_group="Worker Options",
+-              help="Disable broker prefetching. The worker will only fetch a task when a process slot is available.")
++              help="Disable broker prefetching. The worker will only fetch a task when a process slot is available. "
++                   "Only supported with Redis brokers.")
+ @click.option('-c',
+               '--concurrency',
+               type=int,
+diff --git a/celery/worker/consumer/tasks.py b/celery/worker/consumer/tasks.py
+index ae2029bca42..b017cf52838 100644
+--- a/celery/worker/consumer/tasks.py
++++ b/celery/worker/consumer/tasks.py
+@@ -52,6 +52,16 @@ def set_prefetch_count(prefetch_count):
+         )
+ 
+         if c.app.conf.worker_disable_prefetch:
++            # Only apply disable-prefetch for Redis brokers
++            is_redis_broker = c.connection.transport.driver_type == 'redis'
++            if not is_redis_broker:
++                logger.warning(
++                    f"worker_disable_prefetch is only supported for Redis brokers. "
++                    f"Current broker transport: {c.connection.transport.driver_type}. "
++                    f"Ignoring disable_prefetch setting."
++                )
++                return
++
+             from types import MethodType
+ 
+             from celery.worker import state
+diff --git a/docs/faq.rst b/docs/faq.rst
+index d0946153565..17e3dd5b338 100644
+--- a/docs/faq.rst
++++ b/docs/faq.rst
+@@ -790,7 +790,8 @@ consume as many tasks as it can, as fast as possible.
+ 
+ You can use the :option:`--disable-prefetch <celery worker --disable-prefetch>`
+ flag (or set :setting:`worker_disable_prefetch` to ``True``) so that a worker
+-only fetches a task when one of its processes is free.
++only fetches a task when one of its processes is free. This feature is currently
++only supported when using Redis as the broker.
+ 
+ A discussion on prefetch limits, and configuration settings for a worker
+ that only reserves one task at a time is found here:
+diff --git a/docs/userguide/configuration.rst b/docs/userguide/configuration.rst
+index 8c256afb609..975172a9cfd 100644
+--- a/docs/userguide/configuration.rst
++++ b/docs/userguide/configuration.rst
+@@ -3217,6 +3217,10 @@ early acknowledgments, enable :setting:`worker_disable_prefetch`.
+ When this option is enabled the worker only fetches a task from the broker
+ when one of its processes is available.
+ 
++.. note::
++
++    This feature is currently only supported when using Redis as the broker.
++
+ You can also enable this via the :option:`--disable-prefetch <celery worker --disable-prefetch>`
+ command line flag.
+ 
+@@ -3258,6 +3262,12 @@ has an available process to execute them. This disables prefetching while
+ still using early acknowledgments, ensuring that tasks are fairly
+ distributed between workers.
+ 
++.. note::
++
++    This feature is currently only supported when using Redis as the broker.
++    Using this setting with other brokers will result in a warning and the
++    setting will be ignored.
++
+ .. setting:: worker_enable_prefetch_count_reduction
+ 
+ ``worker_enable_prefetch_count_reduction``
+diff --git a/docs/userguide/optimizing.rst b/docs/userguide/optimizing.rst
+index 42cfdda33ad..7cc7b635751 100644
+--- a/docs/userguide/optimizing.rst
++++ b/docs/userguide/optimizing.rst
+@@ -186,7 +186,8 @@ prefetching by enabling :setting:`worker_disable_prefetch`. With this
+ setting the worker fetches a new task only when an execution slot is
+ free, preventing tasks from waiting behind long running ones on busy
+ workers. This can also be set from the command line using
+-:option:`--disable-prefetch <celery worker --disable-prefetch>`.
++:option:`--disable-prefetch <celery worker --disable-prefetch>`. This feature
++is currently only supported when using Redis as the broker.
+ 
+ Memory Usage
+ ------------
+diff --git a/t/unit/bin/test_worker.py b/t/unit/bin/test_worker.py
+index 0f219e177b1..baa73385d6c 100644
+--- a/t/unit/bin/test_worker.py
++++ b/t/unit/bin/test_worker.py
+@@ -19,6 +19,7 @@ def mock_app():
+     app = Mock()
+     app.conf = Mock()
+     app.conf.worker_disable_prefetch = False
++    app.conf.worker_detect_quorum_queues = False
+     return app
+ 
+ 
+@@ -37,10 +38,14 @@ def mock_consumer(mock_app):
+     original_can_consume = Mock(return_value=True)
+     consumer.task_consumer.channel.qos.can_consume = original_can_consume
+     consumer.connection = Mock()
++    consumer.connection.transport = Mock()
++    consumer.connection.transport.driver_type = 'redis'  # Default to Redis for existing tests
++    consumer.connection.qos_semantics_matches_spec = True
+     consumer.update_strategies = Mock()
+     consumer.on_decode_error = Mock()
+     consumer.app.amqp = Mock()
+     consumer.app.amqp.TaskConsumer = Mock(return_value=consumer.task_consumer)
++    consumer.app.amqp.queues = {}  # Empty dict for quorum queue detection
+     return consumer
+ 
+ 
+@@ -107,3 +112,16 @@ def test_disable_prefetch_none_preserves_behavior(mock_app, mock_consumer):
+     tasks_instance = Tasks(mock_consumer)
+     tasks_instance.start(mock_consumer)
+     assert mock_consumer.task_consumer.channel.qos.can_consume == original_can_consume
++
++
++def test_disable_prefetch_ignored_for_non_redis_brokers(mock_app, mock_consumer):
++    """Test that disable_prefetch is ignored for non-Redis brokers."""
++    mock_app.conf.worker_disable_prefetch = True
++    mock_consumer.connection.transport.driver_type = 'amqp'  # RabbitMQ
++    original_can_consume = mock_consumer.task_consumer.channel.qos.can_consume
++
++    tasks_instance = Tasks(mock_consumer)
++    tasks_instance.start(mock_consumer)
++
++    # Should not modify can_consume method for non-Redis brokers
++    assert mock_consumer.task_consumer.channel.qos.can_consume == original_can_consume
+diff --git a/t/unit/worker/test_autoscale.py b/t/unit/worker/test_autoscale.py
+index 79eded5d923..c5f459b5ff0 100644
+--- a/t/unit/worker/test_autoscale.py
++++ b/t/unit/worker/test_autoscale.py
+@@ -259,6 +259,8 @@ def test_disable_prefetch_respects_max_concurrency(self):
+         # Mock the connection and other required attributes
+         consumer.connection = Mock()
+         consumer.connection.default_channel = Mock()
++        consumer.connection.transport = Mock()
++        consumer.connection.transport.driver_type = 'redis'
+         consumer.initial_prefetch_count = 20
+         consumer.update_strategies = Mock()
+         consumer.on_decode_error = Mock()
+diff --git a/t/unit/worker/test_consumer.py b/t/unit/worker/test_consumer.py
+index c98ae23cb00..02e77e9e58e 100644
+--- a/t/unit/worker/test_consumer.py
++++ b/t/unit/worker/test_consumer.py
+@@ -514,6 +514,8 @@ def test_disable_prefetch_not_enabled(self):
+         consumer.initial_prefetch_count = 16
+         consumer.connection = Mock()
+         consumer.connection.default_channel = Mock()
++        consumer.connection.transport = Mock()
++        consumer.connection.transport.driver_type = 'redis'
+         consumer.update_strategies = Mock()
+         consumer.on_decode_error = Mock()
+ 
+@@ -549,6 +551,8 @@ def test_disable_prefetch_enabled_basic(self):
+         consumer.initial_prefetch_count = 16
+         consumer.connection = Mock()
+         consumer.connection.default_channel = Mock()
++        consumer.connection.transport = Mock()
++        consumer.connection.transport.driver_type = 'redis'
+         consumer.update_strategies = Mock()
+         consumer.on_decode_error = Mock()
+ 
+@@ -587,6 +591,8 @@ def test_disable_prefetch_respects_reserved_requests_limit(self):
+         consumer.initial_prefetch_count = 16
+         consumer.connection = Mock()
+         consumer.connection.default_channel = Mock()
++        consumer.connection.transport = Mock()
++        consumer.connection.transport.driver_type = 'redis'
+         consumer.update_strategies = Mock()
+         consumer.on_decode_error = Mock()
+ 
+@@ -625,6 +631,8 @@ def test_disable_prefetch_respects_autoscale_max_concurrency(self):
+         consumer.initial_prefetch_count = 16
+         consumer.connection = Mock()
+         consumer.connection.default_channel = Mock()
++        consumer.connection.transport = Mock()
++        consumer.connection.transport.driver_type = 'redis'
+         consumer.update_strategies = Mock()
+         consumer.on_decode_error = Mock()
+ 
+@@ -648,6 +656,45 @@ def test_disable_prefetch_respects_autoscale_max_concurrency(self):
+             # Should not be able to consume when at autoscale limit
+             assert consumer.task_consumer.channel.qos.can_consume() is False
+ 
++    def test_disable_prefetch_ignored_for_non_redis_brokers(self):
++        """Test that disable_prefetch is ignored for non-Redis brokers."""
++        self.app.conf.worker_disable_prefetch = True
++
++        # Test the core logic by creating a mock consumer and Tasks instance
++        from celery.worker.consumer.tasks import Tasks
++        consumer = Mock()
++        consumer.app = self.app
++        consumer.pool = Mock()
++        consumer.pool.num_processes = 4
++        consumer.controller = Mock()
++        consumer.controller.max_concurrency = None
++        consumer.initial_prefetch_count = 16
++        consumer.connection = Mock()
++        consumer.connection.default_channel = Mock()
++        consumer.connection.transport = Mock()
++        consumer.connection.transport.driver_type = 'amqp'  # RabbitMQ
++        consumer.connection.qos_semantics_matches_spec = True
++        consumer.update_strategies = Mock()
++        consumer.on_decode_error = Mock()
++
++        # Mock task consumer
++        consumer.task_consumer = Mock()
++        consumer.task_consumer.channel = Mock()
++        consumer.task_consumer.channel.qos = Mock()
++        original_can_consume = Mock(return_value=True)
++        consumer.task_consumer.channel.qos.can_consume = original_can_consume
++        consumer.task_consumer.qos = Mock()
++
++        consumer.app.amqp = Mock()
++        consumer.app.amqp.TaskConsumer = Mock(return_value=consumer.task_consumer)
++        consumer.app.amqp.queues = {}  # Empty dict for quorum queue detection
++
++        tasks_instance = Tasks(consumer)
++        tasks_instance.start(consumer)
++
++        # Should not modify can_consume method for non-Redis brokers
++        assert consumer.task_consumer.channel.qos.can_consume == original_can_consume
++
+ 
+ @pytest.mark.parametrize(
+     "broker_connection_retry_on_startup,is_connection_loss_on_startup",
+@@ -847,6 +894,7 @@ def test_log_when_qos_is_false(self, caplog):
+         c = self.c
+         c.connection.transport.driver_type = 'amqp'
+         c.app.conf.broker_native_delayed_delivery = True
++        c.app.conf.worker_disable_prefetch = False  # Prevent our warning from interfering
+         c.app.amqp.queues = {"celery": Mock(queue_arguments={"x-queue-type": "quorum"})}
+         tasks = Tasks(c)
+ 

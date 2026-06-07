@@ -1,0 +1,1 @@
+* [#15144](https://github.com/rubocop/rubocop/issues/15144): Fix an error in `Style/SoleNestedConditional` when autocorrecting nested conditionals containing comments. ([@koic][])

@@ -1,0 +1,1024 @@
+diff --git a/crates/engine/src/game/coverage.rs b/crates/engine/src/game/coverage.rs
+index cf3119f97..d95de105a 100644
+--- a/crates/engine/src/game/coverage.rs
++++ b/crates/engine/src/game/coverage.rs
+@@ -1133,9 +1133,16 @@ fn fmt_quantity_ref(qty: &QuantityRef) -> String {
+         QuantityRef::CardsDrawnThisTurn { player } => {
+             format!("cards drawn this turn ({})", fmt_player_scope(player))
+         }
+-        QuantityRef::LandsPlayedThisTurn { player } => {
+-            format!("lands played this turn ({})", fmt_player_scope(player))
+-        }
++        QuantityRef::LandsPlayedThisTurn { player, from_zones } => from_zones.as_ref().map_or_else(
++            || format!("lands played this turn ({})", fmt_player_scope(player)),
++            |zones| {
++                format!(
++                    "lands played this turn ({}, from {:?})",
++                    fmt_player_scope(player),
++                    zones
++                )
++            },
++        ),
+         QuantityRef::ZoneChangeCountThisTurn { from, to, filter } => {
+             format!(
+                 "{} zone changes this turn ({from:?}->{to:?})",
+diff --git a/crates/engine/src/game/engine.rs b/crates/engine/src/game/engine.rs
+index ab607e52c..70eb74996 100644
+--- a/crates/engine/src/game/engine.rs
++++ b/crates/engine/src/game/engine.rs
+@@ -7,7 +7,7 @@ use crate::types::actions::GameAction;
+ use crate::types::events::{BendingType, ContestRound, GameEvent, ManaTapState, PlayerActionKind};
+ use crate::types::game_state::{
+     ActionResult, AutoPassMode, AutoPassRequest, CastOfferKind, ConvokeMode, CostResume, GameState,
+-    PayCostKind, RetargetScope, StackEntry, StackEntryKind, WaitingFor,
++    LandPlayRecord, PayCostKind, RetargetScope, StackEntry, StackEntryKind, WaitingFor,
+ };
+ use crate::types::identifiers::{CardId, ObjectId};
+ use crate::types::match_config::MatchType;
+@@ -4718,6 +4718,20 @@ fn mark_land_played_from_zone(state: &mut GameState, object_id: ObjectId, zone:
+     }
+ }
+ 
++fn record_land_played_from_zone(
++    state: &mut GameState,
++    player: PlayerId,
++    object_id: ObjectId,
++    zone: Zone,
++) {
++    mark_land_played_from_zone(state, object_id, zone);
++    state
++        .lands_played_this_turn_by_player
++        .entry(player)
++        .or_default()
++        .push_back(LandPlayRecord { from_zone: zone });
++}
++
+ fn handle_play_land(
+     state: &mut GameState,
+     object_id: ObjectId,
+@@ -4986,7 +5000,7 @@ fn handle_play_land(
+                     )
+                 {
+                     state.lands_played_this_turn += 1;
+-                    mark_land_played_from_zone(state, object_id, origin_zone);
++                    record_land_played_from_zone(state, player, object_id, origin_zone);
+                     record_graveyard_play_permission(state, gy_permission_source, object_id);
+                     record_exile_play_permission(state, exile_permission_source);
+                     if let Some(p) = state.players.iter_mut().find(|p| p.id == player) {
+@@ -5014,7 +5028,7 @@ fn handle_play_land(
+             // Increment counters now — the land play is committed, only the ETB
+             // effect is pending.
+             state.lands_played_this_turn += 1;
+-            mark_land_played_from_zone(state, object_id, origin_zone);
++            record_land_played_from_zone(state, player, object_id, origin_zone);
+             // CR 604.2: Record once-per-turn graveyard play permission usage.
+             record_graveyard_play_permission(state, gy_permission_source, object_id);
+             record_exile_play_permission(state, exile_permission_source);
+@@ -5038,7 +5052,7 @@ fn handle_play_land(
+ 
+     // Increment land counter
+     state.lands_played_this_turn += 1;
+-    mark_land_played_from_zone(state, object_id, origin_zone);
++    record_land_played_from_zone(state, player, object_id, origin_zone);
+     // CR 604.2: Record once-per-turn graveyard play permission usage.
+     record_graveyard_play_permission(state, gy_permission_source, object_id);
+     record_exile_play_permission(state, exile_permission_source);
+diff --git a/crates/engine/src/game/quantity.rs b/crates/engine/src/game/quantity.rs
+index beb442e12..de0a20a8d 100644
+--- a/crates/engine/src/game/quantity.rs
++++ b/crates/engine/src/game/quantity.rs
+@@ -1903,9 +1903,24 @@ fn resolve_ref(
+             })
+         }
+         // CR 305.2a + CR 603.4: Lands played this turn by the scoped player.
+-        QuantityRef::LandsPlayedThisTurn { player } => {
++        QuantityRef::LandsPlayedThisTurn { player, from_zones } => {
+             resolve_per_player_scalar(state, player, controller, ctx, targets, ability, |p| {
+-                i32::from(p.lands_played_this_turn)
++                from_zones.as_ref().map_or_else(
++                    || i32::from(p.lands_played_this_turn),
++                    |zones| {
++                        usize_to_i32_saturating(
++                            state.lands_played_this_turn_by_player.get(&p.id).map_or(
++                                0,
++                                |records| {
++                                    records
++                                        .iter()
++                                        .filter(|record| zones.contains(&record.from_zone))
++                                        .count()
++                                },
++                            ),
++                        )
++                    },
++                )
+             })
+         }
+         // CR 400.7 + CR 700.4: Count zone-change snapshots from this turn
+@@ -3527,7 +3542,7 @@ mod tests {
+     use crate::types::keywords::Keyword;
+     use crate::types::mana::{ManaColor, ManaCost, ManaCostShard};
+     use crate::types::zones::Zone;
+-    use crate::types::SpellCastRecord;
++    use crate::types::{LandPlayRecord, SpellCastRecord};
+ 
+     fn add_spent_mana_source_snapshot(
+         state: &mut GameState,
+@@ -7240,6 +7255,50 @@ mod tests {
+         assert_eq!(resolve_quantity(&state, &expr, PlayerId(0), ObjectId(1)), 1);
+     }
+ 
++    #[test]
++    fn resolve_quantity_lands_played_this_turn_filters_origin_zone() {
++        let mut state = GameState::new_two_player(42);
++        state.players[0].lands_played_this_turn = 2;
++        state.lands_played_this_turn_by_player.insert(
++            PlayerId(0),
++            crate::im::Vector::from(vec![
++                LandPlayRecord {
++                    from_zone: Zone::Hand,
++                },
++                LandPlayRecord {
++                    from_zone: Zone::Exile,
++                },
++            ]),
++        );
++
++        let unrestricted = QuantityExpr::Ref {
++            qty: QuantityRef::LandsPlayedThisTurn {
++                player: PlayerScope::Controller,
++                from_zones: None,
++            },
++        };
++        let outside_hand = QuantityExpr::Ref {
++            qty: QuantityRef::LandsPlayedThisTurn {
++                player: PlayerScope::Controller,
++                from_zones: Some(vec![
++                    Zone::Graveyard,
++                    Zone::Library,
++                    Zone::Exile,
++                    Zone::Command,
++                ]),
++            },
++        };
++
++        assert_eq!(
++            resolve_quantity(&state, &unrestricted, PlayerId(0), ObjectId(1)),
++            2
++        );
++        assert_eq!(
++            resolve_quantity(&state, &outside_hand, PlayerId(0), ObjectId(1)),
++            1
++        );
++    }
++
+     #[test]
+     fn resolve_quantity_spells_cast_this_game_filtered_by_name() {
+         // CR 117.1 + CR 201.2: Approach of the Second Sun's game-scope name
+diff --git a/crates/engine/src/game/turns.rs b/crates/engine/src/game/turns.rs
+index 5cd3f1c36..63eb679d1 100644
+--- a/crates/engine/src/game/turns.rs
++++ b/crates/engine/src/game/turns.rs
+@@ -560,6 +560,7 @@ pub fn start_next_turn(state: &mut GameState, events: &mut Vec<GameEvent>) {
+     // a card drawn last turn.
+     state.pending_miracle_offers.clear();
+     state.spells_cast_this_turn_by_player.clear();
++    state.lands_played_this_turn_by_player.clear();
+     state.players_who_searched_library_this_turn.clear();
+     state.player_actions_this_turn.clear();
+     state.players_attacked_this_step.clear();
+diff --git a/crates/engine/src/parser/oracle_casting.rs b/crates/engine/src/parser/oracle_casting.rs
+index 9c06f9301..400b8161c 100644
+--- a/crates/engine/src/parser/oracle_casting.rs
++++ b/crates/engine/src/parser/oracle_casting.rs
+@@ -1,15 +1,16 @@
+ use crate::parser::oracle_nom::error::OracleError;
+ use nom::branch::alt;
+ use nom::bytes::complete::{tag, take_until};
+-use nom::combinator::{all_consuming, map, value};
++use nom::combinator::{all_consuming, map, opt, value};
+ use nom::sequence::{preceded, terminated};
+ use nom::Parser;
+ 
+ use super::oracle_cost::parse_oracle_cost;
+-use super::oracle_util::{parse_mana_symbols, TextPair};
++use super::oracle_util::{parse_mana_symbols, parse_ordinal, TextPair};
+ use crate::parser::oracle_condition::parse_restriction_condition;
+ use crate::types::ability::{
+-    AbilityCost, AdditionalCost, CastingRestriction, ParsedCondition, SpellCastingOption,
++    AbilityCost, AdditionalCost, CastingRestriction, Comparator, ParsedCondition, QuantityExpr,
++    QuantityRef, SpellCastingOption,
+ };
+ 
+ /// Parse "As an additional cost to cast this spell, ..." into an `AdditionalCost`.
+@@ -308,6 +309,13 @@ pub(crate) fn parse_casting_restriction_line(text: &str) -> Option<Vec<CastingRe
+     if let Some(restriction) = parse_negative_self_casting_restriction(&trimmed_lower) {
+         return Some(vec![restriction]);
+     }
++    // Also try after stripping an ability word prefix (e.g., "From the Future — You can't cast ~...").
++    if let Some(after_word) = super::oracle_modal::strip_ability_word(trimmed) {
++        let after_word_lower = after_word.to_lowercase();
++        if let Some(restriction) = parse_negative_self_casting_restriction(&after_word_lower) {
++            return Some(vec![restriction]);
++        }
++    }
+     let effective = if tag::<_, _, OracleError<'_>>("cast this spell only ")
+         .parse(trimmed_lower.as_str())
+         .is_ok()
+@@ -343,23 +351,44 @@ pub(crate) fn parse_casting_restriction_line(text: &str) -> Option<Vec<CastingRe
+ }
+ 
+ fn parse_negative_self_casting_restriction(text: &str) -> Option<CastingRestriction> {
+-    let (condition_text, (subject, negated)) = preceded(
++    // Strip the "you can't cast" prefix first.
++    let after_prefix: &str = preceded(
+         alt((
+             tag::<_, _, OracleError<'_>>("you can't cast "),
+             tag("you cannot cast "),
+             tag("you can\u{2019}t cast "),
+         )),
+-        alt((
+-            map(terminated(take_until(" if "), tag(" if ")), |subject| {
+-                (subject, true)
+-            }),
+-            map(
+-                terminated(take_until(" unless "), tag(" unless ")),
+-                |subject| (subject, false),
+-            ),
+-        )),
++        nom::combinator::rest,
+     )
+     .parse(text)
++    .map(|(_, rest)| rest)
++    .ok()?;
++
++    // "you can't cast ~ during your first[, second, ...] turn[s] of the game"
++    // CR 601.3a: The prohibition window is the caster's own first N turns.
++    // Uses TurnsTaken (per-player, CR 500) — NOT turn_number (global), which
++    // would incorrectly count opponent turns toward the threshold.
++    if let Some(condition) = parse_during_your_nth_turns_of_game_condition(after_prefix) {
++        return Some(CastingRestriction::RequiresCondition {
++            condition: Some(condition),
++        });
++    }
++
++    // "you can't cast ~ if/unless [condition]"
++    let (condition_text, (subject, negated)) = alt((
++        map(
++            terminated(take_until::<_, _, OracleError<'_>>(" if "), tag(" if ")),
++            |subject| (subject, true),
++        ),
++        map(
++            terminated(
++                take_until::<_, _, OracleError<'_>>(" unless "),
++                tag(" unless "),
++            ),
++            |subject| (subject, false),
++        ),
++    ))
++    .parse(after_prefix)
+     .ok()?;
+     let subject = subject.trim();
+     if all_consuming(alt((
+@@ -384,6 +413,75 @@ fn parse_negative_self_casting_restriction(text: &str) -> Option<CastingRestrict
+     })
+ }
+ 
++/// Parse `"[~|this spell] during your first[, second, or third] turn[s] of the game"`
++/// (where `text` is everything after `"you can't cast "`) and return a condition that
++/// is **false** (i.e., blocks casting) while the caster's `turns_taken` ≤ max ordinal.
++///
++/// CR 500 + CR 601.3a: uses `TurnsTaken` (per-player) — NOT `turn_number` (global),
++/// which would incorrectly count opponent turns toward the threshold.
++///
++/// Returns `None` if the phrase doesn't match so the caller falls through to
++/// the `if`/`unless` branch.
++fn parse_during_your_nth_turns_of_game_condition(text: &str) -> Option<ParsedCondition> {
++    // Consume "~" or "this spell", then " during your ".
++    let after_subject: &str = alt((tag::<_, _, OracleError<'_>>("~"), tag("this spell")))
++        .parse(text)
++        .map(|(rest, _)| rest)
++        .ok()?;
++    let after_during: &str = tag::<_, _, OracleError<'_>>(" during your ")
++        .parse(after_subject)
++        .map(|(rest, _)| rest)
++        .ok()?;
++
++    // Parse a comma/or-separated ordinal list: "first", "first or second",
++    // "first, second, or third", etc. Take the maximum ordinal as the threshold.
++    let mut max_ordinal: u32 = 0;
++    let mut remaining = after_during;
++    loop {
++        remaining = alt((
++            tag::<_, _, OracleError<'_>>(", or "),
++            tag(", "),
++            tag(" or "),
++            tag("or "),
++        ))
++        .parse(remaining)
++        .map_or(remaining, |(rest, _)| rest);
++        if let Some((val, rest)) = parse_ordinal(remaining) {
++            max_ordinal = max_ordinal.max(val);
++            remaining = rest;
++        } else {
++            break;
++        }
++    }
++    if max_ordinal == 0 {
++        return None;
++    }
++
++    // Expect "turns" or "turn" (optionally followed by " of the game") and
++    // reject trailing conjuncts so they do not become swallowed restrictions.
++    all_consuming((
++        alt((tag::<_, _, OracleError<'_>>("turns"), tag("turn"))),
++        opt(tag(" of the game")),
++    ))
++    .parse(remaining.trim_start())
++    .ok()?;
++
++    // Casting is allowed only when turns_taken > max_ordinal.
++    // Represented as Not(turns_taken <= max_ordinal) so RequiresCondition
++    // blocks casting while the condition evaluates to false.
++    Some(ParsedCondition::Not {
++        condition: Box::new(ParsedCondition::QuantityComparison {
++            lhs: QuantityExpr::Ref {
++                qty: QuantityRef::TurnsTaken,
++            },
++            comparator: Comparator::LE,
++            rhs: QuantityExpr::Fixed {
++                value: max_ordinal as i32,
++            },
++        }),
++    })
++}
++
+ fn strip_casting_condition_suffixes(text: &str) -> &str {
+     text.trim()
+         .trim_end_matches(" and only as a sorcery")
+@@ -531,8 +629,8 @@ fn scan_timing_restrictions(text: &str) -> Vec<CastingRestriction> {
+ mod tests {
+     use super::*;
+     use crate::types::ability::{
+-        BeholdCostAction, ControllerRef, FilterProp, ParsedCondition, PlayerFilter, QuantityExpr,
+-        QuantityRef, TargetFilter, TypeFilter,
++        BeholdCostAction, Comparator, ControllerRef, FilterProp, ParsedCondition, PlayerFilter,
++        QuantityExpr, QuantityRef, TargetFilter, TypeFilter,
+     };
+     use crate::types::mana::ManaCost;
+     use crate::types::zones::Zone;
+@@ -1391,4 +1489,90 @@ mod tests {
+             "unrecognized if-clause must drop the flash option, got: {option:?}"
+         );
+     }
++
++    // CR 500 + CR 601.3a: "You can't cast ~ during your first[, second, or third] turn[s] of
++    // the game" must use per-player TurnsTaken, NOT the global turn_number.
++    // Regression for issue #2002: Spider-Man 2099 was castable on the player's 3rd turn
++    // because the global turn counter counts both players' turns (my turn 3 = global turn 5).
++    #[test]
++    fn spell_cast_restriction_parses_first_n_turns_of_game_per_player() {
++        // Spider-Man 2099 exact oracle text (with ability-word prefix and curly apostrophe,
++        // after card-name normalization to "~").
++        let restrictions = parse_casting_restriction_line(
++            "From the Future \u{2014} You can\u{2019}t cast ~ during your first, second, or third turns of the game.",
++        )
++        .expect("Spider-Man 2099 restriction should parse");
++        assert_eq!(
++            restrictions,
++            vec![CastingRestriction::RequiresCondition {
++                condition: Some(ParsedCondition::Not {
++                    condition: Box::new(ParsedCondition::QuantityComparison {
++                        lhs: QuantityExpr::Ref {
++                            qty: QuantityRef::TurnsTaken,
++                        },
++                        comparator: Comparator::LE,
++                        rhs: QuantityExpr::Fixed { value: 3 },
++                    }),
++                }),
++            }],
++            "must block casting on turns 1–3 using per-player TurnsTaken, not global turn_number"
++        );
++    }
++
++    #[test]
++    fn spell_cast_restriction_parses_first_two_turns_of_game() {
++        // "first or second" variant — max_ordinal = 2.
++        let restrictions = parse_casting_restriction_line(
++            "You can't cast ~ during your first or second turns of the game.",
++        )
++        .expect("two-turn restriction should parse");
++        assert_eq!(
++            restrictions,
++            vec![CastingRestriction::RequiresCondition {
++                condition: Some(ParsedCondition::Not {
++                    condition: Box::new(ParsedCondition::QuantityComparison {
++                        lhs: QuantityExpr::Ref {
++                            qty: QuantityRef::TurnsTaken,
++                        },
++                        comparator: Comparator::LE,
++                        rhs: QuantityExpr::Fixed { value: 2 },
++                    }),
++                }),
++            }]
++        );
++    }
++
++    #[test]
++    fn spell_cast_restriction_parses_first_turn_of_game() {
++        // Singular "turn" variant — max_ordinal = 1.
++        let restrictions = parse_casting_restriction_line(
++            "You can't cast this spell during your first turn of the game.",
++        )
++        .expect("single-turn restriction should parse");
++        assert_eq!(
++            restrictions,
++            vec![CastingRestriction::RequiresCondition {
++                condition: Some(ParsedCondition::Not {
++                    condition: Box::new(ParsedCondition::QuantityComparison {
++                        lhs: QuantityExpr::Ref {
++                            qty: QuantityRef::TurnsTaken,
++                        },
++                        comparator: Comparator::LE,
++                        rhs: QuantityExpr::Fixed { value: 1 },
++                    }),
++                }),
++            }]
++        );
++    }
++
++    #[test]
++    fn spell_cast_restriction_rejects_trailing_turn_clause_text() {
++        let restrictions = parse_casting_restriction_line(
++            "You can't cast ~ during your first turn of the game and only if you control a Forest.",
++        );
++        assert_eq!(
++            restrictions, None,
++            "trailing conjunct must not be swallowed into an unconditional turn restriction"
++        );
++    }
+ }
+diff --git a/crates/engine/src/parser/oracle_nom/condition.rs b/crates/engine/src/parser/oracle_nom/condition.rs
+index 575b81ada..79cddc023 100644
+--- a/crates/engine/src/parser/oracle_nom/condition.rs
++++ b/crates/engine/src/parser/oracle_nom/condition.rs
+@@ -18,7 +18,8 @@ use super::primitives::{
+ };
+ use super::quantity as nom_quantity;
+ use crate::parser::oracle_target::{
+-    parse_type_phrase, parse_zone_suffix, parse_zone_word, peek_zone_boundary,
++    cast_capable_zones_except, parse_type_phrase, parse_zone_suffix, parse_zone_word,
++    peek_zone_boundary,
+ };
+ use crate::parser::oracle_util::parse_subtype;
+ use crate::types::ability::{
+@@ -2723,6 +2724,9 @@ fn parse_first_spell_this_game_condition(input: &str) -> OracleResult<'_, Static
+ /// CR 700.13: Crime tracking.
+ fn parse_youve_this_turn(input: &str) -> OracleResult<'_, StaticCondition> {
+     let (rest, _) = tag("you've ").parse(input)?;
++    if let Ok(parsed) = parse_youve_played_land_or_cast_spell_this_turn(rest) {
++        return Ok(parsed);
++    }
+     alt((
+         parse_youve_spell_history_condition,
+         parse_youve_card_history_condition,
+@@ -2730,10 +2734,81 @@ fn parse_youve_this_turn(input: &str) -> OracleResult<'_, StaticCondition> {
+         parse_youve_life_history_condition,
+         parse_youve_combat_history_condition,
+         parse_youve_player_action_history_condition,
++        // CR 305.2a + CR 603.4: "you've played a land [this turn]" — land-play
++        // history condition. Backs intervening-if predicates like Spider-Man
++        // 2099's "if you've played a land or cast a spell this turn from
++        // anywhere other than your hand".
++        // The " this turn" suffix is optional so the combinator also serves as
++        // the LHS of `parse_condition_disjunction` when "played a land" is
++        // followed by " or" rather than " this turn".
++        map((tag("played a land"), opt(tag(" this turn"))), |_| {
++            make_quantity_ge(
++                QuantityRef::LandsPlayedThisTurn {
++                    player: PlayerScope::Controller,
++                    from_zones: None,
++                },
++                1,
++            )
++        }),
+     ))
+     .parse(rest)
+ }
+ 
++fn parse_youve_played_land_or_cast_spell_this_turn(
++    input: &str,
++) -> OracleResult<'_, StaticCondition> {
++    let (rest, _) = tag("played a land or cast ").parse(input)?;
++    let (rest, spell_condition) = parse_one_spell_this_turn_after_cast(rest)?;
++    let land_from_zones = spell_condition_origin_zones(&spell_condition);
++    Ok((
++        rest,
++        StaticCondition::Or {
++            conditions: vec![
++                make_quantity_ge(
++                    QuantityRef::LandsPlayedThisTurn {
++                        player: PlayerScope::Controller,
++                        from_zones: land_from_zones,
++                    },
++                    1,
++                ),
++                spell_condition,
++            ],
++        },
++    ))
++}
++
++fn spell_condition_origin_zones(condition: &StaticCondition) -> Option<Vec<Zone>> {
++    let StaticCondition::QuantityComparison {
++        lhs:
++            QuantityExpr::Ref {
++                qty:
++                    QuantityRef::SpellsCastThisTurn {
++                        filter: Some(filter),
++                        ..
++                    },
++            },
++        ..
++    } = condition
++    else {
++        return None;
++    };
++    target_filter_origin_zones(filter)
++}
++
++fn target_filter_origin_zones(filter: &TargetFilter) -> Option<Vec<Zone>> {
++    match filter {
++        TargetFilter::Typed(typed) => typed.properties.iter().find_map(|prop| match prop {
++            FilterProp::InZone { zone } => Some(vec![*zone]),
++            FilterProp::InAnyZone { zones } => Some(zones.clone()),
++            _ => None,
++        }),
++        TargetFilter::And { filters } | TargetFilter::Or { filters } => {
++            filters.iter().find_map(target_filter_origin_zones)
++        }
++        _ => None,
++    }
++}
++
+ fn parse_youve_spell_history_condition(input: &str) -> OracleResult<'_, StaticCondition> {
+     alt((
+         parse_cast_spell_count_this_turn,
+@@ -3730,9 +3805,14 @@ fn parse_one_spell_this_turn_filter(input: &str) -> OracleResult<'_, Option<Targ
+     let (rest, _) = parse_article(input)?;
+     let (rest, type_text) = take_until(" this turn").parse(rest)?;
+     let (rest, _) = tag(" this turn").parse(rest)?;
++    let (rest, origin_props) = parse_spell_history_post_this_turn_origin(rest);
+     if let Ok((empty, _)) = tag::<_, _, OracleError<'_>>("spell").parse(type_text) {
+         if empty.trim().is_empty() {
+-            return Ok((rest, None));
++            return Ok((
++                rest,
++                origin_props
++                    .map(|props| add_spell_history_filter_qualifiers(TargetFilter::Any, props)),
++            ));
+         }
+     }
+     let Some(filter) = parse_spell_history_filter(type_text) else {
+@@ -3741,7 +3821,14 @@ fn parse_one_spell_this_turn_filter(input: &str) -> OracleResult<'_, Option<Targ
+             nom::error::ErrorKind::Fail,
+         )));
+     };
+-    Ok((rest, Some(filter)))
++    Ok((
++        rest,
++        Some(
++            origin_props
++                .map(|props| add_spell_history_filter_qualifiers(filter.clone(), props))
++                .unwrap_or(filter),
++        ),
++    ))
+ }
+ 
+ fn parse_you_cast_both_spell_kinds_this_turn(input: &str) -> OracleResult<'_, StaticCondition> {
+@@ -4070,7 +4157,7 @@ fn parse_spell_history_filter_with_zone_suffix(type_text: &str) -> Option<Target
+     let (suffix, base_text) = take_until::<_, _, OracleError<'_>>(" from ")
+         .parse(type_text)
+         .ok()?;
+-    let (props, _controller, consumed) = parse_zone_suffix(suffix)?;
++    let (props, consumed) = parse_spell_history_origin_props(suffix)?;
+     if !suffix[consumed..].trim().is_empty() {
+         return None;
+     }
+@@ -4079,6 +4166,48 @@ fn parse_spell_history_filter_with_zone_suffix(type_text: &str) -> Option<Target
+     Some(add_spell_history_filter_qualifiers(base_filter, props))
+ }
+ 
++fn parse_spell_history_post_this_turn_origin(input: &str) -> (&str, Option<Vec<FilterProp>>) {
++    parse_spell_history_origin_props(input).map_or((input, None), |(props, consumed)| {
++        (&input[consumed..], Some(props))
++    })
++}
++
++fn parse_spell_history_origin_props(input: &str) -> Option<(Vec<FilterProp>, usize)> {
++    parse_cast_origin_anywhere_other_than_suffix(input).or_else(|| {
++        let (props, _controller, consumed) = parse_zone_suffix(input)?;
++        Some((props, consumed))
++    })
++}
++
++fn parse_cast_origin_anywhere_other_than_suffix(input: &str) -> Option<(Vec<FilterProp>, usize)> {
++    let trimmed = input.trim_start();
++    let leading_ws = input.len() - trimmed.len();
++    let (rest, _) = tag::<_, _, OracleError<'_>>("from anywhere other than ")
++        .parse(trimmed)
++        .ok()?;
++    let (rest, _) = opt(alt((
++        value((), tag::<_, _, OracleError<'_>>("your ")),
++        value((), tag("their ")),
++        value((), tag("his ")),
++        value((), tag("her ")),
++        value((), tag("its ")),
++        value((), tag("a ")),
++        value((), tag("the ")),
++    )))
++    .parse(rest)
++    .ok()?;
++    let (rest, zone) = parse_zone_word(rest).ok()?;
++    let (rest, _) = peek_zone_boundary(rest).ok()?;
++
++    let consumed = leading_ws + trimmed.len() - rest.len();
++    Some((
++        vec![FilterProp::InAnyZone {
++            zones: cast_capable_zones_except(zone),
++        }],
++        consumed,
++    ))
++}
++
+ fn parse_spell_history_base_filter(type_text: &str) -> Option<TargetFilter> {
+     if let Ok((rest, _)) = tag::<_, _, OracleError<'_>>("spell").parse(type_text) {
+         if rest.trim().is_empty() {
+@@ -5707,6 +5836,95 @@ mod tests {
+         assert!(parse_condition("when something happens").is_err());
+     }
+ 
++    #[test]
++    fn parse_played_land_or_cast_spell_from_outside_hand_this_turn() {
++        let (rest, condition) = parse_inner_condition(
++            "you've played a land or cast a spell this turn from anywhere other than your hand",
++        )
++        .unwrap();
++        assert_eq!(rest, "");
++
++        let StaticCondition::Or { conditions } = condition else {
++            panic!("expected Or condition, got {condition:?}");
++        };
++        assert_eq!(conditions.len(), 2);
++        let StaticCondition::QuantityComparison {
++            lhs:
++                QuantityExpr::Ref {
++                    qty:
++                        QuantityRef::LandsPlayedThisTurn {
++                            player: PlayerScope::Controller,
++                            from_zones: Some(land_zones),
++                        },
++                },
++            comparator: Comparator::GE,
++            rhs: QuantityExpr::Fixed { value: 1 },
++        } = &conditions[0]
++        else {
++            panic!(
++                "expected LandsPlayedThisTurn condition, got {:?}",
++                conditions[0]
++            );
++        };
++        assert!(!land_zones.contains(&Zone::Hand));
++        assert!(land_zones.contains(&Zone::Exile));
++
++        let StaticCondition::QuantityComparison {
++            lhs:
++                QuantityExpr::Ref {
++                    qty:
++                        QuantityRef::SpellsCastThisTurn {
++                            scope: CountScope::Controller,
++                            filter: Some(TargetFilter::Typed(TypedFilter { properties, .. })),
++                        },
++                },
++            comparator: Comparator::GE,
++            rhs: QuantityExpr::Fixed { value: 1 },
++        } = &conditions[1]
++        else {
++            panic!(
++                "expected SpellsCastThisTurn condition, got {:?}",
++                conditions[1]
++            );
++        };
++
++        let zones = properties.iter().find_map(|prop| match prop {
++            FilterProp::InAnyZone { zones } => Some(zones),
++            _ => None,
++        });
++        let zones = zones.expect("expected InAnyZone origin qualifier");
++        assert!(!zones.contains(&Zone::Hand));
++        assert!(zones.contains(&Zone::Exile));
++        assert!(zones.contains(&Zone::Graveyard));
++    }
++
++    #[test]
++    fn parse_cast_spell_this_turn_from_zone_after_turn_phrase() {
++        let (rest, condition) =
++            parse_inner_condition("you've cast a creature spell this turn from your graveyard")
++                .unwrap();
++        assert_eq!(rest, "");
++
++        let StaticCondition::QuantityComparison {
++            lhs:
++                QuantityExpr::Ref {
++                    qty:
++                        QuantityRef::SpellsCastThisTurn {
++                            filter: Some(TargetFilter::Typed(TypedFilter { properties, .. })),
++                            ..
++                        },
++                },
++            ..
++        } = condition
++        else {
++            panic!("expected SpellsCastThisTurn condition, got {condition:?}");
++        };
++        assert!(properties.iter().any(|prop| prop
++            == &FilterProp::InZone {
++                zone: Zone::Graveyard
++            }));
++    }
++
+     // -- Generalized control conditions --
+ 
+     #[test]
+diff --git a/crates/engine/src/parser/oracle_static/grammar.rs b/crates/engine/src/parser/oracle_static/grammar.rs
+index c3b12bab8..e20e33b5c 100644
+--- a/crates/engine/src/parser/oracle_static/grammar.rs
++++ b/crates/engine/src/parser/oracle_static/grammar.rs
+@@ -206,14 +206,6 @@ pub(crate) fn parse_cast_from_anywhere_other_than_tp(tp: &TextPair) -> Option<Ve
+     if !nom_primitives::scan_contains(tp.lower, "from anywhere other than") {
+         return None;
+     }
+-    // CR 601.2a: The full set of zones a spell can be cast from.
+-    const CAST_CAPABLE_ZONES: [Zone; 5] = [
+-        Zone::Hand,
+-        Zone::Graveyard,
+-        Zone::Library,
+-        Zone::Exile,
+-        Zone::Command,
+-    ];
+     // Currently only the "their hand(s)" allowed-zone phrasing is printed. The
+     // allowed zone is the hand; the prohibited set is its complement.
+     let allowed = if nom_primitives::scan_contains(tp.lower, "their hand")
+@@ -223,12 +215,9 @@ pub(crate) fn parse_cast_from_anywhere_other_than_tp(tp: &TextPair) -> Option<Ve
+     } else {
+         return None;
+     };
+-    Some(
+-        CAST_CAPABLE_ZONES
+-            .into_iter()
+-            .filter(|zone| *zone != allowed)
+-            .collect(),
+-    )
++    Some(crate::parser::oracle_target::cast_capable_zones_except(
++        allowed,
++    ))
+ }
+ 
+ /// Parse a color name from Oracle text, delegating to the shared nom color combinator.
+diff --git a/crates/engine/src/parser/oracle_target.rs b/crates/engine/src/parser/oracle_target.rs
+index 1986a3406..2e477ce3a 100644
+--- a/crates/engine/src/parser/oracle_target.rs
++++ b/crates/engine/src/parser/oracle_target.rs
+@@ -4811,6 +4811,22 @@ pub(crate) fn parse_zone_suffix(
+     Some((props, ctrl, leading_ws + consumed))
+ }
+ 
++/// CR 601.2a: The zones a spell can be cast from, excluding the named allowed
++/// zone. Used for "from anywhere other than <zone>" cast-origin predicates.
++pub(crate) fn cast_capable_zones_except(allowed: Zone) -> Vec<Zone> {
++    const CAST_CAPABLE_ZONES: [Zone; 5] = [
++        Zone::Hand,
++        Zone::Graveyard,
++        Zone::Library,
++        Zone::Exile,
++        Zone::Command,
++    ];
++    CAST_CAPABLE_ZONES
++        .into_iter()
++        .filter(|zone| *zone != allowed)
++        .collect()
++}
++
+ fn parse_zone_suffix_nom(
+     i: &str,
+ ) -> super::oracle_nom::error::OracleResult<'_, (Vec<FilterProp>, Option<ControllerRef>)> {
+diff --git a/crates/engine/src/parser/oracle_trigger.rs b/crates/engine/src/parser/oracle_trigger.rs
+index 9aade6f3a..2dd4cb227 100644
+--- a/crates/engine/src/parser/oracle_trigger.rs
++++ b/crates/engine/src/parser/oracle_trigger.rs
+@@ -2883,6 +2883,7 @@ fn extract_if_condition(text: &str) -> (String, Option<TriggerCondition>) {
+                 lhs: QuantityExpr::Ref {
+                     qty: QuantityRef::LandsPlayedThisTurn {
+                         player: PlayerScope::Controller,
++                        from_zones: None,
+                     },
+                 },
+                 comparator: Comparator::GE,
+@@ -22988,6 +22989,57 @@ mod tests {
+         );
+     }
+ 
++    #[test]
++    fn combinator_handles_played_land_or_cast_spell_from_outside_hand_this_turn() {
++        let (cleaned, cond) = extract_if_condition(
++            "if you've played a land or cast a spell this turn from anywhere other than your hand, ~ deals damage equal to its power to any target",
++        );
++        assert_eq!(cleaned, "~ deals damage equal to its power to any target");
++
++        let TriggerCondition::Or { conditions } = cond.unwrap() else {
++            panic!("expected Or trigger condition");
++        };
++        assert_eq!(conditions.len(), 2);
++        assert!(matches!(
++            &conditions[0],
++            TriggerCondition::QuantityComparison {
++                lhs: QuantityExpr::Ref {
++                    qty: QuantityRef::LandsPlayedThisTurn {
++                        player: PlayerScope::Controller,
++                        from_zones: Some(_),
++                    }
++                },
++                comparator: Comparator::GE,
++                rhs: QuantityExpr::Fixed { value: 1 },
++            }
++        ));
++
++        let TriggerCondition::QuantityComparison {
++            lhs:
++                QuantityExpr::Ref {
++                    qty:
++                        QuantityRef::SpellsCastThisTurn {
++                            filter: Some(TargetFilter::Typed(TypedFilter { properties, .. })),
++                            ..
++                        },
++                },
++            ..
++        } = &conditions[1]
++        else {
++            panic!(
++                "expected spell-history quantity condition, got {:?}",
++                conditions[1]
++            );
++        };
++        let zones = properties.iter().find_map(|prop| match prop {
++            FilterProp::InAnyZone { zones } => Some(zones),
++            _ => None,
++        });
++        let zones = zones.expect("expected InAnyZone origin qualifier");
++        assert!(!zones.contains(&crate::types::zones::Zone::Hand));
++        assert!(zones.contains(&crate::types::zones::Zone::Exile));
++    }
++
+     #[test]
+     fn fallback_does_not_shadow_specific_not_your_turn() {
+         let (_, cond) = extract_if_condition("if it's not your turn, draw a card");
+diff --git a/crates/engine/src/parser/swallow_check.rs b/crates/engine/src/parser/swallow_check.rs
+index 6b32ec1f9..0bdc887f6 100644
+--- a/crates/engine/src/parser/swallow_check.rs
++++ b/crates/engine/src/parser/swallow_check.rs
+@@ -1962,6 +1962,11 @@ fn detect_duration_this_turn(
+         "OpponentGainedLife",
+         "CastSpellThisTurn",
+         "SpellsCastThisTurn",
++        // CR 305.2a + CR 603.4: "played a land this turn" / "played a land or cast a
++        // spell this turn from anywhere other than your hand" — the land-play count
++        // IS the "this turn" scope; `LandsPlayedThisTurn` in the AST means the clause
++        // was captured by the intervening-if condition parser, not swallowed.
++        "LandsPlayedThisTurn",
+         "AttackedThisTurn",
+         "CounterAddedThisTurn",
+         "NthSpellThisTurn",
+@@ -2594,6 +2599,26 @@ mod tests {
+         assert!(!has_swallowed_detector(&parsed, "Duration_ThisTurn"));
+     }
+ 
++    /// CR 305.2a + CR 603.4: Spider-Man 2099's end-step trigger has "this turn"
++    /// in its intervening-if condition ("if you've played a land or cast a spell
++    /// this turn from anywhere other than your hand"). Both arms of the disjunction
++    /// are turn-history quantities (`LandsPlayedThisTurn` / `SpellsCastThisTurn`)
++    /// — not forward-looking durations — so `detect_duration_this_turn` must not
++    /// fire even after the casting restriction parses cleanly (no Unimplemented
++    /// shield).
++    #[test]
++    fn duration_this_turn_accepts_land_or_spell_this_turn_disjunction_condition() {
++        let parsed = parse_named(
++            "From the Future \u{2014} You can\u{2019}t cast ~ during your first, second, or third turns of the game.\n\
++             Double strike, vigilance\n\
++             At the beginning of your end step, if you've played a land or cast a spell this turn from anywhere other than your hand, ~ deals damage equal to its power to any target.",
++            "Spider-Man 2099",
++            &["Creature"],
++        );
++
++        assert!(!has_swallowed_detector(&parsed, "Duration_ThisTurn"));
++    }
++
+     /// CR 611.3: an "as long as ... this turn" clause routed into an
+     /// `Unrecognized` condition slot means "this turn" was consumed by a
+     /// condition, not dropped as an effect duration (War Historian shape).
+diff --git a/crates/engine/src/types/ability.rs b/crates/engine/src/types/ability.rs
+index 992c29712..ea210e34f 100644
+--- a/crates/engine/src/types/ability.rs
++++ b/crates/engine/src/types/ability.rs
+@@ -3248,9 +3248,14 @@ pub enum QuantityRef {
+     /// four or more cards this turn" reuse the existing per-player aggregate axis.
+     CardsDrawnThisTurn { player: PlayerScope },
+     /// CR 305.2a + CR 603.4: Count of lands played by the scoped player this turn.
+-    /// Backed by `Player::lands_played_this_turn`. Used for intervening-if conditions
+-    /// like "if it wasn't the first land you played this turn" (Fastbond).
+-    LandsPlayedThisTurn { player: PlayerScope },
++    /// `from_zones: None` uses `Player::lands_played_this_turn`; `Some` reads the
++    /// per-player land-play origin history for conditions like "played a land
++    /// from anywhere other than your hand."
++    LandsPlayedThisTurn {
++        player: PlayerScope,
++        #[serde(default, skip_serializing_if = "Option::is_none")]
++        from_zones: Option<Vec<Zone>>,
++    },
+     /// CR 500: Number of turns this player has taken so far in the game.
+     /// Resolved against the controller/scope player.
+     TurnsTaken,
+diff --git a/crates/engine/src/types/game_state.rs b/crates/engine/src/types/game_state.rs
+index d96abdb83..a4896a422 100644
+--- a/crates/engine/src/types/game_state.rs
++++ b/crates/engine/src/types/game_state.rs
+@@ -236,6 +236,15 @@ pub struct SpellCastRecord {
+     pub cast_variant: CastingVariant,
+ }
+ 
++/// Snapshot of a land play's cast-capable origin for per-turn history queries.
++#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
++pub struct LandPlayRecord {
++    /// CR 305.2a + CR 601.2a: Zone the land was played from, captured at play
++    /// time so end-step conditions can answer "played a land from outside your
++    /// hand" after the land has moved or left the battlefield.
++    pub from_zone: Zone,
++}
++
+ /// CR 601.2a: Default origin zone for `SpellCastRecord.from_zone`. Hand is the
+ /// overwhelmingly common cast origin, so it's the safe default for snapshots
+ /// that pre-date the non-Option migration.
+@@ -4815,6 +4824,11 @@ pub struct GameState {
+     /// enabling data-driven filtered counting at resolution.
+     #[serde(default)]
+     pub spells_cast_this_turn_by_player: HashMap<PlayerId, im::Vector<SpellCastRecord>>,
++    /// Per-player land play origin history this turn.
++    /// Mirrors `Player::lands_played_this_turn` when origin-sensitive
++    /// conditions need to distinguish hand plays from exile/graveyard plays.
++    #[serde(default)]
++    pub lands_played_this_turn_by_player: HashMap<PlayerId, im::Vector<LandPlayRecord>>,
+     #[serde(default)]
+     pub players_who_searched_library_this_turn: HashSet<PlayerId>,
+     /// CR 603.4: Typed player-action events performed this turn. This is the
+@@ -5703,6 +5717,7 @@ impl GameState {
+             spells_cast_this_game: HashMap::new(),
+             spells_cast_this_game_by_player: HashMap::new(),
+             spells_cast_this_turn_by_player: HashMap::new(),
++            lands_played_this_turn_by_player: HashMap::new(),
+             players_who_searched_library_this_turn: HashSet::new(),
+             player_actions_this_turn: Vec::new(),
+             players_attacked_this_step: HashSet::new(),
+@@ -6110,6 +6125,7 @@ impl PartialEq for GameState {
+             && self.spells_cast_this_game == other.spells_cast_this_game
+             && self.spells_cast_this_game_by_player == other.spells_cast_this_game_by_player
+             && self.spells_cast_this_turn_by_player == other.spells_cast_this_turn_by_player
++            && self.lands_played_this_turn_by_player == other.lands_played_this_turn_by_player
+             && self.players_who_searched_library_this_turn
+                 == other.players_who_searched_library_this_turn
+             && self.player_actions_this_turn == other.player_actions_this_turn
+diff --git a/crates/engine/src/types/mod.rs b/crates/engine/src/types/mod.rs
+index 0eb6d1871..23372a684 100644
+--- a/crates/engine/src/types/mod.rs
++++ b/crates/engine/src/types/mod.rs
+@@ -39,7 +39,7 @@ pub use events::GameEvent;
+ pub use format::{DeckCopyLimit, FormatConfig, GameFormat};
+ pub use game_state::{
+     ActionResult, BattlefieldEntryRecord, CommanderDamageEntry, CostResume, GameState, LKISnapshot,
+-    NextSpellModifier, PayCostKind, PendingNextSpellModifier, PendingReplacement,
++    LandPlayRecord, NextSpellModifier, PayCostKind, PendingNextSpellModifier, PendingReplacement,
+     PendingSpellCostReduction, PlayerDeckPool, ScheduledTurnControl, SpellCastRecord, StackEntry,
+     StackEntryKind, TransientContinuousEffect, WaitingFor, ZoneChangeRecord,
+ };
+diff --git a/crates/engine/tests/integration/anaphoric_scope_allowlist_guard.rs b/crates/engine/tests/integration/anaphoric_scope_allowlist_guard.rs
+index d4edcd599..a129d05aa 100644
+--- a/crates/engine/tests/integration/anaphoric_scope_allowlist_guard.rs
++++ b/crates/engine/tests/integration/anaphoric_scope_allowlist_guard.rs
+@@ -496,6 +496,10 @@ fn anaphoric_scope_set_is_frozen() {
+     // them) moved 95 cards from this set into DEMONSTRATIVE_SCOPE_CARDS, and
+     // Steadfast Armasaur's "its toughness" rebound to `Source` (the LKI-toughness
+     // fix), taking the count 252 -> 156; the Optional_YouMay capture fix
++    // (#2277) then dropped "ian the reckless" to 155. The causative "may have"
++    // parser (#2313) then rebound Immersturm/Pandemonium to
++    // ParentObjectTargetController, taking the count to 153. If #512/#511 land,
++    // this shrinks further.
+     // (#2277) then dropped "ian the reckless" to 155. The "may have" causative
+     // optional fix (#2313) restructured the optional sub-effect of Pandemonium /
+     // Immersturm ("...may have it deal damage equal to its power..."), letting the

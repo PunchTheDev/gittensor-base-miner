@@ -1,0 +1,1510 @@
+diff --git a/integrations/raycast/package.json b/integrations/raycast/package.json
+index 572910b5ea..359afd01b3 100644
+--- a/integrations/raycast/package.json
++++ b/integrations/raycast/package.json
+@@ -140,6 +140,30 @@
+         "terminal"
+       ]
+     },
++    {
++      "name": "trending",
++      "title": "Trending Resources",
++      "description": "Browse trending HeyClaude resources from public registry signals.",
++      "mode": "view",
++      "keywords": [
++        "trending",
++        "popular",
++        "claude",
++        "discovery"
++      ]
++    },
++    {
++      "name": "recent-updates",
++      "title": "Recent Updates",
++      "description": "Browse recently added or updated HeyClaude registry entries.",
++      "mode": "view",
++      "keywords": [
++        "recent",
++        "updates",
++        "changelog",
++        "claude"
++      ]
++    },
+     {
+       "name": "jobs",
+       "title": "Browse HeyClaude Jobs",
+diff --git a/integrations/raycast/raycast-env.d.ts b/integrations/raycast/raycast-env.d.ts
+index 63b15539ff..658171609b 100644
+--- a/integrations/raycast/raycast-env.d.ts
++++ b/integrations/raycast/raycast-env.d.ts
+@@ -35,6 +35,10 @@ declare namespace Preferences {
+   export type SearchCollections = ExtensionPreferences & {}
+   /** Preferences accessible in the `search-statuslines` command */
+   export type SearchStatuslines = ExtensionPreferences & {}
++  /** Preferences accessible in the `trending` command */
++  export type Trending = ExtensionPreferences & {}
++  /** Preferences accessible in the `recent-updates` command */
++  export type RecentUpdates = ExtensionPreferences & {}
+   /** Preferences accessible in the `jobs` command */
+   export type Jobs = ExtensionPreferences & {}
+   /** Preferences accessible in the `submit-content` command */
+@@ -66,6 +70,10 @@ declare namespace Arguments {
+   export type SearchCollections = {}
+   /** Arguments passed to the `search-statuslines` command */
+   export type SearchStatuslines = {}
++  /** Arguments passed to the `trending` command */
++  export type Trending = {}
++  /** Arguments passed to the `recent-updates` command */
++  export type RecentUpdates = {}
+   /** Arguments passed to the `jobs` command */
+   export type Jobs = {}
+   /** Arguments passed to the `submit-content` command */
+diff --git a/integrations/raycast/src/discovery-command.tsx b/integrations/raycast/src/discovery-command.tsx
+new file mode 100644
+index 0000000000..2b21b13de1
+--- /dev/null
++++ b/integrations/raycast/src/discovery-command.tsx
+@@ -0,0 +1,567 @@
++import {
++  Action,
++  ActionPanel,
++  Cache,
++  Clipboard,
++  Color,
++  Icon,
++  List,
++  LocalStorage,
++  PopToRootType,
++  Toast,
++  showHUD,
++  showToast,
++} from "@raycast/api";
++import { useEffect, useMemo, useRef, useState } from "react";
++import {
++  FAVORITES_KEY,
++  FEED_URL,
++  absoluteDataUrl,
++  attachDiscoveryEntries,
++  buildContributeEntryUrl,
++  buildEntrySummary,
++  buildSuggestChangeUrl,
++  categoryLabel,
++  entryKey,
++  filterDiscoveryEntries,
++  parseFavoriteKeys,
++  serializeFavoriteKeys,
++  sortedCategoryOptions,
++  type RaycastDiscoveryEntry,
++  type RaycastEntry,
++} from "./feed";
++import {
++  fetchFreshFeed,
++  fetchFreshRecentUpdates,
++  fetchFreshTrending,
++  loadCachedFeed as loadCachedFeedFromRuntime,
++  loadCachedRecentUpdates,
++  loadCachedTrending,
++  loadEntryDetail,
++} from "./runtime";
++import { markdownLink, withRaycastUtm } from "./links";
++import { entryDetailMetadata, entrySnippetKeyword } from "./raycast-ui";
++
++const cache = new Cache();
++
++type DiscoveryCommandOptions = {
++  kind: "trending" | "recent";
++  title: string;
++  emptyTitle: string;
++  emptyDescription: string;
++  searchPlaceholder: string;
++};
++
++const categoryIcons: Record<string, Icon> = {
++  agents: Icon.Person,
++  mcp: Icon.Network,
++  tools: Icon.AppWindow,
++  skills: Icon.Hammer,
++  rules: Icon.TextDocument,
++  commands: Icon.Terminal,
++  hooks: Icon.Bolt,
++  guides: Icon.Book,
++  collections: Icon.Folder,
++  statuslines: Icon.BarChart,
++};
++
++function getConfiguredFeed() {
++  return { feedUrl: FEED_URL };
++}
++
++function loadCachedFeed(feedUrl: string) {
++  return loadCachedFeedFromRuntime(cache, feedUrl);
++}
++
++function loadCachedDiscovery(
++  kind: DiscoveryCommandOptions["kind"],
++  feedUrl: string,
++) {
++  return kind === "trending"
++    ? loadCachedTrending(cache, feedUrl)
++    : loadCachedRecentUpdates(cache, feedUrl);
++}
++
++async function fetchFreshDiscovery(
++  kind: DiscoveryCommandOptions["kind"],
++  feedUrl: string,
++) {
++  return kind === "trending"
++    ? fetchFreshTrending({ cache, feedUrl })
++    : fetchFreshRecentUpdates({ cache, feedUrl });
++}
++
++async function loadFavorites() {
++  const raw = await LocalStorage.getItem<string>(FAVORITES_KEY);
++  if (!raw) return new Set<string>();
++
++  try {
++    return new Set(parseFavoriteKeys(raw));
++  } catch {
++    await LocalStorage.removeItem(FAVORITES_KEY);
++    return new Set<string>();
++  }
++}
++
++async function persistFavorites(favorites: Set<string>) {
++  await LocalStorage.setItem(FAVORITES_KEY, serializeFavoriteKeys(favorites));
++}
++
++function raycastEntryIcon(entry: RaycastEntry, feedUrl: string) {
++  const brandIconUrl = String(entry.brandIconUrl || "").trim();
++  return brandIconUrl
++    ? { source: absoluteDataUrl(brandIconUrl, feedUrl) }
++    : (categoryIcons[entry.category] ?? Icon.Document);
++}
++
++function updateKindLabel(value?: string) {
++  switch (value) {
++    case "added":
++      return "Added";
++    case "updated":
++      return "Updated";
++    case "removed":
++      return "Removed";
++    case "upstream_update":
++      return "Upstream update";
++    default:
++      return "Update";
++  }
++}
++
++function reasonLabel(value: string) {
++  return value
++    .split("_")
++    .map((part) => part.slice(0, 1).toUpperCase() + part.slice(1))
++    .join(" ");
++}
++
++function discoveryBadge(entry: RaycastDiscoveryEntry) {
++  if (typeof entry.discovery.score === "number") {
++    return `Score ${Math.round(entry.discovery.score)}`;
++  }
++  return updateKindLabel(entry.discovery.updateKind);
++}
++
++function discoveryAccessories(
++  entry: RaycastDiscoveryEntry,
++  isFavorite: boolean,
++): List.Item.Accessory[] {
++  const accessories: List.Item.Accessory[] = [];
++
++  if (isFavorite) {
++    accessories.push({
++      icon: { source: Icon.Star, tintColor: Color.Yellow },
++    });
++  }
++  accessories.push({ text: discoveryBadge(entry) });
++  if (entry.downloadTrust === "first-party") {
++    accessories.push({
++      icon: { source: Icon.CheckCircle, tintColor: Color.Green },
++    });
++  }
++
++  return accessories;
++}
++
++function buildDiscoverySummary(entry: RaycastDiscoveryEntry) {
++  const reasons = entry.discovery.reasons.map(reasonLabel).join(", ");
++  return [
++    buildEntrySummary(entry),
++    reasons ? `Reasons: ${reasons}` : "",
++    entry.discovery.updatedAt ? `Updated: ${entry.discovery.updatedAt}` : "",
++  ]
++    .filter(Boolean)
++    .join("\n");
++}
++
++function discoveryMarkdown(entry: RaycastDiscoveryEntry, kind: string) {
++  const lines = [
++    kind === "trending" ? "## Trending signal" : "## Recent update",
++    `- ${discoveryBadge(entry)}`,
++    entry.discovery.updatedAt ? `- Updated: ${entry.discovery.updatedAt}` : "",
++    entry.discovery.reasons.length
++      ? `- Reasons: ${entry.discovery.reasons.map(reasonLabel).join(", ")}`
++      : "",
++    "",
++    entry.detailMarkdown,
++  ];
++  return lines.filter((line) => line !== "").join("\n");
++}
++
++function favoriteFilterOptions(entries: RaycastDiscoveryEntry[]) {
++  return sortedCategoryOptions(entries);
++}
++
++export function createDiscoveryCommand(options: DiscoveryCommandOptions) {
++  return function DiscoveryCommand() {
++    const configuredFeed = getConfiguredFeed();
++    const cachedFeed = loadCachedFeed(configuredFeed.feedUrl);
++    const cachedDiscovery = loadCachedDiscovery(
++      options.kind,
++      configuredFeed.feedUrl,
++    );
++    const [entries, setEntries] = useState<RaycastEntry[]>(cachedFeed.entries);
++    const [references, setReferences] = useState(cachedDiscovery.entries);
++    const [generatedAt, setGeneratedAt] = useState(
++      cachedDiscovery.generatedAt || cachedFeed.generatedAt,
++    );
++    const [isLoading, setIsLoading] = useState(
++      entries.length === 0 || references.length === 0,
++    );
++    const [filter, setFilter] = useState("all");
++    const [favorites, setFavorites] = useState<Set<string>>(new Set());
++    const entriesCountRef = useRef(entries.length);
++
++    useEffect(() => {
++      entriesCountRef.current = entries.length;
++    }, [entries.length]);
++
++    async function refreshEntries(showSuccess = false) {
++      setIsLoading(true);
++      try {
++        const [nextFeed, nextDiscovery] = await Promise.all([
++          fetchFreshFeed({ cache, feedUrl: configuredFeed.feedUrl }),
++          fetchFreshDiscovery(options.kind, configuredFeed.feedUrl),
++        ]);
++        entriesCountRef.current = nextFeed.entries.length;
++        setEntries(nextFeed.entries);
++        setReferences(nextDiscovery.entries);
++        setGeneratedAt(nextDiscovery.generatedAt || nextFeed.generatedAt);
++
++        if (showSuccess) {
++          const stale =
++            nextFeed.refreshStatus === "stale" ||
++            nextDiscovery.refreshStatus === "stale";
++          await showToast({
++            style: stale ? Toast.Style.Failure : Toast.Style.Success,
++            title: stale
++              ? `Could not fully refresh ${options.title}`
++              : `${options.title} refreshed`,
++            message: stale
++              ? nextFeed.refreshWarning || nextDiscovery.refreshWarning
++              : `${nextDiscovery.entries.length} entries`,
++          });
++        }
++      } catch (error) {
++        if (entriesCountRef.current === 0 || showSuccess) {
++          await showToast({
++            style: Toast.Style.Failure,
++            title: showSuccess
++              ? `Could not refresh ${options.title}`
++              : `Could not load ${options.title}`,
++            message:
++              error instanceof Error ? error.message : "Unknown feed error",
++          });
++        }
++      } finally {
++        setIsLoading(false);
++      }
++    }
++
++    useEffect(() => {
++      void refreshEntries(false);
++      // Run only once on command open. Manual refresh is exposed as an action.
++    }, []);
++
++    useEffect(() => {
++      let cancelled = false;
++
++      async function initializeFavorites() {
++        const loaded = await loadFavorites();
++        if (!cancelled) setFavorites(loaded);
++      }
++
++      void initializeFavorites();
++      return () => {
++        cancelled = true;
++      };
++    }, []);
++
++    const discoveryEntries = useMemo(
++      () =>
++        attachDiscoveryEntries(entries, references, {
++          fallbackForRemoved: options.kind === "recent",
++        }),
++      [entries, references],
++    );
++    const categoryOptions = useMemo(
++      () => favoriteFilterOptions(discoveryEntries),
++      [discoveryEntries],
++    );
++    const displayedEntries = useMemo(
++      () => filterDiscoveryEntries(discoveryEntries, filter, favorites),
++      [discoveryEntries, favorites, filter],
++    );
++
++    async function copyFullAsset(entry: RaycastDiscoveryEntry) {
++      try {
++        const detail = await loadEntryDetail({
++          entry,
++          cache,
++          feedUrl: configuredFeed.feedUrl,
++        });
++        await Clipboard.copy(detail.copyText || entry.copyText);
++        await showHUD(`Copied ${entry.title}`, {
++          popToRootType: PopToRootType.Immediate,
++        });
++      } catch (error) {
++        await showToast({
++          style: Toast.Style.Failure,
++          title: "Could not copy full asset",
++          message: error instanceof Error ? error.message : "Unknown error",
++        });
++      }
++    }
++
++    async function pasteFullAsset(entry: RaycastDiscoveryEntry) {
++      try {
++        const detail = await loadEntryDetail({
++          entry,
++          cache,
++          feedUrl: configuredFeed.feedUrl,
++        });
++        await Clipboard.paste(detail.copyText || entry.copyText);
++        await showHUD(`Pasted ${entry.title}`, {
++          popToRootType: PopToRootType.Immediate,
++        });
++      } catch (error) {
++        await showToast({
++          style: Toast.Style.Failure,
++          title: "Could not paste full asset",
++          message: error instanceof Error ? error.message : "Unknown error",
++        });
++      }
++    }
++
++    async function toggleFavorite(entry: RaycastDiscoveryEntry) {
++      const key = entryKey(entry);
++      const next = new Set(favorites);
++      const isFavorite = next.has(key);
++
++      if (isFavorite) next.delete(key);
++      else next.add(key);
++
++      setFavorites(next);
++      await persistFavorites(next);
++      await showToast({
++        style: Toast.Style.Success,
++        title: isFavorite ? "Removed favorite" : "Added favorite",
++        message: entry.title,
++      });
++    }
++
++    const emptyTitle =
++      filter === "favorites" ? "No favorites yet" : options.emptyTitle;
++    const emptyDescription =
++      filter === "favorites"
++        ? "Add favorites from any registry command to keep them here."
++        : options.emptyDescription;
++
++    return (
++      <List
++        isLoading={isLoading}
++        isShowingDetail
++        searchBarPlaceholder={options.searchPlaceholder}
++        searchBarAccessory={
++          <List.Dropdown
++            tooltip="Filter entries"
++            value={filter}
++            onChange={setFilter}
++          >
++            {categoryOptions.map((option) => (
++              <List.Dropdown.Item
++                key={option.value}
++                value={option.value}
++                title={option.title}
++              />
++            ))}
++          </List.Dropdown>
++        }
++      >
++        {displayedEntries.map((entry) => {
++          const isFavorite = favorites.has(entryKey(entry));
++          const hasInstallCommand = Boolean(entry.installCommand.trim());
++          const hasConfig = Boolean(entry.configSnippet.trim());
++          const webUrl = withRaycastUtm(entry.webUrl, options.kind);
++
++          return (
++            <List.Item
++              key={`${options.kind}:${entryKey(entry)}`}
++              title={entry.title}
++              subtitle={categoryLabel(entry.category)}
++              keywords={[
++                entry.category,
++                categoryLabel(entry.category),
++                entry.brandName || "",
++                entry.brandDomain || "",
++                entry.discovery.updateKind || "",
++                ...entry.discovery.reasons,
++                ...entry.tags,
++              ].filter(Boolean)}
++              icon={raycastEntryIcon(entry, configuredFeed.feedUrl)}
++              accessories={discoveryAccessories(entry, isFavorite)}
++              detail={
++                <List.Item.Detail
++                  markdown={discoveryMarkdown(entry, options.kind)}
++                  metadata={entryDetailMetadata(entry, generatedAt)}
++                />
++              }
++              actions={
++                <ActionPanel>
++                  <ActionPanel.Section title="Use">
++                    <Action
++                      title="Copy Full Asset"
++                      icon={Icon.Clipboard}
++                      shortcut={{ modifiers: ["cmd"], key: "c" }}
++                      onAction={() => void copyFullAsset(entry)}
++                    />
++                    <Action
++                      title="Paste Full Asset"
++                      icon={Icon.TextCursor}
++                      shortcut={{ modifiers: ["cmd", "shift"], key: "v" }}
++                      onAction={() => void pasteFullAsset(entry)}
++                    />
++                    {hasInstallCommand ? (
++                      <Action.CopyToClipboard
++                        title="Copy Install Command"
++                        content={entry.installCommand}
++                        shortcut={{ modifiers: ["cmd"], key: "i" }}
++                      />
++                    ) : null}
++                    {hasConfig ? (
++                      <Action.CopyToClipboard
++                        title="Copy Config"
++                        content={entry.configSnippet}
++                        shortcut={{ modifiers: ["cmd"], key: "." }}
++                      />
++                    ) : null}
++                    <Action.OpenInBrowser
++                      title="Open on HeyClaude"
++                      url={webUrl}
++                      shortcut={{ modifiers: ["cmd"], key: "o" }}
++                    />
++                    {entry.documentationUrl ? (
++                      <Action.OpenInBrowser
++                        title="Open Documentation"
++                        url={entry.documentationUrl}
++                      />
++                    ) : null}
++                    {entry.repoUrl ? (
++                      <Action.OpenInBrowser
++                        title="Open Source"
++                        url={entry.repoUrl}
++                      />
++                    ) : null}
++                  </ActionPanel.Section>
++                  <ActionPanel.Section title="Share">
++                    <Action.CopyToClipboard
++                      title="Copy Discovery Summary"
++                      content={buildDiscoverySummary(entry)}
++                    />
++                    <Action.CopyToClipboard
++                      title="Copy Canonical URL"
++                      content={entry.webUrl}
++                    />
++                    <Action.CopyToClipboard
++                      title="Copy Markdown Link"
++                      content={markdownLink(entry.title, entry.webUrl)}
++                    />
++                    {entry.brandDomain ? (
++                      <Action.CopyToClipboard
++                        title="Copy Brand Domain"
++                        content={entry.brandDomain}
++                      />
++                    ) : null}
++                  </ActionPanel.Section>
++                  <ActionPanel.Section title="Create">
++                    <Action.CreateQuicklink
++                      title="Create Entry Quicklink"
++                      quicklink={{
++                        name: `HeyClaude: ${entry.title}`,
++                        link: webUrl,
++                        icon: Icon.Link,
++                      }}
++                    />
++                    {hasInstallCommand ? (
++                      <Action.CreateSnippet
++                        title="Create Install Snippet"
++                        snippet={{
++                          name: `${entry.title} install`,
++                          text: entry.installCommand,
++                          keyword: entrySnippetKeyword(entry),
++                        }}
++                      />
++                    ) : null}
++                    {hasConfig ? (
++                      <Action.CreateSnippet
++                        title="Create Config Snippet"
++                        snippet={{
++                          name: `${entry.title} config`,
++                          text: entry.configSnippet,
++                          keyword: `${entrySnippetKeyword(entry)}-config`.slice(
++                            0,
++                            40,
++                          ),
++                        }}
++                      />
++                    ) : null}
++                  </ActionPanel.Section>
++                  <ActionPanel.Section title="Save">
++                    <Action
++                      title={isFavorite ? "Remove Favorite" : "Add Favorite"}
++                      icon={isFavorite ? Icon.StarDisabled : Icon.Star}
++                      shortcut={{ modifiers: ["cmd"], key: "f" }}
++                      onAction={() => void toggleFavorite(entry)}
++                    />
++                  </ActionPanel.Section>
++                  <ActionPanel.Section title="Contribute">
++                    <Action.OpenInBrowser
++                      title="Submit Similar Entry"
++                      url={buildContributeEntryUrl({
++                        category: entry.category,
++                        brandName: entry.brandName,
++                        brandDomain: entry.brandDomain,
++                        tags: entry.tags,
++                      })}
++                      icon={Icon.Plus}
++                    />
++                    <Action.OpenInBrowser
++                      title="Suggest Change"
++                      url={buildSuggestChangeUrl(entry)}
++                      icon={Icon.Pencil}
++                    />
++                  </ActionPanel.Section>
++                  <ActionPanel.Section title="Refresh">
++                    <Action
++                      title={`Refresh ${options.title}`}
++                      icon={Icon.ArrowClockwise}
++                      shortcut={{ modifiers: ["cmd"], key: "r" }}
++                      onAction={() => void refreshEntries(true)}
++                    />
++                  </ActionPanel.Section>
++                </ActionPanel>
++              }
++            />
++          );
++        })}
++        {!isLoading && displayedEntries.length === 0 ? (
++          <List.EmptyView
++            icon={options.kind === "trending" ? Icon.BarChart : Icon.Clock}
++            title={emptyTitle}
++            description={emptyDescription}
++            actions={
++              <ActionPanel>
++                <Action
++                  title={`Refresh ${options.title}`}
++                  icon={Icon.ArrowClockwise}
++                  onAction={() => void refreshEntries(true)}
++                />
++              </ActionPanel>
++            }
++          />
++        ) : null}
++      </List>
++    );
++  };
++}
+diff --git a/integrations/raycast/src/feed.ts b/integrations/raycast/src/feed.ts
+index 3ea984ee62..ff84b637ac 100644
+--- a/integrations/raycast/src/feed.ts
++++ b/integrations/raycast/src/feed.ts
+@@ -15,8 +15,13 @@ export const CACHE_KEY = "heyclaude-raycast-index";
+ export const FEED_METADATA_CACHE_KEY = "heyclaude-raycast-feed-metadata";
+ export const DETAIL_CACHE_PREFIX = "heyclaude-raycast-detail";
+ export const FAVORITES_KEY = "favorite-entry-keys";
++export const TRENDING_CACHE_KEY = "heyclaude-raycast-trending";
++export const RECENT_UPDATES_CACHE_KEY = "heyclaude-raycast-recent-updates";
+ const RAYCAST_FEED_PATH = "/data/raycast-index.json";
+ const REGISTRY_MANIFEST_PATH = "/data/registry-manifest.json";
++const REGISTRY_TRENDING_PATH = "/api/registry/trending";
++const REGISTRY_DIFF_PATH = "/api/registry/diff";
++const DEFAULT_DISCOVERY_LIMIT = 25;
+ 
+ export type DownloadTrust = "first-party" | "external" | null;
+ 
+@@ -53,6 +58,46 @@ export type RaycastEntry = {
+   verificationStatus: string;
+ };
+ 
++export type RaycastDiscoveryReference = {
++  key: string;
++  category: string;
++  slug: string;
++  title: string;
++  description: string;
++  canonicalUrl?: string;
++  dateAdded?: string;
++  score?: number;
++  reasons: string[];
++  updatedAt?: string;
++  updateKind?: string;
++};
++
++export type RaycastDiscoveryEntry = RaycastEntry & {
++  discovery: RaycastDiscoveryReference;
++};
++
++export type ParsedTrendingFeed = {
++  entries: RaycastDiscoveryReference[];
++  category: string;
++  platform: string;
++  generatedAt: string;
++  signalsAvailable?: {
++    votes: boolean;
++    community: boolean;
++    intent: boolean;
++  };
++  refreshStatus?: "updated" | "stale";
++  refreshWarning?: string;
++};
++
++export type ParsedRecentUpdatesFeed = {
++  entries: RaycastDiscoveryReference[];
++  generatedAt: string;
++  currentSignature: string;
++  refreshStatus?: "updated" | "stale";
++  refreshWarning?: string;
++};
++
+ function normalizeDownloadTrust(value: unknown): DownloadTrust {
+   return value === "first-party" || value === "external" ? value : null;
+ }
+@@ -197,6 +242,14 @@ export function feedMetadataCacheKey(feedUrl = FEED_URL) {
+   return scopedCacheKey(FEED_METADATA_CACHE_KEY, feedUrl);
+ }
+ 
++export function trendingCacheKey(feedUrl = FEED_URL) {
++  return scopedCacheKey(TRENDING_CACHE_KEY, feedUrl);
++}
++
++export function recentUpdatesCacheKey(feedUrl = FEED_URL) {
++  return scopedCacheKey(RECENT_UPDATES_CACHE_KEY, feedUrl);
++}
++
+ export function detailCacheKey(
+   entry: Pick<RaycastEntry, "category" | "slug">,
+   feedUrl = FEED_URL,
+@@ -234,6 +287,30 @@ export function registrySearchUrl(options: RegistrySearchUrlOptions) {
+   return url.toString();
+ }
+ 
++function discoveryLimit(value = DEFAULT_DISCOVERY_LIMIT) {
++  const finiteValue = Number(value);
++  if (!Number.isFinite(finiteValue)) return DEFAULT_DISCOVERY_LIMIT;
++  return Math.max(1, Math.min(50, Math.trunc(finiteValue)));
++}
++
++export function trendingFeedUrl(
++  feedUrl = FEED_URL,
++  limit = DEFAULT_DISCOVERY_LIMIT,
++) {
++  const url = new URL(REGISTRY_TRENDING_PATH, feedUrl);
++  url.searchParams.set("limit", String(discoveryLimit(limit)));
++  return url.toString();
++}
++
++export function recentUpdatesFeedUrl(
++  feedUrl = FEED_URL,
++  limit = DEFAULT_DISCOVERY_LIMIT,
++) {
++  const url = new URL(REGISTRY_DIFF_PATH, feedUrl);
++  url.searchParams.set("limit", String(discoveryLimit(limit)));
++  return url.toString();
++}
++
+ function setOptionalParam(
+   params: URLSearchParams,
+   key: string,
+@@ -514,6 +591,151 @@ export function parseFeed(value: string): ParsedFeed {
+   };
+ }
+ 
++function discoveryEnvelope(value: string) {
++  const parsed = JSON.parse(value) as unknown;
++  return isRecord(parsed) ? parsed : {};
++}
++
++function discoveryReferenceFromEntry(
++  value: unknown,
++): RaycastDiscoveryReference | null {
++  if (!isRecord(value)) return null;
++
++  const category = optionalString(value.category);
++  const slug = optionalString(value.slug);
++  if (!category || !slug) return null;
++
++  const key = optionalString(value.key) || `${category}:${slug}`;
++  return {
++    key,
++    category,
++    slug,
++    title: optionalString(value.title),
++    description: optionalString(value.description),
++    canonicalUrl: optionalString(value.canonicalUrl) || undefined,
++    dateAdded: optionalString(value.dateAdded) || undefined,
++    score: optionalNumber(value.score),
++    reasons: normalizeStringArray(value.reasons),
++    updatedAt:
++      optionalString(value.updatedAt) ||
++      optionalString(value.dateAdded) ||
++      undefined,
++    updateKind:
++      optionalString(value.updateKind) ||
++      optionalString(value.type) ||
++      undefined,
++  };
++}
++
++export function parseTrendingFeed(value: string): ParsedTrendingFeed {
++  const envelope = discoveryEnvelope(value);
++  const signalPayload = isRecord(envelope.signalsAvailable)
++    ? envelope.signalsAvailable
++    : {};
++  const entries = Array.isArray(envelope.entries)
++    ? envelope.entries
++        .map(discoveryReferenceFromEntry)
++        .filter((entry): entry is RaycastDiscoveryReference => entry !== null)
++    : [];
++
++  return {
++    entries,
++    category: optionalString(envelope.category) || "all",
++    platform: optionalString(envelope.platform) || "all",
++    generatedAt: optionalString(envelope.generatedAt),
++    signalsAvailable: {
++      votes: Boolean(signalPayload.votes),
++      community: Boolean(signalPayload.community),
++      intent: Boolean(signalPayload.intent),
++    },
++  };
++}
++
++export function parseRecentUpdatesFeed(value: string): ParsedRecentUpdatesFeed {
++  const envelope = discoveryEnvelope(value);
++  const entries = Array.isArray(envelope.entries)
++    ? envelope.entries
++        .map(discoveryReferenceFromEntry)
++        .filter((entry): entry is RaycastDiscoveryReference => entry !== null)
++    : [];
++
++  return {
++    entries,
++    generatedAt: optionalString(envelope.generatedAt),
++    currentSignature: optionalString(envelope.currentSignature),
++  };
++}
++
++export function hasValidDiscoveryEntries(value: string) {
++  const envelope = discoveryEnvelope(value);
++  if (!Array.isArray(envelope.entries)) return false;
++  return envelope.entries.some(
++    (entry) => discoveryReferenceFromEntry(entry) !== null,
++  );
++}
++
++function discoveryFallbackEntry(
++  reference: RaycastDiscoveryReference,
++): RaycastDiscoveryEntry {
++  const title = reference.title || reference.slug;
++  const webUrl =
++    reference.canonicalUrl ||
++    `https://heyclau.de/${reference.category}/${reference.slug}`;
++  const detailMarkdown = [`# ${title}`, "", reference.description]
++    .filter(Boolean)
++    .join("\n");
++  const copyText = [title, reference.description, webUrl]
++    .filter(Boolean)
++    .join("\n\n");
++
++  return {
++    category: reference.category,
++    slug: reference.slug,
++    title,
++    description: reference.description,
++    tags: [],
++    installCommand: "",
++    configSnippet: "",
++    copyText,
++    detailMarkdown,
++    webUrl,
++    canonicalUrl: reference.canonicalUrl,
++    repoUrl: "",
++    documentationUrl: "",
++    downloadTrust: null,
++    verificationStatus: "",
++    discovery: reference,
++  };
++}
++
++export function attachDiscoveryEntries(
++  entries: RaycastEntry[],
++  references: RaycastDiscoveryReference[],
++  options: { fallbackForRemoved?: boolean } = {},
++) {
++  const byKey = new Map(entries.map((entry) => [entryKey(entry), entry]));
++  return references
++    .map((reference) => {
++      const entry = byKey.get(entryKey(reference));
++      if (entry) {
++        return { ...entry, discovery: reference } as RaycastDiscoveryEntry;
++      }
++      if (options.fallbackForRemoved && reference.updateKind === "removed") {
++        return discoveryFallbackEntry(reference);
++      }
++      return null;
++    })
++    .filter((entry): entry is RaycastDiscoveryEntry => entry !== null);
++}
++
++export function filterDiscoveryEntries(
++  entries: RaycastDiscoveryEntry[],
++  category: string,
++  favorites: Set<string>,
++) {
++  return filterEntriesByCategory(entries, category, favorites);
++}
++
+ export function buildFeedSnapshotMetadata(
+   feed: Pick<ParsedFeed, "generatedAt">,
+   manifestSnapshot?: RegistryManifestSnapshot | null,
+@@ -615,11 +837,9 @@ export function sortedCategoryOptions(
+   ];
+ }
+ 
+-export function filterEntriesByCategory(
+-  entries: RaycastEntry[],
+-  category: string,
+-  favorites: Set<string>,
+-) {
++export function filterEntriesByCategory<
++  T extends Pick<RaycastEntry, "category" | "slug">,
++>(entries: T[], category: string, favorites: Set<string>) {
+   if (category === "favorites") {
+     return entries.filter((entry) => favorites.has(entryKey(entry)));
+   }
+diff --git a/integrations/raycast/src/recent-updates.tsx b/integrations/raycast/src/recent-updates.tsx
+new file mode 100644
+index 0000000000..ea91f80c59
+--- /dev/null
++++ b/integrations/raycast/src/recent-updates.tsx
+@@ -0,0 +1,10 @@
++import { createDiscoveryCommand } from "./discovery-command";
++
++export default createDiscoveryCommand({
++  kind: "recent",
++  title: "Recent Updates",
++  emptyTitle: "No recent updates found",
++  emptyDescription:
++    "The registry diff endpoint may be unavailable temporarily. Refresh or search the full registry.",
++  searchPlaceholder: "Search recent HeyClaude updates...",
++});
+diff --git a/integrations/raycast/src/runtime.ts b/integrations/raycast/src/runtime.ts
+index 2811efb54a..4073ef987a 100644
+--- a/integrations/raycast/src/runtime.ts
++++ b/integrations/raycast/src/runtime.ts
+@@ -6,17 +6,26 @@ import {
+   fallbackDetail,
+   feedCacheKey,
+   feedMetadataCacheKey,
++  hasValidDiscoveryEntries,
+   isRaycastDetail,
+   parseFeed,
+   parseFeedSnapshotMetadata,
++  parseRecentUpdatesFeed,
+   parseRegistryManifestSnapshot,
+   parseRegistrySearch,
++  parseTrendingFeed,
++  recentUpdatesCacheKey,
++  recentUpdatesFeedUrl,
+   registryManifestUrl,
+   registrySearchUrl,
+   resolveFeedUrl,
++  trendingCacheKey,
++  trendingFeedUrl,
+   type FeedSnapshotMetadata,
+   type ParsedFeed,
+   type ParsedRegistrySearch,
++  type ParsedRecentUpdatesFeed,
++  type ParsedTrendingFeed,
+   type RaycastDetail,
+   type RaycastEntry,
+   type RegistryManifestSnapshot,
+@@ -80,6 +89,40 @@ export function loadCachedFeed(
+   }
+ }
+ 
++export function loadCachedTrending(
++  cache: RaycastTextCache,
++  feedUrl = FEED_URL,
++): ParsedTrendingFeed {
++  const cacheKey = trendingCacheKey(feedUrl);
++  const cached = cache.get(cacheKey);
++  if (!cached) {
++    return { entries: [], category: "all", platform: "all", generatedAt: "" };
++  }
++
++  try {
++    return parseTrendingFeed(cached);
++  } catch {
++    cache.remove(cacheKey);
++    return { entries: [], category: "all", platform: "all", generatedAt: "" };
++  }
++}
++
++export function loadCachedRecentUpdates(
++  cache: RaycastTextCache,
++  feedUrl = FEED_URL,
++): ParsedRecentUpdatesFeed {
++  const cacheKey = recentUpdatesCacheKey(feedUrl);
++  const cached = cache.get(cacheKey);
++  if (!cached) return { entries: [], generatedAt: "", currentSignature: "" };
++
++  try {
++    return parseRecentUpdatesFeed(cached);
++  } catch {
++    cache.remove(cacheKey);
++    return { entries: [], generatedAt: "", currentSignature: "" };
++  }
++}
++
+ async function fetchRegistryManifestSnapshot(
+   fetchFn: FetchLike,
+   feedUrl: string,
+@@ -160,6 +203,88 @@ async function fetchFeedPayload(
+   return response.text();
+ }
+ 
++async function fetchDiscoveryPayload(
++  fetchFn: FetchLike,
++  url: string,
++  label: string,
++): Promise<string> {
++  const response = await fetchFn(url, {
++    headers: { accept: "application/json" },
++  });
++  if (!response.ok) {
++    throw new Error(`${label} responded with ${response.status}`);
++  }
++  const text = await response.text();
++  if (!hasValidDiscoveryEntries(text)) {
++    throw new Error(`${label} payload was malformed`);
++  }
++  return text;
++}
++
++export async function fetchFreshTrending(options: {
++  cache: RaycastTextCache;
++  fetchFn?: FetchLike;
++  feedUrl?: string;
++  limit?: number;
++}) {
++  const fetchFn = options.fetchFn ?? fetch;
++  const feedUrl = resolveFeedUrl(options.feedUrl);
++  const cacheKey = trendingCacheKey(feedUrl);
++  const cached = loadCachedTrending(options.cache, feedUrl);
++
++  try {
++    const text = await fetchDiscoveryPayload(
++      fetchFn,
++      trendingFeedUrl(feedUrl, options.limit),
++      "Trending feed",
++    );
++    const nextFeed = parseTrendingFeed(text);
++    options.cache.set(cacheKey, text);
++    return { ...nextFeed, refreshStatus: "updated" as const };
++  } catch (error) {
++    if (cached.entries.length > 0) {
++      return {
++        ...cached,
++        refreshStatus: "stale" as const,
++        refreshWarning: error instanceof Error ? error.message : String(error),
++      };
++    }
++    throw error;
++  }
++}
++
++export async function fetchFreshRecentUpdates(options: {
++  cache: RaycastTextCache;
++  fetchFn?: FetchLike;
++  feedUrl?: string;
++  limit?: number;
++}) {
++  const fetchFn = options.fetchFn ?? fetch;
++  const feedUrl = resolveFeedUrl(options.feedUrl);
++  const cacheKey = recentUpdatesCacheKey(feedUrl);
++  const cached = loadCachedRecentUpdates(options.cache, feedUrl);
++
++  try {
++    const text = await fetchDiscoveryPayload(
++      fetchFn,
++      recentUpdatesFeedUrl(feedUrl, options.limit),
++      "Recent updates feed",
++    );
++    const nextFeed = parseRecentUpdatesFeed(text);
++    options.cache.set(cacheKey, text);
++    return { ...nextFeed, refreshStatus: "updated" as const };
++  } catch (error) {
++    if (cached.entries.length > 0) {
++      return {
++        ...cached,
++        refreshStatus: "stale" as const,
++        refreshWarning: error instanceof Error ? error.message : String(error),
++      };
++    }
++    throw error;
++  }
++}
++
+ export async function fetchFreshFeed(options: {
+   cache: RaycastTextCache;
+   fetchFn?: FetchLike;
+diff --git a/integrations/raycast/src/trending.tsx b/integrations/raycast/src/trending.tsx
+new file mode 100644
+index 0000000000..46eb0ec179
+--- /dev/null
++++ b/integrations/raycast/src/trending.tsx
+@@ -0,0 +1,10 @@
++import { createDiscoveryCommand } from "./discovery-command";
++
++export default createDiscoveryCommand({
++  kind: "trending",
++  title: "Trending",
++  emptyTitle: "No trending entries yet",
++  emptyDescription:
++    "Trending signals may be unavailable temporarily. Refresh or search the full registry.",
++  searchPlaceholder: "Search trending HeyClaude resources...",
++});
+diff --git a/integrations/raycast/test/feed.test.ts b/integrations/raycast/test/feed.test.ts
+index db23f1005d..49c01c34ce 100644
+--- a/integrations/raycast/test/feed.test.ts
++++ b/integrations/raycast/test/feed.test.ts
+@@ -7,7 +7,10 @@ import {
+   CACHE_KEY,
+   DETAIL_CACHE_PREFIX,
+   REGISTRY_SEARCH_URL,
++  RECENT_UPDATES_CACHE_KEY,
++  TRENDING_CACHE_KEY,
+   absoluteDataUrl,
++  attachDiscoveryEntries,
+   buildFeedSnapshotMetadata,
+   buildContributeEntryUrl,
+   buildEntrySummary,
+@@ -20,23 +23,35 @@ import {
+   feedCacheKey,
+   feedMetadataCacheKey,
+   filterEntriesBySearchText,
++  filterDiscoveryEntries,
++  hasValidDiscoveryEntries,
+   filterEntriesByCategory,
+   isRaycastDetail,
+   parseDetail,
+   parseFavoriteKeys,
+   parseFeed,
+   parseRegistrySearch,
++  parseRecentUpdatesFeed,
++  parseTrendingFeed,
++  recentUpdatesCacheKey,
++  recentUpdatesFeedUrl,
+   registryManifestUrl,
+   registrySearchUrl,
+   resolveFeedUrl,
+   serializeFavoriteKeys,
+   sortedCategoryOptions,
++  trendingCacheKey,
++  trendingFeedUrl,
+   type RaycastEntry,
+ } from "../src/feed";
+ import {
++  fetchFreshRecentUpdates,
+   fetchFreshFeed,
+   fetchRegistrySearch,
++  fetchFreshTrending,
+   loadCachedFeed,
++  loadCachedRecentUpdates,
++  loadCachedTrending,
+   loadEntryDetail,
+   type RaycastTextCache,
+ } from "../src/runtime";
+@@ -296,6 +311,143 @@ describe("Raycast feed helpers", () => {
+     );
+   });
+ 
++  it("parses discovery feeds and maps them onto full Raycast entries", () => {
++    const toolEntry = { ...sampleEntry, category: "tools", slug: "raycast" };
++    const trending = parseTrendingFeed(
++      JSON.stringify({
++        generatedAt: "2026-05-26T00:00:00.000Z",
++        kind: "registry-trending",
++        category: "all",
++        platform: "all",
++        signalsAvailable: { votes: true, community: false, intent: true },
++        entries: [
++          {
++            category: "tools",
++            slug: "raycast",
++            title: "Raycast",
++            description: "Desktop launcher.",
++            score: 12.7,
++            reasons: ["upvotes", "recent_intent"],
++          },
++          { category: "mcp" },
++        ],
++      }),
++    );
++    const recent = parseRecentUpdatesFeed(
++      JSON.stringify({
++        generatedAt: "2026-05-26T00:00:00.000Z",
++        currentSignature: "abc123",
++        entries: [
++          {
++            key: "mcp:context7",
++            type: "added",
++            category: "mcp",
++            slug: "context7",
++            title: "Context7",
++            dateAdded: "2026-05-26",
++          },
++        ],
++      }),
++    );
++
++    assert.equal(
++      hasValidDiscoveryEntries(JSON.stringify({ entries: [] })),
++      false,
++    );
++    assert.equal(
++      hasValidDiscoveryEntries(
++        JSON.stringify({ entries: [{ title: "no key" }] }),
++      ),
++      false,
++    );
++    assert.equal(hasValidDiscoveryEntries(JSON.stringify({ ok: true })), false);
++    assert.equal(
++      hasValidDiscoveryEntries(
++        JSON.stringify({ entries: [{ category: "mcp", slug: "context7" }] }),
++      ),
++      true,
++    );
++    assert.equal(trending.signalsAvailable?.votes, true);
++    assert.equal(trending.entries.length, 1);
++    assert.equal(trending.entries[0].key, "tools:raycast");
++    assert.deepEqual(trending.entries[0].reasons, ["upvotes", "recent_intent"]);
++    assert.equal(recent.currentSignature, "abc123");
++    assert.equal(recent.entries[0].updatedAt, "2026-05-26");
++    assert.equal(recent.entries[0].updateKind, "added");
++
++    const attached = attachDiscoveryEntries(
++      [sampleEntry, toolEntry],
++      [...trending.entries, ...recent.entries],
++    );
++    assert.deepEqual(
++      attached.map((entry) => entryKey(entry)),
++      ["tools:raycast", "mcp:context7"],
++    );
++    assert.deepEqual(
++      filterDiscoveryEntries(
++        attached,
++        "favorites",
++        new Set(["mcp:context7"]),
++      ).map((entry) => entryKey(entry)),
++      ["mcp:context7"],
++    );
++    assert.deepEqual(
++      filterDiscoveryEntries(attached, "tools", new Set()).map((entry) =>
++        entryKey(entry),
++      ),
++      ["tools:raycast"],
++    );
++  });
++
++  it("renders removed diff references as fallback rows only when requested", () => {
++    const removedReference = parseRecentUpdatesFeed(
++      JSON.stringify({
++        generatedAt: "2026-05-26T00:00:00.000Z",
++        currentSignature: "abc123",
++        entries: [
++          {
++            key: "mcp:retired",
++            type: "removed",
++            category: "mcp",
++            slug: "retired",
++            title: "Retired MCP",
++            description: "Removed from the registry.",
++            canonicalUrl: "https://heyclau.de/mcp/retired",
++          },
++        ],
++      }),
++    ).entries;
++
++    // Default behavior (e.g. trending): removed-only references are dropped.
++    assert.deepEqual(attachDiscoveryEntries([], removedReference), []);
++
++    const fallback = attachDiscoveryEntries([], removedReference, {
++      fallbackForRemoved: true,
++    });
++    assert.equal(fallback.length, 1);
++    assert.equal(entryKey(fallback[0]), "mcp:retired");
++    assert.equal(fallback[0].title, "Retired MCP");
++    assert.equal(fallback[0].webUrl, "https://heyclau.de/mcp/retired");
++    assert.equal(fallback[0].repoUrl, "");
++    assert.equal(fallback[0].discovery.updateKind, "removed");
++    assert.match(fallback[0].detailMarkdown, /Retired MCP/);
++
++    // Non-removed references without a matching entry stay dropped even with the flag.
++    const addedReference = parseRecentUpdatesFeed(
++      JSON.stringify({
++        generatedAt: "2026-05-26T00:00:00.000Z",
++        currentSignature: "abc123",
++        entries: [
++          { key: "mcp:ghost", type: "added", category: "mcp", slug: "ghost" },
++        ],
++      }),
++    ).entries;
++    assert.deepEqual(
++      attachDiscoveryEntries([], addedReference, { fallbackForRemoved: true }),
++      [],
++    );
++  });
++
+   it("normalizes detail URLs relative to the public feed", () => {
+     assert.equal(
+       absoluteDataUrl("/data/raycast/mcp/context7.json"),
+@@ -345,6 +497,28 @@ describe("Raycast feed helpers", () => {
+       detailCacheKey(sampleEntry, devFeed),
+       `${DETAIL_CACHE_PREFIX}:${entryKey(sampleEntry)}`,
+     );
++    assert.equal(
++      trendingFeedUrl(devFeed, 99),
++      "https://preview.example.com/api/registry/trending?limit=50",
++    );
++    assert.equal(
++      recentUpdatesFeedUrl(devFeed, 0),
++      "https://preview.example.com/api/registry/diff?limit=1",
++    );
++    const trendingNaNLimit = new URL(
++      trendingFeedUrl(devFeed, Number.NaN),
++    ).searchParams.get("limit");
++    const recentUpdatesNaNLimit = new URL(
++      recentUpdatesFeedUrl(devFeed, Number.NaN),
++    ).searchParams.get("limit");
++    assert.equal(trendingNaNLimit, "25");
++    assert.equal(recentUpdatesNaNLimit, "25");
++    assert.ok(Number.isFinite(Number(trendingNaNLimit)));
++    assert.ok(Number.isFinite(Number(recentUpdatesNaNLimit)));
++    assert.equal(trendingCacheKey(), TRENDING_CACHE_KEY);
++    assert.equal(recentUpdatesCacheKey(), RECENT_UPDATES_CACHE_KEY);
++    assert.notEqual(trendingCacheKey(devFeed), TRENDING_CACHE_KEY);
++    assert.notEqual(recentUpdatesCacheKey(devFeed), RECENT_UPDATES_CACHE_KEY);
+   });
+ 
+   it("builds bounded server search URLs for Raycast queries", () => {
+@@ -641,6 +815,23 @@ describe("Raycast feed helpers", () => {
+     assert.match(jobsSource, /Action\.CreateQuicklink/);
+   });
+ 
++  it("keeps the discovery Open Source action tied to repoUrl only", () => {
++    const discoverySource = fs.readFileSync(
++      path.join(process.cwd(), "src", "discovery-command.tsx"),
++      "utf8",
++    );
++
++    assert.doesNotMatch(
++      discoverySource,
++      /entry\.repoUrl\s*\|\|\s*entry\.documentationUrl/,
++    );
++    assert.match(
++      discoverySource,
++      /title="Open Source"\s*\n\s*url=\{entry\.repoUrl\}/,
++    );
++    assert.match(discoverySource, /\{entry\.repoUrl \? \(/);
++  });
++
+   it("keeps the production Raycast manifest fixed to HeyClaude endpoints", () => {
+     const manifest = JSON.parse(
+       fs.readFileSync(path.join(process.cwd(), "package.json"), "utf8"),
+@@ -661,6 +852,8 @@ describe("Raycast feed helpers", () => {
+         "search-guides",
+         "search-collections",
+         "search-statuslines",
++        "trending",
++        "recent-updates",
+         "jobs",
+         "submit-content",
+         "get-involved",
+@@ -1036,6 +1229,147 @@ describe("Raycast feed helpers", () => {
+     assert.match(cache.get(feedCacheKey(devFeed)) || "", /context7/);
+   });
+ 
++  it("loads trending and recent update feeds with stale-cache fallback", async () => {
++    const cache = new MemoryCache();
++    const devFeed = "https://preview.example.com/data/raycast-index.json";
++    const requestedUrls: string[] = [];
++    const trending = await fetchFreshTrending({
++      cache,
++      feedUrl: devFeed,
++      fetchFn: async (input) => {
++        requestedUrls.push(String(input));
++        return response({
++          schemaVersion: 1,
++          kind: "registry-trending",
++          category: "all",
++          platform: "all",
++          signalsAvailable: { votes: true, community: true, intent: false },
++          entries: [
++            {
++              category: "mcp",
++              slug: "context7",
++              title: "Context7",
++              description: "Fetch docs.",
++              score: 9,
++              reasons: ["upvotes"],
++            },
++          ],
++        });
++      },
++    });
++    const recent = await fetchFreshRecentUpdates({
++      cache,
++      feedUrl: devFeed,
++      fetchFn: async (input) => {
++        requestedUrls.push(String(input));
++        return response({
++          schemaVersion: 1,
++          kind: "registry-diff",
++          generatedAt: "2026-05-26T00:00:00.000Z",
++          currentSignature: "diff-signature",
++          entries: [
++            {
++              key: "mcp:context7",
++              type: "added",
++              category: "mcp",
++              slug: "context7",
++              title: "Context7",
++              dateAdded: "2026-05-26",
++            },
++          ],
++        });
++      },
++    });
++
++    assert.deepEqual(requestedUrls, [
++      "https://preview.example.com/api/registry/trending?limit=25",
++      "https://preview.example.com/api/registry/diff?limit=25",
++    ]);
++    assert.equal(trending.refreshStatus, "updated");
++    assert.equal(trending.entries[0].score, 9);
++    assert.equal(recent.currentSignature, "diff-signature");
++    assert.equal(loadCachedTrending(cache, devFeed).entries.length, 1);
++    assert.equal(loadCachedRecentUpdates(cache, devFeed).entries.length, 1);
++
++    const staleTrending = await fetchFreshTrending({
++      cache,
++      feedUrl: devFeed,
++      fetchFn: async () => response({ malformed: true }),
++    });
++    const staleRecent = await fetchFreshRecentUpdates({
++      cache,
++      feedUrl: devFeed,
++      fetchFn: async () => response({}, { status: 503 }),
++    });
++
++    assert.equal(staleTrending.refreshStatus, "stale");
++    assert.match(staleTrending.refreshWarning || "", /malformed/);
++    assert.equal(staleTrending.entries[0].slug, "context7");
++    assert.equal(staleRecent.refreshStatus, "stale");
++    assert.match(staleRecent.refreshWarning || "", /503/);
++    assert.equal(staleRecent.entries[0].slug, "context7");
++  });
++
++  it("keeps a useful discovery snapshot when a payload normalizes to zero entries", async () => {
++    const cache = new MemoryCache();
++    const devFeed = "https://preview.example.com/data/raycast-index.json";
++    const goodTrending = {
++      schemaVersion: 1,
++      kind: "registry-trending",
++      category: "all",
++      platform: "all",
++      entries: [
++        {
++          category: "mcp",
++          slug: "context7",
++          title: "Context7",
++          description: "Fetch docs.",
++          score: 9,
++          reasons: ["upvotes"],
++        },
++      ],
++    };
++    await fetchFreshTrending({
++      cache,
++      feedUrl: devFeed,
++      fetchFn: async () => response(goodTrending),
++    });
++    const cachedSnapshot = cache.get(trendingCacheKey(devFeed));
++    assert.equal(loadCachedTrending(cache, devFeed).entries.length, 1);
++
++    // Empty entries array: must not overwrite the cache and must fall back to stale.
++    const emptyArray = await fetchFreshTrending({
++      cache,
++      feedUrl: devFeed,
++      fetchFn: async () => response({ entries: [] }),
++    });
++    assert.equal(emptyArray.refreshStatus, "stale");
++    assert.equal(emptyArray.entries[0].slug, "context7");
++    assert.equal(cache.get(trendingCacheKey(devFeed)), cachedSnapshot);
++
++    // Entries present but all rows fail normalization: same protection.
++    const allMalformed = await fetchFreshTrending({
++      cache,
++      feedUrl: devFeed,
++      fetchFn: async () =>
++        response({ entries: [{ title: "no category or slug" }] }),
++    });
++    assert.equal(allMalformed.refreshStatus, "stale");
++    assert.equal(allMalformed.entries[0].slug, "context7");
++    assert.equal(cache.get(trendingCacheKey(devFeed)), cachedSnapshot);
++
++    // With no prior cache to protect, a zero-entry payload must reject outright.
++    await assert.rejects(
++      fetchFreshRecentUpdates({
++        cache,
++        feedUrl: devFeed,
++        fetchFn: async () => response({ entries: [] }),
++      }),
++      /malformed/,
++    );
++    assert.equal(cache.get(recentUpdatesCacheKey(devFeed)), undefined);
++  });
++
+   it("loads detail payloads on demand and falls back only when no detail URL exists", async () => {
+     const cache = new MemoryCache();
+     let requestedUrl = "";

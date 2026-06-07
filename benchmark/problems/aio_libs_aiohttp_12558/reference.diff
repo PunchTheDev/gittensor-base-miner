@@ -1,0 +1,76 @@
+diff --git a/CHANGES/12436.bugfix.rst b/CHANGES/12436.bugfix.rst
+new file mode 100644
+index 00000000000..d6f7e160697
+--- /dev/null
++++ b/CHANGES/12436.bugfix.rst
+@@ -0,0 +1 @@
++Fixed digest authentication failing for requests whose path or query string contains percent-encoded reserved characters; the digest signature now uses the encoded request-target that is sent on the wire instead of the decoded form -- by :user:`bdraco`.
+diff --git a/aiohttp/client_middleware_digest_auth.py b/aiohttp/client_middleware_digest_auth.py
+index 64257a65c18..8151dea5154 100644
+--- a/aiohttp/client_middleware_digest_auth.py
++++ b/aiohttp/client_middleware_digest_auth.py
+@@ -246,7 +246,11 @@ async def _encode(self, method: str, url: URL, body: Payload | Literal[b""]) ->
+         # Convert string values to bytes once
+         nonce_bytes = nonce.encode("utf-8")
+         realm_bytes = realm.encode("utf-8")
+-        path = URL(url).path_qs
++        # Use the encoded request-target (raw_path_qs) since that is what is
++        # transmitted on the wire and what the server signs against. Using the
++        # decoded form would cause digest verification to fail when the path
++        # or query string contains percent-encoded reserved characters.
++        path = URL(url).raw_path_qs
+ 
+         # Process QoP
+         qop = ""
+diff --git a/tests/test_client_middleware_digest_auth.py b/tests/test_client_middleware_digest_auth.py
+index c490fb70d78..0d2d6ad3325 100644
+--- a/tests/test_client_middleware_digest_auth.py
++++ b/tests/test_client_middleware_digest_auth.py
+@@ -189,6 +189,47 @@ async def test_encode_digest_with_md5(
+     assert "algorithm=MD5" in header
+ 
+ 
++@pytest.mark.parametrize(
++    ("url", "expected_uri"),
++    [
++        (
++            URL("http://example.com/axis-cgi/io/port.cgi?action=9:\\"),
++            "/axis-cgi/io/port.cgi?action=9:%5C",
++        ),
++        (
++            URL("http://example.com/path with space/file"),
++            "/path%20with%20space/file",
++        ),
++        (
++            URL("http://example.com/p?q=a&b=1+2"),
++            "/p?q=a&b=1+2",
++        ),
++        (
++            URL.build(
++                scheme="http",
++                host="example.com",
++                path="/p",
++                query={"x": "[]"},
++            ),
++            "/p?x=%5B%5D",
++        ),
++    ],
++    ids=["backslash-and-colon", "space-in-path", "ampersand-and-plus", "brackets"],
++)
++async def test_encode_uri_uses_wire_encoded_request_target(
++    auth_mw_with_challenge: DigestAuthMiddleware,
++    url: URL,
++    expected_uri: str,
++) -> None:
++    """The digest uri/A2 must use the encoded request-target sent on the wire.
++
++    Servers compute the digest signature against the encoded request-target
++    they actually receive, so the client must sign the same encoded form.
++    """
++    header = await auth_mw_with_challenge._encode("GET", url, b"")
++    assert f'uri="{expected_uri}"' in header
++
++
+ @pytest.mark.parametrize(
+     "algorithm", ["MD5-SESS", "SHA-SESS", "SHA-256-SESS", "SHA-512-SESS"]
+ )

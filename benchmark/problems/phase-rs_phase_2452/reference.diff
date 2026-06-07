@@ -1,0 +1,190 @@
+diff --git a/crates/engine/src/parser/oracle_static/evasion.rs b/crates/engine/src/parser/oracle_static/evasion.rs
+index d1cef182e..0ef019468 100644
+--- a/crates/engine/src/parser/oracle_static/evasion.rs
++++ b/crates/engine/src/parser/oracle_static/evasion.rs
+@@ -729,6 +729,74 @@ pub(crate) fn try_split_and_cant_attack(text: &str) -> Option<Vec<StaticDefiniti
+     Some(defs)
+ }
+ 
++/// CR 702.5 / CR 702.6: Decompose `"<grant or restriction> and can't be
++/// enchanted [or equipped] [by other Auras]"` (and the "equipped" lead-in) into
++/// the first conjunct's static(s) plus the matching attach-prohibition
++/// static(s) — `Other("CantBeEquipped")` / `Other("CantBeEnchanted")` — sharing
++/// the same `affected` set.
++///
++/// Without this split the trailing attach prohibition was dropped: Anti-Magic
++/// Aura ("Enchanted creature can't be the target of spells and can't be
++/// enchanted by other Auras.") and Consecrate Land ("Enchanted land has
++/// indestructible and can't be enchanted by other Auras.") parsed to only the
++/// first clause, so other Auras could still be attached — half the card
++/// vanished. Mirrors `try_split_and_cant_block`; the classifier matches the
++/// standalone attach-prohibition dispatch (equipped-first ordering) so a
++/// compound "equipped or enchanted" yields both prohibitions.
++pub(crate) fn try_split_and_cant_be_attached(text: &str) -> Option<Vec<StaticDefinition>> {
++    type VE<'a> = OracleError<'a>;
++    let lower = text.to_lowercase();
++
++    let (before, _matched, _rest) = nom_primitives::scan_preceded(&lower, |i: &str| {
++        // Match both the ASCII and typographic U+2019 apostrophe.
++        let (i, _) = alt((
++            tag::<_, _, VE>("and can't be "),
++            tag::<_, _, VE>("and can\u{2019}t be "),
++        ))
++        .parse(i)?;
++        let (i, _) = alt((tag::<_, _, VE>("enchanted"), tag::<_, _, VE>("equipped"))).parse(i)?;
++        Ok((i, ()))
++    })?;
++
++    // Classify the attach prohibition(s) from the full second clause, mirroring
++    // the standalone dispatch (`dispatch.rs` / `shared.rs`): "equipped" → host
++    // can't be equipped (CR 702.6), "enchanted" → can't be enchanted (CR 702.5);
++    // a compound "equipped or enchanted" yields both, equipped-first.
++    let attach_clause = &lower[before.len()..];
++    let mut modes: Vec<StaticMode> = Vec::new();
++    if nom_primitives::scan_contains(attach_clause, "equipped") {
++        modes.push(StaticMode::Other("CantBeEquipped".to_string()));
++    }
++    if nom_primitives::scan_contains(attach_clause, "enchanted") {
++        modes.push(StaticMode::Other("CantBeEnchanted".to_string()));
++    }
++    if modes.is_empty() {
++        return None;
++    }
++
++    let cut_end = before
++        .trim_end_matches(|ch: char| ch == ',' || ch.is_whitespace())
++        .len();
++    let line_a = format!("{}.", text[..cut_end].trim_end_matches('.'));
++    let mut defs = parse_static_line_multi(&line_a);
++    if defs.is_empty() {
++        return None;
++    }
++    for def in &mut defs {
++        def.description = Some(text.to_string());
++    }
++
++    let affected = defs[0].affected.clone()?;
++    for mode in modes {
++        defs.push(
++            StaticDefinition::new(mode)
++                .affected(affected.clone())
++                .description(text.to_string()),
++        );
++    }
++    Some(defs)
++}
++
+ /// CR 509.1b: Classify a "can't be blocked …" evasion predicate (lowercased,
+ /// starting with "can't be blocked") into the corresponding `StaticMode` and
+ /// optional evasion condition, composing the same building blocks the standalone
+diff --git a/crates/engine/src/parser/oracle_static/mod.rs b/crates/engine/src/parser/oracle_static/mod.rs
+index 32d920e65..bc9ba3679 100644
+--- a/crates/engine/src/parser/oracle_static/mod.rs
++++ b/crates/engine/src/parser/oracle_static/mod.rs
+@@ -101,8 +101,8 @@ mod support {
+         parse_rule_static_separator_nom, try_parse_compound_subtypes,
+         try_parse_scoped_must_attack_block, try_split_and_can_attack_despite_defender,
+         try_split_and_can_block_additional, try_split_and_cant_attack,
+-        try_split_and_cant_be_blocked, try_split_and_cant_block, try_split_and_doesnt_untap,
+-        try_split_and_must_attack_block,
++        try_split_and_cant_be_attached, try_split_and_cant_be_blocked, try_split_and_cant_block,
++        try_split_and_doesnt_untap, try_split_and_must_attack_block,
+     };
+     pub(super) use super::grammar::*;
+     pub(super) use super::keyword_grant::{
+diff --git a/crates/engine/src/parser/oracle_static/shared.rs b/crates/engine/src/parser/oracle_static/shared.rs
+index a314a7fbd..6aefe7249 100644
+--- a/crates/engine/src/parser/oracle_static/shared.rs
++++ b/crates/engine/src/parser/oracle_static/shared.rs
+@@ -638,6 +638,14 @@ pub(crate) fn parse_static_line_multi_inner(text: &str) -> Vec<StaticDefinition>
+         return defs;
+     }
+ 
++    // CR 702.5 / CR 702.6: "<grant or restriction> and can't be enchanted [or
++    // equipped] [by other Auras]" pairs a first clause with an attach prohibition
++    // under one subject (Anti-Magic Aura, Consecrate Land). Split so the
++    // CantBeEnchanted/CantBeEquipped clause is not dropped.
++    if let Some(defs) = try_split_and_cant_be_attached(&stripped) {
++        return defs;
++    }
++
+     // CR 509.1b + CR 604.1 + CR 611.3a + CR 613.1f: Attached-subject grant lines
+     // ("enchanted creature ...", "equipped creature ...") may decompose into more
+     // than one StaticDefinition (e.g. CantBeBlocked + Continuous{AddKeyword}).
+diff --git a/crates/engine/src/parser/oracle_static/tests.rs b/crates/engine/src/parser/oracle_static/tests.rs
+index 7a3f2a44a..20e0e6be7 100644
+--- a/crates/engine/src/parser/oracle_static/tests.rs
++++ b/crates/engine/src/parser/oracle_static/tests.rs
+@@ -303,6 +303,72 @@ fn cant_attack_split_declines_scoped_restrictions() {
+     );
+ }
+ 
++/// CR 702.5: Consecrate Land — "Enchanted land has indestructible and can't be
++/// enchanted by other Auras." must decompose into BOTH the indestructible grant
++/// AND a `CantBeEnchanted` static affecting the enchanted permanent. Previously
++/// the attach prohibition was dropped, so other Auras could still be attached.
++#[test]
++fn cant_be_attached_static_splits_from_grant() {
++    let defs = parse_static_line_multi(
++        "Enchanted land has indestructible and can't be enchanted by other Auras.",
++    );
++    assert!(
++        defs.iter()
++            .any(|d| d.mode == StaticMode::Other("CantBeEnchanted".to_string())),
++        "expected a CantBeEnchanted static, got {:?}",
++        defs.iter().map(|d| &d.mode).collect::<Vec<_>>()
++    );
++    assert!(
++        defs.iter()
++            .any(|d| matches!(d.mode, StaticMode::Continuous)),
++        "the indestructible grant must be preserved"
++    );
++}
++
++/// CR 702.5: Anti-Magic Aura — "Enchanted creature can't be the target of spells
++/// and can't be enchanted by other Auras." splits into BOTH the targeting
++/// restriction AND a `CantBeEnchanted` static.
++#[test]
++fn cant_be_attached_static_splits_from_restriction() {
++    let defs = parse_static_line_multi(
++        "Enchanted creature can't be the target of spells and can't be enchanted by other Auras.",
++    );
++    let cant = defs
++        .iter()
++        .find(|d| d.mode == StaticMode::Other("CantBeEnchanted".to_string()))
++        .expect("expected a CantBeEnchanted static");
++    assert!(
++        cant.affected.is_some(),
++        "CantBeEnchanted companion must share the first clause's affected set"
++    );
++    assert!(
++        defs.len() >= 2,
++        "the first clause must be preserved alongside CantBeEnchanted, got {:?}",
++        defs.iter().map(|d| &d.mode).collect::<Vec<_>>()
++    );
++}
++
++/// CR 702.5 + CR 702.6: A compound "can't be equipped or enchanted" tail yields
++/// BOTH attach prohibitions (equipped-first, matching the standalone dispatch).
++#[test]
++fn cant_be_attached_static_splits_both_prohibitions() {
++    let defs = parse_static_line_multi(
++        "Enchanted creature gets +1/+1 and can't be equipped or enchanted.",
++    );
++    assert!(
++        defs.iter()
++            .any(|d| d.mode == StaticMode::Other("CantBeEquipped".to_string())),
++        "expected CantBeEquipped, got {:?}",
++        defs.iter().map(|d| &d.mode).collect::<Vec<_>>()
++    );
++    assert!(
++        defs.iter()
++            .any(|d| d.mode == StaticMode::Other("CantBeEnchanted".to_string())),
++        "expected CantBeEnchanted, got {:?}",
++        defs.iter().map(|d| &d.mode).collect::<Vec<_>>()
++    );
++}
++
+ /// CR 509.1b: Madcap Skills — "Enchanted creature gets +3/+0 and can't be
+ /// blocked by more than one creature." must decompose into BOTH the P/T grant
+ /// AND a `CantBeBlockedByMoreThan { max: 1 }` static affecting the enchanted

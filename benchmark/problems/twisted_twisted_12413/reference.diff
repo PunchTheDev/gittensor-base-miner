@@ -1,0 +1,234 @@
+diff --git a/docs/web/howto/using-twistedweb.rst b/docs/web/howto/using-twistedweb.rst
+index fea6ddc3d61..693b52c63c4 100644
+--- a/docs/web/howto/using-twistedweb.rst
++++ b/docs/web/howto/using-twistedweb.rst
+@@ -118,7 +118,8 @@ site:
+     endpoint.listen(site)
+     reactor.run()
+ 
+-
++By default Twisted Web will parse form submissions posted in HTTP request bodies into memory, which can use a lot of memory for large uploads.
++If you want to implement your own parsing logic, you can disable Twisted Web's logic by passing ``parsePOSTFormSubmission=False`` to the ``Site()`` constructor.
+ 
+ 
+ 
+diff --git a/src/twisted/web/http.py b/src/twisted/web/http.py
+index 34d25b076e3..4a7cdbf13dd 100644
+--- a/src/twisted/web/http.py
++++ b/src/twisted/web/http.py
+@@ -926,12 +926,21 @@ class Request:
+     _forceSSL = 0
+     _disconnected = False
+     _log = Logger()
++    _parsePOSTFormSubmission: bool
+ 
+-    def __init__(self, channel: HTTPChannel, queued: object = _QUEUED_SENTINEL) -> None:
++    def __init__(
++        self,
++        channel: HTTPChannel,
++        queued: object = _QUEUED_SENTINEL,
++        parsePOSTFormSubmission: bool = True,
++    ) -> None:
+         """
+         @param channel: the channel we're connected to.
+         @param queued: (deprecated) are we in the request queue, or can we
+             start writing to the transport?
++        @param parsePOSTFormSubmission: If C{True}, the default, parse MIME multipart and
++            URL-encoded body uploads into C{request.args}. This can use large
++            amounts of memory for large uploads.
+         """
+         self.notifications: List[Deferred[None]] = []
+         self.channel = channel
+@@ -952,6 +961,7 @@ def __init__(self, channel: HTTPChannel, queued: object = _QUEUED_SENTINEL) -> N
+             queued = False
+ 
+         self.queued = queued
++        self._parsePOSTFormSubmission = parsePOSTFormSubmission
+ 
+     def _cleanup(self):
+         """
+@@ -1069,7 +1079,12 @@ def requestReceived(self, command, path, version):
+         if ctype is not None:
+             ctype = ctype[0]
+ 
+-        if self.method == b"POST" and ctype and clength:
++        if (
++            self.method == b"POST"
++            and ctype
++            and clength
++            and self._parsePOSTFormSubmission
++        ):
+             mfd = b"multipart/form-data"
+             key = _parseContentType(ctype)
+             if key == b"application/x-www-form-urlencoded":
+diff --git a/src/twisted/web/newsfragments/12412.feature b/src/twisted/web/newsfragments/12412.feature
+new file mode 100644
+index 00000000000..67eaf5d7e6c
+--- /dev/null
++++ b/src/twisted/web/newsfragments/12412.feature
+@@ -0,0 +1 @@
++``twisted.web.server.Site`` can now be created with a ``parsePOSTFormSubmission=False`` parameter to disable parsing of HTTP request bodies.
+\ No newline at end of file
+diff --git a/src/twisted/web/server.py b/src/twisted/web/server.py
+index 1a4318022b9..75344a07588 100644
+--- a/src/twisted/web/server.py
++++ b/src/twisted/web/server.py
+@@ -97,8 +97,23 @@ class Request(Copyable, http.Request, components.Componentized):
+     _encoder = None
+     _log = Logger()
+ 
+-    def __init__(self, *args, **kw):
+-        _HTTPRequest.__init__(self, *args, **kw)
++    def __init__(self, channel, *args, parsePOSTFormSubmission=None, **kw):
++        """
++        @param parsePOSTFormSubmission: By default, get this setting from the L{Site}, but
++            can also be set explicitly. If C{False}, don't parse HTTP bodies.
++        @type parsePOSTFormSubmission: C{None} or C{bool}
++        """
++        if parsePOSTFormSubmission is None:
++            parsePOSTFormSubmissionBool = channel.site._parsePOSTFormSubmission
++        else:
++            parsePOSTFormSubmissionBool = parsePOSTFormSubmission
++        _HTTPRequest.__init__(
++            self,
++            channel,
++            *args,
++            parsePOSTFormSubmission=parsePOSTFormSubmissionBool,
++            **kw,
++        )
+         components.Componentized.__init__(self)
+ 
+     def getStateToCopyFor(self, issuer):
+@@ -784,8 +799,16 @@ class Site(HTTPFactory):
+     sessionFactory = Session
+     sessionCheckTime = 1800
+     _entropy = os.urandom
++    _parsePOSTFormSubmission: bool
+ 
+-    def __init__(self, resource, requestFactory=None, *args, **kwargs):
++    def __init__(
++        self,
++        resource,
++        requestFactory=None,
++        *args,
++        parsePOSTFormSubmission=True,
++        **kwargs,
++    ):
+         """
+         @param resource: The root of the resource hierarchy.  All request
+             traversal for requests received by this factory will begin at this
+@@ -794,6 +817,11 @@ def __init__(self, resource, requestFactory=None, *args, **kwargs):
+         @param requestFactory: Overwrite for default requestFactory.
+         @type requestFactory: C{callable} or C{class}.
+ 
++        @param parsePOSTFormSubmission: If C{True}, the default, parse MIME multipart and
++            URL-encoded body uploads into C{request.args}. This can use large
++            amounts of memory for large uploads.
++        @type parsePOSTFormSubmission: C{bool}
++
+         @see: L{twisted.web.http.HTTPFactory.__init__}
+         """
+         super().__init__(*args, **kwargs)
+@@ -801,6 +829,7 @@ def __init__(self, resource, requestFactory=None, *args, **kwargs):
+         self.resource = resource
+         if requestFactory is not None:
+             self.requestFactory = requestFactory
++        self._parsePOSTFormSubmission = parsePOSTFormSubmission
+ 
+     def _openLogFile(self, path):
+         from twisted.python import logfile
+diff --git a/src/twisted/web/test/test_http.py b/src/twisted/web/test/test_http.py
+index 95f22871ce3..f40c08b67c9 100644
+--- a/src/twisted/web/test/test_http.py
++++ b/src/twisted/web/test/test_http.py
+@@ -8,6 +8,7 @@
+ import base64
+ import calendar
+ import random
++from functools import partial
+ from io import BytesIO, TextIOWrapper
+ from itertools import cycle
+ from typing import Sequence, Union
+@@ -1719,8 +1720,6 @@ def test_multipartFormData(self):
+ 
+         This is essentially a copy of ParsingTests.test_multipartFormData,
+         just with chunking put in.
+-
+-        This fails as of twisted version 18.9.0 because of bug #9678.
+         """
+         processed = []
+ 
+@@ -2543,11 +2542,20 @@ def process(self):
+         self.assertEqual(len(processed), 1)
+         self.assertEqual(processed[0].args, {b"text": [b"abasdfg"]})
+ 
++        # Now check the disabled case:
++        channel = self.runRequest(
++            req, partial(MyRequest, parsePOSTFormSubmission=False), success=False
++        )
++        self.assertEqual(channel.transport.value(), b"HTTP/1.0 200 OK\r\n\r\ndone")
++        self.assertEqual(len(processed), 2)
++        self.assertEqual(processed[1].args, {})
++
+     def test_multipartFileData(self):
+         """
+-        If the request has a Content-Type of C{multipart/form-data},
+-        and the form data is parseable and contains files, the file
+-        portions will be added to the request's args.
++        If the request has a Content-Type of C{multipart/form-data}, the
++        C{Request} is told to parse the body, and the form data is parseable
++        and contains files, the file portions will be added to the request's
++        args.
+         """
+         processed = []
+ 
+@@ -2581,6 +2589,16 @@ def process(self):
+         self.assertEqual(len(processed), 1)
+         self.assertEqual(processed[0].args, {b"uploadedfile": [b"abasdfg"]})
+ 
++        # Now check the disabled case:
++        channel = self.runRequest(
++            req.encode("ascii") + body,
++            partial(MyRequest, parsePOSTFormSubmission=False),
++            success=False,
++        )
++        self.assertEqual(channel.transport.value(), b"HTTP/1.0 200 OK\r\n\r\ndone")
++        self.assertEqual(len(processed), 2)
++        self.assertEqual(processed[1].args, {})
++
+     def test_chunkedEncoding(self):
+         """
+         If a request uses the I{chunked} transfer encoding, the request body is
+diff --git a/src/twisted/web/test/test_web.py b/src/twisted/web/test/test_web.py
+index d8726839406..6989ff58281 100644
+--- a/src/twisted/web/test/test_web.py
++++ b/src/twisted/web/test/test_web.py
+@@ -957,6 +957,28 @@ def getContentFile(length):
+         self.assertEqual([12345], lengths)
+         self.assertIs(contentFile, request.content)
+ 
++    def test_parsePOSTFormSubmissionSetFromSite(self) -> None:
++        """
++        C{Request._parsePOSTFormSubmission} is set to match C{Site._parsePOSTFormSubmission}.
++        """
++        site = server.Site(resource.Resource())
++        self.assertEqual(site._parsePOSTFormSubmission, True)
++        channel = DummyChannel()
++        channel.site = site
++
++        request = server.Request(channel)
++        self.assertEqual(request._parsePOSTFormSubmission, True)
++
++        site = server.Site(resource.Resource(), parsePOSTFormSubmission=False)
++        self.assertEqual(site._parsePOSTFormSubmission, False)
++        channel.site = site
++        request = server.Request(channel)
++        self.assertEqual(request._parsePOSTFormSubmission, False)
++
++        # Can also set it directly:
++        request = server.Request(channel, parsePOSTFormSubmission=True)
++        self.assertEqual(request._parsePOSTFormSubmission, True)
++
+ 
+ class GzipEncoderTests(unittest.TestCase):
+     def setUp(self):

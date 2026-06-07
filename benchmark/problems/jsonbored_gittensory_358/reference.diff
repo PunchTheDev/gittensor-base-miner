@@ -1,0 +1,681 @@
+diff --git a/src/scenarios/input-model.ts b/src/scenarios/input-model.ts
+new file mode 100644
+index 00000000..109c66da
+--- /dev/null
++++ b/src/scenarios/input-model.ts
+@@ -0,0 +1,368 @@
++import { z } from "zod";
++import { sanitizePublicComment } from "../github/commands";
++
++export const SCENARIO_INPUT_VERSION = 1 as const;
++
++export const scenarioInputKinds = ["fact", "assumption", "estimate", "unavailable"] as const;
++export type ScenarioInputKind = (typeof scenarioInputKinds)[number];
++
++export const scenarioTypes = [
++  "open_pr_pressure",
++  "pending_pr_resolution",
++  "branch_preflight",
++  "linked_issue_context",
++  "general_repo",
++] as const;
++export type ScenarioType = (typeof scenarioTypes)[number];
++
++export const scenarioSignalSources = [
++  "github_observed",
++  "user_supplied",
++  "local_metadata",
++  "registry",
++  "gittensory_projection",
++  "missing",
++] as const;
++export type ScenarioSignalSource = (typeof scenarioSignalSources)[number];
++
++const FORBIDDEN_PUBLIC_LANGUAGE =
++  /wallet|hotkey|coldkey|mnemonic|seed phrase|payout|reward[-\s]?estimate|farming|raw trust|trust[-\s]?score|scoreability|private[-\s]?reviewability|public[-\s]?score[-\s]?(?:estimate|prediction)/i;
++
++const FORBIDDEN_SOURCE_UPLOAD_KEYS =
++  /^(?:sourceContent|sourceContents|fileContent|fileContents|rawSource|rawSourceContent|content|contents|diff|patch|rawDiff)$/i;
++
++const scenarioSignalEntrySchema = z
++  .object({
++    id: z.string().min(1).max(120),
++    kind: z.enum(scenarioInputKinds),
++    label: z.string().min(1).max(200),
++    detail: z.string().min(1).max(2000),
++    source: z.enum(scenarioSignalSources),
++  })
++  .strict();
++
++export type ScenarioSignalEntry = z.infer<typeof scenarioSignalEntrySchema>;
++
++const scenarioRepoConfigSchema = z
++  .object({
++    repoFullName: z.string().min(3).max(200),
++    registered: z.boolean().optional(),
++    maintainerLane: z.boolean().optional(),
++  })
++  .strict();
++
++export type ScenarioRepoConfig = z.infer<typeof scenarioRepoConfigSchema>;
++
++const scenarioIssueStateSchema = z
++  .object({
++    openIssueCount: z.number().int().min(0).optional(),
++    linkedIssueNumbers: z.array(z.number().int().positive()).max(50).optional(),
++  })
++  .strict();
++
++export type ScenarioIssueState = z.infer<typeof scenarioIssueStateSchema>;
++
++const scenarioPullRequestStateSchema = z
++  .object({
++    openPrCount: z.number().int().min(0).optional(),
++    draftPrCount: z.number().int().min(0).optional(),
++    stalePrCount: z.number().int().min(0).optional(),
++    targetPullNumber: z.number().int().positive().optional(),
++  })
++  .strict();
++
++export type ScenarioPullRequestState = z.infer<typeof scenarioPullRequestStateSchema>;
++
++const scenarioBranchStateSchema = z
++  .object({
++    branchName: z.string().min(1).max(200).optional(),
++    baseRef: z.string().min(1).max(200).optional(),
++    headRef: z.string().min(1).max(200).optional(),
++    pendingCommitCount: z.number().int().min(0).optional(),
++    changedFileCount: z.number().int().min(0).optional(),
++    eligibilityStatus: z.enum(["eligible", "ineligible", "unknown"]).optional(),
++  })
++  .strict();
++
++export type ScenarioBranchState = z.infer<typeof scenarioBranchStateSchema>;
++
++export const agentScenarioInputSchema = z
++  .object({
++    version: z.literal(SCENARIO_INPUT_VERSION),
++    scenarioType: z.enum(scenarioTypes),
++    repo: scenarioRepoConfigSchema,
++    issueState: scenarioIssueStateSchema.optional(),
++    pullRequestState: scenarioPullRequestStateSchema.optional(),
++    branchState: scenarioBranchStateSchema.optional(),
++    facts: z.array(scenarioSignalEntrySchema).max(100),
++    assumptions: z.array(scenarioSignalEntrySchema).max(100),
++    estimates: z.array(scenarioSignalEntrySchema).max(100),
++    unavailableSignals: z.array(scenarioSignalEntrySchema).max(100),
++    advisoryOnly: z.literal(true),
++    notAutonomousPrBot: z.literal(true),
++    notPublicScoring: z.literal(true),
++  })
++  .strict()
++  .superRefine((value, ctx) => {
++    validateBucketKinds(value.facts, "facts", "fact", ctx);
++    validateBucketKinds(value.assumptions, "assumptions", "assumption", ctx);
++    validateBucketKinds(value.estimates, "estimates", "estimate", ctx);
++    validateBucketKinds(value.unavailableSignals, "unavailableSignals", "unavailable", ctx);
++  });
++
++export type AgentScenarioInput = z.infer<typeof agentScenarioInputSchema>;
++
++export type PublicScenarioInputSnapshot = {
++  version: typeof SCENARIO_INPUT_VERSION;
++  scenarioType: ScenarioType;
++  repo: ScenarioRepoConfig;
++  issueState?: ScenarioIssueState;
++  pullRequestState?: ScenarioPullRequestState;
++  branchState?: ScenarioBranchState;
++  facts: Array<Pick<ScenarioSignalEntry, "id" | "kind" | "label" | "detail" | "source">>;
++  assumptions: Array<Pick<ScenarioSignalEntry, "id" | "kind" | "label" | "detail" | "source">>;
++  estimates: Array<Pick<ScenarioSignalEntry, "id" | "kind" | "label" | "detail" | "source">>;
++  unavailableSignals: Array<Pick<ScenarioSignalEntry, "id" | "kind" | "label" | "detail" | "source">>;
++  advisoryOnly: true;
++  notAutonomousPrBot: true;
++  notPublicScoring: true;
++};
++
++export function createScenarioSignalEntry(args: {
++  id: string;
++  kind: ScenarioInputKind;
++  label: string;
++  detail: string;
++  source: ScenarioSignalSource;
++}): ScenarioSignalEntry {
++  return scenarioSignalEntrySchema.parse(args);
++}
++
++export function parseAgentScenarioInput(raw: unknown): AgentScenarioInput {
++  return normalizeScenarioInput(agentScenarioInputSchema.parse(raw));
++}
++
++export function normalizeScenarioInput(input: AgentScenarioInput): AgentScenarioInput {
++  return agentScenarioInputSchema.parse({
++    ...input,
++    facts: sortEntries(input.facts),
++    assumptions: sortEntries(input.assumptions),
++    estimates: sortEntries(input.estimates),
++    unavailableSignals: sortEntries(input.unavailableSignals),
++  });
++}
++
++export function buildScenarioInput(args: {
++  scenarioType: ScenarioType;
++  repoFullName: string;
++  registered?: boolean;
++  maintainerLane?: boolean;
++  issueState?: ScenarioIssueState;
++  pullRequestState?: ScenarioPullRequestState;
++  branchState?: ScenarioBranchState;
++  facts?: ScenarioSignalEntry[];
++  assumptions?: ScenarioSignalEntry[];
++  estimates?: ScenarioSignalEntry[];
++  unavailableSignals?: ScenarioSignalEntry[];
++}): AgentScenarioInput {
++  return normalizeScenarioInput({
++    version: SCENARIO_INPUT_VERSION,
++    scenarioType: args.scenarioType,
++    repo: compactRepoConfig(args),
++    ...(args.issueState !== undefined ? { issueState: args.issueState } : {}),
++    ...(args.pullRequestState !== undefined ? { pullRequestState: args.pullRequestState } : {}),
++    ...(args.branchState !== undefined ? { branchState: args.branchState } : {}),
++    facts: args.facts ?? [],
++    assumptions: args.assumptions ?? [],
++    estimates: args.estimates ?? [],
++    unavailableSignals: args.unavailableSignals ?? [],
++    advisoryOnly: true,
++    notAutonomousPrBot: true,
++    notPublicScoring: true,
++  });
++}
++
++export function assertScenarioLocalBranchInputSafe(payload: Record<string, unknown>): void {
++  if (/^(1|true|yes)$/i.test(String(process.env.GITTENSORY_UPLOAD_SOURCE ?? "false"))) {
++    throw new Error("GITTENSORY_UPLOAD_SOURCE=true is not supported; scenario inputs remain metadata-only.");
++  }
++  for (const key of Object.keys(payload)) {
++    if (FORBIDDEN_SOURCE_UPLOAD_KEYS.test(key)) {
++      throw new Error(`Refusing scenario local-branch field ${key}; source contents are never uploaded.`);
++    }
++  }
++  const changedFiles = payload.changedFiles;
++  if (Array.isArray(changedFiles)) {
++    for (const entry of changedFiles) {
++      if (!entry || typeof entry !== "object") continue;
++      for (const nestedKey of Object.keys(entry as Record<string, unknown>)) {
++        if (FORBIDDEN_SOURCE_UPLOAD_KEYS.test(nestedKey)) {
++          throw new Error(`Refusing changedFiles.${nestedKey}; source contents are never uploaded.`);
++        }
++        const value = (entry as Record<string, unknown>)[nestedKey];
++        if (typeof value === "string" && value.length > 4000) {
++          throw new Error("Refusing oversized changedFiles payload; metadata-only paths are required.");
++        }
++      }
++    }
++  }
++}
++
++export function scenarioInputFromLocalBranchMetadata(args: {
++  scenarioType: ScenarioType;
++  login: string;
++  repoFullName: string;
++  branchName?: string;
++  baseRef?: string;
++  changedFileCount?: number;
++  linkedIssues?: number[];
++  scenarioNotes?: string[];
++  eligibilityStatus?: "eligible" | "ineligible" | "unknown";
++}): AgentScenarioInput {
++  const facts: ScenarioSignalEntry[] = [
++    createScenarioSignalEntry({
++      id: "actor",
++      kind: "fact",
++      label: "Contributor",
++      detail: `Planning scenario for ${args.login}.`,
++      source: "github_observed",
++    }),
++    createScenarioSignalEntry({
++      id: "repo",
++      kind: "fact",
++      label: "Repository",
++      detail: `Repo context is ${args.repoFullName}.`,
++      source: "local_metadata",
++    }),
++  ];
++  if (args.branchName) {
++    facts.push(
++      createScenarioSignalEntry({
++        id: "branch",
++        kind: "fact",
++        label: "Branch",
++        detail: `Active branch ${args.branchName}${args.baseRef ? ` against ${args.baseRef}` : ""}.`,
++        source: "local_metadata",
++      }),
++    );
++  }
++  const assumptions =
++    args.scenarioNotes?.map((note, index) =>
++      createScenarioSignalEntry({
++        id: `assumption_${index + 1}`,
++        kind: "assumption",
++        label: "Caller assumption",
++        detail: note.trim(),
++        source: "user_supplied",
++      }),
++    ) ?? [];
++  const unavailableSignals: ScenarioSignalEntry[] = [];
++  if (args.eligibilityStatus === "unknown") {
++    unavailableSignals.push(
++      createScenarioSignalEntry({
++        id: "branch_eligibility",
++        kind: "unavailable",
++        label: "Branch eligibility",
++        detail: "Branch eligibility evidence is missing or stale.",
++        source: "missing",
++      }),
++    );
++  }
++  const branchState = compactBranchState(args);
++  return buildScenarioInput({
++    scenarioType: args.scenarioType,
++    repoFullName: args.repoFullName,
++    ...(branchState ? { branchState } : {}),
++    ...(args.linkedIssues?.length ? { issueState: { linkedIssueNumbers: args.linkedIssues } } : {}),
++    facts,
++    assumptions,
++    unavailableSignals,
++  });
++}
++
++export function serializeScenarioInputPublic(input: AgentScenarioInput): PublicScenarioInputSnapshot {
++  const normalized = normalizeScenarioInput(input);
++  const snapshot: PublicScenarioInputSnapshot = {
++    version: normalized.version,
++    scenarioType: normalized.scenarioType,
++    repo: normalized.repo,
++    ...(normalized.issueState !== undefined ? { issueState: normalized.issueState } : {}),
++    ...(normalized.pullRequestState !== undefined ? { pullRequestState: normalized.pullRequestState } : {}),
++    ...(normalized.branchState !== undefined ? { branchState: normalized.branchState } : {}),
++    facts: normalized.facts.map(sanitizeScenarioEntryPublic),
++    assumptions: normalized.assumptions.map(sanitizeScenarioEntryPublic),
++    estimates: normalized.estimates.map(sanitizeScenarioEntryPublic),
++    unavailableSignals: normalized.unavailableSignals.map(sanitizeScenarioEntryPublic),
++    advisoryOnly: true,
++    notAutonomousPrBot: true,
++    notPublicScoring: true,
++  };
++  assertPublicScenarioSnapshotSafe(snapshot);
++  return snapshot;
++}
++
++export function serializeScenarioInputPrivate(input: AgentScenarioInput): AgentScenarioInput {
++  return normalizeScenarioInput(input);
++}
++
++function sanitizeScenarioEntryPublic(entry: ScenarioSignalEntry): ScenarioSignalEntry {
++  return {
++    ...entry,
++    label: sanitizePublicComment(entry.label),
++    detail: sanitizePublicComment(entry.detail),
++  };
++}
++
++function assertPublicScenarioSnapshotSafe(snapshot: PublicScenarioInputSnapshot): void {
++  const serialized = JSON.stringify(snapshot);
++  /* v8 ignore start -- Public entries are sanitized before this guard; defensive check for future fields. */
++  if (FORBIDDEN_PUBLIC_LANGUAGE.test(serialized)) {
++    throw new Error("Public scenario serialization still contains forbidden language.");
++  }
++  /* v8 ignore end */
++}
++
++function validateBucketKinds(
++  entries: ScenarioSignalEntry[],
++  bucket: "facts" | "assumptions" | "estimates" | "unavailableSignals",
++  expectedKind: ScenarioInputKind,
++  ctx: z.RefinementCtx,
++): void {
++  for (const [index, entry] of entries.entries()) {
++    if (entry.kind !== expectedKind) {
++      ctx.addIssue({
++        code: z.ZodIssueCode.custom,
++        message: `Entry ${entry.id} must use kind ${expectedKind} in ${bucket}`,
++        path: [bucket, index, "kind"],
++      });
++    }
++  }
++}
++
++function sortEntries(entries: ScenarioSignalEntry[]): ScenarioSignalEntry[] {
++  return [...entries].sort((left, right) => left.id.localeCompare(right.id));
++}
++
++function compactRepoConfig(args: { repoFullName: string; registered?: boolean; maintainerLane?: boolean }): ScenarioRepoConfig {
++  const repo: ScenarioRepoConfig = { repoFullName: args.repoFullName.trim() };
++  if (args.registered !== undefined) repo.registered = args.registered;
++  if (args.maintainerLane !== undefined) repo.maintainerLane = args.maintainerLane;
++  return repo;
++}
++
++function compactBranchState(args: {
++  branchName?: string;
++  baseRef?: string;
++  changedFileCount?: number;
++  eligibilityStatus?: "eligible" | "ineligible" | "unknown";
++}): ScenarioBranchState | undefined {
++  if (!args.branchName && !args.baseRef && args.changedFileCount === undefined && !args.eligibilityStatus) {
++    return undefined;
++  }
++  const branchState: ScenarioBranchState = {};
++  if (args.branchName) branchState.branchName = args.branchName;
++  if (args.baseRef) branchState.baseRef = args.baseRef;
++  if (args.changedFileCount !== undefined) branchState.changedFileCount = args.changedFileCount;
++  if (args.eligibilityStatus) branchState.eligibilityStatus = args.eligibilityStatus;
++  return branchState;
++}
+diff --git a/test/unit/scenario-input-model.test.ts b/test/unit/scenario-input-model.test.ts
+new file mode 100644
+index 00000000..1575a698
+--- /dev/null
++++ b/test/unit/scenario-input-model.test.ts
+@@ -0,0 +1,301 @@
++import { describe, expect, it } from "vitest";
++import {
++  assertScenarioLocalBranchInputSafe,
++  buildScenarioInput,
++  createScenarioSignalEntry,
++  normalizeScenarioInput,
++  parseAgentScenarioInput,
++  scenarioInputFromLocalBranchMetadata,
++  serializeScenarioInputPrivate,
++  serializeScenarioInputPublic,
++} from "../../src/scenarios/input-model";
++
++const FORBIDDEN_PUBLIC_LANGUAGE =
++  /wallet|hotkey|coldkey|mnemonic|seed phrase|payout|reward[-\s]?estimate|farming|raw trust|trust[-\s]?score|scoreability|private[-\s]?reviewability|public[-\s]?score[-\s]?(?:estimate|prediction)/i;
++
++function completeInput() {
++  return buildScenarioInput({
++    scenarioType: "branch_preflight",
++    repoFullName: "octo/demo",
++    facts: [
++      createScenarioSignalEntry({
++        id: "queue",
++        kind: "fact",
++        label: "Queue",
++        detail: "Repo has two open PRs in cached metadata.",
++        source: "github_observed",
++      }),
++    ],
++    assumptions: [
++      createScenarioSignalEntry({
++        id: "pending",
++        kind: "assumption",
++        label: "Pending merges",
++        detail: "Caller assumes one approved PR will land soon.",
++        source: "user_supplied",
++      }),
++    ],
++    estimates: [
++      createScenarioSignalEntry({
++        id: "pressure",
++        kind: "estimate",
++        label: "Queue pressure",
++        detail: "Opening another PR would add moderate review load.",
++        source: "gittensory_projection",
++      }),
++    ],
++    unavailableSignals: [
++      createScenarioSignalEntry({
++        id: "official_stats",
++        kind: "unavailable",
++        label: "Official stats",
++        detail: "Contributor official stats are not available in cache.",
++        source: "missing",
++      }),
++    ],
++  });
++}
++
++describe("agent scenario input model", () => {
++  it("parses complete, partial, and unavailable-signal inputs", () => {
++    const complete = completeInput();
++    expect(complete.facts[0]?.kind).toBe("fact");
++    expect(complete.assumptions[0]?.kind).toBe("assumption");
++    expect(complete.estimates[0]?.kind).toBe("estimate");
++    expect(complete.unavailableSignals[0]?.kind).toBe("unavailable");
++    expect(complete.advisoryOnly).toBe(true);
++    expect(complete.notAutonomousPrBot).toBe(true);
++    expect(complete.notPublicScoring).toBe(true);
++
++    const partial = buildScenarioInput({
++      scenarioType: "general_repo",
++      repoFullName: "octo/demo",
++      facts: [
++        createScenarioSignalEntry({
++          id: "repo_only",
++          kind: "fact",
++          label: "Repo only",
++          detail: "Only repo context is known.",
++          source: "registry",
++        }),
++      ],
++    });
++    expect(partial.assumptions).toEqual([]);
++    expect(partial.unavailableSignals).toEqual([]);
++  });
++
++  it("rejects invalid schema payloads", () => {
++    expect(() => parseAgentScenarioInput({ version: 2 })).toThrow();
++    expect(() => parseAgentScenarioInput({ version: 1, scenarioType: "not_real", repo: { repoFullName: "octo/demo" } })).toThrow();
++  });
++
++  it("rejects bucket/kind mismatches deterministically", () => {
++    expect(() =>
++      parseAgentScenarioInput({
++        ...completeInput(),
++        facts: [
++          createScenarioSignalEntry({
++            id: "wrong",
++            kind: "assumption",
++            label: "Wrong bucket",
++            detail: "This belongs in assumptions.",
++            source: "user_supplied",
++          }),
++        ],
++      }),
++    ).toThrow();
++  });
++
++  it("sorts entries by id during normalization", () => {
++    const normalized = normalizeScenarioInput(
++      buildScenarioInput({
++        scenarioType: "open_pr_pressure",
++        repoFullName: "octo/demo",
++        facts: [
++          createScenarioSignalEntry({ id: "z", kind: "fact", label: "Z", detail: "last", source: "github_observed" }),
++          createScenarioSignalEntry({ id: "a", kind: "fact", label: "A", detail: "first", source: "github_observed" }),
++        ],
++      }),
++    );
++    expect(normalized.facts.map((entry) => entry.id)).toEqual(["a", "z"]);
++  });
++});
++
++describe("public vs private serialization", () => {
++  it("sanitizes forbidden language in public output only", () => {
++    const input = buildScenarioInput({
++      scenarioType: "pending_pr_resolution",
++      repoFullName: "octo/demo",
++      assumptions: [
++        createScenarioSignalEntry({
++          id: "unsafe",
++          kind: "assumption",
++          label: "Wallet hotkey payout",
++          detail: "Raw trust score and scoreability leak",
++          source: "user_supplied",
++        }),
++      ],
++    });
++    const publicSnapshot = serializeScenarioInputPublic(input);
++    const serialized = JSON.stringify(publicSnapshot);
++    expect(serialized).not.toMatch(FORBIDDEN_PUBLIC_LANGUAGE);
++    expect(serialized).toMatch(/private context/i);
++
++    const privateSnapshot = serializeScenarioInputPrivate(input);
++    expect(privateSnapshot.assumptions[0]?.detail).toMatch(/trust score/i);
++  });
++
++  it("omits optional state sections when not provided", () => {
++    const snapshot = serializeScenarioInputPublic(
++      buildScenarioInput({
++        scenarioType: "linked_issue_context",
++        repoFullName: "octo/demo",
++        issueState: { openIssueCount: 0, linkedIssueNumbers: [] },
++      }),
++    );
++    expect(snapshot.pullRequestState).toBeUndefined();
++    expect(snapshot.branchState).toBeUndefined();
++    expect(snapshot.issueState?.linkedIssueNumbers).toEqual([]);
++  });
++
++  it("includes PR and branch state in public snapshots when present", () => {
++    const snapshot = serializeScenarioInputPublic(
++      buildScenarioInput({
++        scenarioType: "open_pr_pressure",
++        repoFullName: "octo/demo",
++        pullRequestState: { openPrCount: 1 },
++        branchState: { branchName: "feat/x" },
++      }),
++    );
++    expect(snapshot.pullRequestState?.openPrCount).toBe(1);
++    expect(snapshot.branchState?.branchName).toBe("feat/x");
++  });
++
++  it("keeps advisory-only flags in both serializations", () => {
++    const input = completeInput();
++    expect(serializeScenarioInputPublic(input)).toMatchObject({
++      advisoryOnly: true,
++      notAutonomousPrBot: true,
++      notPublicScoring: true,
++    });
++    expect(serializeScenarioInputPrivate(input)).toMatchObject({
++      advisoryOnly: true,
++      notAutonomousPrBot: true,
++      notPublicScoring: true,
++    });
++  });
++});
++
++describe("source-upload safety", () => {
++  it("rejects oversized changedFiles metadata strings", () => {
++    expect(() => assertScenarioLocalBranchInputSafe({ changedFiles: [{ path: "a.ts", body: "x".repeat(5000) }] })).toThrow(
++      /oversized/i,
++    );
++    expect(() => assertScenarioLocalBranchInputSafe({ changedFiles: [null, { path: "ok.ts" }] })).not.toThrow();
++    expect(() => assertScenarioLocalBranchInputSafe({ login: "miner", repoFullName: "octo/demo" })).not.toThrow();
++    expect(() =>
++      assertScenarioLocalBranchInputSafe({ changedFiles: [{ path: "src/a.ts", additions: 1, deletions: 0, status: "modified" }] }),
++    ).not.toThrow();
++  });
++
++  it("rejects source-upload env flag and forbidden local branch keys", () => {
++    const previous = process.env.GITTENSORY_UPLOAD_SOURCE;
++    process.env.GITTENSORY_UPLOAD_SOURCE = "true";
++    expect(() => assertScenarioLocalBranchInputSafe({ login: "miner", repoFullName: "octo/demo" })).toThrow(/metadata-only/i);
++    process.env.GITTENSORY_UPLOAD_SOURCE = previous;
++    expect(() => assertScenarioLocalBranchInputSafe({ fileContent: "secret" })).toThrow(/never uploaded/i);
++    expect(() => assertScenarioLocalBranchInputSafe({ changedFiles: [{ path: "a.ts", diff: "code" }] })).toThrow(/never uploaded/i);
++  });
++
++  it("builds branch metadata with and without optional fields", () => {
++    const minimal = scenarioInputFromLocalBranchMetadata({
++      scenarioType: "general_repo",
++      login: "miner",
++      repoFullName: "octo/demo",
++    });
++    expect(minimal.branchState).toBeUndefined();
++
++    const eligible = scenarioInputFromLocalBranchMetadata({
++      scenarioType: "general_repo",
++      login: "miner",
++      repoFullName: "octo/demo",
++      eligibilityStatus: "eligible",
++    });
++    expect(minimal.facts.map((entry) => entry.id)).toEqual(["actor", "repo"]);
++    expect(minimal.unavailableSignals).toEqual([]);
++    expect(eligible.branchState?.eligibilityStatus).toBe("eligible");
++
++    const branchOnly = scenarioInputFromLocalBranchMetadata({
++      scenarioType: "branch_preflight",
++      login: "miner",
++      repoFullName: "octo/demo",
++      branchName: "feat/demo",
++    });
++    expect(branchOnly.facts.find((entry) => entry.id === "branch")?.detail).not.toMatch(/against/);
++
++    const rich = buildScenarioInput({
++      scenarioType: "open_pr_pressure",
++      repoFullName: "octo/demo",
++      registered: true,
++      maintainerLane: false,
++      issueState: { openIssueCount: 4 },
++      pullRequestState: { openPrCount: 2, stalePrCount: 1 },
++      branchState: { branchName: "feat/x", baseRef: "origin/main", headRef: "feat/x" },
++    });
++    expect(rich.repo.registered).toBe(true);
++    expect(rich.pullRequestState?.openPrCount).toBe(2);
++  });
++
++  it("builds metadata-only scenario input from local branch notes", () => {
++    const input = scenarioInputFromLocalBranchMetadata({
++      scenarioType: "branch_preflight",
++      login: "miner",
++      repoFullName: "octo/demo",
++      branchName: "feat/demo",
++      baseRef: "origin/main",
++      changedFileCount: 3,
++      linkedIssues: [12],
++      scenarioNotes: ["approved PR may land tonight"],
++      eligibilityStatus: "unknown",
++    });
++    expect(input.branchState?.changedFileCount).toBe(3);
++    expect(input.issueState?.linkedIssueNumbers).toEqual([12]);
++    expect(input.assumptions[0]?.source).toBe("user_supplied");
++    expect(input.unavailableSignals[0]?.kind).toBe("unavailable");
++    expect(JSON.stringify(input)).not.toMatch(/fileContent|sourceContent|upload/i);
++  });
++});
++
++describe("invariants", () => {
++  it("does not embed ranking or strategy rendering fields", () => {
++    const serialized = JSON.stringify(completeInput());
++    expect(serialized).not.toMatch(/recommendedOption|rank:|strategy ranking|renderStrategy/i);
++  });
++
++  it("property: public serialization never reintroduces forbidden tokens", () => {
++    const samples = [
++      "wallet",
++      "hotkey reward estimate",
++      "raw trust score",
++      "public score estimate",
++      "private reviewability",
++      "farming loop",
++    ];
++    for (const sample of samples) {
++      const input = buildScenarioInput({
++        scenarioType: "general_repo",
++        repoFullName: "octo/demo",
++        facts: [
++          createScenarioSignalEntry({
++            id: "sample",
++            kind: "fact",
++            label: sample,
++            detail: sample,
++            source: "user_supplied",
++          }),
++        ],
++      });
++      expect(JSON.stringify(serializeScenarioInputPublic(input))).not.toMatch(FORBIDDEN_PUBLIC_LANGUAGE);
++    }
++  });
++});

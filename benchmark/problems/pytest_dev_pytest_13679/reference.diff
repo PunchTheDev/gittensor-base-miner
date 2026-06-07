@@ -1,0 +1,157 @@
+diff --git a/AUTHORS b/AUTHORS
+index 52363a177bb..b6677437654 100644
+--- a/AUTHORS
++++ b/AUTHORS
+@@ -340,6 +340,7 @@ Oleg Sushchenko
+ Oleksandr Zavertniev
+ Olga Matoula
+ Oliver Bestwalter
++Olivier Grisel
+ Omar Kohl
+ Omer Hadari
+ Ondřej Súkup
+diff --git a/changelog/13678.feature.rst b/changelog/13678.feature.rst
+new file mode 100644
+index 00000000000..63c7dfa399f
+--- /dev/null
++++ b/changelog/13678.feature.rst
+@@ -0,0 +1,3 @@
++Added a new `faulthandler_exit_on_timeout` ini option set to "false" by default to let `faulthandler` interrupt the `pytest` process after a timeout in case of deadlock -- by :user:`ogrisel`.
++
++Previously, a `faulthandler` timeout would only dump the traceback of all threads to stderr, but would not interrupt the `pytest` process.
+diff --git a/doc/en/reference/reference.rst b/doc/en/reference/reference.rst
+index 7ec1b110baf..6f8e14995e6 100644
+--- a/doc/en/reference/reference.rst
++++ b/doc/en/reference/reference.rst
+@@ -1484,6 +1484,25 @@ passed multiple times. The expected format is ``name=value``. For example::
+ 
+    For more information please refer to :ref:`faulthandler`.
+ 
++
++.. confval:: faulthandler_exit_on_timeout
++
++   Exit the pytest process after the per-test timeout is reached by passing
++   `exit=True` to the :func:`faulthandler.dump_traceback_later` function. This
++   is particularly useful to avoid wasting CI resources for test suites that
++   are prone to putting the main Python interpreter into a deadlock state.
++
++   This option is set to 'false' by default.
++
++   .. code-block:: ini
++
++        # content of pytest.ini
++        [pytest]
++        faulthandler_timeout=5
++        faulthandler_exit_on_timeout=true
++
++   For more information please refer to :ref:`faulthandler`.
++
+ .. confval:: filterwarnings
+ 
+ 
+@@ -2401,6 +2420,9 @@ All the command-line flags can be obtained by running ``pytest --help``::
+       faulthandler_timeout (string):
+                             Dump the traceback of all threads if a test takes
+                             more than TIMEOUT seconds to finish
++      faulthandler_exit_on_timeout (bool):
++                            Exit the test process if a test takes more than
++                            faulthandler_timeout seconds to finish
+       addopts (args):       Extra command line options
+       minversion (string):  Minimally required pytest version
+       pythonpath (paths):   Add paths to sys.path
+diff --git a/src/_pytest/faulthandler.py b/src/_pytest/faulthandler.py
+index 79efc1d1704..080cf583813 100644
+--- a/src/_pytest/faulthandler.py
++++ b/src/_pytest/faulthandler.py
+@@ -16,11 +16,18 @@
+ 
+ 
+ def pytest_addoption(parser: Parser) -> None:
+-    help = (
++    help_timeout = (
+         "Dump the traceback of all threads if a test takes "
+         "more than TIMEOUT seconds to finish"
+     )
+-    parser.addini("faulthandler_timeout", help, default=0.0)
++    help_exit_on_timeout = (
++        "Exit the test process if a test takes more than "
++        "faulthandler_timeout seconds to finish"
++    )
++    parser.addini("faulthandler_timeout", help_timeout, default=0.0)
++    parser.addini(
++        "faulthandler_exit_on_timeout", help_exit_on_timeout, type="bool", default=False
++    )
+ 
+ 
+ def pytest_configure(config: Config) -> None:
+@@ -72,14 +79,21 @@ def get_timeout_config_value(config: Config) -> float:
+     return float(config.getini("faulthandler_timeout") or 0.0)
+ 
+ 
++def get_exit_on_timeout_config_value(config: Config) -> bool:
++    exit_on_timeout = config.getini("faulthandler_exit_on_timeout")
++    assert isinstance(exit_on_timeout, bool)
++    return exit_on_timeout
++
++
+ @pytest.hookimpl(wrapper=True, trylast=True)
+ def pytest_runtest_protocol(item: Item) -> Generator[None, object, object]:
+     timeout = get_timeout_config_value(item.config)
++    exit_on_timeout = get_exit_on_timeout_config_value(item.config)
+     if timeout > 0:
+         import faulthandler
+ 
+         stderr = item.config.stash[fault_handler_stderr_fd_key]
+-        faulthandler.dump_traceback_later(timeout, file=stderr)
++        faulthandler.dump_traceback_later(timeout, file=stderr, exit=exit_on_timeout)
+         try:
+             return (yield)
+         finally:
+diff --git a/testing/test_faulthandler.py b/testing/test_faulthandler.py
+index b308e89adbd..db9b092c568 100644
+--- a/testing/test_faulthandler.py
++++ b/testing/test_faulthandler.py
+@@ -118,6 +118,43 @@ def test_timeout():
+     assert result.ret == 0
+ 
+ 
++@pytest.mark.keep_ci_var
++@pytest.mark.skipif(
++    "CI" in os.environ and sys.platform == "linux" and sys.version_info >= (3, 14),
++    reason="sometimes crashes on CI because of truncated outputs (#7022)",
++)
++@pytest.mark.parametrize("exit_on_timeout", [True, False])
++def test_timeout_and_exit(pytester: Pytester, exit_on_timeout: bool) -> None:
++    """Test option to force exit pytest process after a certain timeout."""
++    pytester.makepyfile(
++        """
++    import os, time
++    def test_long_sleep_and_raise():
++        time.sleep(1 if "CI" in os.environ else 0.1)
++        raise AssertionError(
++            "This test should have been interrupted before reaching this point."
++        )
++    """
++    )
++    pytester.makeini(
++        f"""
++        [pytest]
++        faulthandler_timeout = 0.01
++        faulthandler_exit_on_timeout = {"true" if exit_on_timeout else "false"}
++        """
++    )
++    result = pytester.runpytest_subprocess()
++    tb_output = "most recent call first"
++    result.stderr.fnmatch_lines([f"*{tb_output}*"])
++    if exit_on_timeout:
++        result.stdout.no_fnmatch_line("*1 failed*")
++        result.stdout.no_fnmatch_line("*AssertionError*")
++    else:
++        result.stdout.fnmatch_lines(["*1 failed*"])
++        result.stdout.fnmatch_lines(["*AssertionError*"])
++    assert result.ret == 1
++
++
+ @pytest.mark.parametrize("hook_name", ["pytest_enter_pdb", "pytest_exception_interact"])
+ def test_cancel_timeout_on_hook(monkeypatch, hook_name) -> None:
+     """Make sure that we are cancelling any scheduled traceback dumping due

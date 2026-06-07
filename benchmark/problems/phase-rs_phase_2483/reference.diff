@@ -1,0 +1,250 @@
+diff --git a/crates/engine/src/game/casting.rs b/crates/engine/src/game/casting.rs
+index abb5e653e..4449daf26 100644
+--- a/crates/engine/src/game/casting.rs
++++ b/crates/engine/src/game/casting.rs
+@@ -28938,6 +28938,59 @@ mod tests {
+         );
+     }
+ 
++    #[test]
++    fn cant_be_activated_aura_blocks_enchanted_creature_not_others() {
++        // CR 602.5: Viper's Kiss — an Aura whose text grants "its activated
++        // abilities can't be activated" must block the ENCHANTED creature's
++        // abilities, not the Aura's own. `CantBeActivated` is not re-homed onto
++        // the host, and the runtime matches `source_filter` from the Aura source,
++        // so the parser must emit `source_filter = EnchantedBy` (the host filter).
++        // This is the end-to-end proof that the #2479 split is not a runtime no-op.
++        let mut state = setup_game_at_main_phase();
++
++        // Enchanted creature with a {T}: Draw activated ability, under P0.
++        let creature = add_artifact_with_activated_ability(&mut state, PlayerId(0));
++        let creature_ability = state.objects[&creature].abilities[0].clone();
++
++        // Parse Viper's Kiss's compound line and take the CantBeActivated companion.
++        let cba = crate::parser::oracle_static::parse_static_line_multi(
++            "Enchanted creature gets -1/-1, and its activated abilities can't be activated.",
++        )
++        .into_iter()
++        .find(|d| matches!(d.mode, StaticMode::CantBeActivated { .. }))
++        .expect("Viper's Kiss yields a CantBeActivated companion static");
++
++        // Place it on an Aura attached to the creature.
++        let aura = create_object(
++            &mut state,
++            CardId(0x71BE),
++            PlayerId(0),
++            "Viper's Kiss".to_string(),
++            Zone::Battlefield,
++        );
++        {
++            let obj = state.objects.get_mut(&aura).unwrap();
++            obj.card_types.core_types.push(CoreType::Enchantment);
++            obj.card_types.subtypes.push("Aura".to_string());
++            obj.entered_battlefield_turn = Some(0);
++            obj.attached_to = Some(creature.into());
++            obj.static_definitions.push(cba);
++        }
++
++        assert!(
++            is_blocked_by_cant_be_activated(&state, PlayerId(0), creature, &creature_ability),
++            "Viper's Kiss must block the ENCHANTED creature's activated ability"
++        );
++
++        // A different, unenchanted creature is unaffected.
++        let other = add_artifact_with_activated_ability(&mut state, PlayerId(0));
++        let other_ability = state.objects[&other].abilities[0].clone();
++        assert!(
++            !is_blocked_by_cant_be_activated(&state, PlayerId(0), other, &other_ability),
++            "Viper's Kiss must NOT block a creature it doesn't enchant"
++        );
++    }
++
+     // === CR 605.1a: Pithing Needle mana-ability exemption gate ===
+ 
+     /// Build a Llanowar-Elves-style mana ability: `{T}: Add {G}` (no targets, produces mana).
+diff --git a/crates/engine/src/parser/oracle_static/evasion.rs b/crates/engine/src/parser/oracle_static/evasion.rs
+index 0ef019468..95c4499f6 100644
+--- a/crates/engine/src/parser/oracle_static/evasion.rs
++++ b/crates/engine/src/parser/oracle_static/evasion.rs
+@@ -797,6 +797,75 @@ pub(crate) fn try_split_and_cant_be_attached(text: &str) -> Option<Vec<StaticDef
+     Some(defs)
+ }
+ 
++/// CR 602.5 + CR 603.2a: Decompose `"<grant or restriction> and [its] activated
++/// abilities can't be activated"` into the first conjunct's static(s) plus a
++/// `CantBeActivated` static (self-reference: the affected permanent's own
++/// activated abilities can't be activated by anyone).
++///
++/// Without this split the trailing activation prohibition was dropped: Viper's
++/// Kiss ("Enchanted creature gets -1/-1, and its activated abilities can't be
++/// activated.") parsed to only the -1/-1 grant, so the enchanted creature's
++/// activated abilities still worked. Mirrors `try_split_and_cant_block`;
++/// `CantBeActivated` is a struct `StaticMode` (not a `ContinuousModification`),
++/// built exactly like the standalone / Arrest-compound path
++/// (`who = AllPlayers, source_filter = SelfRef`) so it rides the same enforcement.
++/// The "can't attack/block, and activated abilities can't be activated" compound
++/// (Arrest, Faith's Fetters) is handled by its own earlier branch.
++pub(crate) fn try_split_and_cant_activate_abilities(text: &str) -> Option<Vec<StaticDefinition>> {
++    type VE<'a> = OracleError<'a>;
++    let lower = text.to_lowercase();
++
++    let (before, _matched, _rest) = nom_primitives::scan_preceded(&lower, |i: &str| {
++        // Compose the two independent axes rather than enumerating the product:
++        // an optional possessive "its " and the ASCII / U+2019 apostrophe form.
++        let (i, _) = tag::<_, _, VE>("and ").parse(i)?;
++        let (i, _) = opt(tag::<_, _, VE>("its ")).parse(i)?;
++        let (i, _) = alt((
++            tag::<_, _, VE>("activated abilities can't be activated"),
++            tag::<_, _, VE>("activated abilities can\u{2019}t be activated"),
++        ))
++        .parse(i)?;
++        Ok((i, ()))
++    })?;
++
++    let cut_end = before
++        .trim_end_matches(|ch: char| ch == ',' || ch.is_whitespace())
++        .len();
++    let line_a = format!("{}.", text[..cut_end].trim_end_matches('.'));
++    let mut defs = parse_static_line_multi(&line_a);
++    if defs.is_empty() {
++        return None;
++    }
++    for def in &mut defs {
++        def.description = Some(text.to_string());
++    }
++
++    // CR 602.5 + CR 603.2a: the prohibition applies to the same subject as the
++    // grant (the enchanted/equipped creature). `CantBeActivated` is a
++    // data-carrying static with no layer-pipeline handler — it is NOT re-homed
++    // onto the host the way `Continuous`/`GrantStaticAbility` modifications are.
++    // `is_blocked_by_cant_be_activated` (game/casting.rs) matches `source_filter`
++    // against the activating permanent from the static SOURCE's perspective
++    // (`FilterContext::from_source(static_owner)`), ignoring `affected`. The
++    // static lives on the Aura/Equipment, so `source_filter` must be the host
++    // filter (e.g. `EnchantedBy`) to resolve to the enchanted/equipped creature.
++    // A `SelfRef` `source_filter` would resolve to the Aura/Equipment itself and
++    // silently block nothing. For a self-referential grant ("this creature gets
++    // … and its activated abilities …") the first conjunct's filter is already
++    // `SelfRef`, so threading it through is correct in every case.
++    let affected = defs[0].affected.clone()?;
++    defs.push(
++        StaticDefinition::new(StaticMode::CantBeActivated {
++            who: ProhibitionScope::AllPlayers,
++            source_filter: affected.clone(),
++            exemption: parse_cant_be_activated_exemption_in_text(&lower),
++        })
++        .affected(affected)
++        .description(text.to_string()),
++    );
++    Some(defs)
++}
++
+ /// CR 509.1b: Classify a "can't be blocked …" evasion predicate (lowercased,
+ /// starting with "can't be blocked") into the corresponding `StaticMode` and
+ /// optional evasion condition, composing the same building blocks the standalone
+diff --git a/crates/engine/src/parser/oracle_static/mod.rs b/crates/engine/src/parser/oracle_static/mod.rs
+index bc9ba3679..5c21e9be5 100644
+--- a/crates/engine/src/parser/oracle_static/mod.rs
++++ b/crates/engine/src/parser/oracle_static/mod.rs
+@@ -100,9 +100,9 @@ mod support {
+         parse_compound_subject_rule_static, parse_property_descriptor,
+         parse_rule_static_separator_nom, try_parse_compound_subtypes,
+         try_parse_scoped_must_attack_block, try_split_and_can_attack_despite_defender,
+-        try_split_and_can_block_additional, try_split_and_cant_attack,
+-        try_split_and_cant_be_attached, try_split_and_cant_be_blocked, try_split_and_cant_block,
+-        try_split_and_doesnt_untap, try_split_and_must_attack_block,
++        try_split_and_can_block_additional, try_split_and_cant_activate_abilities,
++        try_split_and_cant_attack, try_split_and_cant_be_attached, try_split_and_cant_be_blocked,
++        try_split_and_cant_block, try_split_and_doesnt_untap, try_split_and_must_attack_block,
+     };
+     pub(super) use super::grammar::*;
+     pub(super) use super::keyword_grant::{
+diff --git a/crates/engine/src/parser/oracle_static/shared.rs b/crates/engine/src/parser/oracle_static/shared.rs
+index 6aefe7249..26275aaef 100644
+--- a/crates/engine/src/parser/oracle_static/shared.rs
++++ b/crates/engine/src/parser/oracle_static/shared.rs
+@@ -646,6 +646,15 @@ pub(crate) fn parse_static_line_multi_inner(text: &str) -> Vec<StaticDefinition>
+         return defs;
+     }
+ 
++    // CR 602.5: "<grant or restriction> and its activated abilities can't be
++    // activated" pairs a first clause with an activation prohibition under one
++    // subject (Viper's Kiss). Split so the CantBeActivated clause is not dropped.
++    // (The "can't attack/block, and activated abilities …" compound — Arrest,
++    // Faith's Fetters — is handled by its own earlier branch above.)
++    if let Some(defs) = try_split_and_cant_activate_abilities(&stripped) {
++        return defs;
++    }
++
+     // CR 509.1b + CR 604.1 + CR 611.3a + CR 613.1f: Attached-subject grant lines
+     // ("enchanted creature ...", "equipped creature ...") may decompose into more
+     // than one StaticDefinition (e.g. CantBeBlocked + Continuous{AddKeyword}).
+diff --git a/crates/engine/src/parser/oracle_static/tests.rs b/crates/engine/src/parser/oracle_static/tests.rs
+index 20e0e6be7..2327e0ee2 100644
+--- a/crates/engine/src/parser/oracle_static/tests.rs
++++ b/crates/engine/src/parser/oracle_static/tests.rs
+@@ -369,6 +369,64 @@ fn cant_be_attached_static_splits_both_prohibitions() {
+     );
+ }
+ 
++/// CR 602.5: Viper's Kiss — "Enchanted creature gets -1/-1, and its activated
++/// abilities can't be activated." must decompose into BOTH the -1/-1 grant AND a
++/// `CantBeActivated` static. Previously the activation prohibition was dropped,
++/// so the enchanted creature's activated abilities still worked.
++#[test]
++fn cant_activate_abilities_static_splits_from_grant() {
++    let defs = parse_static_line_multi(
++        "Enchanted creature gets -1/-1, and its activated abilities can't be activated.",
++    );
++    assert!(
++        defs.iter()
++            .any(|d| matches!(d.mode, StaticMode::CantBeActivated { .. })),
++        "expected a CantBeActivated static, got {:?}",
++        defs.iter().map(|d| &d.mode).collect::<Vec<_>>()
++    );
++    assert!(
++        defs.iter()
++            .any(|d| matches!(d.mode, StaticMode::Continuous)),
++        "the -1/-1 grant must be preserved"
++    );
++}
++
++/// CR 602.5 + CR 603.2a: The split `CantBeActivated` prohibits every player from
++/// activating the ENCHANTED creature's abilities. Because the static lives on the
++/// Aura and `is_blocked_by_cant_be_activated` matches `source_filter` from the
++/// Aura source (ignoring `affected`, and with no re-homing for this static mode),
++/// the companion's `source_filter` must be the host filter (`EnchantedBy`) — NOT
++/// `SelfRef`, which would resolve to the Aura itself (a silent runtime no-op).
++#[test]
++fn cant_activate_abilities_static_targets_enchanted_creature() {
++    let defs = parse_static_line_multi(
++        "Enchanted creature gets -1/-1, and its activated abilities can't be activated.",
++    );
++    let prohibition = defs
++        .iter()
++        .find(|d| matches!(d.mode, StaticMode::CantBeActivated { .. }))
++        .expect("expected a CantBeActivated static");
++    let StaticMode::CantBeActivated {
++        who, source_filter, ..
++    } = &prohibition.mode
++    else {
++        unreachable!("matched CantBeActivated above");
++    };
++    assert_eq!(
++        *who,
++        ProhibitionScope::AllPlayers,
++        "every player is prohibited"
++    );
++    assert!(
++        matches!(
++            source_filter,
++            TargetFilter::Typed(tf) if tf.properties.contains(&FilterProp::EnchantedBy)
++        ),
++        "source_filter must be the host (EnchantedBy) filter so it resolves to the \
++         enchanted creature from the Aura source, got {source_filter:?}"
++    );
++}
++
+ /// CR 509.1b: Madcap Skills — "Enchanted creature gets +3/+0 and can't be
+ /// blocked by more than one creature." must decompose into BOTH the P/T grant
+ /// AND a `CantBeBlockedByMoreThan { max: 1 }` static affecting the enchanted

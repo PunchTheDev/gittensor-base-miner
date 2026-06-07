@@ -1,0 +1,459 @@
+diff --git a/CHANGELOG.md b/CHANGELOG.md
+index 8bd93496..a7968ece 100644
+--- a/CHANGELOG.md
++++ b/CHANGELOG.md
+@@ -4,6 +4,41 @@
+ 
+ ### Added
+ 
++- `voice` Cargo feature on `genie-core` and `genie-ctl` (issue #41).
++  Default-on so `cargo build` produces today's Jetson-targeted binary
++  unchanged. `cargo build -p genie-core --no-default-features` (and the
++  matching `-p genie-ctl`) produces a chat-only binary that drops the
++  STT/TTS/AEC/wakeword pipeline, the `VoiceOrchestrator`, the
++  `voice_loop::run` dispatcher, and `genie-ctl`'s `speaker` subcommand:
++    - `pub mod voice;` and `pub mod voice_loop;` in
++      `crates/genie-core/src/lib.rs` are now `#[cfg(feature = "voice")]`.
++    - The voice-mode branch in `crates/genie-core/src/main.rs` is gated;
++      when voice is requested (`--voice` / `GENIEPOD_VOICE=1` /
++      `core.voice_enabled = true`) on a chat-only build, the runtime
++      logs one warning and falls through to the existing chat / HTTP
++      path so deploying an unchanged `geniepod.toml` is a non-event.
++    - `genie-ctl`'s `genie-core` dependency uses
++      `default-features = false`; `genie-ctl`'s own new `voice` feature
++      forwards to `genie-core/voice`. The `speaker` subcommand,
++      `speaker` help line, all `cmd_speaker_*` helpers, and the two
++      `parse_speaker_options` unit tests are `#[cfg(feature = "voice")]`.
++      Invoking `genie-ctl speaker …` on a chat-only build exits with a
++      clear "rebuild with --features voice" message instead of crashing.
++  Knock-on cleanups so `cargo clippy -- -D warnings` is green on both
++  variants: `local_http_host` and its two unit tests in
++  `crates/genie-core/src/main.rs` are now `#[cfg(feature = "telegram")]`
++  (they are only used by the Telegram adapter and were latent dead code
++  on no-telegram builds); the `std::process::Command` import in
++  `crates/genie-ctl/src/main.rs` is `#[cfg(feature = "voice")]` because
++  the only `std::process::Command::new` call lives in `record_speaker_wav`.
++  Release binary on x86_64-linux drops from 4.8 MB to 4.6 MB without
++  voice; the bigger payoff is unblocking macOS / Windows hosts that
++  previously could not compile the ALSA-coupled voice modules.
++  CI matrix coverage (acceptance criterion #8) will be added on top of
++  issue #34's `ci.yml` workflow once that lands; the
++  `cargo build / clippy / test` invocations to add are
++  `-p genie-core -p genie-ctl --no-default-features` next to the
++  existing `--workspace` ones.
+ - `.github/workflows/scripts.yml` and `ruff.toml` — shellcheck + ruff
+   workflow for the stretch slice of issue #34. Discovers all
+   tracked `*.sh` and `*.py` files via `git ls-files`, then runs
+diff --git a/crates/genie-core/Cargo.toml b/crates/genie-core/Cargo.toml
+index e5c90dbe..09b65e27 100644
+--- a/crates/genie-core/Cargo.toml
++++ b/crates/genie-core/Cargo.toml
+@@ -14,7 +14,7 @@ name = "genie-core"
+ path = "src/main.rs"
+ 
+ [features]
+-default = ["telegram", "llama-cpp", "genie-ai-runtime"]
++default = ["telegram", "llama-cpp", "genie-ai-runtime", "voice"]
+ telegram = []
+ # LLM backend feature surface (declared per issue #32 closeout).
+ # Both default-on so today's builds are byte-identical.
+@@ -23,6 +23,14 @@ telegram = []
+ # regression is caught automatically rather than silently bit-rotting.
+ llama-cpp = []
+ genie-ai-runtime = []
++# Voice subsystem (issue #41). Gates the STT/TTS/AEC/wakeword pipeline,
++# the `VoiceOrchestrator`, and the `voice_loop::run` dispatcher. Default-on
++# so today's Jetson builds are byte-identical; `--no-default-features`
++# (or `--no-default-features --features telegram,llama-cpp,...`) produces
++# a chat-only binary that builds on macOS / Windows hosts which don't
++# have ALSA. A voice-tagged `geniepod.toml` still deploys cleanly: the
++# runtime logs one warning and falls through to the chat path.
++voice = []
+ 
+ [dependencies]
+ genie-common = { workspace = true }
+diff --git a/crates/genie-core/src/lib.rs b/crates/genie-core/src/lib.rs
+index e5e42384..2192cca2 100644
+--- a/crates/genie-core/src/lib.rs
++++ b/crates/genie-core/src/lib.rs
+@@ -24,7 +24,7 @@
+ //! | [`connectivity`] | Boundary for an ESP32-C6 UART Thread/Matter coprocessor |
+ //! | [`context`] | LLM context window management with summarization |
+ //! | [`prompt`] | Model-aware system prompt builder (6 LLM families) |
+-//! | [`voice`] | STT/TTS subprocess management + voice output formatter |
++//! | [`voice`] | STT/TTS subprocess management + voice output formatter (feature `voice`, default-on) |
+ //! | [`ota`] | OTA update checker via GitHub Releases |
+ //! | [`server`] | HTTP chat API server |
+ //!
+@@ -58,7 +58,9 @@ pub mod skills;
+ #[cfg(feature = "telegram")]
+ pub mod telegram;
+ pub mod tools;
++#[cfg(feature = "voice")]
+ pub mod voice;
++#[cfg(feature = "voice")]
+ pub mod voice_loop;
+ 
+ // Re-export key types at crate root for convenience.
+diff --git a/crates/genie-core/src/main.rs b/crates/genie-core/src/main.rs
+index ad17b526..edd6db76 100644
+--- a/crates/genie-core/src/main.rs
++++ b/crates/genie-core/src/main.rs
+@@ -167,53 +167,80 @@ async fn main() -> Result<()> {
+     }
+ 
+     // Check for voice mode: --voice flag or GENIEPOD_VOICE=1 or config voice_enabled.
+-    let voice_mode = std::env::args().any(|a| a == "--voice")
++    let voice_requested = std::env::args().any(|a| a == "--voice")
+         || std::env::var("GENIEPOD_VOICE").unwrap_or_default() == "1"
+         || config.core.voice_enabled;
+ 
++    // Whether the running binary actually has the voice subsystem compiled in.
++    // When voice was requested but the binary is chat-only (issue #41 feature
++    // gate), emit one warning and fall through to the chat path so an existing
++    // voice-tagged `geniepod.toml` still deploys cleanly on a chat-only build.
++    #[cfg(feature = "voice")]
++    let voice_mode = voice_requested;
++    #[cfg(not(feature = "voice"))]
++    let voice_mode = {
++        if voice_requested {
++            tracing::warn!(
++                "voice mode requested (--voice / GENIEPOD_VOICE=1 / core.voice_enabled) but \
++                 this genie-core build was compiled without the 'voice' feature; falling back \
++                 to chat-only mode. Rebuild with default features (or --features voice) to \
++                 enable the voice loop."
++            );
++        }
++        false
++    };
++
+     if voice_mode {
+-        tracing::info!("voice mode — starting voice interaction loop");
+-        let voice_cfg = genie_core::voice_loop::VoiceConfig {
+-            whisper_model: config.core.whisper_model.to_string_lossy().to_string(),
+-            whisper_cli_path: config.core.whisper_cli_path.to_string_lossy().to_string(),
+-            whisper_port: config.core.whisper_port,
+-            piper_model: config.core.piper_model.to_string_lossy().to_string(),
+-            piper_path: config.core.piper_path.to_string_lossy().to_string(),
+-            piper_pipe_mode: config.core.piper_pipe_mode,
+-            stt_language: config.core.stt_language.clone(),
+-            voice_tts_models: config
+-                .core
+-                .voice_tts_models
+-                .iter()
+-                .map(|(language, path)| (language.clone(), path.to_string_lossy().to_string()))
+-                .collect(),
+-            audio_device: config.core.audio_device.clone(),
+-            audio_output_device: config.core.audio_output_device.clone(),
+-            sample_rate: config.core.audio_sample_rate,
+-            audio_denoiser: config.core.audio_denoiser.clone(),
+-            deep_filter_path: config.core.deep_filter_path.to_string_lossy().to_string(),
+-            deep_filter_atten_lim_db: config.core.deep_filter_atten_lim_db,
+-            post_tts_silence_ms: config.core.post_tts_silence_ms,
+-            record_secs: config.core.voice_record_secs,
+-            llm_model_path: config.core.llm_model_path.to_string_lossy().to_string(),
+-            wakeword_script: config.core.wakeword_script.to_string_lossy().to_string(),
+-            voice_continuous: config.core.voice_continuous,
+-            voice_continuous_secs: config.core.voice_continuous_secs,
+-            speaker_identity: genie_core::voice::identity::SpeakerIdentityProvider::from_config(
+-                &config.core.speaker_identity,
+-            ),
+-        };
+-        genie_core::voice_loop::run(
+-            voice_cfg,
+-            &llm,
+-            &tool_dispatcher,
+-            &mem,
+-            &conversations,
+-            &system_prompt,
+-            config.core.max_history_turns,
+-            model_family,
+-        )
+-        .await
++        #[cfg(feature = "voice")]
++        {
++            tracing::info!("voice mode — starting voice interaction loop");
++            let voice_cfg = genie_core::voice_loop::VoiceConfig {
++                whisper_model: config.core.whisper_model.to_string_lossy().to_string(),
++                whisper_cli_path: config.core.whisper_cli_path.to_string_lossy().to_string(),
++                whisper_port: config.core.whisper_port,
++                piper_model: config.core.piper_model.to_string_lossy().to_string(),
++                piper_path: config.core.piper_path.to_string_lossy().to_string(),
++                piper_pipe_mode: config.core.piper_pipe_mode,
++                stt_language: config.core.stt_language.clone(),
++                voice_tts_models: config
++                    .core
++                    .voice_tts_models
++                    .iter()
++                    .map(|(language, path)| (language.clone(), path.to_string_lossy().to_string()))
++                    .collect(),
++                audio_device: config.core.audio_device.clone(),
++                audio_output_device: config.core.audio_output_device.clone(),
++                sample_rate: config.core.audio_sample_rate,
++                audio_denoiser: config.core.audio_denoiser.clone(),
++                deep_filter_path: config.core.deep_filter_path.to_string_lossy().to_string(),
++                deep_filter_atten_lim_db: config.core.deep_filter_atten_lim_db,
++                post_tts_silence_ms: config.core.post_tts_silence_ms,
++                record_secs: config.core.voice_record_secs,
++                llm_model_path: config.core.llm_model_path.to_string_lossy().to_string(),
++                wakeword_script: config.core.wakeword_script.to_string_lossy().to_string(),
++                voice_continuous: config.core.voice_continuous,
++                voice_continuous_secs: config.core.voice_continuous_secs,
++                speaker_identity: genie_core::voice::identity::SpeakerIdentityProvider::from_config(
++                    &config.core.speaker_identity,
++                ),
++            };
++            genie_core::voice_loop::run(
++                voice_cfg,
++                &llm,
++                &tool_dispatcher,
++                &mem,
++                &conversations,
++                &system_prompt,
++                config.core.max_history_turns,
++                model_family,
++            )
++            .await
++        }
++        #[cfg(not(feature = "voice"))]
++        {
++            // Unreachable: voice_mode is forced false above when the feature is off.
++            unreachable!("voice_mode true with feature 'voice' disabled");
++        }
+     } else if interactive {
+         tracing::info!("interactive mode — starting REPL");
+         genie_core::repl::run(
+@@ -303,6 +330,9 @@ async fn main() -> Result<()> {
+     }
+ }
+ 
++// Only used by the telegram adapter (issue #41: dead in chat-only / no-telegram
++// builds, so gate the definition together with its only caller).
++#[cfg(feature = "telegram")]
+ fn local_http_host(bind_host: &str) -> String {
+     let bind_host = bind_host.trim();
+     if bind_host.is_empty() || matches!(bind_host, "0.0.0.0" | "::") {
+@@ -326,7 +356,10 @@ fn atty_check() -> bool {
+     }
+ }
+ 
+-#[cfg(test)]
++// The only tests in this bin target are local_http_host_* which exercise the
++// telegram adapter's bind-host helper. Gate the whole module so chat-only /
++// no-telegram builds don't emit an `unused_imports` lint on `use super::*;`.
++#[cfg(all(test, feature = "telegram"))]
+ mod tests {
+     use super::*;
+ 
+diff --git a/crates/genie-ctl/Cargo.toml b/crates/genie-ctl/Cargo.toml
+index 98d4272a..ec14160d 100644
+--- a/crates/genie-ctl/Cargo.toml
++++ b/crates/genie-ctl/Cargo.toml
+@@ -9,9 +9,17 @@ description = "GeniePod CLI — device management, status, chat, governor contro
+ name = "genie-ctl"
+ path = "src/main.rs"
+ 
++[features]
++# Mirrors the `voice` feature on genie-core (issue #41). Default-on so
++# today's `cargo build` produces the same binary; turning it off
++# (`cargo build -p genie-ctl --no-default-features`) drops the `speaker`
++# subcommand so the CLI builds against a chat-only genie-core too.
++default = ["voice"]
++voice = ["genie-core/voice"]
++
+ [dependencies]
+ genie-common = { workspace = true }
+-genie-core = { path = "../genie-core" }
++genie-core = { path = "../genie-core", default-features = false }
+ tokio = { workspace = true }
+ serde = { workspace = true }
+ serde_json = { workspace = true }
+diff --git a/crates/genie-ctl/src/main.rs b/crates/genie-ctl/src/main.rs
+index 3613c96a..fa889138 100644
+--- a/crates/genie-ctl/src/main.rs
++++ b/crates/genie-ctl/src/main.rs
+@@ -23,10 +23,12 @@ use genie_core::skills::{
+     SkillLoader, SkillManifestAudit, find_manifest_sidecar, manifest_sidecar_candidates,
+     skills_dir as runtime_skills_dir,
+ };
++#[cfg(feature = "voice")]
+ use genie_core::voice::identity::{
+     enroll_speaker_file, identify_speaker_file, list_speaker_profiles, remove_speaker_profile,
+ };
+ use std::path::{Path, PathBuf};
++#[cfg(feature = "voice")]
+ use std::process::Command;
+ use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+ 
+@@ -89,11 +91,23 @@ async fn main() -> Result<()> {
+             cmd_skill(&args[2..])?;
+         }
+         "speaker" | "speakers" => {
+-            if args.len() < 3 {
+-                print_speaker_usage();
++            #[cfg(feature = "voice")]
++            {
++                if args.len() < 3 {
++                    print_speaker_usage();
++                    std::process::exit(1);
++                }
++                cmd_speaker(&args[2..])?;
++            }
++            #[cfg(not(feature = "voice"))]
++            {
++                eprintln!(
++                    "speaker subcommand is unavailable: this genie-ctl build was compiled \
++                     without the 'voice' feature (issue #41). Rebuild with default features \
++                     (or --features voice) to manage local speaker profiles."
++                );
+                 std::process::exit(1);
+             }
+-            cmd_speaker(&args[2..])?;
+         }
+         "health" => cmd_health().await?,
+         "conversations" | "convos" => cmd_conversations().await?,
+@@ -119,9 +133,16 @@ async fn main() -> Result<()> {
+ }
+ 
+ fn print_usage() {
++    // Gated per issue #41: `speaker` is only listed when this build includes
++    // the `voice` feature, so the help text matches what the binary can do.
++    #[cfg(feature = "voice")]
++    const SPEAKER_HELP_LINE: &str = "    speaker <SUBCOMMAND>\n                        Manage local speaker identity profiles\n";
++    #[cfg(not(feature = "voice"))]
++    const SPEAKER_HELP_LINE: &str = "";
++
+     println!(
+         "\
+-GeniePod CLI v{}
++GeniePod CLI v{version}
+ 
+ USAGE:
+     genie-ctl <COMMAND> [ARGS]
+@@ -136,8 +157,7 @@ COMMANDS:
+     tools               List available tools
+     connectivity        Inspect ESP32-C6 Thread/Matter sidecar status
+     skill <SUBCOMMAND>  Manage loadable skill modules
+-    speaker <SUBCOMMAND>
+-                        Manage local speaker identity profiles
++{speaker}\
+     health              Service health check
+     conversations       List all conversations
+     update-check        Check for OTA updates
+@@ -145,10 +165,12 @@ COMMANDS:
+     support-bundle [P]  Write JSON diagnostics bundle to path P
+     version             Show version info
+     help                Show this help",
+-        env!("CARGO_PKG_VERSION")
++        version = env!("CARGO_PKG_VERSION"),
++        speaker = SPEAKER_HELP_LINE,
+     );
+ }
+ 
++#[cfg(feature = "voice")]
+ fn print_speaker_usage() {
+     println!(
+         "\
+@@ -197,6 +219,7 @@ fn cmd_version() {
+     println!("  governor: {}", GOVERNOR_SOCK);
+ }
+ 
++#[cfg(feature = "voice")]
+ fn cmd_speaker(args: &[String]) -> Result<()> {
+     match args[0].as_str() {
+         "list" | "ls" => {
+@@ -255,6 +278,7 @@ fn cmd_speaker(args: &[String]) -> Result<()> {
+     }
+ }
+ 
++#[cfg(feature = "voice")]
+ #[derive(Debug, Clone)]
+ struct SpeakerCliOptions {
+     profile_dir: PathBuf,
+@@ -264,6 +288,7 @@ struct SpeakerCliOptions {
+     duration_secs: u32,
+ }
+ 
++#[cfg(feature = "voice")]
+ fn parse_speaker_options(args: &[String]) -> Result<SpeakerCliOptions> {
+     let defaults = default_speaker_options();
+     let mut profile_dir = defaults.profile_dir;
+@@ -322,6 +347,7 @@ fn parse_speaker_options(args: &[String]) -> Result<SpeakerCliOptions> {
+     })
+ }
+ 
++#[cfg(feature = "voice")]
+ fn default_speaker_options() -> SpeakerCliOptions {
+     Config::load()
+         .map(|config| SpeakerCliOptions {
+@@ -344,6 +370,7 @@ fn default_speaker_options() -> SpeakerCliOptions {
+         })
+ }
+ 
++#[cfg(feature = "voice")]
+ fn cmd_speaker_list(profile_dir: &Path) -> Result<()> {
+     let profiles = list_speaker_profiles(profile_dir)?;
+     if profiles.is_empty() {
+@@ -366,6 +393,7 @@ fn cmd_speaker_list(profile_dir: &Path) -> Result<()> {
+     Ok(())
+ }
+ 
++#[cfg(feature = "voice")]
+ fn cmd_speaker_enroll(name: &str, wav: &Path, profile_dir: &Path) -> Result<()> {
+     let profile = enroll_speaker_file(profile_dir, name, wav)?;
+     println!(
+@@ -379,6 +407,7 @@ fn cmd_speaker_enroll(name: &str, wav: &Path, profile_dir: &Path) -> Result<()>
+     Ok(())
+ }
+ 
++#[cfg(feature = "voice")]
+ fn cmd_speaker_enroll_live(name: &str, opts: &SpeakerCliOptions) -> Result<()> {
+     let wav_path = std::env::temp_dir().join(format!(
+         "geniepod-speaker-enroll-{}-{}.wav",
+@@ -395,6 +424,7 @@ fn cmd_speaker_enroll_live(name: &str, opts: &SpeakerCliOptions) -> Result<()> {
+     result
+ }
+ 
++#[cfg(feature = "voice")]
+ fn cmd_speaker_record(output: &Path, opts: &SpeakerCliOptions) -> Result<()> {
+     println!(
+         "Recording {} seconds on {} -> {}",
+@@ -407,6 +437,7 @@ fn cmd_speaker_record(output: &Path, opts: &SpeakerCliOptions) -> Result<()> {
+     Ok(())
+ }
+ 
++#[cfg(feature = "voice")]
+ fn cmd_speaker_identify(wav: &Path, profile_dir: &Path, min_score: f32) -> Result<()> {
+     match identify_speaker_file(profile_dir, wav, min_score)? {
+         Some(result) => {
+@@ -428,12 +459,14 @@ fn cmd_speaker_identify(wav: &Path, profile_dir: &Path, min_score: f32) -> Resul
+     Ok(())
+ }
+ 
++#[cfg(feature = "voice")]
+ fn cmd_speaker_remove(name: &str, profile_dir: &Path) -> Result<()> {
+     let removed = remove_speaker_profile(profile_dir, name)?;
+     println!("Removed speaker profile {}", removed.display());
+     Ok(())
+ }
+ 
++#[cfg(feature = "voice")]
+ fn record_speaker_wav(output: &Path, opts: &SpeakerCliOptions) -> Result<()> {
+     if opts.duration_secs == 0 {
+         anyhow::bail!("recording duration must be greater than zero");
+@@ -1756,6 +1789,7 @@ mod tests {
+         assert!(parse_search_args(&args).is_err());
+     }
+ 
++    #[cfg(feature = "voice")]
+     #[test]
+     fn parse_speaker_options_supports_recording_flags() {
+         let args = vec![
+@@ -1780,6 +1814,7 @@ mod tests {
+         assert_eq!(parsed.duration_secs, 7);
+     }
+ 
++    #[cfg(feature = "voice")]
+     #[test]
+     fn parse_speaker_options_rejects_unknown_flag() {
+         let args = vec!["--bad".to_string()];

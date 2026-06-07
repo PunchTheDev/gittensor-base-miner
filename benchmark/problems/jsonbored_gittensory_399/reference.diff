@@ -1,0 +1,78 @@
+diff --git a/src/api/routes.ts b/src/api/routes.ts
+index 211f8287..84753401 100644
+--- a/src/api/routes.ts
++++ b/src/api/routes.ts
+@@ -827,11 +827,12 @@ export function createApp() {
+     const summary = await getRoleSummaryForIdentity(c.env, identity);
+     if (!summary.roles.some((role) => ["maintainer", "owner", "operator"].includes(role))) return c.json({ error: "insufficient_role" }, 403);
+ 
+-    const [allRepositories, allInstallations, allHealth, allRateLimits] = await Promise.all([
++    const [allRepositories, allInstallations, allHealth, allRateLimits, allSyncStates] = await Promise.all([
+       listRepositories(c.env),
+       listInstallations(c.env),
+       listInstallationHealth(c.env),
+       listLatestGitHubRateLimitObservations(c.env, 20),
++      listRepoSyncStates(c.env),
+     ]);
+     const scope = identity.kind === "session" && !summary.roles.includes("operator") ? await loadControlPanelAccessScope(c.env, identity.actor) : null;
+     const scopedRepoNames = new Set(scope?.repositoryFullNames.map((repo) => repo.toLowerCase()) ?? []);
+@@ -845,6 +846,13 @@ export function createApp() {
+       ? allHealth.filter((record) => scopedInstallationIds.has(record.installationId) || scopedAccountLogins.has(record.accountLogin.toLowerCase()))
+       : allHealth;
+     const rateLimits = scope ? allRateLimits.filter((record) => record.repoFullName !== undefined && record.repoFullName !== null && scopedRepoNames.has(record.repoFullName.toLowerCase())) : allRateLimits;
++    // Cached open-PR count is summed across ALL in-scope repos from sync state (a single query) so the
++    // headline metric is a true global count like its siblings. The per-repo PR fetch below is capped at
++    // 12 only to bound the `reviewability` preview list, not the metric.
++    const scopedRepoNameSet = new Set(repositories.map((repo) => repo.fullName.toLowerCase()));
++    const scopedSyncStates = allSyncStates.filter((state) => scopedRepoNameSet.has(state.repoFullName.toLowerCase()));
++    const totalOpenPullRequestsCached = scopedSyncStates.reduce((sum, state) => sum + Math.max(0, state.openPullRequestsCount), 0);
++    const reposWithOpenPullRequests = scopedSyncStates.filter((state) => state.openPullRequestsCount > 0).length;
+     const openPullRequests = (
+       await Promise.all(repositories.slice(0, 12).map((repo) => listOpenPullRequests(c.env, repo.fullName).then((rows) => rows.map((pull) => ({ repoFullName: repo.fullName, pull })))))
+     ).flat();
+@@ -854,7 +862,7 @@ export function createApp() {
+       health: health.map(enrichInstallationHealth),
+       metrics: [
+         { label: "Installations", value: installations.length, spark: sparklineFromCounts(installations.length, Math.max(installations.length, 1)) },
+-        { label: "Open PRs cached", value: openPullRequests.length, spark: sparklineFromCounts(openPullRequests.length, Math.max(repositories.length, 1)) },
++        { label: "Open PRs cached", value: totalOpenPullRequestsCached, spark: sparklineFromCounts(reposWithOpenPullRequests, Math.max(repositories.length, 1)) },
+         { label: "Install issues", value: health.filter((record) => record.status !== "healthy").length, spark: sparklineFromCounts(health.filter((record) => record.status === "healthy").length, Math.max(health.length, 1)) },
+         { label: "Rate-limit events", value: rateLimits.length, spark: sparklineFromCounts(rateLimits.filter((record) => (record.remaining ?? 0) > 0).length, Math.max(rateLimits.length, 1)) },
+       ],
+diff --git a/test/integration/api.test.ts b/test/integration/api.test.ts
+index 144e679b..d7e27e0a 100644
+--- a/test/integration/api.test.ts
++++ b/test/integration/api.test.ts
+@@ -1371,6 +1371,32 @@ describe("api routes", () => {
+     });
+   });
+ 
++  it("counts cached open PRs across all in-scope repos, not just the first 12 fetched", async () => {
++    const app = createApp();
++    const env = createTestEnv();
++    // Two registered repos carry cached open-PR counts in sync state but have NO open PR records.
++    // The old metric summed PRs fetched per repo (so these contributed 0); the global count reports 8.
++    for (const [name, openPrs] of [["alpha", 5] as const, ["beta", 3] as const]) {
++      await upsertRepositoryFromGitHub(env, { name, full_name: `entrius/${name}`, private: false, owner: { login: "entrius" }, default_branch: "main" });
++      await upsertRepoSyncState(env, {
++        repoFullName: `entrius/${name}`,
++        status: "success",
++        sourceKind: "github",
++        primaryLanguage: "TypeScript",
++        defaultBranch: "main",
++        isPrivate: false,
++        openIssuesCount: 0,
++        openPullRequestsCount: openPrs,
++        recentMergedPullRequestsCount: 0,
++        warnings: [],
++      });
++    }
++    const res = await app.request("/v1/app/maintainer-dashboard", { headers: apiHeaders(env) }, env);
++    expect(res.status).toBe(200);
++    const body = (await res.json()) as { metrics: Array<{ label: string; value: number }> };
++    expect(body.metrics.find((metric) => metric.label === "Open PRs cached")?.value).toBe(8);
++  });
++
+   it("serves live app dashboards, digest subscriptions, commands, and extension context", async () => {
+     const app = createApp();
+     const env = createTestEnv({ ADMIN_GITHUB_LOGINS: "oktofeesh1,other", PRODUCT_USAGE_HASH_SALT: "usage-adoption-test-salt" });

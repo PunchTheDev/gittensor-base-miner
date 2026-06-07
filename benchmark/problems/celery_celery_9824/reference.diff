@@ -1,0 +1,97 @@
+diff --git a/celery/fixups/django.py b/celery/fixups/django.py
+index b35499493a6..960077704e4 100644
+--- a/celery/fixups/django.py
++++ b/celery/fixups/django.py
+@@ -168,7 +168,7 @@ def on_worker_process_init(self, **kwargs: Any) -> None:
+                 self._maybe_close_db_fd(c)
+ 
+         # use the _ version to avoid DB_REUSE preventing the conn.close() call
+-        self._close_database(force=True)
++        self._close_database()
+         self.close_cache()
+ 
+     def _maybe_close_db_fd(self, c: "BaseDatabaseWrapper") -> None:
+@@ -197,13 +197,10 @@ def close_database(self, **kwargs: Any) -> None:
+             self._close_database()
+         self._db_recycles += 1
+ 
+-    def _close_database(self, force: bool = False) -> None:
++    def _close_database(self) -> None:
+         for conn in self._db.connections.all():
+             try:
+-                if force:
+-                    conn.close()
+-                else:
+-                    conn.close_if_unusable_or_obsolete()
++                conn.close()
+             except self.interface_errors:
+                 pass
+             except self.DatabaseError as exc:
+diff --git a/t/unit/fixups/test_django.py b/t/unit/fixups/test_django.py
+index c09ba61642c..0d6ab1d83b3 100644
+--- a/t/unit/fixups/test_django.py
++++ b/t/unit/fixups/test_django.py
+@@ -196,7 +196,7 @@ def test_on_worker_process_init(self, patching):
+                         f.on_worker_process_init()
+                         mcf.assert_called_with(conns[1].connection)
+                         f.close_cache.assert_called_with()
+-                        f._close_database.assert_called_with(force=True)
++                        f._close_database.assert_called_with()
+ 
+                         f.validate_models = Mock(name='validate_models')
+                         patching.setenv('FORKED_BY_MULTIPROCESSING', '1')
+@@ -264,38 +264,31 @@ def test__close_database(self):
+             f._db.connections = Mock()  # ConnectionHandler
+             f._db.connections.all.side_effect = lambda: conns
+ 
+-            f._close_database(force=True)
++            f._close_database()
+             conns[0].close.assert_called_with()
+-            conns[0].close_if_unusable_or_obsolete.assert_not_called()
+             conns[1].close.assert_called_with()
+-            conns[1].close_if_unusable_or_obsolete.assert_not_called()
+             conns[2].close.assert_called_with()
+-            conns[2].close_if_unusable_or_obsolete.assert_not_called()
+-
+-            for conn in conns:
+-                conn.reset_mock()
+-
+-            f._close_database()
+-            conns[0].close.assert_not_called()
+-            conns[0].close_if_unusable_or_obsolete.assert_called_with()
+-            conns[1].close.assert_not_called()
+-            conns[1].close_if_unusable_or_obsolete.assert_called_with()
+-            conns[2].close.assert_not_called()
+-            conns[2].close_if_unusable_or_obsolete.assert_called_with()
+ 
+             conns[1].close.side_effect = KeyError(
+                 'omg')
+-            f._close_database()
+-            with pytest.raises(KeyError):
+-                f._close_database(force=True)
+-
+-            conns[1].close.side_effect = None
+-            conns[1].close_if_unusable_or_obsolete.side_effect = KeyError(
+-                'omg')
+-            f._close_database(force=True)
+             with pytest.raises(KeyError):
+                 f._close_database()
+ 
++    def test_close_database_always_closes_connections(self):
++        with self.fixup_context(self.app) as (f, _, _):
++            conn = Mock()
++            f._db.connections.all = Mock(return_value=[conn])
++            f.close_database()
++            conn.close.assert_called_once_with()
++            # close_if_unusable_or_obsolete is not safe to call in all conditions, so avoid using
++            # it to optimize connection handling.
++            conn.close_if_unusable_or_obsolete.assert_not_called()
++
++    def test_close_cache_raises_error(self):
++        with self.fixup_context(self.app) as (f, _, _):
++            f._cache.close_caches.side_effect = AttributeError
++            f.close_cache()
++
+     def test_close_cache(self):
+         with self.fixup_context(self.app) as (f, _, _):
+             f.close_cache()

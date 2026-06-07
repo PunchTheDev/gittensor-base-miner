@@ -1,0 +1,172 @@
+diff --git a/benchmarks/test_calllater.py b/benchmarks/test_calllater.py
+new file mode 100644
+index 00000000000..82e34fde868
+--- /dev/null
++++ b/benchmarks/test_calllater.py
+@@ -0,0 +1,54 @@
++"""Tests for scheduled events."""
++
++import pytest
++
++from twisted.internet.base import ReactorBase
++
++
++class ReactorWithRiggedTime(ReactorBase):
++    """
++    Allows controlling the passed time while benchmarking C{ReactorBase}.
++    """
++
++    _currentTime = 0.0
++
++    def seconds(self) -> float:
++        """
++        Override the regular time function in C{ReactorBase}.
++        """
++        return self._currentTime
++
++    def advance(self, seconds: float) -> None:
++        """
++        Advance time by the given numbe of seconds.
++        """
++        self._currentTime += seconds
++
++    def installWaker(self) -> None:
++        """
++        Subclasses of C{ReactorBase} are required to implement this.
++        """
++        pass
++
++
++@pytest.mark.parametrize("reversed_times", [False, True])
++def test_spaced_out_events(benchmark, reversed_times):
++    """
++    Add spaced out events, then run them all.
++    """
++    timestamps = list(range(100))
++    if reversed_times:
++        timestamps.reverse()
++
++    def go():
++        reactor = ReactorWithRiggedTime()
++        for time in timestamps:
++            reactor.callLater(time, lambda: None)
++        for _ in range(len(timestamps)):
++            reactor.advance(reactor.timeout() or 0)
++            reactor.runUntilCurrent()
++        return reactor
++
++    reactor = benchmark(go)
++    assert not reactor._pendingTimedCalls
++    assert not reactor._newTimedCalls
+diff --git a/src/twisted/internet/base.py b/src/twisted/internet/base.py
+index c807f418731..2c38b80b0ca 100644
+--- a/src/twisted/internet/base.py
++++ b/src/twisted/internet/base.py
+@@ -213,29 +213,23 @@ def active(self) -> bool:
+         """
+         return not (self.cancelled or self.called)
+ 
+-    def __le__(self, other: object) -> bool:
++    def __le__(self, other: "DelayedCall") -> bool:
+         """
+         Implement C{<=} operator between two L{DelayedCall} instances.
+ 
+         Comparison is based on the C{time} attribute (unadjusted by the
+         delayed time).
+         """
+-        if isinstance(other, DelayedCall):
+-            return self.time <= other.time
+-        else:
+-            return NotImplemented
++        return self.time <= other.time
+ 
+-    def __lt__(self, other: object) -> bool:
++    def __lt__(self, other: "DelayedCall") -> bool:
+         """
+         Implement C{<} operator between two L{DelayedCall} instances.
+ 
+         Comparison is based on the C{time} attribute (unadjusted by the
+         delayed time).
+         """
+-        if isinstance(other, DelayedCall):
+-            return self.time < other.time
+-        else:
+-            return NotImplemented
++        return self.time < other.time
+ 
+     def __repr__(self) -> str:
+         """
+@@ -577,6 +571,8 @@ def nameResolver(self) -> IHostnameResolver:
+ _SystemEventID = NewType("_SystemEventID", Tuple[str, _ThreePhaseEventTriggerHandle])
+ _ThreadCall = Tuple[Callable[..., Any], Tuple[object, ...], Dict[str, object]]
+ 
++_DEFAULT_DELAYED_CALL_LOGGING_HANDLER = _log.failureHandler("while handling timed call")
++
+ 
+ @implementer(IReactorCore, IReactorTime, _ISupportsExitSignalCapturing)
+ class ReactorBase(PluggableResolverMixin):
+@@ -964,7 +960,6 @@ def callLater(
+         """
+         See twisted.internet.interfaces.IReactorTime.callLater.
+         """
+-        assert builtins.callable(callable), f"{callable} is not callable"
+         assert delay >= 0, f"{delay} is not greater than or equal to 0 seconds"
+         delayedCall = DelayedCall(
+             self.seconds() + delay,
+@@ -1012,6 +1007,12 @@ def getDelayedCalls(self) -> Sequence[IDelayedCall]:
+         ]
+ 
+     def _insertNewDelayedCalls(self) -> None:
++        # This function is called twice per reactor iteration, once in
++        # timeout() and once in runUntilCurrent(), and in most cases there
++        # won't be any new timeouts. So have a fast path for the empty case.
++        if not self._newTimedCalls:
++            return
++
+         for call in self._newTimedCalls:
+             if call.cancelled:
+                 self._cancellations -= 1
+@@ -1083,18 +1084,23 @@ def runUntilCurrent(self) -> None:
+                 heappush(self._pendingTimedCalls, call)
+                 continue
+ 
+-            with _log.failuresHandled(
+-                "while handling timed call {previous()}",
+-                previous=lambda creator=call.creator: (
+-                    ""
+-                    if creator is None
+-                    else "\n"
+-                    + (" C: from a DelayedCall created here:\n")
+-                    + " C:"
+-                    + "".join(creator).rstrip().replace("\n", "\n C:")
+-                    + "\n"
+-                ),
+-            ):
++            logHandler = (
++                _log.failuresHandled(
++                    "while handling timed call {previous()}",
++                    previous=lambda creator=call.creator: (
++                        "\n"
++                        + (" C: from a DelayedCall created here:\n")
++                        + " C:"
++                        + "".join(creator).rstrip().replace("\n", "\n C:")
++                        + "\n"
++                    ),
++                )
++                if call.creator
++                # A much faster logging handler for the common case where extra
++                # debug info is not being output:
++                else _DEFAULT_DELAYED_CALL_LOGGING_HANDLER
++            )
++            with logHandler:
+                 call.called = 1
+                 call.func(*call.args, **call.kw)
+ 
+diff --git a/src/twisted/newsfragments/12286.feature b/src/twisted/newsfragments/12286.feature
+new file mode 100644
+index 00000000000..f288364f109
+--- /dev/null
++++ b/src/twisted/newsfragments/12286.feature
+@@ -0,0 +1 @@
++The reactor now will use a little less CPU when events have been scheduled with callLater().
+\ No newline at end of file

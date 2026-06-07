@@ -1,0 +1,68 @@
+diff --git a/src/github/backfill.ts b/src/github/backfill.ts
+index d7816346..3e45fa07 100644
+--- a/src/github/backfill.ts
++++ b/src/github/backfill.ts
+@@ -1344,6 +1344,14 @@ async function supplementOpenPullRequestsFromGraphQl(env: Env, repo: RepositoryR
+   /* v8 ignore stop */
+ }
+ 
++// Terminal segment states that count as synced. `sampled` is the terminal state of the
++// recent_merged_pull_requests progressive-history crawl (no other segment produces it), and
++// is already treated as synced for mergedPullRequestsSyncedAt; treating it as terminal here
++// keeps a sampled history from perpetually marking the repo `partial`.
++function isTerminalSegmentStatus(status: RepoSyncSegmentRecord["status"]): boolean {
++  return status === "complete" || status === "not_modified" || status === "sampled";
++}
++
+ async function refreshRepoSyncStateFromSegments(env: Env, repo: RepositoryRecord, sourceKind: RepoSyncSegmentRecord["sourceKind"]): Promise<void> {
+   const [previous, totals, metadata, labels, openIssues, openPullRequests, recentMerged, files, reviews, checks] = await Promise.all([
+     getRepoSyncState(env, repo.fullName),
+@@ -1357,11 +1365,14 @@ async function refreshRepoSyncStateFromSegments(env: Env, repo: RepositoryRecord
+     getRepoSyncSegment(env, repo.fullName, "pull_request_reviews"),
+     getRepoSyncSegment(env, repo.fullName, "check_summaries"),
+   ]);
+-  const required = [metadata, labels, openIssues, openPullRequests, files, reviews, checks].filter(Boolean) as RepoSyncSegmentRecord[];
++  // Include recent_merged_pull_requests so an unfinished merged-history crawl (running /
++  // waiting_rate_limit / error / other non-terminal) is reflected in the repo status instead
++  // of being silently rolled up as `success` and then skipped by the freshness check.
++  const required = [metadata, labels, openIssues, openPullRequests, recentMerged, files, reviews, checks].filter(Boolean) as RepoSyncSegmentRecord[];
+   const waiting = required.some((segment) => segment.status === "waiting_rate_limit" || segment.status === "rate_limited");
+   const running = required.some((segment) => segment.status === "running" || segment.status === "refreshing");
+   const errored = required.some((segment) => segment.status === "error");
+-  const incomplete = required.some((segment) => segment.status !== "complete" && segment.status !== "not_modified");
++  const incomplete = required.some((segment) => !isTerminalSegmentStatus(segment.status));
+   const status: RepoSyncStateRecord["status"] = waiting ? "rate_limited" : errored ? "error" : running ? "running" : incomplete ? "partial" : "success";
+   const warnings = [...new Set(required.flatMap((segment) => segment.warnings))];
+   const completedAt = running || waiting ? previous?.lastCompletedAt : nowIso();
+diff --git a/test/unit/backfill.test.ts b/test/unit/backfill.test.ts
+index b02a39d3..0af0de86 100644
+--- a/test/unit/backfill.test.ts
++++ b/test/unit/backfill.test.ts
+@@ -829,6 +829,27 @@ describe("GitHub backfill", () => {
+     );
+   });
+ 
++  it("rolls an unfinished recent-merged crawl into the repo sync status instead of success", async () => {
++    const env = createTestEnv({ GITHUB_PUBLIC_TOKEN: "public-token" });
++    await seedRegisteredRepo(env);
++    vi.stubGlobal("fetch", async (input: RequestInfo | URL, init?: RequestInit) => {
++      const url = input.toString();
++      const auth = new Headers(init?.headers).get("authorization");
++      if (url === "https://api.github.com/graphql") return githubTotalsResponse({ openIssues: 0, openPullRequests: 0, mergedPullRequests: 1, closedPullRequests: 1, labels: 0 });
++      if (url.includes("/pulls?state=closed") && auth === "Bearer public-token") return new Response("", { status: 404 });
++      if (url.includes("/pulls?state=closed")) return new Response("limited", { status: 403, headers: { "x-ratelimit-remaining": "0", "x-ratelimit-reset": "1779976046" } });
++      return new Response("not found", { status: 404 });
++    });
++
++    const result = await backfillRepositorySegment(env, { repoFullName: "JSONbored/gittensory", segment: "recent_merged_pull_requests", mode: "full" });
++
++    expect(result).toMatchObject({ status: "waiting_rate_limit" });
++    // The repo status must reflect the unfinished merged-history segment, not roll up to "success".
++    expect(await listRepoSyncStates(env)).toEqual(
++      expect.arrayContaining([expect.objectContaining({ repoFullName: "JSONbored/gittensory", status: "rate_limited" })]),
++    );
++  });
++
+   it("paginates beyond the first GitHub page and stores complete segment fidelity", async () => {
+     const env = createTestEnv({ GITHUB_PUBLIC_TOKEN: "public-token" });
+     await seedRegisteredRepo(env);

@@ -1,0 +1,377 @@
+diff --git a/crates/engine/src/game/targeting.rs b/crates/engine/src/game/targeting.rs
+index 0c9f0fd081..0ab85e1c09 100644
+--- a/crates/engine/src/game/targeting.rs
++++ b/crates/engine/src/game/targeting.rs
+@@ -1359,6 +1359,19 @@ fn can_target(
+     if is_protected_from(obj, source_id, state) {
+         return false;
+     }
++    // CR 702.18a: A static "can't be the target of spells or abilities" is the
++    // descriptive (non-keyworded) form of Shroud — the permanent can't be the
++    // target of any spell or ability, regardless of controller. It is modeled as
++    // `StaticMode::CantBeTargeted`, living on the object's own static definitions
++    // (a self-referential static, or propagated onto a subject via `AddStaticMode`
++    // — see `static_mode_needs_grant_propagation`). The opponent-scoped variant
++    // ("... your opponents control") is parsed as `Keyword::Hexproof` instead, so
++    // it is handled by the Hexproof branch above rather than here.
++    if super::functioning_abilities::active_static_definitions(state, obj)
++        .any(|def| matches!(def.mode, crate::types::statics::StaticMode::CantBeTargeted))
++    {
++        return false;
++    }
+     // CR 702.21a: Ward is a triggered ability, not a targeting restriction.
+     // Targeting is legal; the ward trigger fires via process_triggers() and
+     // counters the spell/ability unless the opponent pays the ward cost.
+@@ -1825,6 +1838,34 @@ mod tests {
+         assert!(!targets_p1.contains(&TargetRef::Object(c1)));
+     }
+ 
++    /// CR 702.18a: A `StaticMode::CantBeTargeted` static (the descriptive Shroud
++    /// form, "~ can't be the target of spells or abilities") makes the permanent
++    /// untargetable by EVERY player, including its own controller — distinguishing
++    /// it from Hexproof, which only blocks opponents.
++    #[test]
++    fn cant_be_targeted_static_blocks_all_players() {
++        let (mut state, _c0, c1) = setup_with_creatures();
++        // c1 is controlled by P1. Grant it the blanket static directly, mirroring
++        // a self-referential static / the `AddStaticMode` propagation onto a subject.
++        state.objects.get_mut(&c1).unwrap().static_definitions.push(
++            crate::types::ability::StaticDefinition::new(
++                crate::types::statics::StaticMode::CantBeTargeted,
++            )
++            .affected(crate::types::ability::TargetFilter::SelfRef),
++        );
++
++        let targets_p0 = find_legal_targets(&state, &creature_filter(), PlayerId(0), ObjectId(99));
++        let targets_p1 = find_legal_targets(&state, &creature_filter(), PlayerId(1), ObjectId(99));
++        assert!(
++            !targets_p0.contains(&TargetRef::Object(c1)),
++            "opponent cannot target a CantBeTargeted permanent"
++        );
++        assert!(
++            !targets_p1.contains(&TargetRef::Object(c1)),
++            "the controller cannot target it either (Shroud semantics, not Hexproof)"
++        );
++    }
++
+     #[test]
+     fn validate_targets_filters_out_removed_objects() {
+         let (mut state, c0, c1) = setup_with_creatures();
+diff --git a/crates/engine/src/parser/oracle_effect/imperative.rs b/crates/engine/src/parser/oracle_effect/imperative.rs
+index b95d5cef57..e278eaaf08 100644
+--- a/crates/engine/src/parser/oracle_effect/imperative.rs
++++ b/crates/engine/src/parser/oracle_effect/imperative.rs
+@@ -7240,6 +7240,28 @@ fn try_parse_subjectless_cant(lower: &str) -> Option<ImperativeFamilyAst> {
+         (trimmed, Duration::UntilEndOfTurn)
+     };
+ 
++    // CR 702.18a / 702.11a: "can't be the target [of ...]" granted to the target
++    // for a duration is a Shroud / Hexproof keyword grant (Vines of Vastwood). Map
++    // it to the keyword so the targeting check applies the correct controller scope
++    // (Hexproof leaves the controller able to target), reusing the enforced keyword
++    // path rather than a scope-less rule static.
++    if let Some(scope) = crate::parser::oracle_keyword::classify_cant_be_targeted(clean) {
++        let keyword = match scope {
++            crate::parser::oracle_keyword::CantBeTargetedScope::AnyPlayer => {
++                crate::types::keywords::Keyword::Shroud
++            }
++            crate::parser::oracle_keyword::CantBeTargetedScope::OpponentsOnly => {
++                crate::types::keywords::Keyword::Hexproof
++            }
++        };
++        return Some(ImperativeFamilyAst::GainKeyword(Effect::GenericEffect {
++            static_abilities: vec![StaticDefinition::continuous()
++                .modifications(vec![ContinuousModification::AddKeyword { keyword }])],
++            duration: Some(duration),
++            target: None,
++        }));
++    }
++
+     let modes = parse_restriction_modes(clean)?;
+     let statics: Vec<StaticDefinition> = modes
+         .into_iter()
+diff --git a/crates/engine/src/parser/oracle_effect/subject.rs b/crates/engine/src/parser/oracle_effect/subject.rs
+index 6cf344485f..2e5fc4531f 100644
+--- a/crates/engine/src/parser/oracle_effect/subject.rs
++++ b/crates/engine/src/parser/oracle_effect/subject.rs
+@@ -2366,6 +2366,41 @@ fn build_restriction_clause(
+     let (predicate, duration) = super::strip_trailing_duration(&normalized);
+     let lower = predicate.to_lowercase();
+ 
++    // CR 702.18a / 702.11a: a duration-scoped "can't be the target [of ...]" grant
++    // on a subject/target (Vines of Vastwood: "target creature can't be the target
++    // of spells or abilities your opponents control this turn") is Shroud / Hexproof.
++    // Emit the keyword grant so the targeting check applies the correct controller
++    // scope (Hexproof leaves the controller able to target), reusing the enforced
++    // keyword path rather than a scope-less rule static.
++    if let Some(scope) = crate::parser::oracle_keyword::classify_cant_be_targeted(&lower) {
++        let keyword = match scope {
++            crate::parser::oracle_keyword::CantBeTargetedScope::AnyPlayer => {
++                crate::types::keywords::Keyword::Shroud
++            }
++            crate::parser::oracle_keyword::CantBeTargetedScope::OpponentsOnly => {
++                crate::types::keywords::Keyword::Hexproof
++            }
++        };
++        let static_def = StaticDefinition::continuous()
++            .affected(static_affected_for_application(&application))
++            .modifications(vec![ContinuousModification::AddKeyword { keyword }])
++            .description(predicate.to_string());
++        return Some(ParsedEffectClause {
++            effect: Effect::GenericEffect {
++                static_abilities: vec![static_def],
++                duration: duration.clone(),
++                target: application.target,
++            },
++            duration,
++            sub_ability: None,
++            distribute: None,
++            multi_target: None,
++            condition: None,
++            optional: false,
++            unless_pay: None,
++        });
++    }
++
+     // CR 508.1d / CR 509.1a: Restriction predicates for attack/block/target.
+     // Compound restrictions ("can't attack or block") produce multiple StaticDefinition entries.
+     let modes = parse_restriction_modes(&lower)?;
+@@ -2506,6 +2541,11 @@ pub(crate) fn static_mode_needs_grant_propagation(mode: &StaticMode) -> bool {
+             // bypass in replacement.rs::destroy_applier observes it via
+             // active_static_definitions.
+             | StaticMode::CantBeRegenerated
++            // CR 702.18a: CantBeTargeted (the descriptive Shroud form) is granted to
++            // a subject/target creature and must propagate onto its
++            // `static_definitions` so the targeting check in `targeting.rs::can_target`
++            // observes it via active_static_definitions.
++            | StaticMode::CantBeTargeted
+     )
+ }
+ 
+@@ -2642,14 +2682,16 @@ pub(crate) fn parse_restriction_modes(lower: &str) -> Option<Vec<StaticMode>> {
+             return Some(vec![StaticMode::CantBeBlockedBy { filter }]);
+         }
+     }
+-    // CR 115.4: "can't be the target of ..." — hexproof variant
+-    if alt((
+-        tag::<_, _, OracleError<'_>>("can't be the target of "),
+-        tag("cannot be the target of "),
+-    ))
+-    .parse(lower)
+-    .is_ok()
+-    {
++    // CR 702.18a: "can't be the target of spells or abilities" is blanket Shroud,
++    // modeled as `CantBeTargeted` (propagated onto the subject via `AddStaticMode`
++    // and enforced in `can_target`). CR 702.11a: the opponent-scoped variant is
++    // Hexproof — a keyword grant this rule-mode parser can't express, so it is
++    // handled by the keyword-grant path and deliberately not produced here, lest a
++    // bare `CantBeTargeted` over-block the controller.
++    if matches!(
++        crate::parser::oracle_keyword::classify_cant_be_targeted(lower),
++        Some(crate::parser::oracle_keyword::CantBeTargetedScope::AnyPlayer)
++    ) {
+         return Some(vec![StaticMode::CantBeTargeted]);
+     }
+     // CR 119.7: "can't gain life" — a player can't make their life total increase.
+diff --git a/crates/engine/src/parser/oracle_ir/snapshots/engine__parser__oracle_ir__snapshot_tests__vines_of_vastwood_ir.snap b/crates/engine/src/parser/oracle_ir/snapshots/engine__parser__oracle_ir__snapshot_tests__vines_of_vastwood_ir.snap
+index 84b1b8da82..2be7407391 100644
+--- a/crates/engine/src/parser/oracle_ir/snapshots/engine__parser__oracle_ir__snapshot_tests__vines_of_vastwood_ir.snap
++++ b/crates/engine/src/parser/oracle_ir/snapshots/engine__parser__oracle_ir__snapshot_tests__vines_of_vastwood_ir.snap
+@@ -12,11 +12,16 @@ expression: "&ir"
+           "type": "GenericEffect",
+           "static_abilities": [
+             {
+-              "mode": "CantBeTargeted",
++              "mode": "Continuous",
+               "affected": {
+                 "type": "ParentTarget"
+               },
+-              "modifications": [],
++              "modifications": [
++                {
++                  "type": "AddKeyword",
++                  "keyword": "Hexproof"
++                }
++              ],
+               "condition": null,
+               "affected_zone": null,
+               "effect_zone": null,
+diff --git a/crates/engine/src/parser/oracle_ir/snapshots/engine__parser__oracle_ir__snapshot_tests__vines_of_vastwood_lowered.snap b/crates/engine/src/parser/oracle_ir/snapshots/engine__parser__oracle_ir__snapshot_tests__vines_of_vastwood_lowered.snap
+index a2e73095ff..e727229f54 100644
+--- a/crates/engine/src/parser/oracle_ir/snapshots/engine__parser__oracle_ir__snapshot_tests__vines_of_vastwood_lowered.snap
++++ b/crates/engine/src/parser/oracle_ir/snapshots/engine__parser__oracle_ir__snapshot_tests__vines_of_vastwood_lowered.snap
+@@ -11,11 +11,16 @@ expression: "&lowered"
+         "type": "GenericEffect",
+         "static_abilities": [
+           {
+-            "mode": "CantBeTargeted",
++            "mode": "Continuous",
+             "affected": {
+               "type": "ParentTarget"
+             },
+-            "modifications": [],
++            "modifications": [
++              {
++                "type": "AddKeyword",
++                "keyword": "Hexproof"
++              }
++            ],
+             "condition": null,
+             "affected_zone": null,
+             "effect_zone": null,
+diff --git a/crates/engine/src/parser/oracle_keyword.rs b/crates/engine/src/parser/oracle_keyword.rs
+index cfda932969..e12d819da7 100644
+--- a/crates/engine/src/parser/oracle_keyword.rs
++++ b/crates/engine/src/parser/oracle_keyword.rs
+@@ -867,6 +867,49 @@ fn parse_craft_material_count(input: &str) -> Option<(&str, CostObjectCount)> {
+     Some((input, CostObjectCount::exactly(1)))
+ }
+ 
++/// CR 702.18a / 702.11a: the CR keyword that a descriptive "can't be the target
++/// [of ...]" prohibition corresponds to. These phrasings ARE Shroud / Hexproof
++/// (CR 702.18a: "Shroud" means "can't be the target of spells or abilities";
++/// CR 702.11a: Hexproof restricts only opponents' spells/abilities), so callers
++/// map them onto the existing keyword targeting checks rather than a bespoke rule
++/// static, getting the correct controller scope for free.
++#[derive(Debug, Clone, Copy, PartialEq, Eq)]
++pub(crate) enum CantBeTargetedScope {
++    /// CR 702.18a: blanket — can't be targeted by ANY player (Shroud).
++    AnyPlayer,
++    /// CR 702.11a: only spells/abilities an opponent controls (Hexproof).
++    OpponentsOnly,
++}
++
++/// Classify a predicate carrying a "can't be the target[ed]" prohibition.
++///
++/// Returns `None` when no such prohibition is present, or when its scope is one
++/// this parser does not yet model precisely (e.g. a specific spell type), so a
++/// caller never collapses an unrecognized scope into a blanket restriction.
++pub(crate) fn classify_cant_be_targeted(predicate_lower: &str) -> Option<CantBeTargetedScope> {
++    let is_prohibition = scan_contains(predicate_lower, "can't be the target")
++        || scan_contains(predicate_lower, "cannot be the target")
++        || scan_contains(predicate_lower, "can't be targeted")
++        || scan_contains(predicate_lower, "cannot be targeted");
++    if !is_prohibition {
++        return None;
++    }
++    // CR 702.11a: an opponent-controlled qualifier makes this Hexproof, not Shroud.
++    if scan_contains(predicate_lower, "your opponents control")
++        || scan_contains(predicate_lower, "an opponent controls")
++    {
++        return Some(CantBeTargetedScope::OpponentsOnly);
++    }
++    // CR 702.18a: the bare form ("~ can't be targeted") or the unqualified
++    // "spells or abilities" scope is blanket Shroud. Any other qualifier is left
++    // unclassified so it is not mistreated as a blanket restriction.
++    let bare = !scan_contains(predicate_lower, " of ");
++    let unqualified_scope = scan_contains(predicate_lower, "spells or abilities")
++        || scan_contains(predicate_lower, "spell or ability")
++        || scan_contains(predicate_lower, "spells and abilities");
++    (bare || unqualified_scope).then_some(CantBeTargetedScope::AnyPlayer)
++}
++
+ ///
+ /// Oracle text uses space-separated format: "protection from red", "ward {2}",
+ /// "flashback {2}{U}". Converts to the colon format that `FromStr` expects,
+diff --git a/crates/engine/src/parser/oracle_static/dispatch.rs b/crates/engine/src/parser/oracle_static/dispatch.rs
+index 8099c54bf6..5eaa616d0c 100644
+--- a/crates/engine/src/parser/oracle_static/dispatch.rs
++++ b/crates/engine/src/parser/oracle_static/dispatch.rs
+@@ -1280,14 +1280,27 @@ pub(crate) fn parse_static_line_inner(
+     }
+ 
+     // --- "~ can't be the target" or "~ can't be targeted" ---
+-    if nom_primitives::scan_contains(tp.lower, "can't be the target")
+-        || nom_primitives::scan_contains(tp.lower, "can't be targeted")
+-    {
+-        return Some(
+-            StaticDefinition::new(StaticMode::CantBeTargeted)
+-                .affected(TargetFilter::SelfRef)
+-                .description(text.to_string()),
+-        );
++    // CR 702.18a / 702.11a: these descriptive phrasings ARE Shroud / Hexproof.
++    if let Some(scope) = crate::parser::oracle_keyword::classify_cant_be_targeted(tp.lower) {
++        return Some(match scope {
++            // CR 702.11a: "... your opponents control" — grant Hexproof so the
++            // permanent's own controller can still target it.
++            crate::parser::oracle_keyword::CantBeTargetedScope::OpponentsOnly => {
++                StaticDefinition::continuous()
++                    .affected(TargetFilter::SelfRef)
++                    .modifications(vec![ContinuousModification::AddKeyword {
++                        keyword: Keyword::Hexproof,
++                    }])
++                    .description(text.to_string())
++            }
++            // CR 702.18a: blanket — can't be targeted by any player. Enforced in
++            // `targeting.rs::can_target` via the object's active static definitions.
++            crate::parser::oracle_keyword::CantBeTargetedScope::AnyPlayer => {
++                StaticDefinition::new(StaticMode::CantBeTargeted)
++                    .affected(TargetFilter::SelfRef)
++                    .description(text.to_string())
++            }
++        });
+     }
+ 
+     // --- "~ can't be sacrificed" (CR 701.21) ---
+diff --git a/crates/engine/src/parser/oracle_static/keyword_grant.rs b/crates/engine/src/parser/oracle_static/keyword_grant.rs
+index 16d8c52d1c..5d3f7abf69 100644
+--- a/crates/engine/src/parser/oracle_static/keyword_grant.rs
++++ b/crates/engine/src/parser/oracle_static/keyword_grant.rs
+@@ -635,6 +635,21 @@ pub(crate) fn push_grant_clause_modifications(
+         return;
+     }
+ 
++    // CR 702.18a / 702.11a: a descriptive "can't be the target [of ...]" grant is
++    // Shroud (blanket) or Hexproof (opponents only). Emit the keyword so the
++    // existing targeting checks apply the correct controller scope, rather than a
++    // scope-less rule static.
++    if let Some(scope) =
++        crate::parser::oracle_keyword::classify_cant_be_targeted(part_lower.as_str())
++    {
++        let keyword = match scope {
++            crate::parser::oracle_keyword::CantBeTargetedScope::AnyPlayer => Keyword::Shroud,
++            crate::parser::oracle_keyword::CantBeTargetedScope::OpponentsOnly => Keyword::Hexproof,
++        };
++        modifications.push(ContinuousModification::AddKeyword { keyword });
++        return;
++    }
++
+     if let Some(modes) = parse_restriction_modes(part_lower.as_str()) {
+         for mode in modes {
+             if static_mode_needs_grant_propagation(&mode) {
+diff --git a/crates/engine/src/parser/oracle_static/tests.rs b/crates/engine/src/parser/oracle_static/tests.rs
+index 4f0f85fa94..a18a439b2b 100644
+--- a/crates/engine/src/parser/oracle_static/tests.rs
++++ b/crates/engine/src/parser/oracle_static/tests.rs
+@@ -2638,10 +2638,31 @@ fn static_lands_you_control_have() {
+ 
+ #[test]
+ fn static_cant_be_the_target() {
++    // CR 702.11a: "can't be the target of spells or abilities your opponents
++    // control" (Sphinx of the Final Word) IS Hexproof — the permanent's controller
++    // can still target it — so it is modeled as a Hexproof keyword grant (which the
++    // targeting check already enforces with the correct controller scope) rather
++    // than a scope-less blanket static.
+     let def = parse_static_line(
+             "Sphinx of the Final Word can't be the target of spells or abilities your opponents control.",
+         )
+         .unwrap();
++    assert_eq!(def.mode, StaticMode::Continuous);
++    assert!(def
++        .modifications
++        .contains(&ContinuousModification::AddKeyword {
++            keyword: Keyword::Hexproof,
++        }));
++}
++
++#[test]
++fn static_cant_be_targeted_blanket_is_shroud_static() {
++    // CR 702.18a: the unqualified "can't be the target of spells or abilities"
++    // (no controller qualifier) is blanket Shroud — untargetable by any player,
++    // including the controller — modeled as the CantBeTargeted static and enforced
++    // in `targeting.rs::can_target`.
++    let def =
++        parse_static_line("Guardian Idol can't be the target of spells or abilities.").unwrap();
+     assert_eq!(def.mode, StaticMode::CantBeTargeted);
+ }
+ 

@@ -1,0 +1,109 @@
+diff --git a/CHANGES.rst b/CHANGES.rst
+index 97f6a211b6..f377042879 100644
+--- a/CHANGES.rst
++++ b/CHANGES.rst
+@@ -7,6 +7,7 @@ Version 8.2.1
+     :issue:`2897` :pr:`2930`
+ -   Fix shell completion for nested groups. :issue:`2906` :pr:`2907`
+ -   Flush ``sys.stderr`` at the end of ``CliRunner.invoke``. :issue:`2682`
++-   Fix EOF handling for stdin input in CliRunner. :issue:`2787`
+ 
+ Version 8.2.0
+ -------------
+diff --git a/src/click/testing.py b/src/click/testing.py
+index d9759e55bd..7c0e8741e2 100644
+--- a/src/click/testing.py
++++ b/src/click/testing.py
+@@ -116,6 +116,13 @@ def name(self) -> str:
+     def mode(self) -> str:
+         return self._mode
+ 
++    def __next__(self) -> str:  # type: ignore
++        try:
++            line = super().__next__()
++        except StopIteration as e:
++            raise EOFError() from e
++        return line
++
+ 
+ def make_input_stream(
+     input: str | bytes | t.IO[t.Any] | None, charset: str
+@@ -341,7 +348,7 @@ def isolation(
+         @_pause_echo(echo_input)  # type: ignore
+         def visible_input(prompt: str | None = None) -> str:
+             sys.stdout.write(prompt or "")
+-            val = text_input.readline().rstrip("\r\n")
++            val = next(text_input).rstrip("\r\n")
+             sys.stdout.write(f"{val}\n")
+             sys.stdout.flush()
+             return val
+@@ -350,7 +357,7 @@ def visible_input(prompt: str | None = None) -> str:
+         def hidden_input(prompt: str | None = None) -> str:
+             sys.stdout.write(f"{prompt or ''}\n")
+             sys.stdout.flush()
+-            return text_input.readline().rstrip("\r\n")
++            return next(text_input).rstrip("\r\n")
+ 
+         @_pause_echo(echo_input)  # type: ignore
+         def _getchar(echo: bool) -> str:
+diff --git a/tests/test_chain.py b/tests/test_chain.py
+index 702eaaa3e1..ba11b7e2ae 100644
+--- a/tests/test_chain.py
++++ b/tests/test_chain.py
+@@ -163,8 +163,8 @@ def processor(iterator):
+         return processor
+ 
+     result = runner.invoke(cli, args, input=input)
+-    assert not result.exception
+-    assert result.output.splitlines() == expect
++    # last two lines are '' and 'Aborted!'
++    assert result.output.splitlines()[:-2] == expect
+ 
+ 
+ def test_args_and_chain(runner):
+diff --git a/tests/test_termui.py b/tests/test_termui.py
+index ad9d0a66c2..5d8b9fb803 100644
+--- a/tests/test_termui.py
++++ b/tests/test_termui.py
+@@ -242,7 +242,7 @@ def test_file_prompt_default_format(runner, file_kwargs):
+     def cli(f):
+         click.echo(f.name)
+ 
+-    result = runner.invoke(cli)
++    result = runner.invoke(cli, input="\n")
+     assert result.output == f"file [{__file__}]: \n{__file__}\n"
+ 
+ 
+@@ -451,7 +451,7 @@ def cli(value, o):
+     [
+         (True, "password\npassword", None, "password"),
+         ("Confirm Password", "password\npassword\n", None, "password"),
+-        (True, "", "", ""),
++        (True, "\n\n", "", ""),
+         (False, None, None, None),
+     ],
+ )
+diff --git a/tests/test_utils.py b/tests/test_utils.py
+index 48f9f4c243..e941415b6d 100644
+--- a/tests/test_utils.py
++++ b/tests/test_utils.py
+@@ -179,6 +179,19 @@ def f(_):
+     assert out == "Password:\ninterrupted\n"
+ 
+ 
++def test_prompts_eof(runner):
++    """If too few lines of input are given, prompt should exit, not hang."""
++
++    @click.command
++    def echo():
++        for _ in range(3):
++            click.echo(click.prompt("", type=int))
++
++    # only provide two lines of input for three prompts
++    result = runner.invoke(echo, input="1\n2\n")
++    assert result.exit_code == 1
++
++
+ def _test_gen_func():
+     yield "a"
+     yield "b"

@@ -1,0 +1,996 @@
+diff --git a/apps/gittensory-ui/public/openapi.json b/apps/gittensory-ui/public/openapi.json
+index d1f39cc0..5df49157 100644
+--- a/apps/gittensory-ui/public/openapi.json
++++ b/apps/gittensory-ui/public/openapi.json
+@@ -7528,6 +7528,42 @@
+           "privateTrustEnabled": {
+             "type": "boolean"
+           },
++          "commandAuthorization": {
++            "type": "object",
++            "properties": {
++              "default": {
++                "type": "array",
++                "items": {
++                  "type": "string",
++                  "enum": [
++                    "maintainer",
++                    "collaborator",
++                    "pr_author",
++                    "confirmed_miner"
++                  ]
++                }
++              },
++              "commands": {
++                "type": "object",
++                "additionalProperties": {
++                  "type": "array",
++                  "items": {
++                    "type": "string",
++                    "enum": [
++                      "maintainer",
++                      "collaborator",
++                      "pr_author",
++                      "confirmed_miner"
++                    ]
++                  }
++                }
++              }
++            },
++            "required": [
++              "default",
++              "commands"
++            ]
++          },
+           "createdAt": {
+             "type": "string",
+             "nullable": true
+@@ -7550,7 +7586,8 @@
+           "includeMaintainerAuthors",
+           "requireLinkedIssue",
+           "backfillEnabled",
+-          "privateTrustEnabled"
++          "privateTrustEnabled",
++          "commandAuthorization"
+         ]
+       },
+       "InstallationRepair": {
+@@ -7994,6 +8031,54 @@
+               },
+               "requireLinkedIssue": {
+                 "type": "boolean"
++              },
++              "commandAuthorization": {
++                "type": "object",
++                "properties": {
++                  "defaultAllowed": {
++                    "type": "array",
++                    "items": {
++                      "type": "string",
++                      "enum": [
++                        "maintainer",
++                        "collaborator",
++                        "pr_author",
++                        "confirmed_miner"
++                      ]
++                    }
++                  },
++                  "commandOverrides": {
++                    "type": "array",
++                    "items": {
++                      "type": "object",
++                      "properties": {
++                        "command": {
++                          "type": "string"
++                        },
++                        "allowedRoles": {
++                          "type": "array",
++                          "items": {
++                            "type": "string",
++                            "enum": [
++                              "maintainer",
++                              "collaborator",
++                              "pr_author",
++                              "confirmed_miner"
++                            ]
++                          }
++                        }
++                      },
++                      "required": [
++                        "command",
++                        "allowedRoles"
++                      ]
++                    }
++                  }
++                },
++                "required": [
++                  "defaultAllowed",
++                  "commandOverrides"
++                ]
+               }
+             },
+             "required": [
+@@ -8006,7 +8091,77 @@
+               "gittensorLabel",
+               "createMissingLabel",
+               "includeMaintainerAuthors",
+-              "requireLinkedIssue"
++              "requireLinkedIssue",
++              "commandAuthorization"
++            ]
++          },
++          "commandAuthorizationPreview": {
++            "type": "object",
++            "properties": {
++              "commandName": {
++                "type": "string"
++              },
++              "commenterLogin": {
++                "type": "string"
++              },
++              "commenterAssociation": {
++                "type": "string"
++              },
++              "decision": {
++                "type": "object",
++                "properties": {
++                  "authorized": {
++                    "type": "boolean"
++                  },
++                  "reason": {
++                    "type": "string"
++                  },
++                  "actorKind": {
++                    "type": "string",
++                    "enum": [
++                      "maintainer",
++                      "author",
++                      "none"
++                    ]
++                  },
++                  "matchedRole": {
++                    "type": "string",
++                    "nullable": true,
++                    "enum": [
++                      "maintainer",
++                      "collaborator",
++                      "pr_author",
++                      "confirmed_miner",
++                      null
++                    ]
++                  },
++                  "allowedRoles": {
++                    "type": "array",
++                    "items": {
++                      "type": "string",
++                      "enum": [
++                        "maintainer",
++                        "collaborator",
++                        "pr_author",
++                        "confirmed_miner"
++                      ]
++                    }
++                  }
++                },
++                "required": [
++                  "authorized",
++                  "reason",
++                  "actorKind",
++                  "matchedRole",
++                  "allowedRoles"
++                ]
++              }
++            },
++            "required": [
++              "commandName",
++              "commenterLogin",
++              "commenterAssociation",
++              "decision"
+             ]
+           },
+           "installation": {
+@@ -8397,6 +8552,7 @@
+           "repoFullName",
+           "generatedAt",
+           "settings",
++          "commandAuthorizationPreview",
+           "installation",
+           "sample",
+           "decision",
+diff --git a/migrations/0020_command_authorization_policy.sql b/migrations/0020_command_authorization_policy.sql
+new file mode 100644
+index 00000000..90270ec1
+--- /dev/null
++++ b/migrations/0020_command_authorization_policy.sql
+@@ -0,0 +1 @@
++ALTER TABLE repository_settings ADD COLUMN command_authorization_json TEXT NOT NULL DEFAULT '{}';
+diff --git a/src/api/routes.ts b/src/api/routes.ts
+index 9efdea4c..8855b1a6 100644
+--- a/src/api/routes.ts
++++ b/src/api/routes.ts
+@@ -22,6 +22,7 @@ import {
+   type AuthIdentity,
+ } from "../auth/security";
+ import { normalizeGittBountySnapshot } from "../bounties/ingest";
++import { DEFAULT_COMMAND_AUTHORIZATION_POLICY, normalizeCommandAuthorizationPolicy } from "../settings/command-authorization";
+ import {
+   countOpenIssues,
+   countOpenPullRequests,
+@@ -432,6 +433,12 @@ const repositorySettingsSchema = z.object({
+   requireLinkedIssue: z.boolean().default(false),
+   backfillEnabled: z.boolean().default(true),
+   privateTrustEnabled: z.boolean().default(true),
++  commandAuthorization: z
++    .object({
++      default: z.array(z.enum(["maintainer", "collaborator", "pr_author", "confirmed_miner"])).max(4).optional(),
++      commands: z.record(z.string().trim().min(1).max(64), z.array(z.enum(["maintainer", "collaborator", "pr_author", "confirmed_miner"])).max(4)).optional(),
++    })
++    .default(DEFAULT_COMMAND_AUTHORIZATION_POLICY),
+ });
+ 
+ const settingsPreviewSchema = z.object({
+@@ -445,6 +452,9 @@ const settingsPreviewSchema = z.object({
+       body: z.string().max(10000).nullable().optional(),
+       labels: z.array(z.string().max(100)).max(50).optional(),
+       linkedIssues: z.array(z.number().int().positive()).max(50).optional(),
++      commandName: z.string().trim().min(1).max(64).optional(),
++      commenterLogin: z.string().trim().min(1).max(100).optional(),
++      commenterAssociation: z.enum(["OWNER", "MEMBER", "COLLABORATOR", "CONTRIBUTOR", "FIRST_TIMER", "FIRST_TIME_CONTRIBUTOR", "MANNEQUIN", "NONE"]).optional(),
+     })
+     .optional(),
+ });
+@@ -2147,6 +2157,7 @@ export function createApp() {
+         requireLinkedIssue: parsed.data.requireLinkedIssue,
+         backfillEnabled: parsed.data.backfillEnabled,
+         privateTrustEnabled: parsed.data.privateTrustEnabled,
++        commandAuthorization: normalizeCommandAuthorizationPolicy(parsed.data.commandAuthorization).policy,
+       }),
+     );
+   });
+diff --git a/src/db/repositories.ts b/src/db/repositories.ts
+index 8436b121..4c1f4d78 100644
+--- a/src/db/repositories.ts
++++ b/src/db/repositories.ts
+@@ -135,6 +135,7 @@ import type {
+ } from "../types";
+ import type { GittensorContributorSnapshot, OfficialGittensorMinerDetection } from "../gittensor/api";
+ import { classifyMcpClientVersion, LATEST_RECOMMENDED_MCP_VERSION, MINIMUM_SUPPORTED_MCP_VERSION } from "../services/mcp-compatibility";
++import { DEFAULT_COMMAND_AUTHORIZATION_POLICY, normalizeCommandAuthorizationPolicy } from "../settings/command-authorization";
+ import { sha256Hex } from "../utils/crypto";
+ import { jsonString, nowIso, parseJson, repoParts } from "../utils/json";
+ 
+@@ -367,6 +368,7 @@ export async function getRepositorySettings(env: Env, fullName: string): Promise
+       requireLinkedIssue: false,
+       backfillEnabled: true,
+       privateTrustEnabled: true,
++      commandAuthorization: normalizeCommandAuthorizationPolicy(DEFAULT_COMMAND_AUTHORIZATION_POLICY).policy,
+     };
+   }
+   return {
+@@ -383,6 +385,7 @@ export async function getRepositorySettings(env: Env, fullName: string): Promise
+     requireLinkedIssue: row.requireLinkedIssue,
+     backfillEnabled: row.backfillEnabled,
+     privateTrustEnabled: row.privateTrustEnabled,
++    commandAuthorization: parseCommandAuthorizationPolicy(row.commandAuthorizationJson),
+     createdAt: row.createdAt,
+     updatedAt: row.updatedAt,
+   };
+@@ -403,6 +406,7 @@ export async function upsertRepositorySettings(env: Env, settings: Partial<Repos
+     requireLinkedIssue: settings.requireLinkedIssue ?? false,
+     backfillEnabled: settings.backfillEnabled ?? true,
+     privateTrustEnabled: settings.privateTrustEnabled ?? true,
++    commandAuthorization: normalizeCommandAuthorizationPolicy(settings.commandAuthorization).policy,
+   };
+   const db = getDb(env.DB);
+   await db
+@@ -421,6 +425,7 @@ export async function upsertRepositorySettings(env: Env, settings: Partial<Repos
+       requireLinkedIssue: resolved.requireLinkedIssue,
+       backfillEnabled: resolved.backfillEnabled,
+       privateTrustEnabled: resolved.privateTrustEnabled,
++      commandAuthorizationJson: jsonString(resolved.commandAuthorization),
+       updatedAt: nowIso(),
+     })
+     .onConflictDoUpdate({
+@@ -438,6 +443,7 @@ export async function upsertRepositorySettings(env: Env, settings: Partial<Repos
+         requireLinkedIssue: resolved.requireLinkedIssue,
+         backfillEnabled: resolved.backfillEnabled,
+         privateTrustEnabled: resolved.privateTrustEnabled,
++        commandAuthorizationJson: jsonString(resolved.commandAuthorization),
+         updatedAt: nowIso(),
+       },
+     });
+@@ -4171,6 +4177,10 @@ function parsePublicSurface(value: string): RepositorySettings["publicSurface"]
+   return "comment_and_label";
+ }
+ 
++function parseCommandAuthorizationPolicy(value: string): RepositorySettings["commandAuthorization"] {
++  return normalizeCommandAuthorizationPolicy(parseJson<unknown>(value, null)).policy;
++}
++
+ function parseSyncStatus(value: string): RepoSyncStateRecord["status"] {
+   if (
+     value === "running" ||
+diff --git a/src/db/schema.ts b/src/db/schema.ts
+index 5620845a..625cfad8 100644
+--- a/src/db/schema.ts
++++ b/src/db/schema.ts
+@@ -47,6 +47,7 @@ export const repositorySettings = sqliteTable("repository_settings", {
+   requireLinkedIssue: integer("require_linked_issue", { mode: "boolean" }).notNull().default(false),
+   backfillEnabled: integer("backfill_enabled", { mode: "boolean" }).notNull().default(true),
+   privateTrustEnabled: integer("private_trust_enabled", { mode: "boolean" }).notNull().default(true),
++  commandAuthorizationJson: text("command_authorization_json").notNull().default("{}"),
+   createdAt: text("created_at").notNull().default("CURRENT_TIMESTAMP"),
+   updatedAt: text("updated_at").notNull().default("CURRENT_TIMESTAMP"),
+ });
+diff --git a/src/github/commands.ts b/src/github/commands.ts
+index c7f9bd24..991cf02c 100644
+--- a/src/github/commands.ts
++++ b/src/github/commands.ts
+@@ -1,8 +1,9 @@
+ import { AGENT_COMMAND_COMMENT_MARKER } from "./comments";
+ import type { AgentRunBundle } from "../services/agent-orchestrator";
+ import type { GittensorContributorSnapshot, OfficialGittensorMinerDetection } from "../gittensor/api";
+-import type { AgentActionRecord } from "../types";
++import type { AgentActionRecord, RepositoryCommandAuthorizationPolicy } from "../types";
+ import type { CheckSummaryRecord, GitHubIssuePayload, IssueRecord, PullRequestRecord, RecentMergedPullRequestRecord, RepositoryRecord } from "../types";
++import { evaluateCommandAuthorization } from "../settings/command-authorization";
+ import { buildCollisionReport, buildQueueHealth, type CollisionCluster, type QueueHealth } from "../signals/engine";
+ 
+ const PUBLIC_MENTION_COMMAND_CATALOG = [
+@@ -166,21 +167,17 @@ export function isAuthorizedCommandActor(args: {
+   commenterAssociation?: string | null | undefined;
+   pullRequestAuthorLogin?: string | null | undefined;
+   officialAuthorDetection?: OfficialGittensorMinerDetection | undefined;
++  commandAuthorizationPolicy?: RepositoryCommandAuthorizationPolicy | null | undefined;
+ }): { authorized: boolean; reason: string; actorKind: "maintainer" | "author" | "none" } {
+-  if (isMaintainerAssociation(args.commenterAssociation)) return { authorized: true, reason: "maintainer_invocation", actorKind: "maintainer" };
+-  if (args.commandName && isMaintainerOnlyCommand(args.commandName)) {
+-    return { authorized: false, reason: "maintainer_command_requires_maintainer", actorKind: "none" };
+-  }
+-  if (!args.commenterLogin || !args.pullRequestAuthorLogin || args.commenterLogin.toLowerCase() !== args.pullRequestAuthorLogin.toLowerCase()) {
+-    return { authorized: false, reason: "not_maintainer_or_pr_author", actorKind: "none" };
+-  }
+-  if (!args.officialAuthorDetection || args.officialAuthorDetection.status === "unavailable") {
+-    return { authorized: false, reason: "miner_detection_unavailable", actorKind: "author" };
+-  }
+-  if (args.officialAuthorDetection.status !== "confirmed") {
+-    return { authorized: false, reason: "pr_author_not_confirmed_miner", actorKind: "author" };
+-  }
+-  return { authorized: true, reason: "confirmed_miner_pr_author", actorKind: "author" };
++  const decision = evaluateCommandAuthorization({
++    policy: args.commandAuthorizationPolicy,
++    commandName: args.commandName ?? "preflight",
++    commenterLogin: args.commenterLogin,
++    commenterAssociation: args.commenterAssociation,
++    pullRequestAuthorLogin: args.pullRequestAuthorLogin,
++    minerStatus: args.officialAuthorDetection?.status,
++  });
++  return { authorized: decision.authorized, reason: decision.reason, actorKind: decision.actorKind };
+ }
+ 
+ export function buildPublicAgentCommandComment(args: {
+diff --git a/src/openapi/schemas.ts b/src/openapi/schemas.ts
+index 060bb37b..ac1bbd25 100644
+--- a/src/openapi/schemas.ts
++++ b/src/openapi/schemas.ts
+@@ -528,6 +528,10 @@ export const RepositorySettingsSchema = z
+     requireLinkedIssue: z.boolean(),
+     backfillEnabled: z.boolean(),
+     privateTrustEnabled: z.boolean(),
++    commandAuthorization: z.object({
++      default: z.array(z.enum(["maintainer", "collaborator", "pr_author", "confirmed_miner"])),
++      commands: z.record(z.string(), z.array(z.enum(["maintainer", "collaborator", "pr_author", "confirmed_miner"]))),
++    }),
+     createdAt: z.string().nullable().optional(),
+     updatedAt: z.string().nullable().optional(),
+   })
+@@ -548,6 +552,27 @@ export const RepoSettingsPreviewSchema = z
+       createMissingLabel: z.boolean(),
+       includeMaintainerAuthors: z.boolean(),
+       requireLinkedIssue: z.boolean(),
++      commandAuthorization: z.object({
++        defaultAllowed: z.array(z.enum(["maintainer", "collaborator", "pr_author", "confirmed_miner"])),
++        commandOverrides: z.array(
++          z.object({
++            command: z.string(),
++            allowedRoles: z.array(z.enum(["maintainer", "collaborator", "pr_author", "confirmed_miner"])),
++          }),
++        ),
++      }),
++    }),
++    commandAuthorizationPreview: z.object({
++      commandName: z.string(),
++      commenterLogin: z.string(),
++      commenterAssociation: z.string(),
++      decision: z.object({
++        authorized: z.boolean(),
++        reason: z.string(),
++        actorKind: z.enum(["maintainer", "author", "none"]),
++        matchedRole: z.enum(["maintainer", "collaborator", "pr_author", "confirmed_miner"]).nullable(),
++        allowedRoles: z.array(z.enum(["maintainer", "collaborator", "pr_author", "confirmed_miner"])),
++      }),
+     }),
+     installation: z
+       .object({
+diff --git a/src/queue/processors.ts b/src/queue/processors.ts
+index 5619d6c5..d7f76764 100644
+--- a/src/queue/processors.ts
++++ b/src/queue/processors.ts
+@@ -63,7 +63,6 @@ import {
+   type GittensoryMentionCommandName,
+   isAuthorizedCommandActor,
+   isMaintainerAssociation,
+-  isMaintainerOnlyCommand,
+   isMaintainerQueueDigestCommand,
+   parseAgentCommandFeedbackContext,
+   parseGittensoryMentionCommand,
+@@ -81,6 +80,7 @@ import {
+ } from "../services/contributor-evidence-graph";
+ import { executeAgentRun, explainBlockersWithAgent, planNextWork, preflightBranchWithAgent, preparePrPacketWithAgent } from "../services/agent-orchestrator";
+ import { isAuthorizedGitHubSessionLogin } from "../auth/security";
++import { commandAuthorizationAllowedRoles, commandAuthorizationNeedsMinerDetection } from "../settings/command-authorization";
+ import { loadIssueQualityReportMap } from "../services/issue-quality";
+ import { generateWeeklyValueReport } from "../services/weekly-value-report";
+ import { REPO_OUTCOME_PATTERNS_SIGNAL, computeRepoOutcomePatterns } from "../services/repo-outcome-patterns";
+@@ -912,38 +912,16 @@ async function maybeProcessGittensoryMentionCommand(env: Env, deliveryId: string
+     return true;
+   }
+ 
+-  const [repo, cachedPullRequest] = await Promise.all([getRepository(env, repoFullName), getPullRequest(env, repoFullName, issue.number)]);
++  const [repo, cachedPullRequest, settings] = await Promise.all([getRepository(env, repoFullName), getPullRequest(env, repoFullName, issue.number), getRepositorySettings(env, repoFullName)]);
+   const pullRequestAuthor = cachedPullRequest?.authorLogin ?? issue.user?.login ?? null;
+-  const maintainerActor = isMaintainerAssociation(commenterAssociation);
+-  if (isMaintainerOnlyCommand(command.name) && !maintainerActor) {
+-    await recordAuditEvent(env, {
+-      eventType: "github_app.agent_command_skipped",
+-      actor: commenter,
+-      targetKey: `${repoFullName}#${issue.number}`,
+-      outcome: "denied",
+-      detail: "maintainer_command_requires_maintainer",
+-      metadata: { deliveryId, command: command.name },
+-    });
+-    await recordAgentCommandUsage(env, {
+-      repoFullName,
+-      targetKey: `${repoFullName}#${issue.number}`,
+-      actor: commenter,
+-      command: command.name,
+-      actorKind: "none",
+-      outcome: "skipped",
+-      detail: "maintainer_command_requires_maintainer",
+-      family: "maintainer_digest",
+-    });
+-    await recordGithubProductUsage(env, "agent_command_skipped", {
+-      actor: commenter,
+-      repoFullName,
+-      targetKey: `${repoFullName}#${issue.number}`,
+-      outcome: "denied",
+-      metadata: { command: command.name, reason: "maintainer_command_requires_maintainer", family: "queue_digest" },
+-    });
+-    return true;
+-  }
+-  const official = pullRequestAuthor && (!maintainerActor || command.name === "miner-context")
++  const needsMinerDetection = commandAuthorizationNeedsMinerDetection({
++    policy: settings.commandAuthorization,
++    commandName: command.name,
++    commenterLogin: commenter,
++    commenterAssociation,
++    pullRequestAuthorLogin: pullRequestAuthor,
++  });
++  const official = pullRequestAuthor && (needsMinerDetection || command.name === "miner-context")
+     ? await getCachedOfficialMinerDetection(env, pullRequestAuthor, { targetKey: `${repoFullName}#${issue.number}`, deliveryId })
+     : undefined;
+   const authorization = isAuthorizedCommandActor({
+@@ -952,6 +930,7 @@ async function maybeProcessGittensoryMentionCommand(env: Env, deliveryId: string
+     commenterAssociation,
+     pullRequestAuthorLogin: pullRequestAuthor,
+     officialAuthorDetection: official,
++    commandAuthorizationPolicy: settings.commandAuthorization,
+   });
+   if (!authorization.authorized) {
+     await recordAuditEvent(env, {
+@@ -960,7 +939,7 @@ async function maybeProcessGittensoryMentionCommand(env: Env, deliveryId: string
+       targetKey: `${repoFullName}#${issue.number}`,
+       outcome: authorization.reason === "miner_detection_unavailable" ? "error" : "completed",
+       detail: authorization.reason,
+-      metadata: { deliveryId, command: command.name },
++      metadata: { deliveryId, command: command.name, allowedRoles: commandAuthorizationAllowedRoles(settings.commandAuthorization, command.name) },
+     });
+     await recordAgentCommandUsage(env, {
+       repoFullName,
+diff --git a/src/settings/command-authorization.ts b/src/settings/command-authorization.ts
+new file mode 100644
+index 00000000..98252bf5
+--- /dev/null
++++ b/src/settings/command-authorization.ts
+@@ -0,0 +1,180 @@
++import type { CommandAuthorizationRole, RepositoryCommandAuthorizationPolicy } from "../types";
++
++export const DEFAULT_COMMAND_AUTHORIZATION_POLICY: RepositoryCommandAuthorizationPolicy = {
++  default: ["maintainer", "collaborator", "confirmed_miner"],
++  commands: {
++    "queue-summary": ["maintainer", "collaborator"],
++    "confirmed-miners": ["maintainer", "collaborator"],
++    "review-now": ["maintainer", "collaborator"],
++    "needs-author": ["maintainer", "collaborator"],
++    "duplicate-clusters": ["maintainer", "collaborator"],
++  },
++};
++
++const COMMAND_AUTHORIZATION_ROLES = new Set<CommandAuthorizationRole>(["maintainer", "collaborator", "pr_author", "confirmed_miner"]);
++const MAINTAINER_ONLY_DEFAULT_COMMANDS = new Set(Object.keys(DEFAULT_COMMAND_AUTHORIZATION_POLICY.commands));
++
++export type CommandAuthorizationDecision = {
++  authorized: boolean;
++  reason: string;
++  actorKind: "maintainer" | "author" | "none";
++  matchedRole: CommandAuthorizationRole | null;
++  allowedRoles: CommandAuthorizationRole[];
++};
++
++export function normalizeCommandAuthorizationPolicy(input: unknown): { policy: RepositoryCommandAuthorizationPolicy; warnings: string[] } {
++  const warnings: string[] = [];
++  if (!isRecord(input)) {
++    if (input !== null && input !== undefined) warnings.push("commandAuthorization must be an object; using secure defaults.");
++    return { policy: clonePolicy(DEFAULT_COMMAND_AUTHORIZATION_POLICY), warnings };
++  }
++
++  const defaultRoles = normalizeRoleList(input.default, DEFAULT_COMMAND_AUTHORIZATION_POLICY.default, "default", warnings);
++  const commands: Record<string, CommandAuthorizationRole[]> = { ...DEFAULT_COMMAND_AUTHORIZATION_POLICY.commands };
++  if (input.commands !== undefined) {
++    if (isRecord(input.commands)) {
++      for (const [command, roles] of Object.entries(input.commands)) {
++        const commandName = command.trim().toLowerCase();
++        if (!/^[a-z][a-z-]{0,63}$/.test(commandName)) {
++          warnings.push(`Ignored malformed command authorization key: ${command.slice(0, 64)}`);
++          continue;
++        }
++        commands[commandName] = normalizeRoleList(roles, defaultRoles, commandName, warnings);
++      }
++    } else {
++      warnings.push("commandAuthorization.commands must be an object; using command defaults.");
++    }
++  }
++
++  return { policy: { default: defaultRoles, commands }, warnings };
++}
++
++export function commandAuthorizationAllowedRoles(policy: RepositoryCommandAuthorizationPolicy | null | undefined, commandName: string): CommandAuthorizationRole[] {
++  const normalized = normalizeCommandAuthorizationPolicy(policy).policy;
++  return dedupeRoles(normalized.commands[commandName] ?? normalized.default);
++}
++
++export function commandAuthorizationNeedsMinerDetection(args: {
++  policy?: RepositoryCommandAuthorizationPolicy | null | undefined;
++  commandName: string;
++  commenterLogin?: string | null | undefined;
++  commenterAssociation?: string | null | undefined;
++  pullRequestAuthorLogin?: string | null | undefined;
++}): boolean {
++  const allowedRoles = commandAuthorizationAllowedRoles(args.policy, args.commandName);
++  if (!allowedRoles.includes("confirmed_miner")) return false;
++  if (!isSameLogin(args.commenterLogin, args.pullRequestAuthorLogin)) return false;
++  const rolesWithoutMiner = actorRoles({ ...args, minerStatus: undefined });
++  return !rolesWithoutMiner.some((role) => allowedRoles.includes(role));
++}
++
++export function evaluateCommandAuthorization(args: {
++  policy?: RepositoryCommandAuthorizationPolicy | null | undefined;
++  commandName: string;
++  commenterLogin?: string | null | undefined;
++  commenterAssociation?: string | null | undefined;
++  pullRequestAuthorLogin?: string | null | undefined;
++  minerStatus?: "confirmed" | "not_found" | "unavailable" | undefined;
++}): CommandAuthorizationDecision {
++  const allowedRoles = commandAuthorizationAllowedRoles(args.policy, args.commandName);
++  const roles = actorRoles(args);
++  const matchedRole = roles.find((role) => allowedRoles.includes(role)) ?? null;
++  if (matchedRole) {
++    return {
++      authorized: true,
++      reason: authorizationReason(matchedRole),
++      actorKind: matchedRole === "maintainer" || matchedRole === "collaborator" ? "maintainer" : "author",
++      matchedRole,
++      allowedRoles,
++    };
++  }
++  const ownPrAuthor = isSameLogin(args.commenterLogin, args.pullRequestAuthorLogin);
++  if (ownPrAuthor && allowedRoles.includes("confirmed_miner")) {
++    return {
++      authorized: false,
++      reason: args.minerStatus === "unavailable" || !args.minerStatus ? "miner_detection_unavailable" : "pr_author_not_confirmed_miner",
++      actorKind: "author",
++      matchedRole: null,
++      allowedRoles,
++    };
++  }
++  if (ownPrAuthor && MAINTAINER_ONLY_DEFAULT_COMMANDS.has(args.commandName) && allowedRoles.every((role) => role === "maintainer" || role === "collaborator")) {
++    return { authorized: false, reason: "maintainer_command_requires_maintainer", actorKind: "author", matchedRole: null, allowedRoles };
++  }
++  return {
++    authorized: false,
++    reason: ownPrAuthor ? "command_policy_denied" : "not_maintainer_or_pr_author",
++    actorKind: ownPrAuthor ? "author" : "none",
++    matchedRole: null,
++    allowedRoles,
++  };
++}
++
++export function summarizeCommandAuthorizationPolicy(policy: RepositoryCommandAuthorizationPolicy | null | undefined): {
++  defaultAllowed: CommandAuthorizationRole[];
++  commandOverrides: Array<{ command: string; allowedRoles: CommandAuthorizationRole[] }>;
++} {
++  const normalized = normalizeCommandAuthorizationPolicy(policy).policy;
++  return {
++    defaultAllowed: normalized.default,
++    commandOverrides: Object.entries(normalized.commands)
++      .map(([command, allowedRoles]) => ({ command, allowedRoles }))
++      .sort((left, right) => left.command.localeCompare(right.command)),
++  };
++}
++
++function actorRoles(args: {
++  commenterLogin?: string | null | undefined;
++  commenterAssociation?: string | null | undefined;
++  pullRequestAuthorLogin?: string | null | undefined;
++  minerStatus?: "confirmed" | "not_found" | "unavailable" | undefined;
++}): CommandAuthorizationRole[] {
++  const roles: CommandAuthorizationRole[] = [];
++  if (args.commenterAssociation === "OWNER" || args.commenterAssociation === "MEMBER") roles.push("maintainer");
++  if (args.commenterAssociation === "COLLABORATOR") roles.push("collaborator");
++  if (isSameLogin(args.commenterLogin, args.pullRequestAuthorLogin)) {
++    roles.push("pr_author");
++    if (args.minerStatus === "confirmed") roles.push("confirmed_miner");
++  }
++  return roles;
++}
++
++function normalizeRoleList(input: unknown, fallback: CommandAuthorizationRole[], label: string, warnings: string[]): CommandAuthorizationRole[] {
++  if (!Array.isArray(input)) {
++    if (input !== undefined) warnings.push(`commandAuthorization.${label} must be an array of roles; using fallback roles.`);
++    return dedupeRoles(fallback);
++  }
++  const roles = input.filter((role): role is CommandAuthorizationRole => {
++    const valid = typeof role === "string" && COMMAND_AUTHORIZATION_ROLES.has(role as CommandAuthorizationRole);
++    if (!valid) warnings.push(`Ignored invalid command authorization role for ${label}.`);
++    return valid;
++  });
++  if (roles.length === 0) {
++    warnings.push(`commandAuthorization.${label} had no valid roles; using fallback roles.`);
++    return dedupeRoles(fallback);
++  }
++  return dedupeRoles(roles);
++}
++
++function dedupeRoles(roles: CommandAuthorizationRole[]): CommandAuthorizationRole[] {
++  return [...new Set(roles)];
++}
++
++function clonePolicy(policy: RepositoryCommandAuthorizationPolicy): RepositoryCommandAuthorizationPolicy {
++  return { default: [...policy.default], commands: Object.fromEntries(Object.entries(policy.commands).map(([command, roles]) => [command, [...roles]])) };
++}
++
++function authorizationReason(role: CommandAuthorizationRole): string {
++  if (role === "maintainer") return "maintainer_invocation";
++  if (role === "collaborator") return "collaborator_invocation";
++  if (role === "confirmed_miner") return "confirmed_miner_pr_author";
++  return "allowed_pr_author";
++}
++
++function isRecord(value: unknown): value is Record<string, unknown> {
++  return typeof value === "object" && value !== null && !Array.isArray(value);
++}
++
++function isSameLogin(left: string | null | undefined, right: string | null | undefined): boolean {
++  return Boolean(left && right && left.toLowerCase() === right.toLowerCase());
++}
+diff --git a/src/signals/settings-preview.ts b/src/signals/settings-preview.ts
+index 08e8a397..a1394d11 100644
+--- a/src/signals/settings-preview.ts
++++ b/src/signals/settings-preview.ts
+@@ -1,4 +1,9 @@
+-import type { IssueRecord, PullRequestRecord, RepositoryRecord, RepositorySettings } from "../types";
++import type { CommandAuthorizationRole, IssueRecord, PullRequestRecord, RepositoryRecord, RepositorySettings } from "../types";
++import {
++  evaluateCommandAuthorization,
++  summarizeCommandAuthorizationPolicy,
++  type CommandAuthorizationDecision,
++} from "../settings/command-authorization";
+ import { nowIso } from "../utils/json";
+ import {
+   buildCollisionReport,
+@@ -112,6 +117,9 @@ export type PublicSurfaceSample = {
+   body?: string | null | undefined;
+   labels?: string[] | undefined;
+   linkedIssues?: number[] | undefined;
++  commandName?: string | undefined;
++  commenterLogin?: string | null | undefined;
++  commenterAssociation?: string | null | undefined;
+ };
+ 
+ export type InstallationHealthSummary = {
+@@ -169,6 +177,16 @@ export type RepoSettingsPreview = {
+     createMissingLabel: boolean;
+     includeMaintainerAuthors: boolean;
+     requireLinkedIssue: boolean;
++    commandAuthorization: {
++      defaultAllowed: CommandAuthorizationRole[];
++      commandOverrides: Array<{ command: string; allowedRoles: CommandAuthorizationRole[] }>;
++    };
++  };
++  commandAuthorizationPreview: {
++    commandName: string;
++    commenterLogin: string;
++    commenterAssociation: string;
++    decision: CommandAuthorizationDecision;
+   };
+   installation: InstallationHealthSummary | null;
+   sample: {
+@@ -226,6 +244,22 @@ export function buildRepoSettingsPreview(args: {
+     : null;
+ 
+   const warnings = buildWarnings(settings, decision, args.installation);
++  const commandName = args.sample.commandName?.trim() || "preflight";
++  const commenterLogin = args.sample.commenterLogin?.trim() || sample.authorLogin;
++  const commenterAssociation = args.sample.commenterAssociation || sample.authorAssociation;
++  const commandAuthorizationPreview = {
++    commandName,
++    commenterLogin,
++    commenterAssociation,
++    decision: evaluateCommandAuthorization({
++      policy: settings.commandAuthorization,
++      commandName,
++      commenterLogin,
++      commenterAssociation,
++      pullRequestAuthorLogin: sample.authorLogin,
++      minerStatus: sample.minerStatus,
++    }),
++  };
+   const installPreview = buildRepoInstallPreview({
+     repo,
+     settings,
+@@ -248,7 +282,9 @@ export function buildRepoSettingsPreview(args: {
+       createMissingLabel: settings.createMissingLabel,
+       includeMaintainerAuthors: settings.includeMaintainerAuthors,
+       requireLinkedIssue: settings.requireLinkedIssue,
++      commandAuthorization: summarizeCommandAuthorizationPolicy(settings.commandAuthorization),
+     },
++    commandAuthorizationPreview,
+     installation: args.installation,
+     sample,
+     decision,
+diff --git a/src/types.ts b/src/types.ts
+index f5a5ba2b..731f177d 100644
+--- a/src/types.ts
++++ b/src/types.ts
+@@ -353,10 +353,18 @@ export type RepositorySettings = {
+   requireLinkedIssue: boolean;
+   backfillEnabled: boolean;
+   privateTrustEnabled: boolean;
++  commandAuthorization?: RepositoryCommandAuthorizationPolicy | undefined;
+   createdAt?: string | null | undefined;
+   updatedAt?: string | null | undefined;
+ };
+ 
++export type CommandAuthorizationRole = "maintainer" | "collaborator" | "pr_author" | "confirmed_miner";
++
++export type RepositoryCommandAuthorizationPolicy = {
++  default: CommandAuthorizationRole[];
++  commands: Record<string, CommandAuthorizationRole[]>;
++};
++
+ export type RepoSyncStateRecord = {
+   repoFullName: string;
+   status: "never_synced" | "running" | "success" | "partial" | "error" | "skipped" | "capped" | "rate_limited" | "stale";
+diff --git a/test/integration/api.test.ts b/test/integration/api.test.ts
+index a50b6d5e..e161e720 100644
+--- a/test/integration/api.test.ts
++++ b/test/integration/api.test.ts
+@@ -4903,16 +4903,39 @@ describe("api routes", () => {
+       {
+         method: "POST",
+         headers: { authorization: `Bearer ${env.INTERNAL_JOB_TOKEN}` },
+-        body: JSON.stringify({ commentMode: "detected_contributors_only", publicSignalLevel: "minimal" }),
++        body: JSON.stringify({
++          commentMode: "detected_contributors_only",
++          publicSignalLevel: "minimal",
++          commandAuthorization: { default: ["maintainer"], commands: { preflight: ["pr_author"], "queue-summary": ["maintainer", "collaborator"] } },
++        }),
+       },
+       env,
+     );
+     expect(updated.status).toBe(200);
+-    await expect(updated.json()).resolves.toMatchObject({ commentMode: "detected_contributors_only", publicSignalLevel: "minimal" });
++    await expect(updated.json()).resolves.toMatchObject({
++      commentMode: "detected_contributors_only",
++      publicSignalLevel: "minimal",
++      commandAuthorization: { default: ["maintainer"], commands: expect.objectContaining({ preflight: ["pr_author"] }) },
++    });
+ 
+     const settings = await app.request("/v1/repos/entrius/allways-ui/settings", { headers: apiHeaders(env) }, env);
+     expect(settings.status).toBe(200);
+-    await expect(settings.json()).resolves.toMatchObject({ commentMode: "detected_contributors_only" });
++    await expect(settings.json()).resolves.toMatchObject({ commentMode: "detected_contributors_only", commandAuthorization: { commands: expect.objectContaining({ preflight: ["pr_author"] }) } });
++
++    const preview = await app.request(
++      "/v1/repos/entrius/allways-ui/settings-preview",
++      {
++        method: "POST",
++        headers: apiHeaders(env),
++        body: JSON.stringify({ sample: { authorLogin: "author", commenterLogin: "author", commandName: "preflight", minerStatus: "not_found" } }),
++      },
++      env,
++    );
++    expect(preview.status).toBe(200);
++    await expect(preview.json()).resolves.toMatchObject({
++      settings: { commandAuthorization: { defaultAllowed: ["maintainer"], commandOverrides: expect.arrayContaining([expect.objectContaining({ command: "preflight", allowedRoles: ["pr_author"] })]) } },
++      commandAuthorizationPreview: { commandName: "preflight", decision: { authorized: true, reason: "allowed_pr_author", matchedRole: "pr_author" } },
++    });
+   });
+ });
+ 
+diff --git a/test/unit/command-authorization.test.ts b/test/unit/command-authorization.test.ts
+new file mode 100644
+index 00000000..f89ad83a
+--- /dev/null
++++ b/test/unit/command-authorization.test.ts
+@@ -0,0 +1,76 @@
++import { describe, expect, it } from "vitest";
++import {
++  commandAuthorizationNeedsMinerDetection,
++  evaluateCommandAuthorization,
++  normalizeCommandAuthorizationPolicy,
++  summarizeCommandAuthorizationPolicy,
++} from "../../src/settings/command-authorization";
++
++describe("repo command authorization policy", () => {
++  it("preserves secure defaults for maintainers, collaborators, and confirmed-miner PR authors", () => {
++    expect(evaluateCommandAuthorization({ commandName: "preflight", commenterAssociation: "OWNER" })).toMatchObject({
++      authorized: true,
++      reason: "maintainer_invocation",
++      actorKind: "maintainer",
++    });
++    expect(evaluateCommandAuthorization({ commandName: "preflight", commenterAssociation: "COLLABORATOR" })).toMatchObject({
++      authorized: true,
++      reason: "collaborator_invocation",
++      actorKind: "maintainer",
++    });
++    expect(
++      evaluateCommandAuthorization({
++        commandName: "next-action",
++        commenterLogin: "miner",
++        pullRequestAuthorLogin: "miner",
++        minerStatus: "confirmed",
++      }),
++    ).toMatchObject({ authorized: true, reason: "confirmed_miner_pr_author", actorKind: "author" });
++    expect(evaluateCommandAuthorization({ commandName: "queue-summary", commenterLogin: "miner", pullRequestAuthorLogin: "miner", minerStatus: "confirmed" })).toMatchObject({
++      authorized: false,
++      reason: "maintainer_command_requires_maintainer",
++    });
++  });
++
++  it("honors command overrides and avoids miner lookup when plain PR author is allowed", () => {
++    const policy = normalizeCommandAuthorizationPolicy({ default: ["maintainer"], commands: { "next-action": ["pr_author"] } }).policy;
++    expect(
++      commandAuthorizationNeedsMinerDetection({
++        policy,
++        commandName: "next-action",
++        commenterLogin: "author",
++        pullRequestAuthorLogin: "author",
++      }),
++    ).toBe(false);
++    expect(evaluateCommandAuthorization({ policy, commandName: "next-action", commenterLogin: "author", pullRequestAuthorLogin: "author" })).toMatchObject({
++      authorized: true,
++      reason: "allowed_pr_author",
++      actorKind: "author",
++      matchedRole: "pr_author",
++    });
++    expect(evaluateCommandAuthorization({ policy, commandName: "packet", commenterLogin: "author", pullRequestAuthorLogin: "author" })).toMatchObject({
++      authorized: false,
++      reason: "command_policy_denied",
++    });
++  });
++
++  it("warns on malformed policy and falls back to default command roles", () => {
++    const { policy, warnings } = normalizeCommandAuthorizationPolicy({
++      default: ["unknown", "confirmed_miner"],
++      commands: {
++        "bad command": ["maintainer"],
++        preflight: ["bogus"],
++        blockers: "maintainer",
++      },
++    });
++    expect(warnings.length).toBeGreaterThanOrEqual(3);
++    expect(policy.default).toEqual(["confirmed_miner"]);
++    expect(policy.commands.preflight).toEqual(["confirmed_miner"]);
++    expect(policy.commands.blockers).toEqual(["confirmed_miner"]);
++    expect(summarizeCommandAuthorizationPolicy(policy).commandOverrides.map((entry) => entry.command)).toContain("queue-summary");
++
++    const malformedCommands = normalizeCommandAuthorizationPolicy({ commands: ["preflight"] });
++    expect(malformedCommands.warnings).toContain("commandAuthorization.commands must be an object; using command defaults.");
++    expect(malformedCommands.policy.commands["queue-summary"]).toEqual(["maintainer", "collaborator"]);
++  });
++});
+diff --git a/test/unit/queue.test.ts b/test/unit/queue.test.ts
+index d2eba925..3531cd00 100644
+--- a/test/unit/queue.test.ts
++++ b/test/unit/queue.test.ts
+@@ -1694,6 +1694,79 @@ describe("queue processors", () => {
+     );
+   });
+ 
++  it("applies repo command authorization policy overrides during issue_comment handling", async () => {
++    const env = createTestEnv({ GITHUB_APP_PRIVATE_KEY: await generatePrivateKeyPem() });
++    await upsertRepositorySettings(env, {
++      repoFullName: "JSONbored/gittensory",
++      commandAuthorization: { default: ["maintainer"], commands: { help: ["pr_author"] } },
++    });
++    await upsertPullRequestFromGitHub(env, "JSONbored/gittensory", {
++      number: 91,
++      title: "Author policy command",
++      state: "open",
++      user: { login: "driveby" },
++      author_association: "NONE",
++      labels: [],
++      body: "Fixes #90",
++    });
++
++    const calls = { commentsCreated: 0, token: 0, minerList: 0 };
++    vi.stubGlobal("fetch", async (input: RequestInfo | URL, init?: RequestInit) => {
++      const url = input.toString();
++      const method = init?.method ?? "GET";
++      if (url === "https://api.gittensor.io/miners") {
++        calls.minerList += 1;
++        return Response.json([]);
++      }
++      if (url.includes("/access_tokens")) {
++        calls.token += 1;
++        return Response.json({ token: "installation-token" });
++      }
++      if (url.includes("/issues/") && url.includes("/comments") && method === "GET") return Response.json([]);
++      if (url.includes("/issues/") && url.includes("/comments") && method === "POST") {
++        calls.commentsCreated += 1;
++        const body = JSON.parse(String(init?.body ?? "{}")) as { body?: string };
++        expect(body.body).toContain("<!-- gittensory-agent-command -->");
++        expect(body.body).not.toMatch(/wallet|hotkey|estimated score|reward estimate|payout|farming|raw trust score|private reviewability|public score estimate/i);
++        return Response.json({ id: 9191 }, { status: 201 });
++      }
++      return new Response("not found", { status: 404 });
++    });
++
++    await processJob(env, {
++      type: "github-webhook",
++      deliveryId: "agent-command-policy-author",
++      eventName: "issue_comment",
++      payload: {
++        action: "created",
++        installation: { id: 123, account: { login: "JSONbored", id: 1, type: "User" } },
++        repository: { name: "gittensory", full_name: "JSONbored/gittensory", private: false, owner: { login: "JSONbored" } },
++        issue: { number: 91, title: "Author policy command", state: "open", pull_request: {}, user: { login: "driveby" }, author_association: "NONE" },
++        comment: {
++          id: 191,
++          body: "@gittensory help",
++          user: { login: "driveby", type: "User" },
++          author_association: "NONE",
++        },
++      },
++    });
++
++    expect(calls).toEqual({ commentsCreated: 1, token: 1, minerList: 0 });
++    const audit = await env.DB.prepare("select event_type, detail from audit_events where target_key = ? order by created_at")
++      .bind("JSONbored/gittensory#91")
++      .all<{ event_type: string; detail: string | null }>();
++    expect(audit.results).toEqual(
++      expect.arrayContaining([
++        expect.objectContaining({ event_type: "github_app.agent_command_replied", detail: null }),
++        expect.objectContaining({ event_type: "github_app.agent_command_feedback_prompted", detail: "help" }),
++      ]),
++    );
++    const usage = await env.DB.prepare("select payload_json from signal_snapshots where signal_type = ? and target_key = ?")
++      .bind("github-agent-command-usage", "JSONbored/gittensory#91")
++      .all<{ payload_json: string }>();
++    expect(JSON.parse(usage.results[0]?.payload_json ?? "{}")).toMatchObject({ command: "help", outcome: "replied", actorKind: "author" });
++  });
++
+   it("records deduped @gittensory answer usefulness from authorized reactions only", async () => {
+     const env = createTestEnv({ ADMIN_GITHUB_LOGINS: "maintainer" });
+     await upsertPullRequestFromGitHub(env, "JSONbored/gittensory", {

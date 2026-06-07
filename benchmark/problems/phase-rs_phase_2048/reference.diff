@@ -1,0 +1,417 @@
+diff --git a/crates/engine/src/parser/oracle_static/static_helpers.rs b/crates/engine/src/parser/oracle_static/static_helpers.rs
+index 305825fe75..177d084468 100644
+--- a/crates/engine/src/parser/oracle_static/static_helpers.rs
++++ b/crates/engine/src/parser/oracle_static/static_helpers.rs
+@@ -14,6 +14,119 @@ use super::support::*;
+ /// 5. Self-spell: "This spell costs {N} less to cast for each ..." (Tolarian Terror)
+ ///    — emitted with `affected = SelfRef`, `active_zones = [Hand, Stack, Command]`.
+ ///
++/// CR 601.2f: Parse the spell-type prefix of a cost-modification line before
++/// `"cost"`. Handles compound subjects such as Goblin Anarchomancer's
++/// "Each spell you cast that's red or green" via `parse_that_clause_suffix`.
++fn parse_cost_mod_spell_type_prefix(type_desc: &str) -> Option<TargetFilter> {
++    let base = type_desc.trim();
++    let base = tag::<_, _, OracleError<'_>>("each ")
++        .parse(base)
++        .map_or(base, |(rest, _)| rest);
++
++    let that_split: Result<(&str, (&str, &str)), nom::Err<OracleError<'_>>> = all_consuming(alt((
++        (
++            take_until(" that's "),
++            recognize((tag::<_, _, OracleError<'_>>(" that's "), rest)),
++        ),
++        (
++            take_until(" that is "),
++            recognize((tag::<_, _, OracleError<'_>>(" that is "), rest)),
++        ),
++        (
++            take_until(" that are "),
++            recognize((tag::<_, _, OracleError<'_>>(" that are "), rest)),
++        ),
++    )))
++    .parse(base);
++
++    let (base_part, qual_props) = if let Ok((_, (before, suffix))) = that_split {
++        let suffix = suffix.trim_start();
++        let (props, consumed) = crate::parser::oracle_target::parse_that_clause_suffix(suffix)?;
++        if !suffix[consumed..].trim().is_empty() {
++            return None;
++        }
++        (before.trim(), props)
++    } else {
++        (base, Vec::new())
++    };
++
++    let base_part = strip_cost_mod_cast_scope_suffix(base_part);
++    let base_part = strip_cost_mod_spell_noun_suffix(base_part);
++
++    let typed_filter = if base_part.is_empty() {
++        None
++    } else {
++        let (filter, remainder) = parse_type_phrase(base_part);
++        let remainder = remainder.trim();
++        match &filter {
++            TargetFilter::Typed(tf)
++                if (!tf.type_filters.is_empty() || !tf.properties.is_empty())
++                    && remainder.is_empty() =>
++            {
++                Some(filter)
++            }
++            TargetFilter::Or { filters } if !filters.is_empty() && remainder.is_empty() => {
++                Some(filter)
++            }
++            // Bare color words ("white", "red") are not consumed by parse_type_phrase
++            // because color prefixes require a trailing type word ("white creature").
++            _ if remainder.is_empty() || remainder.eq_ignore_ascii_case(base_part) => {
++                parse_named_color(base_part).map(|color| {
++                    TargetFilter::Typed(
++                        TypedFilter::card().properties(vec![FilterProp::HasColor { color }]),
++                    )
++                })
++            }
++            _ => None,
++        }
++    };
++
++    match (typed_filter, qual_props.is_empty()) {
++        (filter, true) => filter,
++        (Some(TargetFilter::Typed(mut tf)), false) => {
++            tf.properties.extend(qual_props);
++            Some(TargetFilter::Typed(tf))
++        }
++        (Some(other), false) => Some(TargetFilter::And {
++            filters: vec![
++                other,
++                TargetFilter::Typed(TypedFilter::card().properties(qual_props)),
++            ],
++        }),
++        (None, false) => Some(TargetFilter::Typed(
++            TypedFilter::card().properties(qual_props),
++        )),
++    }
++}
++
++fn strip_cost_mod_cast_scope_suffix(input: &str) -> &str {
++    let (_, stripped) = all_consuming(alt((
++        terminated(
++            take_until(" your opponents cast"),
++            (tag::<_, _, OracleError<'_>>(" your opponents cast"), eof),
++        ),
++        terminated(take_until(" opponents cast"), (tag(" opponents cast"), eof)),
++        terminated(take_until(" you cast"), (tag(" you cast"), eof)),
++        rest,
++    )))
++    .parse(input)
++    .expect("rest fallback makes cast-scope suffix stripping infallible");
++    stripped.trim()
++}
++
++fn strip_cost_mod_spell_noun_suffix(input: &str) -> &str {
++    let (_, stripped) = all_consuming(alt((
++        value("", terminated(tag::<_, _, OracleError<'_>>("spells"), eof)),
++        value("", terminated(tag("spell"), eof)),
++        terminated(take_until(" spells"), (tag(" spells"), eof)),
++        terminated(take_until(" spell"), (tag(" spell"), eof)),
++        rest,
++    )))
++    .parse(input)
++    .expect("rest fallback makes spell-noun suffix stripping infallible");
++    stripped.trim()
++}
++
+ /// Dynamic "for each" counts are extracted when present.
+ pub(crate) fn try_parse_cost_modification(text: &str, lower: &str) -> Option<StaticDefinition> {
+     let is_raise = nom_primitives::scan_contains(lower, "more to cast")
+@@ -164,26 +277,7 @@ pub(crate) fn try_parse_cost_modification(text: &str, lower: &str) -> Option<Sta
+         {
+             None
+         } else {
+-            // First try parse_type_phrase for standard type patterns
+-            let (filter, _) = parse_type_phrase(type_desc);
+-            match &filter {
+-                // Single type: "creature", "noncreature", "artifact"
+-                TargetFilter::Typed(tf)
+-                    if !tf.type_filters.is_empty() || !tf.properties.is_empty() =>
+-                {
+-                    Some(filter)
+-                }
+-                // Combined types: "instant and sorcery", "artifact or enchantment"
+-                TargetFilter::Or { filters } if !filters.is_empty() => Some(filter),
+-                _ => {
+-                    // Fallback: check for bare color names ("white", "blue", etc.)
+-                    parse_named_color(type_desc).map(|color| {
+-                        TargetFilter::Typed(
+-                            TypedFilter::card().properties(vec![FilterProp::HasColor { color }]),
+-                        )
+-                    })
+-                }
+-            }
++            parse_cost_mod_spell_type_prefix(type_desc)
+         };
+         // CR 205.2a: Re-attach the chosen-type discriminator stripped above. A
+         // creature-typed base ("Creature spells ... of the chosen type",
+diff --git a/crates/engine/src/parser/oracle_static/tests.rs b/crates/engine/src/parser/oracle_static/tests.rs
+index 0b0d05b168..387da1b2c3 100644
+--- a/crates/engine/src/parser/oracle_static/tests.rs
++++ b/crates/engine/src/parser/oracle_static/tests.rs
+@@ -1601,6 +1601,75 @@ fn static_instant_sorcery_spells_cost_less() {
+     }
+ }
+ 
++#[test]
++fn static_red_or_green_spell_cost_less_issue_141() {
++    // Goblin Anarchomancer (issue #141): "Each spell you cast that's red or green …"
++    let def = parse_static_line("Each spell you cast that's red or green costs {1} less to cast.");
++    assert!(
++        def.is_some(),
++        "Goblin Anarchomancer cost-reduction line must parse"
++    );
++    let def = def.unwrap();
++    let StaticMode::ModifyCost {
++        mode: CostModifyMode::Reduce,
++        spell_filter: Some(filter),
++        ..
++    } = def.mode
++    else {
++        panic!(
++            "expected ModifyCost Reduce with spell_filter, got {:?}",
++            def.mode
++        );
++    };
++    match filter {
++        TargetFilter::Typed(tf) => {
++            let any_of = tf
++                .properties
++                .iter()
++                .find_map(|p| match p {
++                    FilterProp::AnyOf { props } => Some(props),
++                    _ => None,
++                })
++                .expect("expected AnyOf red/green HasColor props");
++            assert!(
++                any_of.contains(&FilterProp::HasColor {
++                    color: ManaColor::Red
++                }),
++                "expected Red in filter, got {any_of:?}"
++            );
++            assert!(
++                any_of.contains(&FilterProp::HasColor {
++                    color: ManaColor::Green
++                }),
++                "expected Green in filter, got {any_of:?}"
++            );
++        }
++        other => panic!("expected Typed spell filter with color AnyOf, got {other:?}"),
++    }
++}
++
++#[test]
++fn static_typed_spell_with_that_clause_cost_less() {
++    let def = parse_static_line("Each creature spell you cast that's red costs {1} less to cast.")
++        .expect("typed spell cost modifier with that-clause should parse");
++    let StaticMode::ModifyCost {
++        mode: CostModifyMode::Reduce,
++        spell_filter: Some(TargetFilter::Typed(filter)),
++        ..
++    } = def.mode
++    else {
++        panic!(
++            "expected ModifyCost Reduce with typed spell_filter, got {:?}",
++            def.mode
++        );
++    };
++
++    assert!(filter.type_filters.contains(&TypeFilter::Creature));
++    assert!(filter.properties.contains(&FilterProp::HasColor {
++        color: ManaColor::Red
++    }));
++}
++
+ #[test]
+ fn static_white_spells_cost_more() {
+     // "White spells your opponents cast cost {1} more to cast."
+diff --git a/crates/engine/tests/integration/main.rs b/crates/engine/tests/integration/main.rs
+index 33251f975d..9144217f62 100644
+--- a/crates/engine/tests/integration/main.rs
++++ b/crates/engine/tests/integration/main.rs
+@@ -86,6 +86,7 @@ mod louisoix_sacrifice_counter;
+ mod lurking_predators_1604_repro;
+ mod madame_null_integration;
+ mod magnetic_mountain_choose_and_pay;
++mod mana_cost_reducers_issue_141;
+ mod mana_drain_refund;
+ mod mass_phase_out_1792_repro;
+ mod master_of_ceremonies;
+diff --git a/crates/engine/tests/integration/mana_cost_reducers_issue_141.rs b/crates/engine/tests/integration/mana_cost_reducers_issue_141.rs
+new file mode 100644
+index 0000000000..180cd2cbf0
+--- /dev/null
++++ b/crates/engine/tests/integration/mana_cost_reducers_issue_141.rs
+@@ -0,0 +1,167 @@
++//! Regression for issue #141: Delighted Halfling restricted mana + Goblin
++//! Anarchomancer cost reduction.
++//!
++//! https://github.com/phase-rs/phase/issues/141
++
++use engine::game::scenario::{GameScenario, P0};
++use engine::game::zones::create_object;
++use engine::parser::oracle_static::parse_static_line;
++use engine::types::card_type::{CoreType, Supertype};
++use engine::types::identifiers::{CardId, ObjectId};
++use engine::types::mana::{
++    ManaColor, ManaCost, ManaCostShard, ManaRestriction, ManaType, ManaUnit,
++};
++use engine::types::phase::Phase;
++use engine::types::zones::Zone;
++
++/// Doors of Durin is {3}{R}{G}; Goblin Anarchomancer should reduce generic by 1.
++#[test]
++fn goblin_anarchomancer_reduces_only_red_or_green_spell_costs() {
++    let mut scenario = GameScenario::new();
++    scenario.at_phase(Phase::PreCombatMain);
++    let mut game = scenario.build();
++
++    let state = game.state_mut();
++    let reducer = create_object(
++        state,
++        CardId(9000),
++        P0,
++        "Goblin Anarchomancer".to_string(),
++        Zone::Battlefield,
++    );
++    let anarchomancer_static =
++        parse_static_line("Each spell you cast that's red or green costs {1} less to cast.")
++            .expect("Goblin Anarchomancer static should parse");
++    state
++        .objects
++        .get_mut(&reducer)
++        .unwrap()
++        .static_definitions
++        .push(anarchomancer_static);
++
++    let doors = create_object(
++        state,
++        CardId(9001),
++        P0,
++        "Doors of Durin".to_string(),
++        Zone::Hand,
++    );
++    {
++        let obj = state.objects.get_mut(&doors).unwrap();
++        obj.card_types.supertypes.push(Supertype::Legendary);
++        obj.card_types.core_types.push(CoreType::Artifact);
++        obj.mana_cost = ManaCost::Cost {
++            shards: vec![ManaCostShard::Red, ManaCostShard::Green],
++            generic: 3,
++        };
++        obj.color = vec![ManaColor::Red, ManaColor::Green];
++        obj.base_color = obj.color.clone();
++    }
++
++    let colorless_artifact = create_object(
++        state,
++        CardId(9002),
++        P0,
++        "Colorless Artifact".to_string(),
++        Zone::Hand,
++    );
++    {
++        let obj = state.objects.get_mut(&colorless_artifact).unwrap();
++        obj.card_types.core_types.push(CoreType::Artifact);
++        obj.mana_cost = ManaCost::generic(3);
++    }
++
++    let cost =
++        engine::game::casting::display_spell_cost(game.state(), P0, doors).expect("display cost");
++    let ManaCost::Cost { generic, .. } = cost else {
++        panic!("expected ManaCost::Cost, got {cost:?}");
++    };
++    assert_eq!(
++        generic, 2,
++        "Doors of Durin should display {{2}}{{R}}{{G}} with Anarchomancer on board (issue #141)"
++    );
++
++    let cost = engine::game::casting::display_spell_cost(game.state(), P0, colorless_artifact)
++        .expect("display cost");
++    let ManaCost::Cost { generic, .. } = cost else {
++        panic!("expected ManaCost::Cost, got {cost:?}");
++    };
++    assert_eq!(
++        generic, 3,
++        "Goblin Anarchomancer must not reduce non-red/non-green spells"
++    );
++
++    {
++        let player = game
++            .state_mut()
++            .players
++            .iter_mut()
++            .find(|player| player.id == P0)
++            .unwrap();
++        for mana_type in [
++            ManaType::Colorless,
++            ManaType::Colorless,
++            ManaType::Red,
++            ManaType::Green,
++        ] {
++            player
++                .mana_pool
++                .add(ManaUnit::new(mana_type, ObjectId(0), false, vec![]));
++        }
++    }
++
++    let outcome = game.cast(doors).resolve();
++    outcome.assert_zone(&[doors], Zone::Battlefield);
++    assert_eq!(
++        outcome.mana_pool_total(P0),
++        0,
++        "the reduced {{2}}{{R}}{{G}} cost should consume the exact four-mana pool"
++    );
++}
++
++/// Delighted Halfling-style restricted mana must pay for a commander.
++#[test]
++fn restricted_mana_pays_legendary_commander_through_cast_pipeline() {
++    let mut scenario = GameScenario::new();
++    scenario.at_phase(Phase::PreCombatMain);
++
++    let mut game = scenario.build();
++    let state = game.state_mut();
++    state.format_config.command_zone = true;
++    let commander_id = create_object(
++        state,
++        CardId(9001),
++        P0,
++        "Test Commander".to_string(),
++        Zone::Command,
++    );
++    {
++        let obj = state.objects.get_mut(&commander_id).unwrap();
++        obj.card_types.supertypes.push(Supertype::Legendary);
++        obj.card_types.core_types.push(CoreType::Creature);
++        obj.is_commander = true;
++        obj.mana_cost = ManaCost::generic(1);
++    }
++
++    let restriction = ManaRestriction::OnlyForSpellType("Legendary".to_string());
++    state
++        .players
++        .iter_mut()
++        .find(|player| player.id == P0)
++        .unwrap()
++        .mana_pool
++        .add(ManaUnit::new(
++            ManaType::Green,
++            ObjectId(1),
++            false,
++            vec![restriction],
++        ));
++
++    let outcome = game.cast(commander_id).resolve();
++    outcome.assert_zone(&[commander_id], Zone::Battlefield);
++    assert_eq!(
++        outcome.mana_pool_total(P0),
++        0,
++        "legendary-restricted mana must be eligible for commander casts (issue #141)"
++    );
++}

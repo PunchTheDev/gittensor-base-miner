@@ -1,0 +1,791 @@
+diff --git a/apps/gittensory-ui/public/openapi.json b/apps/gittensory-ui/public/openapi.json
+index 2697717d..f89b5cb1 100644
+--- a/apps/gittensory-ui/public/openapi.json
++++ b/apps/gittensory-ui/public/openapi.json
+@@ -2836,6 +2836,13 @@
+               "nullable": true
+             }
+           },
++          "queueTrends": {
++            "type": "object",
++            "nullable": true,
++            "additionalProperties": {
++              "nullable": true
++            }
++          },
+           "collisions": {
+             "type": "object",
+             "additionalProperties": {
+diff --git a/migrations/0021_queue_trend_snapshots.sql b/migrations/0021_queue_trend_snapshots.sql
+new file mode 100644
+index 00000000..11fd425f
+--- /dev/null
++++ b/migrations/0021_queue_trend_snapshots.sql
+@@ -0,0 +1,5 @@
++CREATE TABLE IF NOT EXISTS repo_queue_trend_snapshots (
++  repo_full_name TEXT PRIMARY KEY,
++  payload_json TEXT NOT NULL DEFAULT '{}',
++  generated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
++);
+diff --git a/src/api/routes.ts b/src/api/routes.ts
+index 8855b1a6..4f0110bd 100644
+--- a/src/api/routes.ts
++++ b/src/api/routes.ts
+@@ -38,6 +38,7 @@ import {
+   getLatestScoringModelSnapshot,
+   getPullRequest,
+   getRepository,
++  getRepoQueueTrendSnapshot,
+   getRepositorySettings,
+   recordAuditEvent,
+   getContributorEvidence,
+@@ -148,6 +149,7 @@ import {
+ } from "../services/weekly-value-report";
+ import { loadOrComputeIssueQualityResponse } from "../services/issue-quality";
+ import { loadOrComputeBurdenForecastResponse } from "../services/burden-forecast";
++import { buildUnavailableQueueTrendReport } from "../services/queue-trends";
+ import { loadOrComputeRepoOutcomePatternsResponse } from "../services/repo-outcome-patterns";
+ import {
+   buildBountyAdvisory,
+@@ -2708,7 +2710,7 @@ function buildDigestItems(args: {
+ 
+ async function buildRepoIntelligenceResponse(env: Env, fullName: string) {
+   let burdenForecastError: unknown;
+-  const [repo, snapshots, dataQuality, burdenForecast] = await Promise.all([
++  const [repo, snapshots, dataQuality, burdenForecast, queueTrends] = await Promise.all([
+     getRepository(env, fullName),
+     Promise.all(
+       ["queue-health", "config-quality", "label-audit", "maintainer-lane", "maintainer-cut-readiness", "contributor-intake-health"].map(async (signalType) => [
+@@ -2721,6 +2723,7 @@ async function buildRepoIntelligenceResponse(env: Env, fullName: string) {
+       burdenForecastError = error;
+       return null;
+     }),
++    getRepoQueueTrendSnapshot(env, fullName),
+   ]);
+   const intelligenceDataQuality = burdenForecastError
+     ? withDataQualityWarning(dataQuality, `Burden forecast unavailable for ${fullName}: ${errorMessage(burdenForecastError)}`)
+@@ -2737,6 +2740,7 @@ async function buildRepoIntelligenceResponse(env: Env, fullName: string) {
+         },
+       }
+     : {};
++  const queueTrendReport = queueTrends?.payload ?? (buildUnavailableQueueTrendReport(fullName) as unknown as Record<string, never>);
+   if (snapshotMap["queue-health"] && snapshotMap["config-quality"] && snapshotMap["label-audit"]) {
+     return {
+       status: "ready",
+@@ -2746,6 +2750,7 @@ async function buildRepoIntelligenceResponse(env: Env, fullName: string) {
+       repo,
+       lane: buildLaneAdvice(repo, fullName),
+       queueHealth: snapshotMap["queue-health"],
++      queueTrends: queueTrendReport,
+       configQuality: snapshotMap["config-quality"],
+       labelAudit: snapshotMap["label-audit"],
+       maintainerLane: snapshotMap["maintainer-lane"],
+@@ -2777,6 +2782,7 @@ async function buildRepoIntelligenceResponse(env: Env, fullName: string) {
+     repo,
+     lane: buildLaneAdvice(repo, fullName),
+     queueHealth,
++    queueTrends: queueTrendReport,
+     collisions,
+     configQuality,
+     labelAudit,
+diff --git a/src/db/repositories.ts b/src/db/repositories.ts
+index 16fcbbaa..c77fb05d 100644
+--- a/src/db/repositories.ts
++++ b/src/db/repositories.ts
+@@ -36,6 +36,7 @@ import {
+   recentMergedPullRequests,
+   repositories,
+   repoGithubTotalsSnapshots,
++  repoQueueTrendSnapshots,
+   registryDriftEvents,
+   repoLabels,
+   repoSnapshots,
+@@ -117,6 +118,7 @@ import type {
+   RegistryDriftEventRecord,
+   RepoLabelRecord,
+   RepoGithubTotalsSnapshotRecord,
++  RepoQueueTrendSnapshotRecord,
+   RepoSnapshotRecord,
+   RepoSyncSegmentRecord,
+   RepoSyncStateRecord,
+@@ -633,6 +635,24 @@ export async function getLatestRepoGithubTotalsSnapshot(env: Env, fullName: stri
+   return row ? toRepoGithubTotalsSnapshotRecord(row) : null;
+ }
+ 
++export async function listRepoGithubTotalsSnapshotHistory(
++  env: Env,
++  fullName: string,
++  options: { sinceIso?: string | undefined; limit?: number | undefined } = {},
++): Promise<RepoGithubTotalsSnapshotRecord[]> {
++  const db = getDb(env.DB);
++  const limit = Math.max(2, Math.min(options.limit ?? 120, 240));
++  const conditions = [eq(repoGithubTotalsSnapshots.repoFullName, fullName)];
++  if (options.sinceIso) conditions.push(gte(repoGithubTotalsSnapshots.fetchedAt, options.sinceIso));
++  const rows = await db
++    .select()
++    .from(repoGithubTotalsSnapshots)
++    .where(and(...conditions))
++    .orderBy(desc(repoGithubTotalsSnapshots.fetchedAt))
++    .limit(limit);
++  return rows.map(toRepoGithubTotalsSnapshotRecord).reverse();
++}
++
+ export async function listLatestRepoGithubTotalsSnapshots(env: Env): Promise<RepoGithubTotalsSnapshotRecord[]> {
+   const db = getDb(env.DB);
+   const latestRows = await db
+@@ -654,6 +674,23 @@ export async function listLatestRepoGithubTotalsSnapshots(env: Env): Promise<Rep
+   return rows.map(toRepoGithubTotalsSnapshotRecord).sort((left, right) => left.repoFullName.localeCompare(right.repoFullName));
+ }
+ 
++export async function upsertRepoQueueTrendSnapshot(env: Env, snapshot: RepoQueueTrendSnapshotRecord): Promise<void> {
++  const db = getDb(env.DB);
++  await db
++    .insert(repoQueueTrendSnapshots)
++    .values({ repoFullName: snapshot.repoFullName, payloadJson: jsonString(snapshot.payload), generatedAt: snapshot.generatedAt })
++    .onConflictDoUpdate({
++      target: repoQueueTrendSnapshots.repoFullName,
++      set: { payloadJson: jsonString(snapshot.payload), generatedAt: snapshot.generatedAt },
++    });
++}
++
++export async function getRepoQueueTrendSnapshot(env: Env, repoFullName: string): Promise<RepoQueueTrendSnapshotRecord | null> {
++  const db = getDb(env.DB);
++  const [row] = await db.select().from(repoQueueTrendSnapshots).where(eq(repoQueueTrendSnapshots.repoFullName, repoFullName)).limit(1);
++  return row ? toRepoQueueTrendSnapshotRecord(row) : null;
++}
++
+ export async function upsertPullRequestDetailSyncState(env: Env, state: PullRequestDetailSyncStateRecord): Promise<void> {
+   const db = getDb(env.DB);
+   await db
+@@ -2855,6 +2892,14 @@ function toRepoGithubTotalsSnapshotRecord(row: typeof repoGithubTotalsSnapshots.
+   };
+ }
+ 
++function toRepoQueueTrendSnapshotRecord(row: typeof repoQueueTrendSnapshots.$inferSelect): RepoQueueTrendSnapshotRecord {
++  return {
++    repoFullName: row.repoFullName,
++    payload: parseJson<Record<string, JsonValue>>(row.payloadJson, {}),
++    generatedAt: row.generatedAt,
++  };
++}
++
+ function toPullRequestDetailSyncStateRecord(row: typeof pullRequestDetailSyncState.$inferSelect): PullRequestDetailSyncStateRecord {
+   return {
+     repoFullName: row.repoFullName,
+diff --git a/src/db/schema.ts b/src/db/schema.ts
+index 625cfad8..b9991c4d 100644
+--- a/src/db/schema.ts
++++ b/src/db/schema.ts
+@@ -633,6 +633,12 @@ export const burdenForecasts = sqliteTable("burden_forecasts", {
+   generatedAt: text("generated_at").notNull().default("CURRENT_TIMESTAMP"),
+ });
+ 
++export const repoQueueTrendSnapshots = sqliteTable("repo_queue_trend_snapshots", {
++  repoFullName: text("repo_full_name").primaryKey(),
++  payloadJson: text("payload_json").notNull().default("{}"),
++  generatedAt: text("generated_at").notNull().default("CURRENT_TIMESTAMP"),
++});
++
+ export const registryDriftEvents = sqliteTable("registry_drift_events", {
+   id: text("id").primaryKey(),
+   repoFullName: text("repo_full_name").notNull(),
+diff --git a/src/mcp/server.ts b/src/mcp/server.ts
+index 788aa528..2eb496d9 100644
+--- a/src/mcp/server.ts
++++ b/src/mcp/server.ts
+@@ -15,6 +15,7 @@ import {
+   getLatestRepoGithubTotalsSnapshot,
+   getIssue,
+   getRepository,
++  getRepoQueueTrendSnapshot,
+   listCheckSummaries,
+   listContributorRepoStats,
+   listContributorIssues,
+@@ -46,6 +47,7 @@ import { loadOrComputeIssueQualityResponse } from "../services/issue-quality";
+ import { loadOrComputeBurdenForecastResponse } from "../services/burden-forecast";
+ import { buildMcpClientTelemetry } from "../services/client-telemetry";
+ import { loadOrComputeRepoOutcomePatternsResponse } from "../services/repo-outcome-patterns";
++import { buildUnavailableQueueTrendReport } from "../services/queue-trends";
+ import {
+   applyMcpPlanningChoices,
+   buildMcpPlanningElicitationAudit,
+@@ -275,6 +277,7 @@ const repoContextOutputSchema = {
+   repo: z.unknown().optional(),
+   lane: z.unknown().optional(),
+   queueHealth: z.unknown().optional(),
++  queueTrends: z.unknown().optional(),
+   collisions: z.unknown().optional(),
+   configQuality: z.unknown().optional(),
+   dataQuality: z.unknown().optional(),
+@@ -805,12 +808,13 @@ export class GittensoryMcp {
+ 
+   private async getRepoContext(input: { owner: string; repo: string }): Promise<ToolPayload> {
+     const fullName = `${input.owner}/${input.repo}`;
+-    const [repo, issues, pullRequests, recentMergedPullRequests, queueCounts] = await Promise.all([
++    const [repo, issues, pullRequests, recentMergedPullRequests, queueCounts, queueTrends] = await Promise.all([
+       getRepository(this.env, fullName),
+       listIssueSignalSample(this.env, fullName),
+       listOpenPullRequests(this.env, fullName),
+       listRecentMergedPullRequests(this.env, fullName),
+       this.loadOpenQueueCounts(fullName),
++      getRepoQueueTrendSnapshot(this.env, fullName),
+     ]);
+     const collisions = buildCollisionReport(fullName, issues, pullRequests, recentMergedPullRequests);
+     return {
+@@ -820,6 +824,7 @@ export class GittensoryMcp {
+         repo,
+         lane: buildLaneAdvice(repo, fullName),
+         queueHealth: buildQueueHealth(repo, issues, pullRequests, collisions, queueCounts),
++        queueTrends: queueTrends?.payload ?? buildUnavailableQueueTrendReport(fullName),
+         collisions,
+         configQuality: buildConfigQuality(repo, issues, pullRequests, fullName),
+         dataQuality: await this.loadRepoDataQuality(fullName),
+diff --git a/src/openapi/schemas.ts b/src/openapi/schemas.ts
+index f402b7ab..df94a1dc 100644
+--- a/src/openapi/schemas.ts
++++ b/src/openapi/schemas.ts
+@@ -1748,6 +1748,7 @@ export const RepoIntelligenceSchema = z
+     repo: RepositorySchema.nullable(),
+     lane: LaneAdviceSchema,
+     queueHealth: z.record(z.string(), z.unknown()).nullable().optional(),
++    queueTrends: z.record(z.string(), z.unknown()).nullable().optional(),
+     collisions: z.record(z.string(), z.unknown()).optional(),
+     configQuality: z.record(z.string(), z.unknown()).nullable().optional(),
+     labelAudit: z.record(z.string(), z.unknown()).nullable().optional(),
+diff --git a/src/queue/processors.ts b/src/queue/processors.ts
+index 68638b58..38dc3f45 100644
+--- a/src/queue/processors.ts
++++ b/src/queue/processors.ts
+@@ -18,6 +18,8 @@ import {
+   listIssues,
+   listIssueSignalSample,
+   listLatestSignalSnapshotsByTarget,
++  listSignalSnapshots,
++  listRepoGithubTotalsSnapshotHistory,
+   listOtherOpenPullRequests,
+   listOpenPullRequests,
+   listPullRequests,
+@@ -35,6 +37,7 @@ import {
+   persistSignalSnapshot,
+   recordWebhookEvent,
+   replaceCollisionEdges,
++  upsertRepoQueueTrendSnapshot,
+   upsertAgentCommandAnswer,
+   upsertOfficialMinerDetection,
+   rollupProductUsageDaily,
+@@ -84,6 +87,7 @@ import { commandAuthorizationAllowedRoles, commandAuthorizationNeedsMinerDetecti
+ import { loadIssueQualityReportMap } from "../services/issue-quality";
+ import { generateWeeklyValueReport } from "../services/weekly-value-report";
+ import { REPO_OUTCOME_PATTERNS_SIGNAL, computeRepoOutcomePatterns } from "../services/repo-outcome-patterns";
++import { buildQueueTrendReport, QUEUE_TREND_HISTORY_DAYS } from "../services/queue-trends";
+ import {
+   buildUpstreamRulesetSnapshot,
+   detectAndPersistUpstreamDrift,
+@@ -463,13 +467,16 @@ async function buildBurdenForecasts(env: Env, repoFullName?: string): Promise<vo
+ export async function generateSignalSnapshots(env: Env, repoFullName?: string): Promise<void> {
+   const repositories = (await listRepositories(env)).filter((repo) => repo.isRegistered && (!repoFullName || repo.fullName === repoFullName));
+   for (const repo of repositories) {
+-    const [issues, pullRequests, recentMergedPullRequests, labels, queueCounts, bounties] = await Promise.all([
++    const trendSince = new Date(Date.now() - QUEUE_TREND_HISTORY_DAYS * 24 * 60 * 60 * 1000).toISOString();
++    const [issues, pullRequests, recentMergedPullRequests, labels, queueCounts, bounties, totalsHistory, queueHealthHistory] = await Promise.all([
+       listIssueSignalSample(env, repo.fullName),
+       listOpenPullRequests(env, repo.fullName),
+       listRecentMergedPullRequests(env, repo.fullName),
+       listRepoLabels(env, repo.fullName),
+       loadOpenQueueCounts(env, repo.fullName),
+       listBountiesByRepo(env, repo.fullName),
++      listRepoGithubTotalsSnapshotHistory(env, repo.fullName, { sinceIso: trendSince, limit: 120 }),
++      listSignalSnapshots(env, "queue-health", repo.fullName),
+     ]);
+     const collisions = buildCollisionReport(repo.fullName, issues, pullRequests, recentMergedPullRequests);
+     const queueHealth = buildQueueHealth(repo, issues, pullRequests, collisions, queueCounts);
+@@ -489,6 +496,17 @@ export async function generateSignalSnapshots(env: Env, repoFullName?: string):
+       payload: queueHealth as unknown as Record<string, never>,
+       generatedAt,
+     });
++    await upsertRepoQueueTrendSnapshot(env, {
++      repoFullName: repo.fullName,
++      payload: buildQueueTrendReport({
++        repoFullName: repo.fullName,
++        totalsSnapshots: totalsHistory,
++        queueHealthSnapshots: queueHealthHistory,
++        currentQueueHealth: queueHealth,
++        generatedAt,
++      }) as unknown as Record<string, never>,
++      generatedAt,
++    });
+     await persistSignalSnapshot(env, {
+       id: crypto.randomUUID(),
+       signalType: "config-quality",
+diff --git a/src/services/queue-trends.ts b/src/services/queue-trends.ts
+new file mode 100644
+index 00000000..de77f2cb
+--- /dev/null
++++ b/src/services/queue-trends.ts
+@@ -0,0 +1,208 @@
++import type { JsonValue, RepoGithubTotalsSnapshotRecord, SignalSnapshotRecord } from "../types";
++import type { QueueHealth } from "../signals/engine";
++import { nowIso } from "../utils/json";
++
++export const QUEUE_TREND_WINDOWS_DAYS = [7, 14, 30] as const;
++export const QUEUE_TREND_HISTORY_DAYS = 35;
++
++export type QueueTrendWindow = {
++  windowDays: 7 | 14 | 30;
++  status: "ready" | "unavailable";
++  observedDays: number;
++  baselineAt: string | null;
++  latestAt: string | null;
++  pullRequestGrowth: number | null;
++  issueGrowth: number | null;
++  mergedPullRequests: number | null;
++  closedUnmergedPullRequests: number | null;
++  reviewVelocityPerDay: number | null;
++  stalePullRequestRate: number | null;
++  stalePullRequestRateDelta: number | null;
++  duplicateTrend: number | null;
++  summary: string;
++};
++
++export type QueueTrendReport = {
++  repoFullName: string;
++  status: "ready" | "unavailable";
++  generatedAt: string;
++  source: "snapshot";
++  windows: QueueTrendWindow[];
++  warnings: string[];
++  summary: string;
++};
++
++type QueueHealthTrendPoint = {
++  generatedAt: string;
++  openPullRequests: number;
++  stalePullRequests: number;
++  collisionClusters: number;
++};
++
++export function buildQueueTrendReport(args: {
++  repoFullName: string;
++  totalsSnapshots: RepoGithubTotalsSnapshotRecord[];
++  queueHealthSnapshots?: SignalSnapshotRecord[] | undefined;
++  currentQueueHealth?: QueueHealth | undefined;
++  generatedAt?: string | undefined;
++}): QueueTrendReport {
++  const generatedAt = args.generatedAt ?? nowIso();
++  const totals = sortTotals(args.totalsSnapshots);
++  const queuePoints = sortQueuePoints([
++    ...(args.queueHealthSnapshots ?? []).flatMap(queuePointFromSignalSnapshot),
++    ...(args.currentQueueHealth ? [queuePointFromQueueHealth(args.currentQueueHealth)] : []),
++  ]);
++  const windows = QUEUE_TREND_WINDOWS_DAYS.map((windowDays) => buildWindow(windowDays, totals, queuePoints));
++  const readyWindows = windows.filter((window) => window.status === "ready");
++  const warnings = trendWarnings(windows);
++  return {
++    repoFullName: args.repoFullName,
++    status: readyWindows.length > 0 ? "ready" : "unavailable",
++    generatedAt,
++    source: "snapshot",
++    windows,
++    warnings,
++    summary: readyWindows.length > 0
++      ? `${readyWindows.length} queue trend window(s) available for ${args.repoFullName}. ${warnings[0] ?? "No major queue trend warning detected."}`
++      : `Queue trend history is unavailable for ${args.repoFullName}; at least two totals snapshots spanning a requested window are required.`,
++  };
++}
++
++export function buildUnavailableQueueTrendReport(repoFullName: string, generatedAt = nowIso()): QueueTrendReport {
++  const windows = QUEUE_TREND_WINDOWS_DAYS.map((windowDays) => unavailableWindow(windowDays, "Missing queue trend snapshot."));
++  return {
++    repoFullName,
++    status: "unavailable",
++    generatedAt,
++    source: "snapshot",
++    windows,
++    warnings: ["Queue trend snapshot is missing; run the signal snapshot job after GitHub totals history is available."],
++    summary: `Queue trend history is unavailable for ${repoFullName}.`,
++  };
++}
++
++function buildWindow(windowDays: 7 | 14 | 30, totals: RepoGithubTotalsSnapshotRecord[], queuePoints: QueueHealthTrendPoint[]): QueueTrendWindow {
++  const latest = totals.at(-1);
++  if (!latest) return unavailableWindow(windowDays, "Missing GitHub totals snapshots.");
++  const latestMs = Date.parse(latest.fetchedAt);
++  const targetMs = latestMs - windowDays * 24 * 60 * 60 * 1000;
++  const baseline = [...totals].reverse().find((snapshot) => Date.parse(snapshot.fetchedAt) <= targetMs);
++  if (!baseline) return unavailableWindow(windowDays, `Need at least ${windowDays} days of totals history.`);
++  const observedDays = Math.max(0, round((latestMs - Date.parse(baseline.fetchedAt)) / (24 * 60 * 60 * 1000)));
++  const mergedPullRequests = Math.max(0, latest.mergedPullRequestsTotal - baseline.mergedPullRequestsTotal);
++  const closedUnmergedPullRequests = Math.max(0, latest.closedUnmergedPullRequestsTotal - baseline.closedUnmergedPullRequestsTotal);
++  const latestQueue = latestQueuePoint(queuePoints);
++  const baselineQueue = latestQueue ? baselineQueuePoint(queuePoints, latestQueue.generatedAt, windowDays) : null;
++  const stalePullRequestRate = latestQueue ? staleRate(latestQueue) : null;
++  const baselineStaleRate = baselineQueue ? staleRate(baselineQueue) : null;
++  const duplicateTrend = latestQueue && baselineQueue ? latestQueue.collisionClusters - baselineQueue.collisionClusters : null;
++  const reviewVelocityPerDay = round((mergedPullRequests + closedUnmergedPullRequests) / observedDays);
++  const pullRequestGrowth = latest.openPullRequestsTotal - baseline.openPullRequestsTotal;
++  return {
++    windowDays,
++    status: "ready",
++    observedDays,
++    baselineAt: baseline.fetchedAt,
++    latestAt: latest.fetchedAt,
++    pullRequestGrowth,
++    issueGrowth: latest.openIssuesTotal - baseline.openIssuesTotal,
++    mergedPullRequests,
++    closedUnmergedPullRequests,
++    reviewVelocityPerDay,
++    stalePullRequestRate,
++    stalePullRequestRateDelta: stalePullRequestRate !== null && baselineStaleRate !== null ? round(stalePullRequestRate - baselineStaleRate) : null,
++    duplicateTrend,
++    summary: `${windowDays}d trend: PR queue ${signed(pullRequestGrowth)}, review velocity ${reviewVelocityPerDay}/day.`,
++  };
++}
++
++function trendWarnings(windows: QueueTrendWindow[]): string[] {
++  const warnings: string[] = [];
++  for (const window of windows.filter((entry) => entry.status === "ready")) {
++    if ((window.pullRequestGrowth ?? 0) >= 5) warnings.push(`${window.windowDays}d PR queue grew by ${window.pullRequestGrowth}; review load is increasing.`);
++    if ((window.stalePullRequestRate ?? 0) >= 0.35) warnings.push(`${window.windowDays}d stale PR rate is ${Math.round((window.stalePullRequestRate ?? 0) * 100)}%.`);
++    if ((window.duplicateTrend ?? 0) > 0) warnings.push(`${window.windowDays}d duplicate cluster count increased by ${window.duplicateTrend}.`);
++  }
++  return [...new Set(warnings)].slice(0, 5);
++}
++
++function queuePointFromSignalSnapshot(snapshot: SignalSnapshotRecord): QueueHealthTrendPoint[] {
++  const signals = readSignals(snapshot.payload);
++  return signals && snapshot.generatedAt ? [{ ...signals, generatedAt: snapshot.generatedAt }] : [];
++}
++
++function queuePointFromQueueHealth(queueHealth: QueueHealth): QueueHealthTrendPoint {
++  return {
++    generatedAt: queueHealth.generatedAt,
++    openPullRequests: queueHealth.signals.openPullRequests,
++    stalePullRequests: queueHealth.signals.stalePullRequests,
++    collisionClusters: queueHealth.signals.collisionClusters,
++  };
++}
++
++function readSignals(payload: Record<string, JsonValue>): Omit<QueueHealthTrendPoint, "generatedAt"> | null {
++  const signals = isRecord(payload.signals) ? payload.signals : null;
++  if (!signals) return null;
++  return {
++    openPullRequests: numberValue(signals.openPullRequests),
++    stalePullRequests: numberValue(signals.stalePullRequests),
++    collisionClusters: numberValue(signals.collisionClusters),
++  };
++}
++
++function baselineQueuePoint(points: QueueHealthTrendPoint[], latestAt: string, windowDays: number): QueueHealthTrendPoint | null {
++  const latestMs = Date.parse(latestAt);
++  const targetMs = latestMs - windowDays * 24 * 60 * 60 * 1000;
++  return [...points].reverse().find((point) => Date.parse(point.generatedAt) <= targetMs) ?? null;
++}
++
++function latestQueuePoint(points: QueueHealthTrendPoint[]): QueueHealthTrendPoint | null {
++  return points.at(-1) ?? null;
++}
++
++function unavailableWindow(windowDays: 7 | 14 | 30, summary: string): QueueTrendWindow {
++  return {
++    windowDays,
++    status: "unavailable",
++    observedDays: 0,
++    baselineAt: null,
++    latestAt: null,
++    pullRequestGrowth: null,
++    issueGrowth: null,
++    mergedPullRequests: null,
++    closedUnmergedPullRequests: null,
++    reviewVelocityPerDay: null,
++    stalePullRequestRate: null,
++    stalePullRequestRateDelta: null,
++    duplicateTrend: null,
++    summary,
++  };
++}
++
++function staleRate(point: QueueHealthTrendPoint): number {
++  return point.openPullRequests > 0 ? round(point.stalePullRequests / point.openPullRequests) : 0;
++}
++
++function sortTotals(snapshots: RepoGithubTotalsSnapshotRecord[]): RepoGithubTotalsSnapshotRecord[] {
++  return snapshots.filter((snapshot) => Number.isFinite(Date.parse(snapshot.fetchedAt))).sort((left, right) => Date.parse(left.fetchedAt) - Date.parse(right.fetchedAt));
++}
++
++function sortQueuePoints(points: QueueHealthTrendPoint[]): QueueHealthTrendPoint[] {
++  return points.filter((point) => Number.isFinite(Date.parse(point.generatedAt))).sort((left, right) => Date.parse(left.generatedAt) - Date.parse(right.generatedAt));
++}
++
++function numberValue(value: JsonValue | undefined): number {
++  return typeof value === "number" && Number.isFinite(value) ? value : 0;
++}
++
++function signed(value: number): string {
++  return value > 0 ? `+${value}` : String(value);
++}
++
++function round(value: number): number {
++  return Math.round(value * 100) / 100;
++}
++
++function isRecord(value: JsonValue | undefined): value is Record<string, JsonValue> {
++  return typeof value === "object" && value !== null && !Array.isArray(value);
++}
+diff --git a/src/types.ts b/src/types.ts
+index 731f177d..95ea5cd4 100644
+--- a/src/types.ts
++++ b/src/types.ts
+@@ -444,6 +444,12 @@ export type RepoGithubTotalsSnapshotRecord = {
+   payload: Record<string, JsonValue>;
+ };
+ 
++export type RepoQueueTrendSnapshotRecord = {
++  repoFullName: string;
++  payload: Record<string, JsonValue>;
++  generatedAt: string;
++};
++
+ export type PullRequestDetailSyncStateRecord = {
+   repoFullName: string;
+   pullNumber: number;
+diff --git a/test/integration/api.test.ts b/test/integration/api.test.ts
+index 08dce378..fe590752 100644
+--- a/test/integration/api.test.ts
++++ b/test/integration/api.test.ts
+@@ -7,6 +7,7 @@ import {
+   upsertCheckSummary,
+   upsertInstallation,
+   upsertInstallationHealth,
++  upsertRepoQueueTrendSnapshot,
+   upsertPullRequestFile,
+   upsertPullRequestReview,
+   upsertPullRequestDetailSyncState,
+@@ -469,6 +470,7 @@ describe("api routes", () => {
+       repoFullName: "entrius/allways-ui",
+       lane: { lane: "direct_pr" },
+       queueHealth: { signals: { openPullRequests: 2 } },
++      queueTrends: { status: "unavailable", windows: expect.arrayContaining([expect.objectContaining({ windowDays: 7, status: "unavailable" })]) },
+       collisions: { summary: { clusterCount: expect.any(Number) } },
+       configQuality: { notObservedConfiguredLabels: expect.arrayContaining(["refactor"]) },
+       labelAudit: { missingConfiguredLabels: expect.arrayContaining(["refactor"]) },
+@@ -1197,10 +1199,22 @@ describe("api routes", () => {
+       payload: { repoFullName: "entrius/allways-ui", level: "medium", summary: "intelligence fixture" } as unknown as Record<string, JsonValue>,
+       generatedAt: staleForecastGeneratedAt,
+     });
++    await upsertRepoQueueTrendSnapshot(env, {
++      repoFullName: "entrius/allways-ui",
++      generatedAt: "2026-05-25T00:00:00.000Z",
++      payload: {
++        repoFullName: "entrius/allways-ui",
++        status: "ready",
++        source: "snapshot",
++        windows: [{ windowDays: 7, status: "ready", pullRequestGrowth: 2, reviewVelocityPerDay: 1, summary: "7d fixture" }],
++        warnings: ["7d PR queue grew by 2; review load is increasing."],
++      } as unknown as Record<string, JsonValue>,
++    });
+     const snapshotIntelligence = await app.request("/v1/repos/entrius/allways-ui/intelligence", { headers: apiHeaders(env) }, env);
+     expect(snapshotIntelligence.status).toBe(200);
+     const snapshotIntelligenceBody = (await snapshotIntelligence.json()) as Record<string, unknown> & { burdenForecast?: Record<string, unknown>; burdenForecastFreshness?: { freshness: string; source: string; ageSeconds: number } };
+     expect(snapshotIntelligenceBody).toMatchObject({ source: "snapshot", queueHealth: { signals: { openPullRequests: 2 } } });
++    expect(snapshotIntelligenceBody.queueTrends).toMatchObject({ status: "ready", windows: [expect.objectContaining({ windowDays: 7, pullRequestGrowth: 2 })] });
+     expect(snapshotIntelligenceBody.burdenForecast).toMatchObject({ level: "medium" });
+     expect(snapshotIntelligenceBody.burdenForecastFreshness).toMatchObject({ source: "snapshot", freshness: "stale" });
+     expect(snapshotIntelligenceBody.burdenForecastFreshness?.ageSeconds).toBeGreaterThanOrEqual(Math.floor((BURDEN_FORECAST_MAX_AGE_MS + 50_000) / 1000));
+diff --git a/test/unit/queue-trends.test.ts b/test/unit/queue-trends.test.ts
+new file mode 100644
+index 00000000..b9b3fe54
+--- /dev/null
++++ b/test/unit/queue-trends.test.ts
+@@ -0,0 +1,192 @@
++import { describe, expect, it } from "vitest";
++import { getRepoQueueTrendSnapshot, persistRepoGithubTotalsSnapshot, persistSignalSnapshot, upsertPullRequestFromGitHub, upsertRepositoryFromGitHub } from "../../src/db/repositories";
++import { generateSignalSnapshots } from "../../src/queue/processors";
++import { buildQueueTrendReport, buildUnavailableQueueTrendReport, type QueueTrendReport } from "../../src/services/queue-trends";
++import type { RepoGithubTotalsSnapshotRecord } from "../../src/types";
++import { createTestEnv } from "../helpers/d1";
++
++describe("queue trend windows", () => {
++  it("builds deterministic 7/14/30-day queue pressure and review velocity windows", () => {
++    const report = buildQueueTrendReport({
++      repoFullName: "owner/repo",
++      generatedAt: atDaysAgo(0),
++      totalsSnapshots: [
++        totals(30, { openIssues: 30, openPrs: 6, merged: 10, closed: 4 }),
++        totals(14, { openIssues: 34, openPrs: 7, merged: 14, closed: 6 }),
++        totals(7, { openIssues: 37, openPrs: 9, merged: 18, closed: 8 }),
++        totals(0, { openIssues: 40, openPrs: 12, merged: 25, closed: 11 }),
++      ],
++      queueHealthSnapshots: [
++        queueHealthSnapshot("qh-30", 30, { openPrs: 6, stalePrs: 1, clusters: 1 }),
++        queueHealthSnapshot("qh-7", 7, { openPrs: 9, stalePrs: 3, clusters: 2 }),
++      ],
++      currentQueueHealth: {
++        repoFullName: "owner/repo",
++        generatedAt: atDaysAgo(0),
++        burdenScore: 70,
++        level: "high",
++        summary: "busy queue",
++        signals: {
++          openIssues: 40,
++          openPullRequests: 12,
++          unlinkedPullRequests: 2,
++          stalePullRequests: 5,
++          maintainerAuthoredPullRequests: 1,
++          collisionClusters: 4,
++          ageBuckets: { under7Days: 2, days7To30: 6, over30Days: 4 },
++          likelyReviewablePullRequests: 3,
++        },
++        findings: [],
++      },
++    });
++
++    expect(report.status).toBe("ready");
++    expect(report.windows.map((window) => window.status)).toEqual(["ready", "ready", "ready"]);
++    expect(report.windows[0]).toMatchObject({
++      windowDays: 7,
++      pullRequestGrowth: 3,
++      issueGrowth: 3,
++      mergedPullRequests: 7,
++      closedUnmergedPullRequests: 3,
++      reviewVelocityPerDay: expect.any(Number),
++      duplicateTrend: 2,
++    });
++    expect(report.warnings).toEqual(expect.arrayContaining([expect.stringContaining("stale PR rate"), expect.stringContaining("duplicate cluster")]));
++  });
++
++  it("returns clear unavailable windows when history is missing", () => {
++    const report = buildQueueTrendReport({ repoFullName: "owner/repo", totalsSnapshots: [totals(0, { openIssues: 1, openPrs: 1, merged: 0, closed: 0 })] });
++    expect(report).toMatchObject({
++      status: "unavailable",
++      windows: [
++        expect.objectContaining({ windowDays: 7, status: "unavailable", summary: expect.stringContaining("Need at least 7 days") }),
++        expect.objectContaining({ windowDays: 14, status: "unavailable" }),
++        expect.objectContaining({ windowDays: 30, status: "unavailable" }),
++      ],
++    });
++    expect(buildUnavailableQueueTrendReport("owner/repo").warnings[0]).toContain("snapshot is missing");
++
++    const empty = buildQueueTrendReport({ repoFullName: "owner/repo", totalsSnapshots: [] });
++    expect(empty.windows[0]).toMatchObject({ status: "unavailable", summary: "Missing GitHub totals snapshots." });
++  });
++
++  it("handles quiet trends, malformed queue-health snapshots, and zero-open stale rates", () => {
++    const report = buildQueueTrendReport({
++      repoFullName: "owner/repo",
++      totalsSnapshots: [
++        totals(7, { openIssues: 10, openPrs: 5, merged: 10, closed: 4 }),
++        totals(0, { openIssues: 8, openPrs: 3, merged: 11, closed: 4 }),
++      ],
++      queueHealthSnapshots: [
++        { ...queueHealthSnapshot("qh-zero", 7, { openPrs: 0, stalePrs: 0, clusters: 0 }) },
++        { ...queueHealthSnapshot("qh-malformed", 0, { openPrs: 3, stalePrs: 1, clusters: 0 }), generatedAt: undefined, payload: {} },
++      ],
++    });
++
++    expect(report.status).toBe("ready");
++    expect(report.summary).toContain("No major queue trend warning detected.");
++    expect(report.warnings).toEqual([]);
++    expect(report.windows[0]).toMatchObject({
++      windowDays: 7,
++      pullRequestGrowth: -2,
++      stalePullRequestRate: 0,
++      duplicateTrend: null,
++      summary: expect.stringContaining("PR queue -2"),
++    });
++  });
++
++  it("keeps ready totals windows when queue-health trend details are absent or malformed", () => {
++    const noQueuePoints = buildQueueTrendReport({
++      repoFullName: "owner/repo",
++      totalsSnapshots: [
++        totals(30, { openIssues: 20, openPrs: 4, merged: 2, closed: 1 }),
++        totals(0, { openIssues: 21, openPrs: 4, merged: 4, closed: 2 }),
++      ],
++    });
++    expect(noQueuePoints.windows[2]).toMatchObject({ status: "ready", stalePullRequestRate: null, duplicateTrend: null });
++
++    const malformedSignals = buildQueueTrendReport({
++      repoFullName: "owner/repo",
++      totalsSnapshots: [
++        totals(30, { openIssues: 20, openPrs: 4, merged: 2, closed: 1 }),
++        totals(0, { openIssues: 21, openPrs: 4, merged: 4, closed: 2 }),
++      ],
++      queueHealthSnapshots: [
++        {
++          id: "qh-invalid-values",
++          signalType: "queue-health",
++          targetKey: "owner/repo",
++          repoFullName: "owner/repo",
++          generatedAt: atDaysAgo(0),
++          payload: { signals: { openPullRequests: "4", stalePullRequests: null, collisionClusters: "many" } },
++        },
++      ],
++    });
++    expect(malformedSignals.windows[2]).toMatchObject({ status: "ready", stalePullRequestRate: 0, duplicateTrend: null });
++  });
++
++  it("persists a compact trend snapshot during signal generation", async () => {
++    const env = createTestEnv();
++    await upsertRepositoryFromGitHub(env, { name: "repo", full_name: "owner/repo", private: false, owner: { login: "owner" }, default_branch: "main" });
++    await env.DB.prepare("update repositories set is_registered = 1 where full_name = ?").bind("owner/repo").run();
++    await persistRepoGithubTotalsSnapshot(env, totals(30, { openIssues: 10, openPrs: 2, merged: 5, closed: 1 }));
++    await persistRepoGithubTotalsSnapshot(env, totals(0, { openIssues: 16, openPrs: 8, merged: 9, closed: 3 }));
++    await persistSignalSnapshot(env, queueHealthSnapshot("qh-history", 30, { openPrs: 2, stalePrs: 0, clusters: 1 }));
++    await upsertPullRequestFromGitHub(env, "owner/repo", {
++      number: 1,
++      title: "Open fix",
++      state: "open",
++      user: { login: "miner" },
++      author_association: "NONE",
++      labels: [],
++      body: "Fixes #1",
++    });
++
++    await generateSignalSnapshots(env, "owner/repo");
++
++    const snapshot = await getRepoQueueTrendSnapshot(env, "owner/repo");
++    const report = snapshot?.payload as unknown as QueueTrendReport;
++    expect(report).toMatchObject({
++      repoFullName: "owner/repo",
++      status: "ready",
++      source: "snapshot",
++      windows: expect.arrayContaining([expect.objectContaining({ windowDays: 30, status: "ready", pullRequestGrowth: 6 })]),
++    });
++  });
++});
++
++function totals(daysAgo: number, values: { openIssues: number; openPrs: number; merged: number; closed: number }): RepoGithubTotalsSnapshotRecord {
++  return {
++    id: `totals-${daysAgo}`,
++    repoFullName: "owner/repo",
++    openIssuesTotal: values.openIssues,
++    openPullRequestsTotal: values.openPrs,
++    mergedPullRequestsTotal: values.merged,
++    closedUnmergedPullRequestsTotal: values.closed,
++    labelsTotal: 0,
++    sourceKind: "test",
++    fetchedAt: atDaysAgo(daysAgo),
++    payload: {},
++  };
++}
++
++function queueHealthSnapshot(id: string, daysAgo: number, values: { openPrs: number; stalePrs: number; clusters: number }) {
++  return {
++    id,
++    signalType: "queue-health",
++    targetKey: "owner/repo",
++    repoFullName: "owner/repo",
++    generatedAt: atDaysAgo(daysAgo),
++    payload: {
++      signals: {
++        openPullRequests: values.openPrs,
++        stalePullRequests: values.stalePrs,
++        collisionClusters: values.clusters,
++      },
++    },
++  };
++}
++
++function atDaysAgo(daysAgo: number): string {
++  return new Date(Date.now() - daysAgo * 24 * 60 * 60 * 1000).toISOString();
++}

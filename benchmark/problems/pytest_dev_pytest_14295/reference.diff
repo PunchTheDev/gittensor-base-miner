@@ -1,0 +1,277 @@
+diff --git a/changelog/12882.deprecation.rst b/changelog/12882.deprecation.rst
+new file mode 100644
+index 00000000000..ba5f3240946
+--- /dev/null
++++ b/changelog/12882.deprecation.rst
+@@ -0,0 +1,3 @@
++Calling :meth:`request.getfixturevalue() <pytest.FixtureRequest.getfixturevalue>` during teardown to request a fixture that was not already requested is now deprecated and will become an error in pytest 10.
++
++See :ref:`dynamic-fixture-request-during-teardown` for details.
+diff --git a/doc/en/deprecations.rst b/doc/en/deprecations.rst
+index 048c99cedf2..4043b4fa7f8 100644
+--- a/doc/en/deprecations.rst
++++ b/doc/en/deprecations.rst
+@@ -15,6 +15,29 @@ Below is a complete list of all pytest features which are considered deprecated.
+ :class:`~pytest.PytestWarning` or subclasses, which can be filtered using :ref:`standard warning filters <warnings>`.
+ 
+ 
++.. _dynamic-fixture-request-during-teardown:
++
++``request.getfixturevalue()`` during fixture teardown
++~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
++
++.. deprecated:: 9.1
++
++Calling :meth:`request.getfixturevalue() <pytest.FixtureRequest.getfixturevalue>`
++during teardown to request a fixture that was not already requested is deprecated.
++
++This pattern is brittle because teardown runs after pytest has started unwinding active scopes.
++Depending on the requested fixture's scope and the current teardown order, the lookup may appear
++to work, or it may fail.
++
++In pytest 10, first-time fixture requests made during teardown will become an error.
++If teardown logic needs another fixture, request it before teardown begins, either by
++declaring it in the fixture signature or by calling ``request.getfixturevalue()`` before
++the fixture yields.
++
++Fixtures that were already requested before teardown started are unaffected and may still
++be retrieved while they remain active, though this is discouraged.
++
++
+ .. _config-inicfg:
+ 
+ ``config.inicfg``
+diff --git a/src/_pytest/deprecated.py b/src/_pytest/deprecated.py
+index 4c7824e6446..9fe761e8ab4 100644
+--- a/src/_pytest/deprecated.py
++++ b/src/_pytest/deprecated.py
+@@ -67,6 +67,14 @@
+     "See https://docs.pytest.org/en/stable/deprecations.html#config-inicfg"
+ )
+ 
++FIXTURE_GETFIXTUREVALUE_DURING_TEARDOWN = UnformattedWarning(
++    PytestRemovedIn10Warning,
++    'Calling request.getfixturevalue("{argname}") during teardown is deprecated.\n'
++    "Please request the fixture before teardown begins, either by declaring it in the fixture signature "
++    "or by calling request.getfixturevalue() before the fixture yields.\n"
++    "See https://docs.pytest.org/en/stable/deprecations.html#dynamic-fixture-request-during-teardown",
++)
++
+ # You want to make some `__init__` or function "private".
+ #
+ #   def my_private_function(some, args):
+diff --git a/src/_pytest/fixtures.py b/src/_pytest/fixtures.py
+index cbe408052a4..9a5c1f113aa 100644
+--- a/src/_pytest/fixtures.py
++++ b/src/_pytest/fixtures.py
+@@ -54,6 +54,7 @@
+ from _pytest.config import ExitCode
+ from _pytest.config.argparsing import Parser
+ from _pytest.deprecated import check_ispytest
++from _pytest.deprecated import FIXTURE_GETFIXTUREVALUE_DURING_TEARDOWN
+ from _pytest.deprecated import YIELD_FIXTURE
+ from _pytest.main import Session
+ from _pytest.mark import ParameterSet
+@@ -507,6 +508,16 @@ def raiseerror(self, msg: str | None) -> NoReturn:
+         """
+         raise FixtureLookupError(None, self, msg)
+ 
++    def _raise_teardown_lookup_error(self, argname: str) -> NoReturn:
++        msg = (
++            f'The fixture value for "{argname}" is not available during teardown '
++            "because it was not previously requested.\n"
++            "Only fixtures that were already active can be retrieved during teardown.\n"
++            "Request the fixture before teardown begins by declaring it in the fixture "
++            "signature or by calling request.getfixturevalue() before the fixture yields."
++        )
++        raise FixtureLookupError(argname, self, msg)
++
+     def getfixturevalue(self, argname: str) -> Any:
+         """Dynamically run a named fixture function.
+ 
+@@ -516,8 +527,12 @@ def getfixturevalue(self, argname: str) -> Any:
+         or test function body.
+ 
+         This method can be used during the test setup phase or the test run
+-        phase, but during the test teardown phase a fixture's value may not
+-        be available.
++        phase. Avoid using it during the teardown phase.
++
++        .. versionchanged:: 9.1
++            Calling ``request.getfixturevalue()`` during teardown to request a
++            fixture that was not already requested
++            :ref:`is deprecated <dynamic-fixture-request-during-teardown>`.
+ 
+         :param argname:
+             The fixture name.
+@@ -616,6 +631,16 @@ def _get_active_fixturedef(self, argname: str) -> FixtureDef[object]:
+             self, scope, param, param_index, fixturedef, _ispytest=True
+         )
+ 
++        if not self.session._setupstate.is_node_active(self.node):
++            # TODO(pytest10.1): Remove the `warn` and `if` and call
++            # _raise_teardown_lookup_error unconditionally.
++            warnings.warn(
++                FIXTURE_GETFIXTUREVALUE_DURING_TEARDOWN.format(argname=argname),
++                stacklevel=3,
++            )
++            if subrequest.node not in self.session._setupstate.stack:
++                self._raise_teardown_lookup_error(argname)
++
+         # Make sure the fixture value is cached, running it if it isn't
+         fixturedef.execute(request=subrequest)
+ 
+@@ -808,16 +833,7 @@ def formatrepr(self) -> FixtureLookupErrorRepr:
+         stack = [self.request._pyfuncitem.obj]
+         stack.extend(map(lambda x: x.func, self.fixturestack))
+         msg = self.msg
+-        # This function currently makes an assumption that a non-None msg means we
+-        # have a non-empty `self.fixturestack`. This is currently true, but if
+-        # somebody at some point want to extend the use of FixtureLookupError to
+-        # new cases it might break.
+-        # Add the assert to make it clearer to developer that this will fail, otherwise
+-        # it crashes because `fspath` does not get set due to `stack` being empty.
+-        assert self.msg is None or self.fixturestack, (
+-            "formatrepr assumptions broken, rewrite it to handle it"
+-        )
+-        if msg is not None:
++        if msg is not None and len(stack) > 1:
+             # The last fixture raise an error, let's present
+             # it at the requesting side.
+             stack = stack[:-1]
+diff --git a/src/_pytest/runner.py b/src/_pytest/runner.py
+index d1090aace89..18d3591abfe 100644
+--- a/src/_pytest/runner.py
++++ b/src/_pytest/runner.py
+@@ -507,6 +507,11 @@ def __init__(self) -> None:
+             ],
+         ] = {}
+ 
++    def is_node_active(self, node: Node) -> bool:
++        """Check if a node is currently active in the stack -- set up and not
++        torn down yet."""
++        return node in self.stack
++
+     def setup(self, item: Item) -> None:
+         """Setup objects along the collector chain to the item."""
+         needed_collectors = item.listchain()
+diff --git a/testing/python/fixtures.py b/testing/python/fixtures.py
+index 4d8dfc3958f..38d219a547b 100644
+--- a/testing/python/fixtures.py
++++ b/testing/python/fixtures.py
+@@ -871,6 +871,115 @@ def test_func(resource):
+         result = pytester.runpytest()
+         result.stdout.fnmatch_lines(["* 2 passed in *"])
+ 
++    def test_getfixturevalue_teardown_previously_requested_does_not_warn(
++        self, pytester: Pytester
++    ) -> None:
++        """Test that requesting a fixture during teardown that was previously
++        requested is OK (#12882).
++
++        Note: this is still kinda dubious so don't let this test lock you in to
++        allowing this behavior forever...
++        """
++        pytester.makepyfile(
++            """
++            import pytest
++
++            @pytest.fixture
++            def fix(request, tmp_path):
++                yield
++                assert request.getfixturevalue("tmp_path") == tmp_path
++
++            def test_it(fix):
++                pass
++        """
++        )
++        result = pytester.runpytest("-Werror")
++        result.assert_outcomes(passed=1)
++
++    def test_getfixturevalue_teardown_new_fixture_deprecated(
++        self, pytester: Pytester
++    ) -> None:
++        """Test that requesting a fixture during teardown that was not
++        previously requested raises a deprecation warning (#12882).
++
++        Note: this is a case that previously worked but will become a hard
++        error after the deprecation is completed.
++        """
++        pytester.makepyfile(
++            """
++            import pytest
++
++            @pytest.fixture(scope="session")
++            def resource():
++                return "value"
++
++            @pytest.fixture
++            def fix(request):
++                yield
++                with pytest.warns(
++                    pytest.PytestRemovedIn10Warning,
++                    match=r'Calling request\\.getfixturevalue\\("resource"\\) during teardown is deprecated',
++                ):
++                    assert request.getfixturevalue("resource") == "value"
++
++            def test_it(fix):
++                pass
++            """
++        )
++        result = pytester.runpytest()
++        result.assert_outcomes(passed=1)
++
++    def test_getfixturevalue_teardown_new_inactive_fixture_errors(
++        self, pytester: Pytester
++    ) -> None:
++        """Test that requesting a fixture during teardown that was not
++        previously requested raises an error (#12882)."""
++        pytester.makepyfile(
++            """
++            import pytest
++
++            @pytest.fixture
++            def fix(request):
++                yield
++                request.getfixturevalue("tmp_path")
++
++            def test_it(fix):
++                pass
++            """
++        )
++        result = pytester.runpytest()
++        result.assert_outcomes(passed=1, errors=1)
++        result.stdout.fnmatch_lines(
++            [
++                (
++                    '*The fixture value for "tmp_path" is not available during '
++                    "teardown because it was not previously requested.*"
++                ),
++            ]
++        )
++
++    def test_getfixturevalue_teardown_new_inactive_fixture_errors_top_request(
++        self, pytester: Pytester
++    ) -> None:
++        """Test that requesting a fixture during teardown that was not
++        previously requested raises an error (tricky case) (#12882)."""
++        pytester.makepyfile(
++            """
++            def test_it(request):
++                request.addfinalizer(lambda: request.getfixturevalue("tmp_path"))
++            """
++        )
++        result = pytester.runpytest()
++        result.assert_outcomes(passed=1, errors=1)
++        result.stdout.fnmatch_lines(
++            [
++                (
++                    '*The fixture value for "tmp_path" is not available during '
++                    "teardown because it was not previously requested.*"
++                ),
++            ]
++        )
++
+     def test_getfixturevalue(self, pytester: Pytester) -> None:
+         item = pytester.getitem(
+             """

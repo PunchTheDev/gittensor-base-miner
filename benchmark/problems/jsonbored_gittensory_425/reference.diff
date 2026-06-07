@@ -1,0 +1,96 @@
+diff --git a/src/signals/engine.ts b/src/signals/engine.ts
+index ed13f510..38a78be3 100644
+--- a/src/signals/engine.ts
++++ b/src/signals/engine.ts
+@@ -3541,7 +3541,11 @@ export function buildPublicPrIntelligenceComment(args: {
+     .slice(0, args.settings.publicSignalLevel === "minimal" ? 2 : 5);
+   const prCollisionClusters = pullRequestSpecificCollisionClusters(args.collisions, args.pr);
+   const linkedDuplicatePrs = linkedIssueDuplicatePullRequests(args.pr, prCollisionClusters);
+-  const scopedOverlapCount = Math.max(prCollisionClusters.length, args.preflight.collisions.length);
++  // Deduplicated union of PR-specific clusters and planned-overlap (preflight) clusters -- they are
++  // different filtered subsets of the same report, so the count must be their union, not max(), to
++  // match the related-work items rendered in the panel details below.
++  const scopedOverlapClusters = [...new Map([...prCollisionClusters, ...args.preflight.collisions].map((cluster) => [cluster.id, cluster])).values()];
++  const scopedOverlapCount = scopedOverlapClusters.length;
+   const hasRelatedWork = linkedDuplicatePrs.length > 0 || scopedOverlapCount > 0;
+   const readiness = buildPublicReadinessScore({ pr: args.pr, preflight: args.preflight, queueHealth: args.queueHealth, linkedDuplicatePrs, scopedOverlapCount });
+   const linkedIssueResult = linkedIssuePanelResult(args.pr);
+@@ -3621,7 +3625,7 @@ export function buildPublicPrIntelligenceComment(args: {
+     ["Contributor context", contributorContext.result, contributorContext.evidence, contributorContext.action],
+     ["Gate result", gateStatus(gateEnabled, gateConclusion), gateEnabled ? gateAction(gateConclusion) : "Advisory only.", gateEnabled ? gateNextAction(gateConclusion) : "No action."],
+   ];
+-  const overlapDetails = relatedWorkDetails(args.pr, prCollisionClusters, args.preflight.collisions);
++  const overlapDetails = relatedWorkDetails(args.pr, scopedOverlapClusters);
+   const maintainerNotes =
+     publicFindings.length > 0
+       ? publicFindings.map((finding) => `- ${sanitizePanelText(finding.title)}: ${sanitizePanelText(finding.publicText ?? finding.detail)}`)
+@@ -3874,8 +3878,7 @@ function gittensorMinerDashboardUrl(githubId: string): string {
+   return `https://gittensor.io/miners/details?githubId=${encodeURIComponent(githubId)}`;
+ }
+ 
+-function relatedWorkDetails(pr: PullRequestRecord, prCollisionClusters: CollisionCluster[], preflightCollisions: CollisionCluster[]): string[] {
+-  const clusters = [...new Map([...prCollisionClusters, ...preflightCollisions].map((cluster) => [cluster.id, cluster])).values()];
++function relatedWorkDetails(pr: PullRequestRecord, clusters: CollisionCluster[]): string[] {
+   if (clusters.length === 0) return ["- PR-specific overlap: none found."];
+   const summaries = clusters.slice(0, 3).map((cluster) => {
+     const refs = cluster.items
+diff --git a/test/unit/signals-coverage.test.ts b/test/unit/signals-coverage.test.ts
+index f19b76df..7ae393ec 100644
+--- a/test/unit/signals-coverage.test.ts
++++ b/test/unit/signals-coverage.test.ts
+@@ -820,6 +820,55 @@ describe("signal coverage edge cases", () => {
+     expect(scopedComment).toContain("Additional title-only matches omitted; title-only overlap does not block.");
+   });
+ 
++  it("counts scoped related-work as the union of PR-specific and preflight clusters, not the max", () => {
++    const directRepo = repo("owner/union");
++    const currentPr = pr(directRepo.fullName, 99, "Union overlap PR", { authorLogin: "dev", linkedIssues: [50], body: "Fixes #50" });
++    // One repo collision cluster that contains THIS PR (deterministic literal, so prCollisionClusters = 1).
++    const collisions: CollisionReport = {
++      repoFullName: directRepo.fullName,
++      generatedAt: "2026-06-05T00:00:00.000Z",
++      summary: { clusterCount: 1, highRiskCount: 0, itemsReviewed: 2 },
++      clusters: [
++        {
++          id: "pr-cluster",
++          risk: "medium",
++          reason: "Open PR work references issue #50.",
++          items: [
++            { type: "pull_request", number: 99, title: "Union overlap PR", authorLogin: "dev", labels: [], linkedIssues: [50] },
++            { type: "issue", number: 50, title: "Shared issue", authorLogin: "reporter", labels: [], linkedIssues: [] },
++          ],
++        },
++      ],
++    };
++    // Two preflight clusters, disjoint from the PR cluster (different ids, none contain PR #99).
++    const preflightClusters: CollisionCluster[] = [1, 2].map((n) => ({
++      id: `preflight-${n}`,
++      risk: "medium",
++      reason: "Titles share 2 meaningful terms.",
++      items: [{ type: "issue", number: 200 + n, title: `Related ${n}`, authorLogin: "reporter", labels: [], linkedIssues: [] }],
++    }));
++    const profile = buildContributorProfile("dev", { login: "dev", topLanguages: [], source: "github" }, [currentPr], []);
++    const detection = { detected: true, source: "github_cache" as const, reason: "cached contributor", priorPullRequests: 1, priorMergedPullRequests: 0, priorIssues: 0 };
++    const comment = buildPublicPrIntelligenceComment({
++      repo: directRepo,
++      pr: currentPr,
++      profile,
++      detection,
++      queueHealth: buildQueueHealth(directRepo, [], [currentPr], collisions),
++      collisions,
++      preflight: {
++        ...buildPreflightResult({ repoFullName: directRepo.fullName, title: currentPr.title, body: currentPr.body ?? undefined, linkedIssues: [50] }, directRepo, [], [currentPr]),
++        collisions: preflightClusters,
++        findings: [],
++      },
++      settings: { ...repoSettings(directRepo.fullName), gateCheckMode: "off" },
++    });
++    // PR-specific clusters = {pr-cluster} (1); preflight clusters = 2 disjoint -> 3 distinct overlaps.
++    // Old code used Math.max(1, 2) = 2; the union (3) is the correct count feeding the related-work row.
++    expect(comment).toContain("3 scoped overlaps");
++    expect(comment).not.toContain("2 scoped overlaps");
++  });
++
+   it("does not present global repo collision clusters as PR duplicate risk", () => {
+     const directRepo = repo("owner/noisy");
+     const unrelatedIssues = Array.from({ length: 12 }, (_, index) => issue(directRepo.fullName, index + 1, `Unrelated cache issue ${index + 1}`));

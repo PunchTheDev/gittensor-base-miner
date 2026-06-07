@@ -1,0 +1,428 @@
+diff --git a/src/services/open-pr-pressure-scenarios.ts b/src/services/open-pr-pressure-scenarios.ts
+new file mode 100644
+index 00000000..84320cc4
+--- /dev/null
++++ b/src/services/open-pr-pressure-scenarios.ts
+@@ -0,0 +1,221 @@
++import { sanitizePublicComment } from "../github/commands";
++import type { QueueHealth, RoleContext } from "../signals/engine";
++
++/**
++ * Models how opening another PR affects repo queue pressure and contributor strategy.
++ *
++ * Compares three strategy options — opening new work, waiting, or cleaning up existing
++ * work first — using repo queue and maintainer-lane signals. Each option separates known
++ * facts from assumptions and explains likely blockers and tradeoffs WITHOUT any payout,
++ * reward, or private-scoreability claims.
++ *
++ * Scoped to open-PR pressure only: linked-issue eligibility and duplicate/stale blockers
++ * are handled by separate services. Advisory only — never opens PRs or takes GitHub action.
++ */
++export type OpenPrStrategyOption = "open_new_work" | "wait" | "cleanup_first";
++
++export type OpenPrQueuePressure = "low" | "medium" | "high" | "critical" | "unknown";
++
++export type OpenPrStrategyScenario = {
++  option: OpenPrStrategyOption;
++  label: string;
++  rank: number;
++  recommended: boolean;
++  facts: string[];
++  assumptions: string[];
++  tradeoffs: string[];
++  blockers: string[];
++};
++
++export type OpenPrPressureSimulation = {
++  repoFullName: string;
++  generatedAt: string;
++  lane: "contributor" | "maintainer";
++  queuePressure: OpenPrQueuePressure;
++  recommendedOption: OpenPrStrategyOption;
++  scenarios: OpenPrStrategyScenario[];
++  summary: string;
++};
++
++export type OpenPrPressureInput = {
++  repoFullName: string;
++  generatedAt: string;
++  queueHealth: QueueHealth | null;
++  roleContext: RoleContext;
++  contributorOpenPrCount?: number | undefined;
++};
++
++const OPTION_LABELS: Record<OpenPrStrategyOption, string> = {
++  open_new_work: "Open another PR now",
++  wait: "Wait before opening more",
++  cleanup_first: "Clean up existing work first",
++};
++
++const PRESSURE_WEIGHT: Record<OpenPrQueuePressure, number> = {
++  low: 0,
++  medium: 1,
++  high: 2,
++  critical: 3,
++  unknown: 2,
++};
++
++function pressureFor(queueHealth: QueueHealth | null): OpenPrQueuePressure {
++  return queueHealth ? queueHealth.level : "unknown";
++}
++
++function queueFacts(queueHealth: QueueHealth | null, ownOpenPrs: number): string[] {
++  if (!queueHealth) {
++    return [`You have ${ownOpenPrs} open PR(s) on this repo.`];
++  }
++  const { signals } = queueHealth;
++  return [
++    `Repo queue pressure is ${queueHealth.level}.`,
++    `${signals.openPullRequests} open PR(s) and ${signals.openIssues} open issue(s) in the repo queue.`,
++    ...(signals.stalePullRequests > 0 ? [`${signals.stalePullRequests} stale PR(s) in the queue.`] : []),
++    `You have ${ownOpenPrs} open PR(s) on this repo.`,
++  ];
++}
++
++// ── Contributor-lane ranking ───────────────────────────────────────────────
++
++function rankContributorOptions(pressure: OpenPrQueuePressure, ownOpenPrs: number): OpenPrStrategyOption[] {
++  const hasOwnWork = ownOpenPrs > 0;
++  const heavy = PRESSURE_WEIGHT[pressure] >= 2; // high, critical, or unknown
++  if (hasOwnWork && heavy) return ["cleanup_first", "wait", "open_new_work"];
++  if (hasOwnWork) return ["cleanup_first", "open_new_work", "wait"];
++  if (heavy) return ["wait", "open_new_work", "cleanup_first"];
++  return ["open_new_work", "wait", "cleanup_first"];
++}
++
++function contributorScenario(
++  option: OpenPrStrategyOption,
++  pressure: OpenPrQueuePressure,
++  ownOpenPrs: number,
++  queueHealth: QueueHealth | null,
++): Pick<OpenPrStrategyScenario, "facts" | "assumptions" | "tradeoffs" | "blockers"> {
++  const hasOwnWork = ownOpenPrs > 0;
++  const facts = queueFacts(queueHealth, ownOpenPrs);
++  if (option === "open_new_work") {
++    return {
++      facts,
++      assumptions: [
++        `Opening another PR would add to the current ${pressure} repo queue pressure.`,
++        ...(pressure === "unknown" ? ["Queue signals are unavailable, so the pressure impact is an estimate."] : []),
++      ],
++      tradeoffs: ["Starts new work immediately, but increases concurrent review load on maintainers."],
++      blockers: hasOwnWork ? ["You already have open PR(s); landing or closing them first usually clears review faster."] : [],
++    };
++  }
++  if (option === "wait") {
++    return {
++      facts,
++      assumptions: ["Waiting assumes the queue will drain as maintainers review existing work."],
++      tradeoffs: ["Avoids adding queue pressure, but delays starting your next contribution."],
++      blockers: [],
++    };
++  }
++  // cleanup_first
++  return {
++    facts,
++    assumptions: ["Cleaning up assumes your existing open PR(s) can be advanced, merged, or closed."],
++    tradeoffs: ["Reduces your own queue footprint first, but defers new work until existing PR(s) resolve."],
++    blockers: hasOwnWork ? [] : ["You have no open PR(s) on this repo, so there is nothing to clean up first."],
++  };
++}
++
++// ── Maintainer-lane ranking ────────────────────────────────────────────────
++
++function rankMaintainerOptions(pressure: OpenPrQueuePressure): OpenPrStrategyOption[] {
++  // Maintainers are not penalized for their own concurrent PRs; the strategy is about repo
++  // health. Under critical pressure, triaging the queue first is the priority.
++  if (pressure === "critical") return ["cleanup_first", "open_new_work", "wait"];
++  return ["open_new_work", "cleanup_first", "wait"];
++}
++
++function maintainerScenario(
++  option: OpenPrStrategyOption,
++  pressure: OpenPrQueuePressure,
++  queueHealth: QueueHealth | null,
++  ownOpenPrs: number,
++): Pick<OpenPrStrategyScenario, "facts" | "assumptions" | "tradeoffs" | "blockers"> {
++  const facts = queueFacts(queueHealth, ownOpenPrs);
++  if (option === "open_new_work") {
++    return {
++      facts,
++      assumptions: ["As a maintainer-lane author, opening a PR is repo-health work and is not treated as outside-contributor queue load."],
++      tradeoffs: ["Keeps repo work moving, but a large maintainer PR can still compete for review attention."],
++      blockers: [],
++    };
++  }
++  if (option === "cleanup_first") {
++    return {
++      facts,
++      assumptions: [`Triaging the queue first assumes the ${pressure} pressure can be reduced by reviewing or closing existing PR(s).`],
++      tradeoffs: ["Improves overall repo health, but defers your own new work."],
++      blockers: [],
++    };
++  }
++  return {
++    facts,
++    assumptions: ["Waiting is rarely needed in the maintainer lane; repo-health work can usually proceed."],
++    tradeoffs: ["Avoids any added load, but maintainer work generally should not be blocked on queue pressure."],
++    blockers: [],
++  };
++}
++
++function sanitizeScenario(scenario: OpenPrStrategyScenario): OpenPrStrategyScenario {
++  return {
++    ...scenario,
++    label: sanitizePublicComment(scenario.label),
++    facts: scenario.facts.map((line) => sanitizePublicComment(line)),
++    assumptions: scenario.assumptions.map((line) => sanitizePublicComment(line)),
++    tradeoffs: scenario.tradeoffs.map((line) => sanitizePublicComment(line)),
++    blockers: scenario.blockers.map((line) => sanitizePublicComment(line)),
++  };
++}
++
++function summarize(lane: "contributor" | "maintainer", recommended: OpenPrStrategyOption, pressure: OpenPrQueuePressure): string {
++  const action =
++    recommended === "open_new_work" ? "opening another PR is reasonable" : recommended === "wait" ? "waiting before opening more is the safer move" : "clearing existing work first is the better move";
++  if (pressure === "unknown") {
++    return sanitizePublicComment(`Queue signals are unavailable; ${action} as a conservative default until repo data is refreshed.`);
++  }
++  return sanitizePublicComment(`With ${pressure} repo queue pressure in the ${lane} lane, ${action}.`);
++}
++
++/**
++ * Simulate open-PR pressure strategy options. Pure and read-only; no network or state access.
++ * Maintainer-lane authors are ranked separately from outside-contributor lanes.
++ */
++export function simulateOpenPrPressure(input: OpenPrPressureInput): OpenPrPressureSimulation {
++  const pressure = pressureFor(input.queueHealth);
++  const ownOpenPrs = Math.max(0, input.contributorOpenPrCount ?? 0);
++  const lane: "contributor" | "maintainer" = input.roleContext.maintainerLane ? "maintainer" : "contributor";
++
++  const orderedOptions = lane === "maintainer" ? rankMaintainerOptions(pressure) : rankContributorOptions(pressure, ownOpenPrs);
++
++  const scenarios = orderedOptions.map((option, index) => {
++    const detail =
++      lane === "maintainer"
++        ? maintainerScenario(option, pressure, input.queueHealth, ownOpenPrs)
++        : contributorScenario(option, pressure, ownOpenPrs, input.queueHealth);
++    return sanitizeScenario({
++      option,
++      label: OPTION_LABELS[option],
++      rank: index + 1,
++      recommended: index === 0,
++      ...detail,
++    });
++  });
++
++  const recommendedOption = orderedOptions[0]!;
++  return {
++    repoFullName: input.repoFullName,
++    generatedAt: input.generatedAt,
++    lane,
++    queuePressure: pressure,
++    recommendedOption,
++    scenarios,
++    summary: summarize(lane, recommendedOption, pressure),
++  };
++}
+diff --git a/test/unit/open-pr-pressure-scenarios.test.ts b/test/unit/open-pr-pressure-scenarios.test.ts
+new file mode 100644
+index 00000000..ed1994a2
+--- /dev/null
++++ b/test/unit/open-pr-pressure-scenarios.test.ts
+@@ -0,0 +1,195 @@
++import { describe, expect, it } from "vitest";
++import { sanitizePublicComment } from "../../src/github/commands";
++import type { QueueHealth, RoleContext } from "../../src/signals/engine";
++import { simulateOpenPrPressure, type OpenPrPressureInput } from "../../src/services/open-pr-pressure-scenarios";
++
++const FORBIDDEN_PUBLIC_LANGUAGE =
++  /wallet|hotkey|coldkey|mnemonic|seed phrase|payout|reward estimate|raw trust|trust score|scoreability|private reviewability|estimated score|score estimate|farming/i;
++
++function queueHealth(level: QueueHealth["level"], overrides: Partial<QueueHealth["signals"]> = {}): QueueHealth {
++  return {
++    repoFullName: "octo/demo",
++    generatedAt: "2026-06-03T00:00:00.000Z",
++    burdenScore: level === "low" ? 10 : level === "medium" ? 40 : level === "high" ? 65 : 90,
++    level,
++    summary: `Queue is ${level}.`,
++    signals: {
++      openIssues: 5,
++      openPullRequests: level === "low" ? 1 : 12,
++      unlinkedPullRequests: 0,
++      stalePullRequests: level === "high" || level === "critical" ? 4 : 0,
++      maintainerAuthoredPullRequests: 0,
++      collisionClusters: 0,
++      ageBuckets: { under7Days: 1, days7To30: 0, over30Days: 0 },
++      likelyReviewablePullRequests: 1,
++      ...overrides,
++    },
++    findings: [],
++  };
++}
++
++function role(maintainerLane: boolean): RoleContext {
++  return {
++    login: "miner-a",
++    repoFullName: "octo/demo",
++    generatedAt: "2026-06-03T00:00:00.000Z",
++    role: maintainerLane ? "owner" : "outside_contributor",
++    maintainerLane,
++    normalContributorEvidenceAllowed: !maintainerLane,
++    source: maintainerLane ? "repo_owner_match" : "cache",
++    association: maintainerLane ? "OWNER" : "NONE",
++    reasons: [],
++    guidance: maintainerLane ? "maintainer" : "contributor",
++  };
++}
++
++function input(overrides: Partial<OpenPrPressureInput> = {}): OpenPrPressureInput {
++  return {
++    repoFullName: "octo/demo",
++    generatedAt: "2026-06-03T00:00:00.000Z",
++    queueHealth: queueHealth("low"),
++    roleContext: role(false),
++    contributorOpenPrCount: 0,
++    ...overrides,
++  };
++}
++
++// ── Low-pressure repo ──────────────────────────────────────────────────────
++
++describe("low-pressure contributor repo", () => {
++  it("recommends opening another PR when pressure is low and the contributor has no open PRs", () => {
++    const sim = simulateOpenPrPressure(input({ queueHealth: queueHealth("low"), contributorOpenPrCount: 0 }));
++    expect(sim.lane).toBe("contributor");
++    expect(sim.queuePressure).toBe("low");
++    expect(sim.recommendedOption).toBe("open_new_work");
++    expect(sim.scenarios[0]).toMatchObject({ option: "open_new_work", rank: 1, recommended: true });
++    expect(sim.scenarios.map((s) => s.option)).toEqual(["open_new_work", "wait", "cleanup_first"]);
++  });
++
++  it("flags that cleanup-first has nothing to clean when the contributor has no open PRs", () => {
++    const sim = simulateOpenPrPressure(input({ queueHealth: queueHealth("low"), contributorOpenPrCount: 0 }));
++    const cleanup = sim.scenarios.find((s) => s.option === "cleanup_first")!;
++    expect(cleanup.blockers.join(" ")).toMatch(/no open PR|nothing to clean/i);
++  });
++
++  it("ranks every option exactly once with sequential ranks", () => {
++    const sim = simulateOpenPrPressure(input());
++    expect(sim.scenarios.map((s) => s.rank)).toEqual([1, 2, 3]);
++    expect(new Set(sim.scenarios.map((s) => s.option)).size).toBe(3);
++  });
++});
++
++// ── High-pressure repo ─────────────────────────────────────────────────────
++
++describe("high-pressure contributor repo", () => {
++  it("recommends waiting when pressure is high and the contributor has no open PRs", () => {
++    const sim = simulateOpenPrPressure(input({ queueHealth: queueHealth("high"), contributorOpenPrCount: 0 }));
++    expect(sim.queuePressure).toBe("high");
++    expect(sim.recommendedOption).toBe("wait");
++    expect(sim.scenarios.map((s) => s.option)).toEqual(["wait", "open_new_work", "cleanup_first"]);
++  });
++
++  it("recommends cleanup-first when pressure is high and the contributor already has open PRs", () => {
++    const sim = simulateOpenPrPressure(input({ queueHealth: queueHealth("critical"), contributorOpenPrCount: 2 }));
++    expect(sim.recommendedOption).toBe("cleanup_first");
++    expect(sim.scenarios.map((s) => s.option)).toEqual(["cleanup_first", "wait", "open_new_work"]);
++  });
++
++  it("includes the stale PR fact in scenario facts under high pressure", () => {
++    const sim = simulateOpenPrPressure(input({ queueHealth: queueHealth("high"), contributorOpenPrCount: 0 }));
++    expect(sim.scenarios[0]!.facts.join(" ")).toMatch(/stale PR/i);
++  });
++
++  it("open-new-work scenario warns about adding to queue pressure", () => {
++    const sim = simulateOpenPrPressure(input({ queueHealth: queueHealth("high"), contributorOpenPrCount: 0 }));
++    const open = sim.scenarios.find((s) => s.option === "open_new_work")!;
++    expect(open.assumptions.join(" ")).toMatch(/add to the current high/i);
++  });
++});
++
++// ── Maintainer-lane repo ───────────────────────────────────────────────────
++
++describe("maintainer-lane repo", () => {
++  it("handles maintainer lane separately and recommends opening work under non-critical pressure", () => {
++    const sim = simulateOpenPrPressure(input({ queueHealth: queueHealth("medium"), roleContext: role(true), contributorOpenPrCount: 3 }));
++    expect(sim.lane).toBe("maintainer");
++    expect(sim.recommendedOption).toBe("open_new_work");
++    const open = sim.scenarios.find((s) => s.option === "open_new_work")!;
++    expect(open.assumptions.join(" ")).toMatch(/maintainer-lane|repo-health/i);
++  });
++
++  it("recommends triaging the queue first under critical pressure in the maintainer lane", () => {
++    const sim = simulateOpenPrPressure(input({ queueHealth: queueHealth("critical"), roleContext: role(true), contributorOpenPrCount: 1 }));
++    expect(sim.lane).toBe("maintainer");
++    expect(sim.recommendedOption).toBe("cleanup_first");
++  });
++
++  it("never penalizes a maintainer for their own concurrent PRs", () => {
++    const sim = simulateOpenPrPressure(input({ queueHealth: queueHealth("medium"), roleContext: role(true), contributorOpenPrCount: 5 }));
++    const open = sim.scenarios.find((s) => s.option === "open_new_work")!;
++    expect(open.blockers).toHaveLength(0);
++  });
++});
++
++// ── Missing-signal repo ────────────────────────────────────────────────────
++
++describe("missing-signal repo", () => {
++  it("treats pressure as unknown and recommends a conservative wait for contributors", () => {
++    const sim = simulateOpenPrPressure(input({ queueHealth: null, contributorOpenPrCount: 0 }));
++    expect(sim.queuePressure).toBe("unknown");
++    expect(sim.recommendedOption).toBe("wait");
++    expect(sim.summary).toMatch(/signals are unavailable|conservative default/i);
++  });
++
++  it("marks open-new-work as an estimate when signals are missing", () => {
++    const sim = simulateOpenPrPressure(input({ queueHealth: null, contributorOpenPrCount: 0 }));
++    const open = sim.scenarios.find((s) => s.option === "open_new_work")!;
++    expect(open.assumptions.join(" ")).toMatch(/unavailable|estimate/i);
++  });
++
++  it("still recommends cleanup-first when signals are missing but the contributor has open PRs", () => {
++    const sim = simulateOpenPrPressure(input({ queueHealth: null, contributorOpenPrCount: 3 }));
++    expect(sim.recommendedOption).toBe("cleanup_first");
++  });
++});
++
++// ── Facts vs assumptions separation ────────────────────────────────────────
++
++describe("facts vs assumptions separation", () => {
++  it("keeps known facts and assumptions in distinct fields", () => {
++    const sim = simulateOpenPrPressure(input({ queueHealth: queueHealth("medium"), contributorOpenPrCount: 1 }));
++    for (const scenario of sim.scenarios) {
++      // facts describe observed queue state; assumptions describe projections
++      expect(scenario.facts.length).toBeGreaterThan(0);
++      expect(scenario.facts.join(" ")).toMatch(/open PR|open issue|queue pressure/i);
++    }
++  });
++});
++
++// ── Public sanitizer tests ─────────────────────────────────────────────────
++
++describe("public sanitizer tests for open-pr pressure summaries", () => {
++  it("every scenario field across all fixtures is free of forbidden public language", () => {
++    const fixtures: OpenPrPressureInput[] = [
++      input({ queueHealth: queueHealth("low"), contributorOpenPrCount: 0 }),
++      input({ queueHealth: queueHealth("high"), contributorOpenPrCount: 2 }),
++      input({ queueHealth: queueHealth("critical"), roleContext: role(true), contributorOpenPrCount: 1 }),
++      input({ queueHealth: null, contributorOpenPrCount: 0 }),
++    ];
++    for (const fixture of fixtures) {
++      const sim = simulateOpenPrPressure(fixture);
++      const text = [
++        sim.summary,
++        ...sim.scenarios.flatMap((s) => [s.label, ...s.facts, ...s.assumptions, ...s.tradeoffs, ...s.blockers]),
++      ].join(" ");
++      expect(text).not.toMatch(FORBIDDEN_PUBLIC_LANGUAGE);
++      expect(text).toBe(sanitizePublicComment(text));
++    }
++  });
++
++  it("makes no payout, reward, or score claims in any scenario", () => {
++    const sim = simulateOpenPrPressure(input({ queueHealth: queueHealth("medium"), contributorOpenPrCount: 1 }));
++    const text = JSON.stringify(sim);
++    expect(text).not.toMatch(/payout|reward|earn|\bscore\b/i);
++  });
++});

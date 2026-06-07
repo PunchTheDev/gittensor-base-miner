@@ -1,0 +1,140 @@
+diff --git a/celery/utils/time.py b/celery/utils/time.py
+index 2376bb3b71d..f7a373bf2ca 100644
+--- a/celery/utils/time.py
++++ b/celery/utils/time.py
+@@ -1,6 +1,7 @@
+ """Utilities related to dates, times, intervals, and timezones."""
+ from __future__ import annotations
+ 
++import logging
+ import numbers
+ import os
+ import random
+@@ -17,6 +18,7 @@
+ from dateutil.parser import isoparse
+ from kombu.utils.functional import reprcall
+ from kombu.utils.objects import cached_property
++from tzlocal import get_localzone
+ 
+ from .functional import dictfilter
+ from .text import pluralize
+@@ -26,6 +28,7 @@
+ else:
+     from backports.zoneinfo import ZoneInfo
+ 
++logger = logging.getLogger(__name__)
+ 
+ __all__ = (
+     'LocalTimezone', 'timezone', 'maybe_timedelta',
+@@ -117,7 +120,7 @@ def _isdst(self, dt: datetime) -> bool:
+ 
+ class _Zone:
+     """Timezone class that provides the timezone for the application.
+-    If `enable_utc` is disabled, LocalTimezone is provided as the timezone provider through local().
++    If `enable_utc` is disabled, local system timezone is provided as the timezone provider through local().
+     Otherwise, this class provides a UTC ZoneInfo instance as the timezone provider for the application.
+ 
+     Additionally this class provides a few utility methods for converting datetimes.
+@@ -158,9 +161,16 @@ def get_timezone(self, zone: str | tzinfo) -> tzinfo:
+         return zone
+ 
+     @cached_property
+-    def local(self) -> LocalTimezone:
+-        """Return LocalTimezone instance for the application."""
+-        return LocalTimezone()
++    def local(self) -> tzinfo:
++        """Return the local system timezone for the application."""
++        try:
++            timezone = get_localzone()
++        except Exception as ex:
++            timezone = None
++            logger.warning("Failed to retrieve local timezone (%s): %s", type(ex).__name__, ex)
++        if timezone is None:
++            return LocalTimezone()
++        return timezone
+ 
+     @cached_property
+     def utc(self) -> tzinfo:
+diff --git a/requirements/default.txt b/requirements/default.txt
+index 015541462aa..7077a678c2b 100644
+--- a/requirements/default.txt
++++ b/requirements/default.txt
+@@ -7,3 +7,4 @@ click-repl>=0.2.0
+ click-plugins>=1.1.1
+ backports.zoneinfo[tzdata]>=0.2.1; python_version < '3.9'
+ python-dateutil>=2.8.2
++tzlocal
+diff --git a/setup.cfg b/setup.cfg
+index a74a438d952..775ec0cc776 100644
+--- a/setup.cfg
++++ b/setup.cfg
+@@ -34,6 +34,7 @@ per-file-ignores =
+ [bdist_rpm]
+ requires = backports.zoneinfo>=0.2.1;python_version<'3.9'
+            tzdata>=2022.7
++           tzlocal
+            billiard >=4.1.0,<5.0
+            kombu >= 5.3.4,<6.0.0
+ 
+diff --git a/t/unit/app/test_app.py b/t/unit/app/test_app.py
+index ca2dd2b4bf1..32cc338c336 100644
+--- a/t/unit/app/test_app.py
++++ b/t/unit/app/test_app.py
+@@ -32,13 +32,13 @@
+ from celery.utils.collections import DictAttribute
+ from celery.utils.objects import Bunch
+ from celery.utils.serialization import pickle
+-from celery.utils.time import localize, timezone, to_utc
++from celery.utils.time import LocalTimezone, localize, timezone, to_utc
+ from t.unit import conftest
+ 
+ if sys.version_info >= (3, 9):
+     from zoneinfo import ZoneInfo
+ else:
+-    from backports.zoneinfo import ZoneInfo  # noqa
++    from backports.zoneinfo import ZoneInfo
+ 
+ THIS_IS_A_KEY = 'this is a value'
+ 
+@@ -1176,7 +1176,7 @@ def test_signature(self):
+         sig = self.app.signature('foo', (1, 2))
+         assert sig.app is self.app
+ 
+-    def test_timezone__none_set(self):
++    def test_timezone_none_set(self):
+         self.app.conf.timezone = None
+         self.app.conf.enable_utc = True
+         assert self.app.timezone == timezone.utc
+@@ -1184,6 +1184,32 @@ def test_timezone__none_set(self):
+         self.app.conf.enable_utc = False
+         assert self.app.timezone == timezone.local
+ 
++    def test_use_local_timezone(self):
++        self.app.conf.timezone = None
++        self.app.conf.enable_utc = False
++
++        self._clear_timezone_cache()
++        try:
++            assert isinstance(self.app.timezone, ZoneInfo)
++        finally:
++            self._clear_timezone_cache()
++
++    @patch("celery.utils.time.get_localzone")
++    def test_use_local_timezone_failure(self, mock_get_localzone):
++        mock_get_localzone.side_effect = Exception("Failed to get local timezone")
++        self.app.conf.timezone = None
++        self.app.conf.enable_utc = False
++
++        self._clear_timezone_cache()
++        try:
++            assert isinstance(self.app.timezone, LocalTimezone)
++        finally:
++            self._clear_timezone_cache()
++
++    def _clear_timezone_cache(self):
++        del self.app.timezone
++        del timezone.local
++
+     def test_uses_utc_timezone(self):
+         self.app.conf.timezone = None
+         self.app.conf.enable_utc = True

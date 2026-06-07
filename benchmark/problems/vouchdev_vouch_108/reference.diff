@@ -1,0 +1,449 @@
+diff --git a/CHANGELOG.md b/CHANGELOG.md
+index dccec54..8489172 100644
+--- a/CHANGELOG.md
++++ b/CHANGELOG.md
+@@ -6,14 +6,15 @@ All notable changes to vouch are documented here. Format follows
+ 
+ ## [Unreleased]
+ 
+-### Fixed
+-- `discover_root()` now honours `VOUCH_KB_PATH=/abs/path/.vouch` and returns the parent root, instead of always walking up from cwd. The env var was already documented in `adapters/generic-mcp/README.md` but wasn't wired into the code — closing the doc-vs-code drift removes the `"cwd": "..."` ceremony hosts like Claude Desktop need today to point at a specific KB.
+ ### Added
+ - `vouch fsck` performs deep consistency checks beyond `vouch doctor`:
+   orphaned embeddings, dangling supersede/contradict chains, decided
+   proposals whose artifact is missing, and FTS5 index-vs-file drift
+   (orphan rows, missing rows, status drift). Read-only; reports findings
+   with object ids. `--fix` is intentionally out of scope (#96).
++- `vouch migrate` checks, dry-runs, and applies on-disk KB format migrations,
++  preserving audit history and rebuilding derived indexes after successful
++  upgrades.
+ - `vouch expire` garbage-collects stale pending proposals: dry-run by default,
+   `--apply` moves them to `decided/` with `decision_reason: expired`, emits
+   `proposal.expire` audit events, and honors `review.expire_pending_after_days`
+@@ -28,6 +29,9 @@ All notable changes to vouch are documented here. Format follows
+   was already documented in `ROADMAP.md` and `adapters/generic-mcp/README.md`
+   but had no implementation (#97).
+ 
++### Fixed
++- `discover_root()` now honours `VOUCH_KB_PATH=/abs/path/.vouch` and returns the parent root, instead of always walking up from cwd. The env var was already documented in `adapters/generic-mcp/README.md` but wasn't wired into the code — closing the doc-vs-code drift removes the `"cwd": "..."` ceremony hosts like Claude Desktop need today to point at a specific KB.
++
+ ## [0.1.0] — 2026-05-26
+ 
+ ### Packaging
+diff --git a/README.md b/README.md
+index 74879fb..3148b2b 100644
+--- a/README.md
++++ b/README.md
+@@ -146,6 +146,7 @@ vouch status [--json]                       # KB counts + pending proposals
+ vouch lint [--stale-days N]                 # user-actionable problems
+ vouch doctor                                # full sweep incl. source verification
+ vouch fsck                                  # deep consistency: indexes, lifecycle, decided
++vouch migrate [--check] [--dry-run]         # upgrade .vouch/ format safely
+ 
+ vouch pending                               # list pending proposals
+ vouch review [--limit N] [--type KIND]      # guided proposal review queue
+diff --git a/src/vouch/cli.py b/src/vouch/cli.py
+index 4200b8f..af86b8c 100644
+--- a/src/vouch/cli.py
++++ b/src/vouch/cli.py
+@@ -23,6 +23,7 @@
+ from . import __version__, bundle, health
+ from . import audit as audit_mod
+ from . import lifecycle as life
++from . import migrations as migrations_mod
+ from . import sessions as sess_mod
+ from . import sync as sync_mod
+ from . import verify as verify_mod
+@@ -71,7 +72,13 @@ def _cli_errors() -> Iterator[None]:
+     # their own request envelopes.
+     try:
+         yield
+-    except (ArtifactNotFoundError, ValueError, ProposalError, LifecycleError) as e:
++    except (
++        ArtifactNotFoundError,
++        ValueError,
++        ProposalError,
++        LifecycleError,
++        migrations_mod.MigrationError,
++    ) as e:
+         raise click.ClickException(str(e)) from e
+ 
+ 
+@@ -308,6 +315,62 @@ def fsck() -> None:
+     sys.exit(0 if report.ok else 1)
+ 
+ 
++@cli.command()
++@click.option("--check", "check_only", is_flag=True, help="Only check whether migration is needed.")
++@click.option("--dry-run", is_flag=True, help="Show planned changes without writing.")
++@click.option("--to-version", type=int, default=None, help="Target KB format version.")
++@click.option("--json", "as_json", is_flag=True, help="Emit JSON instead of text.")
++def migrate(
++    check_only: bool,
++    dry_run: bool,
++    to_version: int | None,
++    as_json: bool,
++) -> None:
++    """Upgrade the on-disk .vouch/ layout to the supported format."""
++    if check_only and dry_run:
++        raise click.ClickException("--check and --dry-run are mutually exclusive")
++
++    store = _load_store()
++    with _cli_errors():
++        result = migrations_mod.migrate(
++            store,
++            to_version=to_version,
++            dry_run=check_only or dry_run,
++        )
++        if as_json:
++            _emit_json(asdict(result))
++        else:
++            if result.steps:
++                click.echo(
++                    f"KB format: {result.from_version} -> {result.to_version} "
++                    f"({'dry run' if result.dry_run else 'applied'})"
++                )
++                for step in result.steps:
++                    click.echo(f"- {step}")
++                for change in result.changes:
++                    click.echo(f"  * {change}")
++            else:
++                click.echo(f"KB format: {result.from_version} (up to date)")
++
++        if result.applied:
++            health.rebuild_index(store)
++            audit_mod.log_event(
++                store.kb_dir,
++                event="kb.migrate",
++                actor=_whoami(),
++                reversible=False,
++                data={
++                    "from_version": result.from_version,
++                    "to_version": result.to_version,
++                    "steps": result.steps,
++                    "changes": result.changes,
++                },
++            )
++
++    if check_only and result.steps:
++        sys.exit(1)
++
++
+ # --- proposals ------------------------------------------------------------
+ 
+ 
+diff --git a/src/vouch/migrations.py b/src/vouch/migrations.py
+new file mode 100644
+index 0000000..bdb7037
+--- /dev/null
++++ b/src/vouch/migrations.py
+@@ -0,0 +1,184 @@
++"""On-disk KB format migrations.
++
++The migration layer only changes source-of-truth files under `.vouch/`.
++Derived caches such as state.db are rebuilt by the CLI after a successful
++apply.
++"""
++
++from __future__ import annotations
++
++from collections.abc import Callable
++from dataclasses import dataclass
++from typing import Any
++
++import yaml
++
++from .storage import KB_FORMAT_VERSION, SUBDIRS, KBStore, _starter_config
++
++
++class MigrationError(RuntimeError):
++    """Raised when a KB cannot be migrated safely."""
++
++
++@dataclass(frozen=True)
++class MigrationStep:
++    from_version: int
++    to_version: int
++    description: str
++    apply: Callable[[KBStore, bool], list[str]]
++
++
++@dataclass(frozen=True)
++class MigrationPlan:
++    current_version: int
++    target_version: int
++    latest_version: int
++    steps: list[MigrationStep]
++
++    @property
++    def needed(self) -> bool:
++        return bool(self.steps)
++
++
++@dataclass(frozen=True)
++class MigrationResult:
++    from_version: int
++    to_version: int
++    applied: bool
++    dry_run: bool
++    steps: list[str]
++    changes: list[str]
++
++
++def read_config(store: KBStore) -> dict[str, Any]:
++    if not store.config_path.exists():
++        return {}
++    loaded = yaml.safe_load(store.config_path.read_text())
++    if loaded is None:
++        return {}
++    if not isinstance(loaded, dict):
++        raise MigrationError("config.yaml must contain a mapping")
++    return loaded
++
++
++def write_config(store: KBStore, config: dict[str, Any]) -> None:
++    store.config_path.write_text(yaml.safe_dump(config, sort_keys=False, allow_unicode=True))
++
++
++def detect_version(store: KBStore) -> int:
++    config = read_config(store)
++    raw = config.get("version", 0)
++    if isinstance(raw, bool) or not isinstance(raw, int):
++        raise MigrationError("config.yaml version must be an integer")
++    if raw < 0:
++        raise MigrationError("config.yaml version must be non-negative")
++    if raw > KB_FORMAT_VERSION:
++        raise MigrationError(
++            f"KB format version {raw} is newer than this vouch supports "
++            f"({KB_FORMAT_VERSION})"
++        )
++    return raw
++
++
++def build_plan(store: KBStore, *, to_version: int | None = None) -> MigrationPlan:
++    current = detect_version(store)
++    target = KB_FORMAT_VERSION if to_version is None else to_version
++    if target > KB_FORMAT_VERSION:
++        raise MigrationError(
++            f"target KB format version {target} is newer than this vouch supports "
++            f"({KB_FORMAT_VERSION})"
++        )
++    if target < current:
++        raise MigrationError(
++            f"cannot migrate backwards from KB format version {current} to {target}"
++        )
++
++    steps: list[MigrationStep] = []
++    version = current
++    while version < target:
++        step = _STEPS_BY_FROM.get(version)
++        if step is None:
++            raise MigrationError(f"no migration registered from KB format version {version}")
++        if step.to_version > target:
++            break
++        steps.append(step)
++        version = step.to_version
++
++    if version != target:
++        raise MigrationError(
++            f"no complete migration path from KB format version {current} to {target}"
++        )
++    return MigrationPlan(
++        current_version=current,
++        target_version=target,
++        latest_version=KB_FORMAT_VERSION,
++        steps=steps,
++    )
++
++
++def migrate(
++    store: KBStore,
++    *,
++    to_version: int | None = None,
++    dry_run: bool = False,
++) -> MigrationResult:
++    plan = build_plan(store, to_version=to_version)
++    changes: list[str] = []
++    for step in plan.steps:
++        changes.extend(step.apply(store, dry_run))
++    return MigrationResult(
++        from_version=plan.current_version,
++        to_version=plan.target_version,
++        applied=plan.needed and not dry_run,
++        dry_run=dry_run,
++        steps=[s.description for s in plan.steps],
++        changes=changes,
++    )
++
++
++def _migration_0_to_1(store: KBStore, dry_run: bool) -> list[str]:
++    changes: list[str] = []
++
++    missing_subdirs = [sub for sub in SUBDIRS if not (store.kb_dir / sub).is_dir()]
++    for sub in missing_subdirs:
++        changes.append(f"create {sub}/")
++        if not dry_run:
++            (store.kb_dir / sub).mkdir(parents=True, exist_ok=True)
++
++    config = read_config(store)
++    if not config:
++        config = _starter_config()
++        changes.append("create config.yaml with version 1")
++    elif config.get("version") != 1:
++        config = dict(config)
++        config["version"] = 1
++        changes.append("set config.yaml version to 1")
++    if not dry_run and changes:
++        write_config(store, config)
++
++    gitignore_path = store.kb_dir / ".gitignore"
++    required_ignores = ("proposed/", "state.db", "state.db-*")
++    existing_ignores: list[str] = []
++    if gitignore_path.exists():
++        existing_ignores = gitignore_path.read_text().splitlines()
++    missing_ignores = [line for line in required_ignores if line not in existing_ignores]
++    if missing_ignores:
++        changes.append("ensure .gitignore excludes proposed/ and state.db")
++        if not dry_run:
++            gitignore_path.parent.mkdir(parents=True, exist_ok=True)
++            lines = [*existing_ignores, *missing_ignores]
++            gitignore_path.write_text("\n".join(lines).rstrip() + "\n")
++
++    return changes
++
++
++_STEPS: tuple[MigrationStep, ...] = (
++    MigrationStep(
++        from_version=0,
++        to_version=1,
++        description="stamp legacy KB as format version 1",
++        apply=_migration_0_to_1,
++    ),
++)
++
++_STEPS_BY_FROM = {step.from_version: step for step in _STEPS}
+diff --git a/src/vouch/storage.py b/src/vouch/storage.py
+index e3c3e27..2e1a1e7 100644
+--- a/src/vouch/storage.py
++++ b/src/vouch/storage.py
+@@ -50,6 +50,7 @@
+ 
+ KB_DIRNAME = ".vouch"
+ CONFIG_FILENAME = "config.yaml"
++KB_FORMAT_VERSION = 1
+ 
+ SUBDIRS = (
+     "claims", "pages", "sources", "entities", "relations",
+@@ -67,7 +68,7 @@ class ArtifactNotFoundError(KeyError):
+ 
+ def _starter_config() -> dict[str, Any]:
+     return {
+-        "version": 1,
++        "version": KB_FORMAT_VERSION,
+         "review": {
+             "require_human_approval": True,
+             "expire_pending_after_days": 90,
+diff --git a/tests/test_migrations.py b/tests/test_migrations.py
+new file mode 100644
+index 0000000..78e878e
+--- /dev/null
++++ b/tests/test_migrations.py
+@@ -0,0 +1,98 @@
++"""On-disk KB format migration behavior."""
++
++from __future__ import annotations
++
++from pathlib import Path
++
++import pytest
++import yaml
++from click.testing import CliRunner
++
++from vouch import audit, migrations
++from vouch.cli import cli
++from vouch.storage import KBStore
++
++
++@pytest.fixture
++def store(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> KBStore:
++    s = KBStore.init(tmp_path)
++    monkeypatch.chdir(s.root)
++    return s
++
++
++def _config(store: KBStore) -> dict:
++    loaded = yaml.safe_load(store.config_path.read_text())
++    assert isinstance(loaded, dict)
++    return loaded
++
++
++def test_current_kb_has_no_migration_plan(store: KBStore) -> None:
++    plan = migrations.build_plan(store)
++
++    assert plan.current_version == 1
++    assert plan.target_version == 1
++    assert plan.steps == []
++
++    result = CliRunner().invoke(cli, ["migrate", "--check"])
++    assert result.exit_code == 0, result.output
++    assert "up to date" in result.output
++
++
++def test_migrate_check_reports_needed_migration_without_writing(store: KBStore) -> None:
++    config = _config(store)
++    config.pop("version")
++    store.config_path.write_text(yaml.safe_dump(config, sort_keys=False))
++
++    result = CliRunner().invoke(cli, ["migrate", "--check"])
++
++    assert result.exit_code == 1, result.output
++    assert "0 -> 1" in result.output
++    assert "dry run" in result.output
++    assert "version" not in _config(store)
++
++
++def test_migrate_dry_run_does_not_create_missing_layout(store: KBStore) -> None:
++    config = _config(store)
++    config.pop("version")
++    store.config_path.write_text(yaml.safe_dump(config, sort_keys=False))
++    (store.kb_dir / "proposed").rmdir()
++
++    result = CliRunner().invoke(cli, ["migrate", "--dry-run"])
++
++    assert result.exit_code == 0, result.output
++    assert "create proposed/" in result.output
++    assert "version" not in _config(store)
++    assert not (store.kb_dir / "proposed").exists()
++
++
++def test_migrate_applies_legacy_v0_to_v1(store: KBStore) -> None:
++    config = _config(store)
++    config.pop("version")
++    store.config_path.write_text(yaml.safe_dump(config, sort_keys=False))
++    (store.kb_dir / "proposed").rmdir()
++    (store.kb_dir / ".gitignore").write_text("custom.tmp\n")
++
++    result = CliRunner().invoke(cli, ["migrate"])
++
++    assert result.exit_code == 0, result.output
++    assert _config(store)["version"] == 1
++    assert (store.kb_dir / "proposed").is_dir()
++    assert "custom.tmp" in (store.kb_dir / ".gitignore").read_text()
++    assert "proposed/" in (store.kb_dir / ".gitignore").read_text()
++    assert (store.kb_dir / "state.db").exists()
++    events = list(audit.read_events(store.kb_dir))
++    assert events[-1].event == "kb.migrate"
++    assert events[-1].data["from_version"] == 0
++    assert events[-1].data["to_version"] == 1
++
++
++def test_migrate_rejects_newer_kb_version_cleanly(store: KBStore) -> None:
++    config = _config(store)
++    config["version"] = 999
++    store.config_path.write_text(yaml.safe_dump(config, sort_keys=False))
++
++    result = CliRunner().invoke(cli, ["migrate"])
++
++    assert result.exit_code == 1
++    assert "Traceback" not in result.output
++    assert "newer than this vouch supports" in result.output

@@ -1,0 +1,167 @@
+diff --git a/celery/app/base.py b/celery/app/base.py
+index 5c853af70e5..a4d1c4cd8c9 100644
+--- a/celery/app/base.py
++++ b/celery/app/base.py
+@@ -833,30 +833,38 @@ def send_task(self, name, args=None, kwargs=None, countdown=None,
+             options, route_name or name, args, kwargs, task_type)
+ 
+         driver_type = self.producer_pool.connections.connection.transport.driver_type
+-        is_native_delayed_delivery = detect_quorum_queues(self, driver_type)[0]
+-        if is_native_delayed_delivery and options['queue'].exchange.type != 'direct':
+-            if eta:
+-                if isinstance(eta, str):
+-                    eta = isoparse(eta)
+-                countdown = (maybe_make_aware(eta) - self.now()).total_seconds()
+-
+-            if countdown:
+-                if countdown > 0:
+-                    routing_key = calculate_routing_key(int(countdown), options["queue"].routing_key)
+-                    exchange = Exchange(
+-                        'celery_delayed_27',
+-                        type='topic',
+-                    )
+-                    del options['queue']
+-                    options['routing_key'] = routing_key
+-                    options['exchange'] = exchange
+-        elif is_native_delayed_delivery and options['queue'].exchange.type == 'direct':
+-            logger.warning(
+-                'Direct exchanges are not supported with native delayed delivery.\n'
+-                f'{options["queue"].exchange.name} is a direct exchange but should be a topic exchange or '
+-                'a fanout exchange in order for native delayed delivery to work properly.\n'
+-                'If quorum queues are used, this task may block the worker process until the ETA arrives.'
+-            )
++
++        if (eta or countdown) and detect_quorum_queues(self, driver_type)[0]:
++
++            queue = options.get("queue")
++            exchange_type = queue.exchange.type if queue else options["exchange_type"]
++            routing_key = queue.routing_key if queue else options["routing_key"]
++            exchange_name = queue.exchange.name if queue else options["exchange"]
++
++            if exchange_type != 'direct':
++                if eta:
++                    if isinstance(eta, str):
++                        eta = isoparse(eta)
++                    countdown = (maybe_make_aware(eta) - self.now()).total_seconds()
++
++                if countdown:
++                    if countdown > 0:
++                        routing_key = calculate_routing_key(int(countdown), routing_key)
++                        exchange = Exchange(
++                            'celery_delayed_27',
++                            type='topic',
++                        )
++                        options.pop("queue", None)
++                        options['routing_key'] = routing_key
++                        options['exchange'] = exchange
++
++            else:
++                logger.warning(
++                    'Direct exchanges are not supported with native delayed delivery.\n'
++                    f'{exchange_name} is a direct exchange but should be a topic exchange or '
++                    'a fanout exchange in order for native delayed delivery to work properly.\n'
++                    'If quorum queues are used, this task may block the worker process until the ETA arrives.'
++                )
+ 
+         if expires is not None:
+             if isinstance(expires, datetime):
+diff --git a/t/smoke/tests/quorum_queues/test_native_delayed_delivery.py b/t/smoke/tests/quorum_queues/test_native_delayed_delivery.py
+index f68efaa481e..dc5bbdaa8bb 100644
+--- a/t/smoke/tests/quorum_queues/test_native_delayed_delivery.py
++++ b/t/smoke/tests/quorum_queues/test_native_delayed_delivery.py
+@@ -127,6 +127,32 @@ def test_countdown(self, celery_setup: CeleryTestSetup):
+ 
+         result.get(timeout=10)
+ 
++    def test_countdown__no_queue_arg(self, celery_setup: CeleryTestSetup):
++        task_route_function = lambda *args, **kwargs: {  # noqa: E731
++            "routing_key": "celery",
++            "exchange": "celery",
++            "exchange_type": "topic",
++        }
++        celery_setup.app.conf.task_routes = (task_route_function,)
++        s = noop.s().set()
++
++        result = s.apply_async()
++
++        result.get(timeout=3)
++
++    def test_countdown__no_queue_arg__countdown(self, celery_setup: CeleryTestSetup):
++        task_route_function = lambda *args, **kwargs: {  # noqa: E731
++            "routing_key": "celery",
++            "exchange": "celery",
++            "exchange_type": "topic",
++        }
++        celery_setup.app.conf.task_routes = (task_route_function,)
++        s = noop.s().set()
++
++        result = s.apply_async(countdown=5)
++
++        result.get(timeout=10)
++
+     def test_eta(self, celery_setup: CeleryTestSetup):
+         s = noop.s().set(queue=celery_setup.worker.worker_queue)
+ 
+diff --git a/t/unit/app/test_app.py b/t/unit/app/test_app.py
+index 9092ffaaa5c..ca2dd2b4bf1 100644
+--- a/t/unit/app/test_app.py
++++ b/t/unit/app/test_app.py
+@@ -1451,6 +1451,58 @@ def test_native_delayed_delivery_countdown(self, detect_quorum_queues):
+         driver_type_stub = self.app.amqp.producer_pool.connections.connection.transport.driver_type
+         detect_quorum_queues.assert_called_once_with(self.app, driver_type_stub)
+ 
++    @patch('celery.app.base.detect_quorum_queues', return_value=[True, "testcelery"])
++    def test_native_delayed_delivery__no_queue_arg__no_eta(self, detect_quorum_queues):
++        self.app.amqp = MagicMock(name='amqp')
++        options = {
++            'routing_key': 'testcelery',
++            'exchange': 'testcelery',
++            'exchange_type': 'topic',
++        }
++        self.app.amqp.router.route.return_value = options
++
++        self.app.send_task(
++            name='foo',
++            args=(1, 2),
++        )
++        self.app.amqp.send_task_message.assert_called_once_with(
++            ANY,
++            ANY,
++            ANY,
++            **options,
++        )
++        assert not detect_quorum_queues.called
++
++    @patch('celery.app.base.detect_quorum_queues', return_value=[True, "testcelery"])
++    def test_native_delayed_delivery__no_queue_arg__with_countdown(self, detect_quorum_queues):
++        self.app.amqp = MagicMock(name='amqp')
++        options = {
++            'routing_key': 'testcelery',
++            'exchange': 'testcelery',
++            'exchange_type': 'topic',
++        }
++        self.app.amqp.router.route.return_value = options
++
++        self.app.send_task(
++            name='foo',
++            args=(1, 2),
++            countdown=30,
++        )
++        exchange = Exchange(
++            'celery_delayed_27',
++            type='topic',
++        )
++        self.app.amqp.send_task_message.assert_called_once_with(
++            ANY,
++            ANY,
++            ANY,
++            exchange=exchange,
++            routing_key='0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.1.1.1.1.0.testcelery',
++            exchange_type="topic",
++        )
++        driver_type_stub = self.app.amqp.producer_pool.connections.connection.transport.driver_type
++        detect_quorum_queues.assert_called_once_with(self.app, driver_type_stub)
++
+     @patch('celery.app.base.detect_quorum_queues', return_value=[True, "testcelery"])
+     def test_native_delayed_delivery_eta_datetime(self, detect_quorum_queues):
+         self.app.amqp = MagicMock(name='amqp')

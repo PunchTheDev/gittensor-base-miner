@@ -1,0 +1,69 @@
+diff --git a/CHANGES/12826.bugfix.rst b/CHANGES/12826.bugfix.rst
+new file mode 100644
+index 00000000000..7e095615d84
+--- /dev/null
++++ b/CHANGES/12826.bugfix.rst
+@@ -0,0 +1 @@
++Fixed the C HTTP parser not enforcing ``max_line_size`` on a request target or response reason phrase that is split across multiple reads; each fragment was checked on its own, so an accumulated line could exceed the limit without raising ``LineTooLong``. The accumulated length is now checked, matching the pure-Python parser -- by :user:`bdraco`.
+diff --git a/aiohttp/_http_parser.pyx b/aiohttp/_http_parser.pyx
+index 8bf16ab16f4..b5e5d6fc375 100644
+--- a/aiohttp/_http_parser.pyx
++++ b/aiohttp/_http_parser.pyx
+@@ -779,7 +779,7 @@ cdef int cb_on_url(cparser.llhttp_t* parser,
+                    const char *at, size_t length) except -1:
+     cdef HttpParser pyparser = <HttpParser>parser.data
+     try:
+-        if length > pyparser._max_line_size:
++        if len(pyparser._buf) + length > pyparser._max_line_size:
+             status = pyparser._buf + at[:length]
+             raise LineTooLong(status[:100] + b"...", pyparser._max_line_size)
+         extend(pyparser._buf, at, length)
+@@ -794,7 +794,7 @@ cdef int cb_on_status(cparser.llhttp_t* parser,
+                       const char *at, size_t length) except -1:
+     cdef HttpParser pyparser = <HttpParser>parser.data
+     try:
+-        if length > pyparser._max_line_size:
++        if len(pyparser._buf) + length > pyparser._max_line_size:
+             reason = pyparser._buf + at[:length]
+             raise LineTooLong(reason[:100] + b"...", pyparser._max_line_size)
+         extend(pyparser._buf, at, length)
+diff --git a/tests/test_http_parser.py b/tests/test_http_parser.py
+index 935cf65a493..4f0d2f1b1cd 100644
+--- a/tests/test_http_parser.py
++++ b/tests/test_http_parser.py
+@@ -1574,6 +1574,17 @@ def test_http_request_max_status_line_under_limit(parser: HttpRequestParser) ->
+     assert msg.url == URL("/path" + path.decode())
+ 
+ 
++def test_http_request_max_status_line_fragmented(
++    parser: HttpRequestParser,
++) -> None:
++    # Split an overlong request target across reads so that each callback
++    # fragment is under the limit but the accumulated target is not.
++    match = "400, message:\n  Got more than 8190 bytes when reading"
++    with pytest.raises(http_exceptions.LineTooLong, match=match):
++        parser.feed_data(b"GET /" + b"a" * 8000)
++        parser.feed_data(b"a" * 8000 + b" HTTP/1.1\r\nHost: a\r\n\r\n")
++
++
+ def test_http_response_parser_utf8(response) -> None:
+     text = "HTTP/1.1 200 Ok\r\nx-test:тест\r\n\r\n".encode()
+ 
+@@ -1651,6 +1662,17 @@ def test_http_response_parser_status_line_under_limit(
+     assert msg.reason == reason.decode()
+ 
+ 
++def test_http_response_parser_status_line_too_long_fragmented(
++    response: HttpResponseParser,
++) -> None:
++    # Split an overlong reason phrase across reads so that each callback
++    # fragment is under the limit but the accumulated reason is not.
++    match = "400, message:\n  Got more than 8190 bytes when reading"
++    with pytest.raises(http_exceptions.LineTooLong, match=match):
++        response.feed_data(b"HTTP/1.1 200 " + b"a" * 8000)
++        response.feed_data(b"a" * 8000 + b"\r\n\r\n")
++
++
+ def test_http_response_parser_bad_version(response) -> None:
+     with pytest.raises(http_exceptions.BadHttpMessage):
+         response.feed_data(b"HT/11 200 Ok\r\n\r\n")

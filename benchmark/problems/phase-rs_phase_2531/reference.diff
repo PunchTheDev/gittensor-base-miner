@@ -1,0 +1,523 @@
+diff --git a/crates/engine/src/game/engine.rs b/crates/engine/src/game/engine.rs
+index 6dd7a3591..abf7793e4 100644
+--- a/crates/engine/src/game/engine.rs
++++ b/crates/engine/src/game/engine.rs
+@@ -5470,11 +5470,18 @@ fn handle_crew_activation(
+         })
+         .collect();
+ 
+-    // Validate total power of all eligible creatures can meet the threshold
++    // Validate total power of all eligible creatures can meet the threshold.
++    // CR 702.122c: a creature's contribution may be modified ("as though its
++    // power were N greater" / "using its toughness rather than its power").
+     let total_power: i32 = eligible_creatures
+         .iter()
+-        .filter_map(|id| state.objects.get(id))
+-        .map(|o| o.power.unwrap_or(0).max(0))
++        .map(|&id| {
++            super::static_abilities::object_crew_power_contribution(
++                state,
++                id,
++                crate::types::statics::CrewAction::Crew,
++            )
++        })
+         .sum();
+ 
+     if total_power < crew_power as i32 {
+@@ -5578,7 +5585,12 @@ fn handle_crew_announcement(
+                 "Creature can't crew Vehicles".to_string(),
+             ));
+         }
+-        total_power += obj.power.unwrap_or(0).max(0);
++        // CR 702.122c: apply any crew power-contribution modifier.
++        total_power += super::static_abilities::object_crew_power_contribution(
++            state,
++            cid,
++            crate::types::statics::CrewAction::Crew,
++        );
+     }
+ 
+     // CR 702.122a: Total power must meet threshold
+@@ -5748,10 +5760,15 @@ fn handle_station_announcement(
+ 
+     // CR 702.184a + CR 113.7a: Snapshot the creature's power BEFORE tapping —
+     // the counter count is determined at cost-payment time and survives the
+-    // creature leaving the battlefield before resolution. CR 702.184c lets
+-    // static abilities modify the characteristic read; this implementation
+-    // reads `power`, which is the default per the rule.
+-    let snapshot_power = creature.power.unwrap_or(0).max(0);
++    // creature leaving the battlefield before resolution. CR 702.184c +
++    // CR 702.122c: static abilities may modify the contributed value ("stations
++    // permanents as though its power were N greater"); the helper applies any
++    // such modifier and otherwise reads `power`, the default per the rule.
++    let snapshot_power = super::static_abilities::object_crew_power_contribution(
++        state,
++        creature_id,
++        crate::types::statics::CrewAction::Station,
++    );
+ 
+     // CR 701.26a: Tap the creature as cost payment.
+     if let Some(obj) = state.objects.get_mut(&creature_id) {
+@@ -5844,10 +5861,16 @@ fn handle_saddle_activation(
+         })
+         .collect();
+ 
++    // CR 702.171a + CR 702.122c: a creature's saddle contribution may be modified.
+     let total_power: i32 = eligible_creatures
+         .iter()
+-        .filter_map(|id| state.objects.get(id))
+-        .map(|o| o.power.unwrap_or(0).max(0))
++        .map(|&id| {
++            super::static_abilities::object_crew_power_contribution(
++                state,
++                id,
++                crate::types::statics::CrewAction::Saddle,
++            )
++        })
+         .sum();
+ 
+     if total_power < saddle_power as i32 {
+@@ -5914,7 +5937,12 @@ fn handle_saddle_announcement(
+                 "Creature is no longer eligible for saddling".to_string(),
+             ));
+         }
+-        total_power += obj.power.unwrap_or(0).max(0);
++        // CR 702.122c: apply any saddle power-contribution modifier.
++        total_power += super::static_abilities::object_crew_power_contribution(
++            state,
++            cid,
++            crate::types::statics::CrewAction::Saddle,
++        );
+     }
+ 
+     if total_power < saddle_power as i32 {
+@@ -19746,9 +19774,9 @@ mod crew_tests {
+     use crate::types::card_type::CoreType;
+     use crate::types::identifiers::{CardId, ObjectId};
+     use crate::types::player::PlayerId;
+-    use crate::types::statics::StaticMode;
++    use crate::types::statics::{CrewAction, CrewContributionKind, StaticMode};
+     use crate::types::zones::Zone;
+-    use crate::types::StaticDefinition;
++    use crate::types::{StaticDefinition, TargetFilter};
+ 
+     fn setup_game_at_main_phase() -> GameState {
+         let mut state = new_game(42);
+@@ -20011,6 +20039,84 @@ mod crew_tests {
+         assert!(result.is_err());
+     }
+ 
++    /// CR 702.122c: a creature with "crews Vehicles as though its power were N
++    /// greater" (Reckoner Bankbuster) contributes its modified power, letting an
++    /// otherwise-insufficient creature pay the crew cost alone.
++    #[test]
++    fn crew_contribution_power_delta_lets_low_power_creature_crew() {
++        let (mut state, vehicle_id, _creature_a, creature_b) = setup_crew_scenario();
++        // creature_b is 2/2; the Vehicle needs Crew 3, so it cannot crew alone
++        // (see `test_crew_fails_insufficient_power`). Grant it the +2 modifier.
++        {
++            let obj = state.objects.get_mut(&creature_b).unwrap();
++            obj.static_definitions.push(
++                StaticDefinition::new(StaticMode::CrewContribution {
++                    kind: CrewContributionKind::PowerDelta { delta: 2 },
++                    actions: vec![CrewAction::Crew],
++                })
++                .affected(TargetFilter::SelfRef),
++            );
++        }
++
++        apply_as_current(
++            &mut state,
++            GameAction::CrewVehicle {
++                vehicle_id,
++                creature_ids: vec![],
++            },
++        )
++        .unwrap();
++        let result = apply_as_current(
++            &mut state,
++            GameAction::CrewVehicle {
++                vehicle_id,
++                creature_ids: vec![creature_b],
++            },
++        );
++        assert!(
++            result.is_ok(),
++            "power 2 + delta 2 = 4 should satisfy Crew 3: {result:?}"
++        );
++    }
++
++    /// CR 702.122c: "using its toughness rather than its power" (Giant Ox)
++    /// substitutes toughness for power, and the modifier applies only to the
++    /// named keyword actions (crew-only here, not saddle).
++    #[test]
++    fn crew_contribution_toughness_substitution_and_action_scope() {
++        let (mut state, _vehicle_id, _creature_a, creature_b) = setup_crew_scenario();
++        {
++            let obj = state.objects.get_mut(&creature_b).unwrap();
++            obj.power = Some(0);
++            obj.toughness = Some(4);
++            obj.static_definitions.push(
++                StaticDefinition::new(StaticMode::CrewContribution {
++                    kind: CrewContributionKind::ToughnessInsteadOfPower,
++                    actions: vec![CrewAction::Crew],
++                })
++                .affected(TargetFilter::SelfRef),
++            );
++        }
++        // Crew: contributes toughness (4) instead of power (0).
++        assert_eq!(
++            crate::game::static_abilities::object_crew_power_contribution(
++                &state,
++                creature_b,
++                CrewAction::Crew
++            ),
++            4
++        );
++        // Saddle: the modifier is crew-only, so the base power (0) is contributed.
++        assert_eq!(
++            crate::game::static_abilities::object_crew_power_contribution(
++                &state,
++                creature_b,
++                CrewAction::Saddle
++            ),
++            0
++        );
++    }
++
+     #[test]
+     fn test_crew_succeeds_at_instant_speed() {
+         // CR 702.122a: Crew has no "Activate only as a sorcery" restriction —
+diff --git a/crates/engine/src/game/static_abilities.rs b/crates/engine/src/game/static_abilities.rs
+index abd89b2e9..5257bb43e 100644
+--- a/crates/engine/src/game/static_abilities.rs
++++ b/crates/engine/src/game/static_abilities.rs
+@@ -9,7 +9,9 @@ use crate::types::ability::{ContinuousModification, Duration, TargetFilter, Type
+ use crate::types::game_state::GameState;
+ use crate::types::identifiers::ObjectId;
+ use crate::types::player::PlayerId;
+-use crate::types::statics::{CostPaymentProhibition, ProhibitionScope, StaticMode};
++use crate::types::statics::{
++    CostPaymentProhibition, CrewAction, CrewContributionKind, ProhibitionScope, StaticMode,
++};
+ 
+ /// Handler function type for static ability modes.
+ /// Receives the `StaticMode` variant the handler was registered under.
+@@ -1159,6 +1161,39 @@ pub fn object_has_cant_crew(state: &GameState, object_id: ObjectId) -> bool {
+     })
+ }
+ 
++/// CR 702.122c / 702.171a / 702.184a: The power a creature contributes toward a
++/// crew / saddle / station cost, after applying any active `CrewContribution`
++/// static whose action list contains `action`. "Using its toughness rather than
++/// its power" substitutes the creature's toughness for its base power; "as
++/// though its power were N greater" adds N. Multiple deltas accumulate. The
++/// result is clamped to 0, matching the plain `power.unwrap_or(0).max(0)` it
++/// replaces.
++pub fn object_crew_power_contribution(
++    state: &GameState,
++    object_id: ObjectId,
++    action: CrewAction,
++) -> i32 {
++    let Some(obj) = state.objects.get(&object_id) else {
++        return 0;
++    };
++    let mut base = obj.power.unwrap_or(0);
++    let mut delta = 0;
++    for def in super::functioning_abilities::active_static_definitions(state, obj) {
++        if let StaticMode::CrewContribution { kind, actions } = &def.mode {
++            if !actions.contains(&action) {
++                continue;
++            }
++            match kind {
++                CrewContributionKind::ToughnessInsteadOfPower => {
++                    base = obj.toughness.unwrap_or(0);
++                }
++                CrewContributionKind::PowerDelta { delta: d } => delta += *d,
++            }
++        }
++    }
++    (base + delta).max(0)
++}
++
+ /// Check if a static ability named `name` applies to a specific object
+ /// (target-scoped query). Used for object-targeted prohibitions like
+ /// `CantBeSacrificed`, `CantBeEnchanted`, `CantTransform`, etc.
+diff --git a/crates/engine/src/parser/oracle_effect/subject.rs b/crates/engine/src/parser/oracle_effect/subject.rs
+index 57477ebf5..048fe4d33 100644
+--- a/crates/engine/src/parser/oracle_effect/subject.rs
++++ b/crates/engine/src/parser/oracle_effect/subject.rs
+@@ -2643,6 +2643,11 @@ pub(crate) fn static_mode_needs_grant_propagation(mode: &StaticMode) -> bool {
+             | StaticMode::CantAttack
+             | StaticMode::CantAttackOrBlock
+             | StaticMode::CantCrew
++            // CR 702.122c: a granted crew/saddle/station power modifier (e.g. Stoic
++            // Star-Captain's "Each creature you control crews … as though its power
++            // were 2 greater") must propagate onto the affected creatures so the
++            // crew/saddle power summation observes it via active_static_definitions.
++            | StaticMode::CrewContribution { .. }
+             | StaticMode::CantBeBlocked
+             | StaticMode::CantBeBlockedBy { .. }
+             | StaticMode::CantBeBlockedExceptBy { .. }
+diff --git a/crates/engine/src/parser/oracle_static/dispatch.rs b/crates/engine/src/parser/oracle_static/dispatch.rs
+index b27448400..d16583084 100644
+--- a/crates/engine/src/parser/oracle_static/dispatch.rs
++++ b/crates/engine/src/parser/oracle_static/dispatch.rs
+@@ -1172,6 +1172,12 @@ pub(crate) fn parse_static_line_inner(
+         return Some(def);
+     }
+ 
++    // CR 702.122c / 702.171a / 702.184a: crew/saddle/station power-contribution
++    // modifier (Reckoner Bankbuster, Giant Ox, Stoic Star-Captain).
++    if let Some(def) = parse_crew_contribution_static(&text) {
++        return Some(def);
++    }
++
+     if let Some(def) = parse_source_power_block_restriction(&text) {
+         return Some(def);
+     }
+diff --git a/crates/engine/src/parser/oracle_static/evasion.rs b/crates/engine/src/parser/oracle_static/evasion.rs
+index adb7a43b9..e6494d7b9 100644
+--- a/crates/engine/src/parser/oracle_static/evasion.rs
++++ b/crates/engine/src/parser/oracle_static/evasion.rs
+@@ -1657,6 +1657,75 @@ pub(crate) fn parse_subject_combat_rule_static(text: &str) -> Option<StaticDefin
+     None
+ }
+ 
++/// CR 702.122c / 702.171a / 702.184a: nom parser for the crew/saddle/station
++/// power-contribution modifier predicate. Composes the named action-list prefix
++/// (which records the affected keyword actions) with the modifier tail.
++fn parse_crew_contribution_predicate_nom(
++    input: &str,
++) -> OracleResult<'_, (CrewContributionKind, Vec<CrewAction>)> {
++    let (input, actions) = alt((
++        value(
++            vec![CrewAction::Saddle, CrewAction::Crew],
++            tag::<_, _, OracleError<'_>>("saddles mounts and crews vehicles"),
++        ),
++        value(
++            vec![CrewAction::Crew, CrewAction::Station],
++            tag("crews vehicles and stations permanents"),
++        ),
++        value(vec![CrewAction::Crew], tag("crews vehicles")),
++    ))
++    .parse(input)?;
++    let (input, _) = space1.parse(input)?;
++    let (input, kind) = alt((
++        map(
++            (
++                tag::<_, _, OracleError<'_>>("as though its power were "),
++                nom_primitives::parse_number,
++                tag(" greater"),
++            ),
++            |(_, n, _)| CrewContributionKind::PowerDelta { delta: n as i32 },
++        ),
++        value(
++            CrewContributionKind::ToughnessInsteadOfPower,
++            tag("using its toughness rather than its power"),
++        ),
++    ))
++    .parse(input)?;
++    Ok((input, (kind, actions)))
++}
++
++/// CR 702.122c / 702.171a / 702.184a: "<subject> crews Vehicles [/ saddles
++/// Mounts / stations permanents] as though its power were N greater" or "…
++/// using its toughness rather than its power" — a continuous static that
++/// modifies the creature's contributed power when paying a crew/saddle/station
++/// cost (Reckoner Bankbuster, the "Roads" cycle, Giant Ox, Stoic Star-Captain).
++pub(crate) fn parse_crew_contribution_static(text: &str) -> Option<StaticDefinition> {
++    let lower = text.to_lowercase();
++    let (subject_lower, (kind, actions), rest) =
++        nom_primitives::scan_preceded(&lower, parse_crew_contribution_predicate_nom)?;
++    let (rest, _) = opt(tag::<_, _, OracleError<'_>>(".")).parse(rest).ok()?;
++    if !rest.trim().is_empty() {
++        return None;
++    }
++    let subject = text[..subject_lower.len()].trim();
++    let affected = parse_rule_static_subject_filter(subject)?;
++    let mode = StaticMode::CrewContribution { kind, actions };
++    // CR 613.1: a self-referential modifier lives directly on the creature's own
++    // `static_definitions` (read by `active_static_definitions`). A modifier
++    // granted to a group ("Each creature you control crews … as though its power
++    // were 2 greater", Stoic Star-Captain) must be propagated onto each affected
++    // creature via `AddStaticMode` so the same lookup observes it — mirroring how
++    // a granted `CantCrew` propagates.
++    let def = if matches!(affected, TargetFilter::SelfRef) {
++        StaticDefinition::new(mode).affected(affected)
++    } else {
++        StaticDefinition::continuous()
++            .affected(affected)
++            .modifications(vec![ContinuousModification::AddStaticMode { mode }])
++    };
++    Some(def.description(text.to_string()))
++}
++
+ /// Nom 8.0 parser for the combat-tax body.
+ ///
+ /// Grammar (case-insensitive):
+diff --git a/crates/engine/src/parser/oracle_static/mod.rs b/crates/engine/src/parser/oracle_static/mod.rs
+index d96e357b8..affdd4a8d 100644
+--- a/crates/engine/src/parser/oracle_static/mod.rs
++++ b/crates/engine/src/parser/oracle_static/mod.rs
+@@ -56,9 +56,9 @@ mod prelude {
+     pub(super) use crate::types::phase::Phase;
+     pub(super) use crate::types::statics::{
+         ActivationExemption, BlockExceptionKind, CastFreeOrigin, CastFrequency,
+-        CastingProhibitionCondition, CostModifyMode, CostPaymentProhibition, ExileCardPool,
+-        ExileCastCost, ExileCastTiming, HandSizeModification, ProhibitionScope, StaticMode,
+-        TriggerCause,
++        CastingProhibitionCondition, CostModifyMode, CostPaymentProhibition, CrewAction,
++        CrewContributionKind, ExileCardPool, ExileCastCost, ExileCastTiming, HandSizeModification,
++        ProhibitionScope, StaticMode, TriggerCause,
+     };
+     pub(super) use crate::types::zones::Zone;
+ }
+diff --git a/crates/engine/src/parser/oracle_static/tests.rs b/crates/engine/src/parser/oracle_static/tests.rs
+index a1e7b130a..ab1d1f55a 100644
+--- a/crates/engine/src/parser/oracle_static/tests.rs
++++ b/crates/engine/src/parser/oracle_static/tests.rs
+@@ -12,6 +12,7 @@ use crate::types::ability::{
+ use crate::types::counter::CounterType;
+ use crate::types::keywords::Keyword;
+ use crate::types::mana::ManaCost;
++use crate::types::statics::{CrewAction, CrewContributionKind};
+ 
+ /// CR 702.16 + CR 609.6: Serra's Emissary's compound-subject keyword grant
+ /// "You and creatures you control have protection from the chosen card
+@@ -14453,3 +14454,67 @@ fn eriette_charmed_apple_static_and_trigger_parse() {
+         other => panic!("expected GainLife, got {other:?}"),
+     }
+ }
++
++/// CR 702.122c / 702.171a / 702.184a: crew/saddle/station power-contribution
++/// modifiers (Reckoner Bankbuster, the "Roads" cycle, Giant Ox, Stoic
++/// Star-Captain) parse into a `CrewContribution` static carrying the kind and
++/// the named action list.
++#[test]
++fn crew_contribution_power_and_toughness_modifiers_parse() {
++    let defs = parse_static_line_multi("~ crews Vehicles as though its power were 2 greater.");
++    assert_eq!(
++        defs.len(),
++        1,
++        "got {:?}",
++        defs.iter().map(|d| &d.mode).collect::<Vec<_>>()
++    );
++    assert_eq!(
++        defs[0].mode,
++        StaticMode::CrewContribution {
++            kind: CrewContributionKind::PowerDelta { delta: 2 },
++            actions: vec![CrewAction::Crew],
++        }
++    );
++    assert_eq!(defs[0].affected, Some(TargetFilter::SelfRef));
++
++    let defs = parse_static_line_multi(
++        "~ saddles Mounts and crews Vehicles as though its power were 2 greater.",
++    );
++    assert_eq!(
++        defs[0].mode,
++        StaticMode::CrewContribution {
++            kind: CrewContributionKind::PowerDelta { delta: 2 },
++            actions: vec![CrewAction::Saddle, CrewAction::Crew],
++        }
++    );
++
++    let defs =
++        parse_static_line_multi("~ crews Vehicles using its toughness rather than its power.");
++    assert_eq!(
++        defs[0].mode,
++        StaticMode::CrewContribution {
++            kind: CrewContributionKind::ToughnessInsteadOfPower,
++            actions: vec![CrewAction::Crew],
++        }
++    );
++
++    // Anthem form (Stoic Star-Captain): granted to a group, so it is emitted as a
++    // Continuous static carrying AddStaticMode(CrewContribution) for propagation
++    // onto each affected creature, rather than a bare group-affected mode.
++    let defs = parse_static_line_multi(
++        "Each creature you control crews Vehicles and stations permanents as though its power were 2 greater.",
++    );
++    assert_eq!(defs[0].mode, StaticMode::Continuous);
++    assert!(
++        defs[0]
++            .modifications
++            .contains(&ContinuousModification::AddStaticMode {
++                mode: StaticMode::CrewContribution {
++                    kind: CrewContributionKind::PowerDelta { delta: 2 },
++                    actions: vec![CrewAction::Crew, CrewAction::Station],
++                }
++            }),
++        "anthem form must propagate via AddStaticMode, got {:?}",
++        defs[0].modifications
++    );
++}
+diff --git a/crates/engine/src/types/statics.rs b/crates/engine/src/types/statics.rs
+index 54708ffe8..3cc1268e2 100644
+--- a/crates/engine/src/types/statics.rs
++++ b/crates/engine/src/types/statics.rs
+@@ -563,6 +563,25 @@ pub enum CostModifyMode {
+     Minimum,
+ }
+ 
++/// CR 702.122c: How a creature's contributed power is modified when it crews a
++/// Vehicle, saddles a Mount, or stations a permanent. See [`StaticMode::CrewContribution`].
++#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
++pub enum CrewContributionKind {
++    /// "as though its power were N greater" — contribute `power + delta`.
++    PowerDelta { delta: i32 },
++    /// "using its toughness rather than its power" — contribute `toughness`.
++    ToughnessInsteadOfPower,
++}
++
++/// The keyword action being performed. `StaticMode::CrewContribution` stores the
++/// exact named actions it modifies. CR 702.122 / 702.171 / 702.184.
++#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
++pub enum CrewAction {
++    Crew,
++    Saddle,
++    Station,
++}
++
+ /// All static ability modes from Forge's static ability registry.
+ /// Matched case-sensitively against Forge mode strings.
+ #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+@@ -1102,6 +1121,15 @@ pub enum StaticMode {
+     CantBlockAlone,
+     /// CR 702.122c: This creature can't crew Vehicles.
+     CantCrew,
++    /// CR 702.122c / CR 702.171a / CR 702.184a: This creature contributes to a
++    /// crew/saddle/station cost as though its power were modified (Reckoner
++    /// Bankbuster: "as though its power were 2 greater") or using its toughness
++    /// instead of its power (Giant Ox). `actions` records which keyword actions
++    /// the modifier applies to, since a card may name only some of them.
++    CrewContribution {
++        kind: CrewContributionKind,
++        actions: Vec<CrewAction>,
++    },
+     MayLookAtTopOfLibrary,
+ 
+     // -- Tier 3: Parser-produced statics --
+@@ -1285,6 +1313,10 @@ impl Hash for StaticMode {
+             StaticMode::ActivateAsInstant { cost_category } => {
+                 cost_category.hash(state);
+             }
++            StaticMode::CrewContribution { kind, actions } => {
++                kind.hash(state);
++                actions.hash(state);
++            }
+             StaticMode::ExtraBlockers { count } => count.hash(state),
+             StaticMode::MustBlockAttacker { attacker } => attacker.hash(state),
+             StaticMode::MustAttackPlayer { player } => player.hash(state),
+@@ -1570,6 +1602,10 @@ impl fmt::Display for StaticMode {
+             StaticMode::CantAttackAlone => write!(f, "CantAttackAlone"),
+             StaticMode::CantBlockAlone => write!(f, "CantBlockAlone"),
+             StaticMode::CantCrew => write!(f, "CantCrew"),
++            // Debug format, one-way (mirrors CantBeBlockedBy). No from_str reconstruction.
++            StaticMode::CrewContribution { kind, actions } => {
++                write!(f, "CrewContribution({kind:?},{actions:?})")
++            }
+             StaticMode::MayLookAtTopOfLibrary => write!(f, "MayLookAtTopOfLibrary"),
+             // Tier 3
+             StaticMode::MayChooseNotToUntap => write!(f, "MayChooseNotToUntap"),

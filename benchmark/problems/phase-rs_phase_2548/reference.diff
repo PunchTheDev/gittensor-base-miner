@@ -1,0 +1,880 @@
+diff --git a/crates/engine/src/game/combat.rs b/crates/engine/src/game/combat.rs
+index 07a8c6a87..185833632 100644
+--- a/crates/engine/src/game/combat.rs
++++ b/crates/engine/src/game/combat.rs
+@@ -1994,6 +1994,19 @@ pub fn declare_attackers_with_bands(
+         }
+     }
+ 
++    // CR 508.1a + CR 608.2c: Snapshot declaration-time characteristics before
++    // later combat/SBA movement can make post-combat "attacked with <quality>"
++    // queries chase stale or missing live objects.
++    let attacker_declarations: Vec<_> = attacker_ids
++        .iter()
++        .filter_map(|id| {
++            state
++                .objects
++                .get(id)
++                .map(|obj| obj.snapshot_for_attack_declaration(*id))
++        })
++        .collect();
++
+     // Populate CombatState with per-creature defending players and attack targets
+     let mut attackers: Vec<AttackerInfo> = attacks
+         .iter()
+@@ -2070,6 +2083,9 @@ pub fn declare_attackers_with_bands(
+     state
+         .creatures_attacked_this_turn
+         .extend(attacker_ids.iter().copied());
++    state
++        .attacker_declarations_this_turn
++        .extend(attacker_declarations);
+     for (attacker_id, defending_player) in creature_attacked_defenders {
+         state
+             .creature_attacked_defenders_this_turn
+diff --git a/crates/engine/src/game/coverage.rs b/crates/engine/src/game/coverage.rs
+index 4c5256b85..855aebfef 100644
+--- a/crates/engine/src/game/coverage.rs
++++ b/crates/engine/src/game/coverage.rs
+@@ -1180,7 +1180,7 @@ fn fmt_quantity_ref(qty: &QuantityRef) -> String {
+         }
+         QuantityRef::TurnsTaken => "turns taken".into(),
+         QuantityRef::ChosenNumber => "chosen number".into(),
+-        QuantityRef::AttackedThisTurn => "attacked this turn".into(),
++        QuantityRef::AttackedThisTurn { .. } => "attacked this turn".into(),
+         QuantityRef::DescendedThisTurn => "descended this turn".into(),
+         QuantityRef::LoyaltyAbilitiesActivatedThisTurn { player } => {
+             format!("loyalty abilities activated this turn ({player:?})")
+@@ -5418,7 +5418,7 @@ fn quantity_ref_feature(qref: &QuantityRef) -> (&'static str, FeatureSupport) {
+         QuantityRef::DamageDealtThisTurn { .. } => ("DamageDealtThisTurn", Handled),
+         QuantityRef::TurnsTaken => ("TurnsTaken", Unhandled),
+         QuantityRef::ChosenNumber => ("ChosenNumber", Unhandled),
+-        QuantityRef::AttackedThisTurn => ("AttackedThisTurn", Handled),
++        QuantityRef::AttackedThisTurn { .. } => ("AttackedThisTurn", Handled),
+         QuantityRef::DescendedThisTurn => ("DescendedThisTurn", Unhandled),
+         QuantityRef::LoyaltyAbilitiesActivatedThisTurn { .. } => {
+             ("LoyaltyAbilitiesActivatedThisTurn", Handled)
+diff --git a/crates/engine/src/game/filter.rs b/crates/engine/src/game/filter.rs
+index dc8af9aed..02f884490 100644
+--- a/crates/engine/src/game/filter.rs
++++ b/crates/engine/src/game/filter.rs
+@@ -18,11 +18,12 @@ use crate::types::ability::{
+ use crate::types::card_type::{CoreType, Supertype};
+ use crate::types::counter::CounterMatch;
+ use crate::types::game_state::{
+-    CounterAddedRecord, DamageRecord, GameState, LKISnapshot, SpellCastRecord, ZoneChangeRecord,
++    AttackDeclarationRecord, CounterAddedRecord, DamageRecord, GameState, LKISnapshot,
++    SpellCastRecord, ZoneChangeRecord,
+ };
+ use crate::types::identifiers::{CardId, ObjectId};
+ use crate::types::keywords::Keyword;
+-use crate::types::mana::ManaColor;
++use crate::types::mana::{ManaColor, ManaCost};
+ use crate::types::player::PlayerId;
+ use crate::types::proposed_event::{EtbTapState, ProposedEvent, TokenSpec};
+ use crate::types::zones::Zone;
+@@ -861,6 +862,49 @@ pub fn matches_target_filter_on_counter_added_record(
+     )
+ }
+ 
++/// CR 508.1a + CR 608.2c: Check whether an attacker declaration snapshot
++/// matches a target filter using declaration-time characteristics.
++pub fn matches_target_filter_on_attack_declaration_record(
++    state: &GameState,
++    record: &AttackDeclarationRecord,
++    filter: &TargetFilter,
++    ctx: &FilterContext<'_>,
++) -> bool {
++    let mut obj = GameObject::new(
++        record.object_id,
++        CardId(0),
++        record.lki.owner,
++        record.lki.name.clone(),
++        Zone::Battlefield,
++    );
++    obj.controller = record.lki.controller;
++    obj.power = record.lki.power;
++    obj.toughness = record.lki.toughness;
++    obj.base_power = record.lki.base_power;
++    obj.base_toughness = record.lki.base_toughness;
++    obj.card_types.core_types = record.lki.card_types.clone();
++    obj.card_types.subtypes = record.lki.subtypes.clone();
++    obj.card_types.supertypes = record.lki.supertypes.clone();
++    obj.mana_cost = ManaCost::generic(record.lki.mana_value);
++    obj.keywords = record.lki.keywords.clone();
++    obj.color = record.lki.colors.clone();
++    obj.counters = record.lki.counters.clone();
++    obj.is_token = record.is_token;
++    obj.is_commander = record.is_commander;
++
++    filter_inner_for_object(
++        state,
++        &obj,
++        record.object_id,
++        filter,
++        ctx.source_id,
++        ctx.source_controller,
++        ctx.ability,
++        ctx.recipient_id,
++        ControllerLookup::LiveOrLki,
++    )
++}
++
+ /// CR 120.9 + CR 608.2i + CR 608.2h: Check whether a per-turn combat-damage
+ /// snapshot's *source* matches a target filter using the source's event-time
+ /// characteristics. Look-back queries ("opponents who were dealt combat damage
+@@ -2452,16 +2496,10 @@ fn matches_filter_prop(
+     source: &SourceContext<'_>,
+ ) -> bool {
+     match prop {
+-        // CR 111.1: Token identity of the live object.
+-        FilterProp::Token => state
+-            .objects
+-            .get(&object_id)
+-            .is_some_and(|obj| obj.is_token),
+-        // CR 111.1: Nontoken identity of the live object.
+-        FilterProp::NonToken => state
+-            .objects
+-            .get(&object_id)
+-            .is_some_and(|obj| !obj.is_token),
++        // CR 111.1: Token identity of the matched object or event-time snapshot.
++        FilterProp::Token => obj.is_token,
++        // CR 111.1: Nontoken identity of the matched object or event-time snapshot.
++        FilterProp::NonToken => !obj.is_token,
+         FilterProp::Attacking => state.combat.as_ref().is_some_and(|combat| {
+             combat
+                 .attackers
+diff --git a/crates/engine/src/game/game_object.rs b/crates/engine/src/game/game_object.rs
+index 49306e343..cdb2dddac 100644
+--- a/crates/engine/src/game/game_object.rs
++++ b/crates/engine/src/game/game_object.rs
+@@ -12,7 +12,7 @@ use crate::types::card::{LayoutKind, PrintedCardRef, TokenImageRef};
+ use crate::types::card_type::{CardType, CoreType};
+ use crate::types::counter::CounterType;
+ use crate::types::definitions::Definitions;
+-use crate::types::game_state::{GameState, LKISnapshot};
++use crate::types::game_state::{AttackDeclarationRecord, GameState, LKISnapshot};
+ use crate::types::identifiers::{CardId, ObjectId};
+ use crate::types::keywords::{Keyword, KeywordKind};
+ use crate::types::mana::{ColoredManaCount, ManaColor, ManaCost, ManaPip};
+@@ -1063,9 +1063,8 @@ impl GameObject {
+         }
+     }
+ 
+-    /// CR 106.3 + CR 601.2h: Capture the public source characteristics needed
+-    /// by source-qualified "mana spent to cast" effects.
+-    pub fn snapshot_for_mana_spent(&self) -> LKISnapshot {
++    /// Capture public object characteristics for event-time look-back queries.
++    pub fn snapshot_public_characteristics(&self) -> LKISnapshot {
+         LKISnapshot {
+             name: self.name.clone(),
+             power: self.power,
+@@ -1087,6 +1086,24 @@ impl GameObject {
+         }
+     }
+ 
++    /// CR 106.3 + CR 601.2h: Capture the public source characteristics needed
++    /// by source-qualified "mana spent to cast" effects.
++    pub fn snapshot_for_mana_spent(&self) -> LKISnapshot {
++        self.snapshot_public_characteristics()
++    }
++
++    /// CR 508.1a: Capture the public characteristics of a creature when it is
++    /// declared as an attacker, so later "attacked with <quality> this turn"
++    /// queries do not depend on the attacker still existing.
++    pub fn snapshot_for_attack_declaration(&self, object_id: ObjectId) -> AttackDeclarationRecord {
++        AttackDeclarationRecord {
++            object_id,
++            lki: self.snapshot_public_characteristics(),
++            is_token: self.is_token,
++            is_commander: self.is_commander,
++        }
++    }
++
+     /// CR 400.7: Reset transient battlefield state when a permanent enters the battlefield.
+     /// A permanent entering the battlefield is a new object with no memory of its previous
+     /// existence. Callers that need enter_tapped=true override `tapped` after this call.
+diff --git a/crates/engine/src/game/quantity.rs b/crates/engine/src/game/quantity.rs
+index 8abdb61ef..b9266acb4 100644
+--- a/crates/engine/src/game/quantity.rs
++++ b/crates/engine/src/game/quantity.rs
+@@ -8,10 +8,10 @@ use std::collections::{HashMap, HashSet};
+ 
+ use crate::game::arithmetic::{u32_to_i32_saturating, usize_to_i32_saturating};
+ use crate::game::filter::{
+-    matches_target_filter, matches_target_filter_on_counter_added_record,
+-    matches_target_filter_on_damage_record_source, matches_target_filter_on_zone_change_record,
+-    player_matches_target_filter_in_state, spell_record_matches_filter, type_filter_matches,
+-    FilterContext,
++    matches_target_filter, matches_target_filter_on_attack_declaration_record,
++    matches_target_filter_on_counter_added_record, matches_target_filter_on_damage_record_source,
++    matches_target_filter_on_zone_change_record, player_matches_target_filter_in_state,
++    spell_record_matches_filter, type_filter_matches, FilterContext,
+ };
+ use crate::game::speed::effective_speed;
+ use crate::types::ability::{
+@@ -303,7 +303,7 @@ fn quantity_ref_uses_object_count(qty: &QuantityRef) -> bool {
+         | QuantityRef::ZoneChangeCountThisTurn { .. }
+         | QuantityRef::DamageDealtThisTurn { .. }
+         | QuantityRef::ChosenNumber
+-        | QuantityRef::AttackedThisTurn
++        | QuantityRef::AttackedThisTurn { .. }
+         | QuantityRef::DescendedThisTurn
+         | QuantityRef::LoyaltyAbilitiesActivatedThisTurn { .. }
+         | QuantityRef::SpellsCastLastTurn
+@@ -471,7 +471,7 @@ fn entered_object_perturbs_quantity_ref(
+         | QuantityRef::ZoneChangeCountThisTurn { .. }
+         | QuantityRef::DamageDealtThisTurn { .. }
+         | QuantityRef::ChosenNumber
+-        | QuantityRef::AttackedThisTurn
++        | QuantityRef::AttackedThisTurn { .. }
+         | QuantityRef::DescendedThisTurn
+         | QuantityRef::LoyaltyAbilitiesActivatedThisTurn { .. }
+         | QuantityRef::SpellsCastLastTurn
+@@ -1979,12 +1979,34 @@ fn resolve_ref(
+             })
+             .unwrap_or(0),
+         // CR 508.1a: Count creatures the controller attacked with this turn.
+-        QuantityRef::AttackedThisTurn => state
+-            .attacking_creatures_this_turn
+-            .get(&controller)
+-            .copied()
+-            .map(u32_to_i32_saturating)
+-            .unwrap_or(0),
++        QuantityRef::AttackedThisTurn { filter } => match filter {
++            // Bare form — total attackers this turn (per-player tally).
++            None => state
++                .attacking_creatures_this_turn
++                .get(&controller)
++                .copied()
++                .map(u32_to_i32_saturating)
++                .unwrap_or(0),
++            // Filtered form — this-turn attackers controlled by the player that
++            // match `filter` (Neyali "a token", Neriv "a commander", Goblin
++            // Researcher "~", etc.), resolved against declaration-time snapshots
++            // so attackers that died or otherwise left the battlefield still count.
++            Some(filter) => usize_to_i32_saturating(
++                state
++                    .attacker_declarations_this_turn
++                    .iter()
++                    .filter(|record| {
++                        record.lki.controller == controller
++                            && matches_target_filter_on_attack_declaration_record(
++                                state,
++                                record,
++                                filter,
++                                &filter_ctx,
++                            )
++                    })
++                    .count(),
++            ),
++        },
+         // CR 603.4: Whether the controller descended this turn.
+         QuantityRef::DescendedThisTurn => {
+             if player.is_some_and(|p| p.descended_this_turn) {
+@@ -3716,12 +3738,87 @@ mod tests {
+         state.attacking_creatures_this_turn.insert(PlayerId(0), 3);
+ 
+         let qty = QuantityExpr::Ref {
+-            qty: QuantityRef::AttackedThisTurn,
++            qty: QuantityRef::AttackedThisTurn { filter: None },
+         };
+ 
+         assert_eq!(resolve_quantity(&state, &qty, PlayerId(0), ObjectId(1)), 3);
+     }
+ 
++    #[test]
++    fn resolve_filtered_attacked_this_turn_uses_declaration_snapshot_after_attacker_leaves() {
++        let mut state = GameState::new_two_player(42);
++        let token = create_object(
++            &mut state,
++            CardId(100),
++            PlayerId(0),
++            "Goblin".to_string(),
++            Zone::Battlefield,
++        );
++        {
++            let obj = state.objects.get_mut(&token).unwrap();
++            obj.is_token = true;
++            obj.card_types.core_types = vec![CoreType::Creature];
++            obj.card_types.subtypes = vec!["Goblin".to_string()];
++        }
++
++        let non_token = create_object(
++            &mut state,
++            CardId(101),
++            PlayerId(0),
++            "Knight".to_string(),
++            Zone::Battlefield,
++        );
++        state
++            .objects
++            .get_mut(&non_token)
++            .unwrap()
++            .card_types
++            .core_types = vec![CoreType::Creature];
++
++        crate::game::combat::declare_attackers(
++            &mut state,
++            &[
++                (
++                    token,
++                    crate::game::combat::AttackTarget::Player(PlayerId(1)),
++                ),
++                (
++                    non_token,
++                    crate::game::combat::AttackTarget::Player(PlayerId(1)),
++                ),
++            ],
++            &mut Vec::new(),
++        )
++        .unwrap();
++        state.objects.remove(&token);
++
++        let token_attackers = QuantityExpr::Ref {
++            qty: QuantityRef::AttackedThisTurn {
++                filter: Some(TargetFilter::Typed(
++                    TypedFilter::creature().properties(vec![FilterProp::Token]),
++                )),
++            },
++        };
++        let goblin_attackers = QuantityExpr::Ref {
++            qty: QuantityRef::AttackedThisTurn {
++                filter: Some(TargetFilter::Typed(TypedFilter {
++                    type_filters: vec![TypeFilter::Creature, TypeFilter::Subtype("Goblin".into())],
++                    controller: None,
++                    properties: vec![],
++                })),
++            },
++        };
++
++        assert_eq!(
++            resolve_quantity(&state, &token_attackers, PlayerId(0), ObjectId(1)),
++            1
++        );
++        assert_eq!(
++            resolve_quantity(&state, &goblin_attackers, PlayerId(0), ObjectId(1)),
++            1
++        );
++    }
++
+     #[test]
+     fn resolve_sacrificed_this_turn_counts_matching_controller_records() {
+         let mut state = GameState::new_two_player(42);
+diff --git a/crates/engine/src/game/turns.rs b/crates/engine/src/game/turns.rs
+index 1dea72fb4..bf2903b36 100644
+--- a/crates/engine/src/game/turns.rs
++++ b/crates/engine/src/game/turns.rs
+@@ -570,6 +570,7 @@ pub fn start_next_turn(state: &mut GameState, events: &mut Vec<GameEvent>) {
+     state.creature_attacked_defenders_this_turn.clear();
+     state.combat_phases_started_this_turn = 0;
+     state.creatures_attacked_this_turn.clear();
++    state.attacker_declarations_this_turn.clear();
+     state.creatures_blocked_this_turn.clear();
+     state.players_who_created_token_this_turn.clear();
+     state.created_tokens_this_turn.clear();
+diff --git a/crates/engine/src/parser/oracle.rs b/crates/engine/src/parser/oracle.rs
+index 93886ad40..dfc901d2b 100644
+--- a/crates/engine/src/parser/oracle.rs
++++ b/crates/engine/src/parser/oracle.rs
+@@ -4568,6 +4568,44 @@ mod tests {
+         parse_oracle_text(text, name, &keyword_names, &types, &subtypes)
+     }
+ 
++    /// CR 508.1a + CR 508.6: "During any turn you attacked with <filter>, you
++    /// may play that card" must gate the play permission on a (filtered)
++    /// AttackedThisTurn condition instead of dropping the clause to
++    /// Unimplemented. Neyali (token) and Boros Strike-Captain (count) both
++    /// produce a gated CastFromZone with no Unimplemented chunk.
++    #[test]
++    fn attacked_with_filter_gates_play_permission() {
++        let neyali = parse(
++            "Whenever one or more tokens you control attack a player, exile the top card of your library. During any turn you attacked with a token, you may play that card.",
++            "Neyali, Suns' Vanguard",
++            &[],
++            &["Creature"],
++            &[],
++        );
++        let s = format!("{:?}", neyali.triggers);
++        // allow-noncombinator: test assertions over Debug-formatted AST, not parser dispatch.
++        assert!(!s.contains("Unimplemented"), "no Unimplemented chunk: {s}");
++        assert!(
++            s.contains("AttackedThisTurn") && s.contains("Token"), // allow-noncombinator: Debug-string assertion
++            "expected a token-filtered AttackedThisTurn gate, got {s}"
++        );
++
++        let boros = parse(
++            "Battalion \u{2014} Whenever this creature and at least two other creatures attack, exile the top card of your library. During any turn you attacked with three or more creatures, you may play that card.",
++            "Boros Strike-Captain",
++            &[],
++            &["Creature"],
++            &[],
++        );
++        let s = format!("{:?}", boros.triggers);
++        // allow-noncombinator: test assertions over Debug-formatted AST, not parser dispatch.
++        assert!(!s.contains("Unimplemented"), "no Unimplemented chunk: {s}");
++        assert!(
++            s.contains("AttackedThisTurn"), // allow-noncombinator: Debug-string assertion
++            "expected an AttackedThisTurn gate, got {s}"
++        );
++    }
++
+     /// Parse with raw MTGJSON keyword names (for testing keyword extraction).
+     fn parse_with_keyword_names(
+         text: &str,
+@@ -14412,7 +14450,7 @@ mod tests {
+                 inner.as_ref(),
+                 AbilityCondition::QuantityCheck {
+                     lhs: QuantityExpr::Ref {
+-                        qty: QuantityRef::AttackedThisTurn,
++                        qty: QuantityRef::AttackedThisTurn { filter: None },
+                     },
+                     comparator: Comparator::GE,
+                     rhs: QuantityExpr::Fixed { value: 1 },
+diff --git a/crates/engine/src/parser/oracle_effect/conditions.rs b/crates/engine/src/parser/oracle_effect/conditions.rs
+index d5280c9d5..e7e7c07b3 100644
+--- a/crates/engine/src/parser/oracle_effect/conditions.rs
++++ b/crates/engine/src/parser/oracle_effect/conditions.rs
+@@ -63,6 +63,11 @@ pub(crate) fn split_leading_conditional(text: &str) -> Option<(String, String)>
+         tag::<_, _, OracleError<'_>>("then, if "),
+         tag("then if "),
+         tag("if "),
++        // CR 508.6 + CR 608.2c: temporal "during any turn <cond>, <body>" gate
++        // (Neyali, Neriv, Boros Strike-Captain) — the head names a turn-scoped
++        // condition rather than "if", but splits and gates identically.
++        tag("during any turn "),
++        tag("during a turn "),
+     ))
+     .parse(lower.as_str())
+     .is_err()
+@@ -138,6 +143,8 @@ pub(crate) fn strip_leading_general_conditional(
+                     tag::<_, _, OracleError<'_>>("then, if "),
+                     tag("then if "),
+                     tag("if "),
++                    tag("during any turn "),
++                    tag("during a turn "),
+                 )),
+             )
+             .parse(i)
+@@ -2283,6 +2290,112 @@ pub(crate) fn ability_condition_to_static_condition(
+     }
+ }
+ 
++/// CR 508.1a + CR 608.2c: "you attacked with <filter> [this turn]" — a filtered
++/// attack-history gate. Recognizes the count form ("N or more creatures",
++/// filter `None`), the token / commander / self forms, and a trailing type or
++/// subtype phrase, producing a `QuantityCheck` against the (optionally filtered)
++/// `AttackedThisTurn` count. Covers Neyali ("a token"), Neriv ("a commander"),
++/// Boros Strike-Captain ("three or more creatures"), Goblin Researcher ("~").
++fn parse_attacked_with_filter_condition(text: &str) -> Option<AbilityCondition> {
++    let trimmed = text.trim().trim_end_matches('.').trim();
++    let lower = trimmed.to_lowercase();
++    // Strip "you['ve] attacked with ".
++    let ((), after_verb) = nom_on_lower(trimmed, &lower, |i| {
++        value(
++            (),
++            preceded(
++                alt((tag::<_, _, OracleError<'_>>("you've "), tag("you "))),
++                tag("attacked with "),
++            ),
++        )
++        .parse(i)
++    })?;
++    // Strip an optional trailing " this turn".
++    let after_verb = after_verb.trim();
++    let after_lower = after_verb.to_lowercase();
++    // CR 508.6: drop a trailing " this turn" if present. The closure yields `()`
++    // (the `take_until` prefix borrows the lowercase local and must not escape);
++    // the body is sliced from the ORIGINAL text using the mapped-back remainder.
++    let body = match nom_on_lower(after_verb, &after_lower, |i| {
++        value(
++            (),
++            terminated(
++                take_until::<_, _, OracleError<'_>>(" this turn"),
++                tag(" this turn"),
++            ),
++        )
++        .parse(i)
++    }) {
++        Some(((), remainder)) => {
++            &after_verb[..after_verb.len() - remainder.len() - " this turn".len()]
++        }
++        None => after_verb,
++    }
++    .trim();
++    let body_lower = body.to_lowercase();
++
++    let make = |filter: Option<TargetFilter>, count: i32| {
++        Some(AbilityCondition::QuantityCheck {
++            lhs: QuantityExpr::Ref {
++                qty: QuantityRef::AttackedThisTurn { filter },
++            },
++            comparator: Comparator::GE,
++            rhs: QuantityExpr::Fixed { value: count },
++        })
++    };
++
++    // Count form: "<N> [or more] creature(s)" — unfiltered attacker count.
++    if let Ok((rest, n)) = nom_primitives::parse_number(body_lower.as_str()) {
++        let rest = rest.trim_start();
++        let (rest, _) = opt(tag::<_, _, OracleError<'_>>("or more "))
++            .parse(rest)
++            .ok()?;
++        if matches!(rest.trim(), "creatures" | "creature") {
++            return make(None, n as i32);
++        }
++    }
++
++    // Self-reference (Goblin Researcher "attacked with ~").
++    if matches!(body_lower.as_str(), "~" | "this creature" | "it") {
++        return make(Some(TargetFilter::SelfRef), 1);
++    }
++
++    // Drop a leading article, then recognize token / commander / a type or
++    // subtype phrase. A bare "a creature" is the unfiltered count of 1.
++    let noun = nom_on_lower(body, &body_lower, |i| {
++        value((), alt((tag::<_, _, OracleError<'_>>("a "), tag("an ")))).parse(i)
++    })
++    .map(|((), rest)| rest)
++    .unwrap_or(body)
++    .trim();
++    let noun_lower = noun.to_lowercase();
++    if noun_lower == "creature" {
++        return make(None, 1);
++    }
++    if noun_lower == "token" {
++        return make(
++            Some(TargetFilter::Typed(
++                TypedFilter::creature().properties(vec![FilterProp::Token]),
++            )),
++            1,
++        );
++    }
++    if noun_lower == "commander" {
++        return make(
++            Some(TargetFilter::Typed(
++                TypedFilter::creature().properties(vec![FilterProp::IsCommander]),
++            )),
++            1,
++        );
++    }
++    // Type / subtype phrase ("a Wolf or Werewolf", etc.).
++    let (filter, rest) = parse_type_phrase(noun);
++    if rest.trim().is_empty() && !matches!(filter, TargetFilter::Any) {
++        return make(Some(filter), 1);
++    }
++    None
++}
++
+ pub(super) fn try_nom_condition_as_ability_condition(
+     text: &str,
+     ctx: &mut ParseContext,
+@@ -2291,6 +2404,11 @@ pub(super) fn try_nom_condition_as_ability_condition(
+ 
+     let lower = text.to_lowercase();
+ 
++    // CR 508.1a: "you attacked with <filter> [this turn]" filtered attack-history gate.
++    if let Some(condition) = parse_attacked_with_filter_condition(lower.as_str()) {
++        return Some(condition);
++    }
++
+     if let Some(condition) = parse_you_controlled_parent_target_condition(lower.as_str()) {
+         return Some(condition);
+     }
+@@ -3502,6 +3620,49 @@ mod tests {
+     use crate::parser::oracle_nom::condition::parse_inner_condition;
+     use crate::types::counter::{CounterMatch, CounterType};
+ 
++    /// CR 508.1a: filtered attack-history condition — "you attacked with <X>"
++    /// resolves to a QuantityCheck over the (optionally filtered) AttackedThisTurn
++    /// count. Covers the count, commander, and self-reference forms.
++    #[test]
++    fn attacked_with_filter_condition_forms() {
++        // Count form: "three or more creatures" → unfiltered, GE 3.
++        assert_eq!(
++            parse_attacked_with_filter_condition("you attacked with three or more creatures"),
++            Some(AbilityCondition::QuantityCheck {
++                lhs: QuantityExpr::Ref {
++                    qty: QuantityRef::AttackedThisTurn { filter: None },
++                },
++                comparator: Comparator::GE,
++                rhs: QuantityExpr::Fixed { value: 3 },
++            })
++        );
++        // Commander form → IsCommander filter, GE 1.
++        let cmdr = parse_attacked_with_filter_condition("you attacked with a commander");
++        assert!(matches!(
++            cmdr,
++            Some(AbilityCondition::QuantityCheck {
++                lhs: QuantityExpr::Ref {
++                    qty: QuantityRef::AttackedThisTurn {
++                        filter: Some(TargetFilter::Typed(ref tf)),
++                    },
++                },
++                ..
++            }) if tf.properties.contains(&FilterProp::IsCommander)
++        ));
++        // Self-reference (Goblin Researcher) → SelfRef filter.
++        assert!(matches!(
++            parse_attacked_with_filter_condition("you attacked with ~"),
++            Some(AbilityCondition::QuantityCheck {
++                lhs: QuantityExpr::Ref {
++                    qty: QuantityRef::AttackedThisTurn {
++                        filter: Some(TargetFilter::SelfRef),
++                    },
++                },
++                ..
++            })
++        ));
++    }
++
+     /// CR 608.2c + CR 608.2d: When the leading `If <X>, ` has no typed
+     /// recognizer AND the body begins with `"you may "`, the structural
+     /// fallback strips the head so the inner optional choice can be peeled
+diff --git a/crates/engine/src/parser/oracle_effect/mod.rs b/crates/engine/src/parser/oracle_effect/mod.rs
+index 48c3f12bd..7b249442a 100644
+--- a/crates/engine/src/parser/oracle_effect/mod.rs
++++ b/crates/engine/src/parser/oracle_effect/mod.rs
+@@ -6934,7 +6934,11 @@ fn parse_clause_ast(text: &str, ctx: &mut ParseContext) -> ClauseAst {
+         // Strip "if " prefix before passing to the condition parser.
+         let condition_lower = condition_text.to_lowercase();
+         let cond_body = nom_on_lower(&condition_text, &condition_lower, |i| {
+-            value((), tag("if ")).parse(i)
++            value(
++                (),
++                alt((tag("if "), tag("during any turn "), tag("during a turn "))),
++            )
++            .parse(i)
+         })
+         .map(|((), rest)| rest)
+         .unwrap_or(&condition_text)
+diff --git a/crates/engine/src/parser/oracle_effect/sequence.rs b/crates/engine/src/parser/oracle_effect/sequence.rs
+index 4a8f814c5..b27b52265 100644
+--- a/crates/engine/src/parser/oracle_effect/sequence.rs
++++ b/crates/engine/src/parser/oracle_effect/sequence.rs
+@@ -917,6 +917,12 @@ fn starts_prefix_clause(current_lower: &str) -> bool {
+         tag("the next time "),
+         tag("at the beginning "),
+         tag("for as long as "),
++        // CR 508.6: "During any turn [you attacked with X], [effect]" — temporal
++        // attack-history gate (Neyali, Neriv, Boros Strike-Captain). Keep the
++        // whole clause together so the leading-conditional splitter (which gates
++        // the body on the parsed condition) sees the comma, not the chunker.
++        tag("during any turn "),
++        tag("during a turn "),
+     ))
+     .parse(current_lower)
+     .is_ok()
+diff --git a/crates/engine/src/parser/oracle_nom/condition.rs b/crates/engine/src/parser/oracle_nom/condition.rs
+index e6dc36edc..14769388e 100644
+--- a/crates/engine/src/parser/oracle_nom/condition.rs
++++ b/crates/engine/src/parser/oracle_nom/condition.rs
+@@ -2916,7 +2916,7 @@ fn parse_youve_life_history_condition(input: &str) -> OracleResult<'_, StaticCon
+ fn parse_youve_combat_history_condition(input: &str) -> OracleResult<'_, StaticCondition> {
+     // "you've attacked this turn" / "you've attacked with a creature this turn"
+     value(
+-        make_quantity_ge(QuantityRef::AttackedThisTurn, 1),
++        make_quantity_ge(QuantityRef::AttackedThisTurn { filter: None }, 1),
+         alt((
+             tag("attacked with a creature this turn"),
+             tag("attacked this turn"),
+@@ -3259,7 +3259,7 @@ fn parse_combat_history_condition(input: &str) -> OracleResult<'_, StaticConditi
+     alt((
+         // "you attacked this turn" (without "you've" prefix)
+         value(
+-            make_quantity_ge(QuantityRef::AttackedThisTurn, 1),
++            make_quantity_ge(QuantityRef::AttackedThisTurn { filter: None }, 1),
+             alt((
+                 tag("you attacked with a creature this turn"),
+                 tag("you attacked this turn"),
+@@ -4383,7 +4383,11 @@ fn parse_you_didnt_this_turn(input: &str) -> OracleResult<'_, StaticCondition> {
+             tag("lose life this turn"),
+         ),
+         value(
+-            make_quantity_comparison(QuantityRef::AttackedThisTurn, Comparator::EQ, 0),
++            make_quantity_comparison(
++                QuantityRef::AttackedThisTurn { filter: None },
++                Comparator::EQ,
++                0,
++            ),
+             tag("attack this turn"),
+         ),
+         // CR 606.1 + CR 603.4: "you didn't activate a loyalty ability of a
+@@ -9046,7 +9050,7 @@ mod tests {
+                 assert!(matches!(
+                     lhs,
+                     QuantityExpr::Ref {
+-                        qty: QuantityRef::AttackedThisTurn
++                        qty: QuantityRef::AttackedThisTurn { filter: None }
+                     }
+                 ));
+                 assert_eq!(comparator, Comparator::EQ);
+diff --git a/crates/engine/src/parser/oracle_quantity.rs b/crates/engine/src/parser/oracle_quantity.rs
+index 428df7a10..742f459a4 100644
+--- a/crates/engine/src/parser/oracle_quantity.rs
++++ b/crates/engine/src/parser/oracle_quantity.rs
+@@ -2155,7 +2155,7 @@ fn parse_for_each_clause_with_they_controller(
+     .parse(clause)
+     {
+         if rest.is_empty() {
+-            return Some(QuantityRef::AttackedThisTurn);
++            return Some(QuantityRef::AttackedThisTurn { filter: None });
+         }
+     }
+ 
+@@ -2642,13 +2642,13 @@ mod tests {
+     }
+ 
+     /// Collision guard: "creature you attacked WITH this turn" (the source-
+-    /// referential attacked-with form) must stay `QuantityRef::AttackedThisTurn`
++    /// referential attacked-with form) must stay `QuantityRef::AttackedThisTurn { filter: None }`
+     /// — the " with" subject distinguishes it from the player-population
+     /// "opponents you attacked" phrase.
+     #[test]
+     fn creature_you_attacked_with_this_turn_stays_attacked_this_turn() {
+         let qty = parse_for_each_clause("creature you attacked with this turn").unwrap();
+-        assert_eq!(qty, QuantityRef::AttackedThisTurn);
++        assert_eq!(qty, QuantityRef::AttackedThisTurn { filter: None });
+     }
+ 
+     #[test]
+@@ -2667,7 +2667,7 @@ mod tests {
+     #[test]
+     fn for_each_creature_you_attacked_with_this_turn_counts_attacking_creatures() {
+         let qty = parse_for_each_clause("creature you attacked with this turn").unwrap();
+-        assert_eq!(qty, QuantityRef::AttackedThisTurn);
++        assert_eq!(qty, QuantityRef::AttackedThisTurn { filter: None });
+     }
+ 
+     #[test]
+diff --git a/crates/engine/src/parser/oracle_static/tests.rs b/crates/engine/src/parser/oracle_static/tests.rs
+index ab1d1f55a..7c0dce699 100644
+--- a/crates/engine/src/parser/oracle_static/tests.rs
++++ b/crates/engine/src/parser/oracle_static/tests.rs
+@@ -1855,7 +1855,7 @@ fn static_this_spell_cost_less_for_each_creature_you_attacked_with_this_turn() {
+         StaticMode::ModifyCost {
+             mode: CostModifyMode::Reduce,
+             amount: ManaCost::Cost { generic: 1, .. },
+-            dynamic_count: Some(QuantityRef::AttackedThisTurn),
++            dynamic_count: Some(QuantityRef::AttackedThisTurn { filter: None }),
+             ..
+         }
+     ));
+diff --git a/crates/engine/src/parser/oracle_trigger.rs b/crates/engine/src/parser/oracle_trigger.rs
+index f981637dc..7c7ff23a5 100644
+--- a/crates/engine/src/parser/oracle_trigger.rs
++++ b/crates/engine/src/parser/oracle_trigger.rs
+@@ -18470,7 +18470,7 @@ mod tests {
+                 TriggerCondition::QuantityComparison {
+                     lhs:
+                         QuantityExpr::Ref {
+-                            qty: QuantityRef::AttackedThisTurn,
++                            qty: QuantityRef::AttackedThisTurn { filter: None },
+                         },
+                     comparator: Comparator::GE,
+                     rhs: QuantityExpr::Fixed { value: 1 },
+diff --git a/crates/engine/src/types/ability.rs b/crates/engine/src/types/ability.rs
+index 101d12059..fa00f4fe2 100644
+--- a/crates/engine/src/types/ability.rs
++++ b/crates/engine/src/types/ability.rs
+@@ -3306,10 +3306,16 @@ pub enum QuantityRef {
+     /// A number chosen as the source entered the battlefield (e.g., Talion, the Kindly Lord).
+     /// Resolved from the source object's `ChosenAttribute::Number`.
+     ChosenNumber,
+-    /// CR 508.1a: Number of creatures the controller attacked with this turn.
+-    /// Used for "if you attacked this turn" and "for each creature you attacked
+-    /// with this turn" patterns.
+-    AttackedThisTurn,
++    /// CR 508.1a: Number of creatures the controller attacked with this turn,
++    /// optionally narrowed by `filter` (e.g. "attacked with a token / a
++    /// commander / a Wolf"). `None` counts all attacking creatures (the bare
++    /// "if you attacked this turn" / "for each creature you attacked with this
++    /// turn" patterns); `Some(filter)` counts only this-turn attackers matching
++    /// `filter`, resolved against `state.creatures_attacked_this_turn`.
++    AttackedThisTurn {
++        #[serde(default, skip_serializing_if = "Option::is_none")]
++        filter: Option<TargetFilter>,
++    },
+     /// CR 603.4: Whether the controller descended this turn (permanent card entered graveyard).
+     DescendedThisTurn,
+     /// CR 606.1 + CR 603.4: Number of loyalty abilities the scoped player has
+diff --git a/crates/engine/src/types/game_state.rs b/crates/engine/src/types/game_state.rs
+index f8847e9fa..40edeb40b 100644
+--- a/crates/engine/src/types/game_state.rs
++++ b/crates/engine/src/types/game_state.rs
+@@ -420,6 +420,24 @@ pub struct ZoneChangeCombatStatus {
+     pub defending_player: Option<PlayerId>,
+ }
+ 
++/// CR 508.1a: Snapshot of a creature's public characteristics when it was
++/// declared as an attacker.
++///
++/// Later "you attacked with <quality> this turn" checks resolve after combat,
++/// after the attacker may have changed zones or ceased to exist, so they must
++/// read declaration-time characteristics instead of live battlefield state.
++#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
++pub struct AttackDeclarationRecord {
++    pub object_id: ObjectId,
++    pub lki: LKISnapshot,
++    /// CR 111.1: Token identity at declaration time.
++    #[serde(default)]
++    pub is_token: bool,
++    /// CR 903.3d: Commander identity at declaration time.
++    #[serde(default)]
++    pub is_commander: bool,
++}
++
+ /// CR 603.10a: Snapshot of a single attachment on a leaving-battlefield object
+ /// at the instant before the zone change. Controller/kind are captured so that
+ /// post-LTB resolvers can filter ("each Aura you controlled") without chasing
+@@ -5059,6 +5077,12 @@ pub struct GameState {
+     /// Persists after combat ends for post-combat filtering.
+     #[serde(default)]
+     pub creatures_attacked_this_turn: HashSet<ObjectId>,
++    /// CR 508.1a + CR 608.2c: Declaration-time attacker snapshots for filtered
++    /// post-combat queries ("attacked with a token/commander/Dinosaur this
++    /// turn"). Persists after combat ends because attackers may have left the
++    /// battlefield by resolution.
++    #[serde(default, skip_serializing_if = "Vec::is_empty")]
++    pub attacker_declarations_this_turn: Vec<AttackDeclarationRecord>,
+     /// CR 509.1a: Object IDs of creatures declared as blockers this turn.
+     /// Persists after combat ends for post-combat filtering.
+     #[serde(default)]
+@@ -5932,6 +5956,7 @@ impl GameState {
+             creature_attacked_defenders_this_turn: HashMap::new(),
+             combat_phases_started_this_turn: 0,
+             creatures_attacked_this_turn: HashSet::new(),
++            attacker_declarations_this_turn: Vec::new(),
+             creatures_blocked_this_turn: HashSet::new(),
+             players_who_created_token_this_turn: HashSet::new(),
+             created_tokens_this_turn: Vec::new(),
+@@ -6343,6 +6368,7 @@ impl PartialEq for GameState {
+                 == other.creature_attacked_defenders_this_turn
+             && self.combat_phases_started_this_turn == other.combat_phases_started_this_turn
+             && self.creatures_attacked_this_turn == other.creatures_attacked_this_turn
++            && self.attacker_declarations_this_turn == other.attacker_declarations_this_turn
+             && self.creatures_blocked_this_turn == other.creatures_blocked_this_turn
+             && self.players_who_created_token_this_turn == other.players_who_created_token_this_turn
+             && self.created_tokens_this_turn == other.created_tokens_this_turn
+diff --git a/crates/mtgish-import/src/convert/condition.rs b/crates/mtgish-import/src/convert/condition.rs
+index ae4a51e84..f8534d137 100644
+--- a/crates/mtgish-import/src/convert/condition.rs
++++ b/crates/mtgish-import/src/convert/condition.rs
+@@ -1966,7 +1966,7 @@ pub fn convert_player_predicate_ability(
+             require_you_player(player, "Players::AttackedThisTurn (ability)")?;
+             AbilityCondition::QuantityCheck {
+                 lhs: QuantityExpr::Ref {
+-                    qty: QuantityRef::AttackedThisTurn,
++                    qty: QuantityRef::AttackedThisTurn { filter: None },
+                 },
+                 comparator: Comparator::GE,
+                 rhs: QuantityExpr::Fixed { value: 1 },
+@@ -2312,7 +2312,7 @@ pub fn convert_player_predicate_static(
+             require_you_player(player, "Players::AttackedThisTurn (static)")?;
+             StaticCondition::QuantityComparison {
+                 lhs: QuantityExpr::Ref {
+-                    qty: QuantityRef::AttackedThisTurn,
++                    qty: QuantityRef::AttackedThisTurn { filter: None },
+                 },
+                 comparator: Comparator::GE,
+                 rhs: QuantityExpr::Fixed { value: 1 },

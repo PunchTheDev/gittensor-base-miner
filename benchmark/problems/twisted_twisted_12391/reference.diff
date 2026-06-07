@@ -1,0 +1,269 @@
+diff --git a/src/twisted/trial/_asynctest.py b/src/twisted/trial/_asynctest.py
+index 048e8dc0378..9c5fc39a1d6 100644
+--- a/src/twisted/trial/_asynctest.py
++++ b/src/twisted/trial/_asynctest.py
+@@ -58,6 +58,14 @@ def __init__(self, methodName="runTest"):
+         """
+         super().__init__(methodName)
+ 
++        # Acquire and store real reactor so that it does not interfere with any
++        # patching to the reactor done by the user.
++        from twisted.internet import reactor
++
++        # A unique name must be used in order not to clash with user code that
++        # sets their own attributes.
++        self._twistedPrivateScheduler = reactor
++
+     def assertFailure(self, deferred, *expectedFailures):
+         """
+         Fail if C{deferred} does not errback with one of C{expectedFailures}.
+@@ -83,14 +91,12 @@ def _eb(failure):
+ 
+     failUnlessFailure = assertFailure
+ 
+-    def _run(self, methodName, result):
+-        from twisted.internet import reactor
+-
++    def _run(self, func, funcDescription, result):
+         timeout = self.getTimeout()
+ 
+         def onTimeout(d):
+             e = defer.TimeoutError(
+-                f"{self!r} ({methodName}) still running at {timeout} secs"
++                f"{self!r} ({funcDescription}) still running at {timeout} secs"
+             )
+             f = failure.Failure(e)
+             # try to errback the deferred that the test returns (for no gorram
+@@ -102,7 +108,7 @@ def onTimeout(d):
+                 # if the deferred has been called already but the *back chain
+                 # is still unfinished, crash the reactor and report timeout
+                 # error ourself.
+-                reactor.crash()
++                self._twistedPrivateScheduler.crash()
+                 self._timedOut = True  # see self._wait
+                 todo = self.getTodo()
+                 if todo is not None and todo.expected(f):
+@@ -113,18 +119,15 @@ def onTimeout(d):
+         onTimeout = utils.suppressWarnings(
+             onTimeout, util.suppress(category=DeprecationWarning)
+         )
+-        method = getattr(self, methodName)
+-        if inspect.isgeneratorfunction(method):
++        if inspect.isgeneratorfunction(func):
+             exc = TypeError(
+-                "{!r} is a generator function and therefore will never run".format(
+-                    method
+-                )
++                "{!r} is a generator function and therefore will never run".format(func)
+             )
+             return defer.fail(exc)
+         d = defer.maybeDeferred(
+-            utils.runWithWarningsSuppressed, self._getSuppress(), method
++            utils.runWithWarningsSuppressed, self._getSuppress(), func
+         )
+-        call = reactor.callLater(timeout, onTimeout, d)
++        call = self._twistedPrivateScheduler.callLater(timeout, onTimeout, d)
+         d.addBoth(lambda x: call.active() and call.cancel() or x)
+         return d
+ 
+@@ -132,7 +135,7 @@ def __call__(self, *args, **kwargs):
+         return self.run(*args, **kwargs)
+ 
+     def deferSetUp(self, ignored, result):
+-        d = self._run("setUp", result)
++        d = self._run(self.setUp, "setUp", result)
+         d.addCallbacks(
+             self.deferTestMethod,
+             self._ebDeferSetUp,
+@@ -151,7 +154,7 @@ def _ebDeferSetUp(self, failure, result):
+         return self.deferRunCleanups(None, result)
+ 
+     def deferTestMethod(self, ignored, result):
+-        d = self._run(self._testMethodName, result)
++        d = self._run(getattr(self, self._testMethodName), self._testMethodName, result)
+         d.addCallbacks(
+             self._cbDeferTestMethod,
+             self._ebDeferTestMethod,
+@@ -186,7 +189,7 @@ def _ebDeferTestMethod(self, f, result):
+             result.addError(self, f)
+ 
+     def deferTearDown(self, ignored, result):
+-        d = self._run("tearDown", result)
++        d = self._run(self.tearDown, "tearDown", result)
+         d.addErrback(self._ebDeferTearDown, result)
+         return d
+ 
+@@ -206,7 +209,11 @@ def deferRunCleanups(self, ignored, result):
+         while len(self._cleanups) > 0:
+             func, args, kwargs = self._cleanups.pop()
+             try:
+-                yield func(*args, **kwargs)
++                yield self._run(
++                    lambda: func(*args, **kwargs),
++                    f"cleanup function {func.__name__}",
++                    result,
++                )
+             except Exception:
+                 failures.append(failure.Failure())
+ 
+@@ -310,6 +317,9 @@ def addCleanup(  # type: ignore[override]
+ 
+         If the function C{f} returns a Deferred, C{TestCase} will wait until the
+         Deferred has fired before proceeding to the next function.
++
++        If the function takes more than C{timeout} settings, then the test will
++        raise an error.
+         """
+         return super().addCleanup(f, *args, **kwargs)
+ 
+diff --git a/src/twisted/trial/newsfragments/12390.bugfix b/src/twisted/trial/newsfragments/12390.bugfix
+new file mode 100644
+index 00000000000..c27e2151890
+--- /dev/null
++++ b/src/twisted/trial/newsfragments/12390.bugfix
+@@ -0,0 +1 @@
++twisted.trial.unittest.TestCase.addCleanup will cause the test to fail if the returned deferred is not resolved before the test's timeout.
+diff --git a/src/twisted/trial/test/detests.py b/src/twisted/trial/test/detests.py
+index 4b2fbcaabe7..35c4bdc1e70 100644
+--- a/src/twisted/trial/test/detests.py
++++ b/src/twisted/trial/test/detests.py
+@@ -186,6 +186,34 @@ def test_timeoutZero(self):
+ 
+     test_timeoutZero.timeout = 0  # type: ignore[attr-defined]
+ 
++    def test_addCleanupPassDefault(self):
++        """
++        A cleanup can return a deferred.
++        The cleanup is successuful as long as the deferred is resolve sooner than the default
++        test case timeout (DEFAULT_TIMEOUT_DURATION seconds)
++        """
++
++        def cleanup():
++            d = defer.Deferred()
++            reactor.callLater(0, d.callback, "success")
++            return d
++
++        self.addCleanup(cleanup)
++
++    def test_addCleanupTimeout(self):
++        """
++        A cleanup can return a deferred.
++        When the deferred returned by addCleanup is not resolved sooner than the
++        test's timeout, the test is considered failed.
++        """
++
++        def cleanup():
++            return defer.Deferred()
++
++        self.addCleanup(cleanup)
++
++    test_addCleanupTimeout.timeout = 0.1  # type: ignore[attr-defined]
++
+     def test_expectedFailure(self):
+         return defer.Deferred()
+ 
+diff --git a/src/twisted/trial/test/test_deferred.py b/src/twisted/trial/test/test_deferred.py
+index 259f4ea879e..1e39f6515de 100644
+--- a/src/twisted/trial/test/test_deferred.py
++++ b/src/twisted/trial/test/test_deferred.py
+@@ -181,8 +181,9 @@ class TimeoutTests(TestTester):
+     def getTest(self, name: str) -> detests.TimeoutTests:
+         return detests.TimeoutTests(name)
+ 
+-    def _wasTimeout(self, error: Failure) -> None:
++    def _wasTimeout(self, error: Failure, expectedMessage: str) -> None:
+         self.assertEqual(error.check(defer.TimeoutError), defer.TimeoutError)
++        self.assertIn(expectedMessage, error.value.args[0])
+ 
+     def test_pass(self) -> None:
+         result = self.runTest("test_pass")
+@@ -200,7 +201,9 @@ def test_timeout(self) -> None:
+         self.assertEqual(result.testsRun, 1)
+         self.assertEqual(len(result.errors), 1)
+         assert isinstance(result.errors[0][1], Failure)
+-        self._wasTimeout(result.errors[0][1])
++        self._wasTimeout(
++            result.errors[0][1], "(test_timeout) still running at 0.1 secs"
++        )
+ 
+     def test_timeoutZero(self) -> None:
+         result = self.runTest("test_timeoutZero")
+@@ -208,7 +211,33 @@ def test_timeoutZero(self) -> None:
+         self.assertEqual(result.testsRun, 1)
+         self.assertEqual(len(result.errors), 1)
+         assert isinstance(result.errors[0][1], Failure)
+-        self._wasTimeout(result.errors[0][1])
++        self._wasTimeout(
++            result.errors[0][1], "(test_timeoutZero) still running at 0.0 secs"
++        )
++
++    def test_addCleanupPassDefault(self) -> None:
++        """
++        See L{twisted.trial.test.detests.TimeoutTests.test_addCleanupPassDefault}
++        """
++        result = self.runTest("test_addCleanupPassDefault")
++        self.assertTrue(result.wasSuccessful())
++        self.assertEqual(result.testsRun, 1)
++
++    def test_addCleanupTimeout(self) -> None:
++        """
++        See L{twisted.trial.test.detests.TimeoutTests.test_addCleanupTimeout}
++
++        TODO: current test does not mock reactor and thus the test spends real time
++        until the timeout fires.
++        """
++        result = self.runTest("test_addCleanupTimeout")
++        self.assertFalse(result.wasSuccessful())
++        self.assertEqual(result.testsRun, 1)
++        self.assertEqual(len(result.errors), 1)
++        assert isinstance(result.errors[0][1], Failure)
++        self._wasTimeout(
++            result.errors[0][1], "(cleanup function cleanup) still running at 0.1 secs"
++        )
+ 
+     def test_skip(self) -> None:
+         result = self.runTest("test_skip")
+@@ -222,14 +251,20 @@ def test_todo(self) -> None:
+         self.assertEqual(result.testsRun, 1)
+         self.assertEqual(len(result.expectedFailures), 1)
+         assert isinstance(result.expectedFailures[0][1], Failure)
+-        self._wasTimeout(result.expectedFailures[0][1])
++        self._wasTimeout(
++            result.expectedFailures[0][1],
++            "(test_expectedFailure) still running at 0.1 secs",
++        )
+ 
+     def test_errorPropagation(self) -> None:
+         result = self.runTest("test_errorPropagation")
+         self.assertFalse(result.wasSuccessful())
+         self.assertEqual(result.testsRun, 1)
+         assert detests.TimeoutTests.timedOut is not None
+-        self._wasTimeout(detests.TimeoutTests.timedOut)
++        self._wasTimeout(
++            detests.TimeoutTests.timedOut,
++            "(test_errorPropagation) still running at 0.1 secs",
++        )
+ 
+     def test_classTimeout(self) -> None:
+         loader = pyunit.TestLoader()
+@@ -238,7 +273,7 @@ def test_classTimeout(self) -> None:
+         suite.run(result)
+         self.assertEqual(len(result.errors), 1)
+         assert isinstance(result.errors[0][1], Failure)
+-        self._wasTimeout(result.errors[0][1])
++        self._wasTimeout(result.errors[0][1], "(testMethod) still running at 0.2 secs")
+ 
+     def test_callbackReturnsNonCallingDeferred(self) -> None:
+         # hacky timeout
+@@ -251,7 +286,10 @@ def test_callbackReturnsNonCallingDeferred(self) -> None:
+             call.cancel()
+         self.assertFalse(result.wasSuccessful())
+         assert isinstance(result.errors[0][1], Failure)
+-        self._wasTimeout(result.errors[0][1])
++        self._wasTimeout(
++            result.errors[0][1],
++            "(test_calledButNeverCallback) still running at 0.1 secs",
++        )
+ 
+ 
+ # The test loader erroneously attempts to run this:

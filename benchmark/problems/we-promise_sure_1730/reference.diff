@@ -1,0 +1,303 @@
+diff --git a/app/models/account.rb b/app/models/account.rb
+index 48a64b7966..a2c144b8e2 100644
+--- a/app/models/account.rb
++++ b/app/models/account.rb
+@@ -41,7 +41,11 @@ class Account < ApplicationRecord
+ 
+   enum :classification, { asset: "asset", liability: "liability" }, validate: { allow_nil: true }
+ 
+-  scope :visible, -> { where(status: [ "draft", "active" ]) }
++  VISIBLE_STATUSES = %w[draft active].freeze
++  HISTORICAL_STATUSES = (VISIBLE_STATUSES + %w[disabled]).freeze
++
++  scope :visible, -> { where(status: VISIBLE_STATUSES) }
++  scope :historical, -> { where(status: HISTORICAL_STATUSES) }
+   scope :assets, -> { where(classification: "asset") }
+   scope :liabilities, -> { where(classification: "liability") }
+   scope :alphabetically, -> { order(:name) }
+diff --git a/app/models/balance/chart_series_builder.rb b/app/models/balance/chart_series_builder.rb
+index c8c733579e..b6aa9f7bc8 100644
+--- a/app/models/balance/chart_series_builder.rb
++++ b/app/models/balance/chart_series_builder.rb
+@@ -1,10 +1,14 @@
+ class Balance::ChartSeriesBuilder
+-  def initialize(account_ids:, currency:, period: Period.last_30_days, interval: nil, favorable_direction: "up")
++  def initialize(account_ids:, currency:, period: Period.last_30_days, interval: nil,
++                 favorable_direction: "up", account_active_until_dates: {})
+     @account_ids = account_ids
+     @currency = currency
+     @period = period
+     @interval = interval
+     @favorable_direction = favorable_direction
++    @account_active_until_dates = account_active_until_dates.compact
++      .transform_keys(&:to_s)
++      .transform_values { |date| date.to_date.iso8601 }
+   end
+ 
+   def balance_series
+@@ -29,7 +33,7 @@ def holdings_balance_series
+   end
+ 
+   private
+-    attr_reader :account_ids, :currency, :period, :favorable_direction
++    attr_reader :account_ids, :currency, :period, :favorable_direction, :account_active_until_dates
+ 
+     def interval
+       @interval || period.interval
+@@ -74,7 +78,8 @@ def query_data
+           start_date: period.start_date,
+           end_date: period.end_date,
+           interval: interval,
+-          sign_multiplier: sign_multiplier
++          sign_multiplier: sign_multiplier,
++          account_active_until_dates_json: account_active_until_dates.to_json
+         }
+       ])
+     rescue => e
+@@ -96,6 +101,19 @@ def query
+           SELECT generate_series(DATE :start_date, DATE :end_date, :interval::interval)::date AS date
+           UNION DISTINCT
+           SELECT :end_date::date  -- Ensure end date is included
++        ),
++        account_windows AS (
++          SELECT
++            account_window.account_id::uuid AS account_id,
++            account_window.active_until_date::date AS active_until_date
++          FROM jsonb_each_text(CAST(:account_active_until_dates_json AS jsonb))
++            AS account_window(account_id, active_until_date)
++        ),
++        selected_accounts AS (
++          SELECT accounts.*, account_windows.active_until_date
++          FROM accounts
++          LEFT JOIN account_windows ON account_windows.account_id = accounts.id
++          WHERE accounts.id = ANY(array[:account_ids]::uuid[])
+         )
+         SELECT
+           d.date,
+@@ -119,7 +137,8 @@ def query
+             END * COALESCE(er.rate, 1) * :sign_multiplier::integer
+           ), 0) AS start_holdings_balance
+         FROM dates d
+-        CROSS JOIN accounts
++        LEFT JOIN selected_accounts accounts
++          ON accounts.active_until_date IS NULL OR d.date <= accounts.active_until_date
+         LEFT JOIN LATERAL (
+           SELECT b.end_balance,
+                  b.end_cash_balance,
+@@ -153,7 +172,6 @@ def query
+              LIMIT 1)
+           ) AS rate
+         ) er ON TRUE
+-        WHERE accounts.id = ANY(array[:account_ids]::uuid[])
+         GROUP BY d.date
+         ORDER BY d.date
+       SQL
+diff --git a/app/models/balance_sheet/historical_account_scope.rb b/app/models/balance_sheet/historical_account_scope.rb
+new file mode 100644
+index 0000000000..2906908e9e
+--- /dev/null
++++ b/app/models/balance_sheet/historical_account_scope.rb
+@@ -0,0 +1,18 @@
++class BalanceSheet::HistoricalAccountScope
++  def initialize(family, user: nil)
++    @family = family
++    @user = user
++  end
++
++  def account_ids
++    relation.pluck(:id)
++  end
++
++  def relation
++    scope = family.accounts.historical
++    user.present? ? scope.included_in_finances_for(user) : scope
++  end
++
++  private
++    attr_reader :family, :user
++end
+diff --git a/app/models/balance_sheet/net_worth_series_builder.rb b/app/models/balance_sheet/net_worth_series_builder.rb
+index 7c29a6ece7..58f97d321e 100644
+--- a/app/models/balance_sheet/net_worth_series_builder.rb
++++ b/app/models/balance_sheet/net_worth_series_builder.rb
+@@ -7,7 +7,8 @@ def initialize(family, user: nil)
+   def net_worth_series(period: Period.last_30_days)
+     Rails.cache.fetch(cache_key(period)) do
+       builder = Balance::ChartSeriesBuilder.new(
+-        account_ids: visible_account_ids,
++        account_ids: historical_account_ids,
++        account_active_until_dates: disabled_account_active_until_dates,
+         currency: family.currency,
+         period: period,
+         favorable_direction: "up"
+@@ -20,18 +21,31 @@ def net_worth_series(period: Period.last_30_days)
+   private
+     attr_reader :family, :user
+ 
+-    def visible_account_ids
+-      @visible_account_ids ||= begin
+-        scope = family.accounts.visible
+-        scope = scope.included_in_finances_for(user) if user
+-        scope.pluck(:id)
++    def historical_accounts
++      @historical_accounts ||= historical_account_scope.relation.to_a
++    end
++
++    def historical_account_ids
++      @historical_account_ids ||= historical_accounts.map(&:id)
++    end
++
++    def disabled_account_active_until_dates
++      @disabled_account_active_until_dates ||= historical_accounts.each_with_object({}) do |account, dates|
++        next unless account.disabled?
++
++        disabled_on = (account.disabled_at || account.updated_at).to_date
++        dates[account.id] = disabled_on - 1.day
+       end
+     end
+ 
++    def historical_account_scope
++      @historical_account_scope ||= BalanceSheet::HistoricalAccountScope.new(family, user: user)
++    end
++
+     def cache_key(period)
+       shares_version = user ? AccountShare.where(user: user).maximum(:updated_at)&.to_i : nil
+       key = [
+-        "balance_sheet_net_worth_series",
++        "balance_sheet_net_worth_series_historical",
+         user&.id,
+         shares_version,
+         period.start_date,
+diff --git a/db/migrate/20260531213000_add_disabled_at_to_accounts.rb b/db/migrate/20260531213000_add_disabled_at_to_accounts.rb
+new file mode 100644
+index 0000000000..4f33e08b8a
+--- /dev/null
++++ b/db/migrate/20260531213000_add_disabled_at_to_accounts.rb
+@@ -0,0 +1,16 @@
++class AddDisabledAtToAccounts < ActiveRecord::Migration[7.2]
++  def change
++    add_column :accounts, :disabled_at, :datetime
++
++    reversible do |dir|
++      dir.up do
++        execute <<~SQL.squish
++          UPDATE accounts
++          SET disabled_at = updated_at
++          WHERE status = 'disabled'
++            AND disabled_at IS NULL
++        SQL
++      end
++    end
++  end
++end
+diff --git a/db/schema.rb b/db/schema.rb
+index 7f67f2646f..c055adbfc2 100644
+--- a/db/schema.rb
++++ b/db/schema.rb
+@@ -10,7 +10,7 @@
+ #
+ # It's strongly recommended that you check this file into your version control system.
+ 
+-ActiveRecord::Schema[7.2].define(version: 2026_05_31_153000) do
++ActiveRecord::Schema[7.2].define(version: 2026_05_31_213000) do
+   # These are extensions that must be enabled in order to support this database
+   enable_extension "pgcrypto"
+   enable_extension "plpgsql"
+@@ -117,6 +117,7 @@
+     t.string "institution_domain"
+     t.text "notes"
+     t.uuid "owner_id"
++    t.datetime "disabled_at"
+     t.integer "account_providers_count", default: 0, null: false
+     t.index ["accountable_id", "accountable_type"], name: "index_accounts_on_accountable_id_and_accountable_type"
+     t.index ["accountable_type"], name: "index_accounts_on_accountable_type"
+diff --git a/test/models/balance/chart_series_builder_test.rb b/test/models/balance/chart_series_builder_test.rb
+index 7e180ef365..47049964f3 100644
+--- a/test/models/balance/chart_series_builder_test.rb
++++ b/test/models/balance/chart_series_builder_test.rb
+@@ -96,6 +96,24 @@ class Balance::ChartSeriesBuilderTest < ActiveSupport::TestCase
+     assert_equal expected, builder.balance_series.map { |v| v.value.amount }
+   end
+ 
++  test "account active until dates stop locf while preserving date rows" do
++    account = accounts(:depository)
++    account.balances.destroy_all
++
++    period = Period.custom(start_date: 2.days.ago.to_date, end_date: Date.current)
++    create_balance(account: account, date: period.start_date, balance: 1000)
++
++    builder = Balance::ChartSeriesBuilder.new(
++      account_ids: [ account.id ],
++      account_active_until_dates: { account.id => 1.day.ago.to_date },
++      currency: "USD",
++      period: period,
++      interval: "1 day"
++    )
++
++    assert_equal [ 1000, 1000, 0 ], builder.balance_series.map { |v| v.value.amount }
++  end
++
+   test "when favorable direction is down balance signage inverts" do
+     account = accounts(:credit_card)
+     account.balances.destroy_all
+diff --git a/test/models/balance_sheet_test.rb b/test/models/balance_sheet_test.rb
+index 558657279a..3d178b5755 100644
+--- a/test/models/balance_sheet_test.rb
++++ b/test/models/balance_sheet_test.rb
+@@ -1,6 +1,8 @@
+ require "test_helper"
+ 
+ class BalanceSheetTest < ActiveSupport::TestCase
++  include BalanceTestHelper
++
+   setup do
+     @family = families(:empty)
+   end
+@@ -46,6 +48,47 @@ class BalanceSheetTest < ActiveSupport::TestCase
+     assert_equal 1000, BalanceSheet.new(@family).liabilities.total
+   end
+ 
++  test "net worth series preserves disabled history without carrying it into current totals" do
++    period = Period.custom(start_date: Date.current - 1.day, end_date: Date.current)
++    active_account = create_account(balance: 20_000, accountable: Depository.new)
++    disabled_account = create_account(balance: 0, accountable: Depository.new)
++    pending_deletion_account = create_account(balance: 0, accountable: Depository.new)
++    disabled_account.disable!
++    pending_deletion_account.mark_for_deletion!
++
++    assert_not_nil disabled_account.reload.disabled_at
++
++    create_balance(account: active_account, date: period.start_date, balance: 10_000)
++    create_balance(account: active_account, date: period.end_date, balance: 20_000)
++    create_balance(account: disabled_account, date: period.start_date, balance: 20_000)
++    create_balance(account: disabled_account, date: period.end_date, balance: 10_000)
++    create_balance(account: pending_deletion_account, date: period.start_date, balance: 40_000)
++    create_balance(account: pending_deletion_account, date: period.end_date, balance: 80_000)
++
++    series = BalanceSheet.new(@family).net_worth_series(period: period)
++    values_by_date = series.values.index_by(&:date)
++
++    assert_equal 30_000, values_by_date.fetch(period.start_date).value.amount
++    assert_equal 20_000, BalanceSheet.new(@family).net_worth
++    assert_equal BalanceSheet.new(@family).net_worth, values_by_date.fetch(period.end_date).value.amount
++  end
++
++  test "historical account scope respects shared-account finance settings" do
++    member = users(:new_email)
++    included_account = create_account(balance: 0, accountable: Depository.new)
++    excluded_account = create_account(balance: 0, accountable: Depository.new)
++
++    included_account.disable!
++    excluded_account.disable!
++    included_account.share_with!(member, include_in_finances: true)
++    excluded_account.share_with!(member, include_in_finances: false)
++
++    account_ids = BalanceSheet::HistoricalAccountScope.new(@family, user: member).account_ids
++
++    assert_includes account_ids, included_account.id
++    assert_not_includes account_ids, excluded_account.id
++  end
++
+   test "calculates asset group totals" do
+     create_account(balance: 1000, accountable: Depository.new)
+     create_account(balance: 2000, accountable: Depository.new)

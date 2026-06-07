@@ -1,0 +1,342 @@
+diff --git a/crates/engine/src/parser/oracle_ir/snapshots/engine__parser__oracle_ir__snapshot_tests__changeling_outcast_ir.snap b/crates/engine/src/parser/oracle_ir/snapshots/engine__parser__oracle_ir__snapshot_tests__changeling_outcast_ir.snap
+index 55c0360ad5..699aed2ee3 100644
+--- a/crates/engine/src/parser/oracle_ir/snapshots/engine__parser__oracle_ir__snapshot_tests__changeling_outcast_ir.snap
++++ b/crates/engine/src/parser/oracle_ir/snapshots/engine__parser__oracle_ir__snapshot_tests__changeling_outcast_ir.snap
+@@ -24,6 +24,21 @@ expression: "&ir"
+         "forward_result": false
+       }
+     },
++    {
++      "PreLoweredStatic": {
++        "mode": "CantBlock",
++        "affected": {
++          "type": "SelfRef"
++        },
++        "modifications": [],
++        "condition": null,
++        "affected_zone": null,
++        "effect_zone": null,
++        "active_zones": [],
++        "characteristic_defining": false,
++        "description": "~ can't block and can't be blocked."
++      }
++    },
+     {
+       "PreLoweredStatic": {
+         "mode": "CantBeBlocked",
+diff --git a/crates/engine/src/parser/oracle_ir/snapshots/engine__parser__oracle_ir__snapshot_tests__changeling_outcast_lowered.snap b/crates/engine/src/parser/oracle_ir/snapshots/engine__parser__oracle_ir__snapshot_tests__changeling_outcast_lowered.snap
+index c8f419ac73..6a59714def 100644
+--- a/crates/engine/src/parser/oracle_ir/snapshots/engine__parser__oracle_ir__snapshot_tests__changeling_outcast_lowered.snap
++++ b/crates/engine/src/parser/oracle_ir/snapshots/engine__parser__oracle_ir__snapshot_tests__changeling_outcast_lowered.snap
+@@ -25,6 +25,19 @@ expression: "&lowered"
+   ],
+   "triggers": [],
+   "statics": [
++    {
++      "mode": "CantBlock",
++      "affected": {
++        "type": "SelfRef"
++      },
++      "modifications": [],
++      "condition": null,
++      "affected_zone": null,
++      "effect_zone": null,
++      "active_zones": [],
++      "characteristic_defining": false,
++      "description": "~ can't block and can't be blocked."
++    },
+     {
+       "mode": "CantBeBlocked",
+       "affected": {
+diff --git a/crates/engine/src/parser/oracle_static/evasion.rs b/crates/engine/src/parser/oracle_static/evasion.rs
+index f8e056f940..6ecc83511d 100644
+--- a/crates/engine/src/parser/oracle_static/evasion.rs
++++ b/crates/engine/src/parser/oracle_static/evasion.rs
+@@ -520,6 +520,127 @@ pub(crate) fn try_split_and_can_block_additional(text: &str) -> Option<Vec<Stati
+     Some(defs)
+ }
+ 
++/// CR 509.1b: Classify a "can't be blocked …" evasion predicate (lowercased,
++/// starting with "can't be blocked") into the corresponding `StaticMode` and
++/// optional evasion condition, composing the same building blocks the standalone
++/// branches use. Returns `None` when the tail is not a recognized evasion shape.
++fn cant_be_blocked_mode(clause: &str) -> Option<(StaticMode, Option<StaticCondition>)> {
++    type VE<'a> = OracleError<'a>;
++    let rest = nom_tag_lower(clause, clause, "can't be blocked")?;
++    let rest = rest.trim_end_matches('.').trim_end();
++    // "except by <filter>" → CantBeBlockedExceptBy (quality or min-blockers).
++    if let Some(filter) = nom_tag_lower(rest, rest, " except by ") {
++        return Some((
++            StaticMode::CantBeBlockedExceptBy {
++                kind: classify_block_exception(filter),
++            },
++            None,
++        ));
++    }
++    // "by more than N creature(s)" → per-creature blocker maximum. Must precede
++    // the generic "by <filter>" branch, which would read "more than …" as a
++    // quality filter.
++    if let Some(after) = nom_tag_lower(rest, rest, " by more than ") {
++        if let Ok((after, max)) = nom_primitives::parse_number(after) {
++            if let Ok((after, _)) =
++                alt((tag::<_, _, VE>(" creatures"), tag(" creature"))).parse(after)
++            {
++                if after.trim().is_empty() {
++                    return Some((StaticMode::CantBeBlockedByMoreThan { max }, None));
++                }
++            }
++        }
++        return None;
++    }
++    // "by <filter>" → CantBeBlockedBy.
++    if let Some(filter_text) = nom_tag_lower(rest, rest, " by ") {
++        let filter_tp = TextPair::new(filter_text, filter_text);
++        let (filter, remainder) = if let Some(filter) = parse_chosen_qualifier_subject(&filter_tp) {
++            (filter, "")
++        } else {
++            parse_type_phrase(filter_text)
++        };
++        if !matches!(filter, TargetFilter::Any) {
++            let condition = parse_compound_cant_be_blocked_condition(remainder);
++            return Some((StaticMode::CantBeBlockedBy { filter }, condition));
++        }
++        return None;
++    }
++    // Bare "can't be blocked".
++    if rest.is_empty() {
++        return Some((StaticMode::CantBeBlocked, None));
++    }
++    if let Some(condition) = parse_compound_cant_be_blocked_condition(rest) {
++        return Some((StaticMode::CantBeBlocked, Some(condition)));
++    }
++    None
++}
++
++/// CR 509.1b: Attach a trailing "as long as …" condition to the evasion
++/// restriction produced by the compound split.
++fn parse_compound_cant_be_blocked_condition(text: &str) -> Option<StaticCondition> {
++    let condition_text = text.trim().trim_end_matches('.');
++    if condition_text.is_empty() {
++        return None;
++    }
++    nom_condition::parse_condition(condition_text)
++        .ok()
++        .and_then(|(rest, condition)| rest.trim().is_empty().then_some(condition))
++}
++
++/// CR 509.1b: Decompose `"<predicate> and can't be blocked[ by/except by … | by
++/// more than N creatures]"` into the first conjunct's static(s) plus the
++/// matching `CantBeBlocked*` static, both sharing the same `affected` set.
++///
++/// Without this split the trailing evasion clause was dropped: Madcap Skills
++/// ("Enchanted creature gets +3/+0 and can't be blocked by more than one
++/// creature.") parsed to only the +3/+0 grant. Mirrors
++/// `try_split_and_can_block_additional`. Standalone "can't be blocked …" lines
++/// (no preceding "and") are handled by the existing branches, so this requires
++/// the conjunction.
++pub(crate) fn try_split_and_cant_be_blocked(text: &str) -> Option<Vec<StaticDefinition>> {
++    type VE<'a> = OracleError<'a>;
++    let lower = text.to_lowercase();
++
++    // Match both the ASCII apostrophe and the typographic U+2019 form, mirroring
++    // the standalone evasion branches (`shared.rs` / the dispatch path); the
++    // static parse path does not universally normalize apostrophes. The matched
++    // tail (`rest`) carries no apostrophe, so the clause is reconstructed with an
++    // ASCII "can't be blocked" and `cant_be_blocked_mode` needs no apostrophe arm.
++    let (before, _matched, rest) = nom_primitives::scan_preceded(&lower, |i: &str| {
++        alt((
++            tag::<_, _, VE>("and can't be blocked"),
++            tag::<_, _, VE>("and can\u{2019}t be blocked"),
++        ))
++        .parse(i)
++    })?;
++    let clause = format!("can't be blocked{rest}");
++    let (mode, evasion_condition) = cant_be_blocked_mode(&clause)?;
++
++    let cut_end = before
++        .trim_end_matches(|ch: char| ch == ',' || ch.is_whitespace())
++        .len();
++    let line_a = format!("{}.", text[..cut_end].trim_end_matches('.'));
++    let mut defs = parse_static_line_multi(&line_a);
++    if defs.is_empty() {
++        return None;
++    }
++    for def in &mut defs {
++        def.description = Some(text.to_string());
++    }
++
++    let affected = defs[0].affected.clone()?;
++    let condition = evasion_condition.or_else(|| defs[0].condition.clone());
++    let mut companion = StaticDefinition::new(mode)
++        .affected(affected)
++        .description(text.to_string());
++    if let Some(condition) = condition {
++        companion = companion.condition(condition);
++    }
++    defs.push(companion);
++    Some(defs)
++}
++
+ /// CR 105.2c / CR 205.4a: Parse property-based creature descriptors that are not subtypes.
+ /// Handles "colorless", "multicolored", "snow", and "snow and [Subtype]" patterns.
+ /// Returns a fully constructed `TargetFilter` with the appropriate properties.
+diff --git a/crates/engine/src/parser/oracle_static/mod.rs b/crates/engine/src/parser/oracle_static/mod.rs
+index 4840f3a953..57a363056c 100644
+--- a/crates/engine/src/parser/oracle_static/mod.rs
++++ b/crates/engine/src/parser/oracle_static/mod.rs
+@@ -99,7 +99,8 @@ mod support {
+         parse_compound_subject_rule_static, parse_property_descriptor,
+         parse_rule_static_separator_nom, try_parse_compound_subtypes,
+         try_parse_scoped_must_attack_block, try_split_and_can_attack_despite_defender,
+-        try_split_and_can_block_additional, try_split_and_must_attack_block,
++        try_split_and_can_block_additional, try_split_and_cant_be_blocked,
++        try_split_and_must_attack_block,
+     };
+     pub(super) use super::grammar::*;
+     pub(super) use super::keyword_grant::{
+diff --git a/crates/engine/src/parser/oracle_static/shared.rs b/crates/engine/src/parser/oracle_static/shared.rs
+index fd55eddbe4..3e3b83ae3c 100644
+--- a/crates/engine/src/parser/oracle_static/shared.rs
++++ b/crates/engine/src/parser/oracle_static/shared.rs
+@@ -606,6 +606,14 @@ pub(crate) fn parse_static_line_multi_inner(text: &str) -> Vec<StaticDefinition>
+         return defs;
+     }
+ 
++    // CR 509.1b: "<predicate> and can't be blocked[ by/except by … | by more
++    // than N creatures]" pairs a keyword/continuous grant with an evasion grant
++    // under one subject (Madcap Skills). Split so the evasion clause is not
++    // dropped.
++    if let Some(defs) = try_split_and_cant_be_blocked(&stripped) {
++        return defs;
++    }
++
+     // CR 509.1b + CR 604.1 + CR 611.3a + CR 613.1f: Attached-subject grant lines
+     // ("enchanted creature ...", "equipped creature ...") may decompose into more
+     // than one StaticDefinition (e.g. CantBeBlocked + Continuous{AddKeyword}).
+diff --git a/crates/engine/src/parser/oracle_static/tests.rs b/crates/engine/src/parser/oracle_static/tests.rs
+index 53e353f91f..8e07f9ba9f 100644
+--- a/crates/engine/src/parser/oracle_static/tests.rs
++++ b/crates/engine/src/parser/oracle_static/tests.rs
+@@ -115,6 +115,122 @@ fn extra_blockers_static_self_reference_stays_selfref() {
+     assert_eq!(def.affected, Some(TargetFilter::SelfRef));
+ }
+ 
++/// CR 509.1b: Madcap Skills — "Enchanted creature gets +3/+0 and can't be
++/// blocked by more than one creature." must decompose into BOTH the P/T grant
++/// AND a `CantBeBlockedByMoreThan { max: 1 }` static affecting the enchanted
++/// creature. Previously the evasion clause was dropped entirely.
++#[test]
++fn cant_be_blocked_static_splits_from_keyword_grant() {
++    let defs = parse_static_line_multi(
++        "Enchanted creature gets +3/+0 and can't be blocked by more than one creature.",
++    );
++    assert!(
++        defs.len() >= 2,
++        "expected P/T + evasion defs, got {:?}",
++        defs.iter().map(|d| &d.mode).collect::<Vec<_>>()
++    );
++    assert!(
++        defs.iter()
++            .any(|d| d.mode == StaticMode::CantBeBlockedByMoreThan { max: 1 }
++                && matches!(
++                    d.affected,
++                    Some(TargetFilter::Typed(TypedFilter { ref properties, .. }))
++                        if properties.contains(&FilterProp::EnchantedBy)
++                )),
++        "expected enchanted-creature CantBeBlockedByMoreThan {{ max: 1 }}, got {:?}",
++        defs.iter().map(|d| &d.mode).collect::<Vec<_>>()
++    );
++    // The P/T grant is preserved (and remains a continuous modification).
++    assert!(
++        defs.iter()
++            .any(|d| matches!(d.mode, StaticMode::Continuous)),
++        "P/T grant must be preserved"
++    );
++}
++
++/// CR 509.1b: The compound split must also match the typographic U+2019
++/// apostrophe ("can'​t"), matching the standalone evasion branches — MTGJSON
++/// Oracle text uses U+2019, and the static path doesn't normalize apostrophes.
++#[test]
++fn cant_be_blocked_static_splits_with_typographic_apostrophe() {
++    let defs = parse_static_line_multi(
++        "Enchanted creature gets +3/+0 and can\u{2019}t be blocked by more than one creature.",
++    );
++    assert!(
++        defs.iter()
++            .any(|d| d.mode == StaticMode::CantBeBlockedByMoreThan { max: 1 }),
++        "U+2019 form must still split off the evasion grant, got {:?}",
++        defs.iter().map(|d| &d.mode).collect::<Vec<_>>()
++    );
++}
++
++/// CR 509.1b: The bare compound form "… and can't be blocked" yields a plain
++/// `CantBeBlocked` static alongside the keyword grant.
++#[test]
++fn cant_be_blocked_static_splits_bare_form() {
++    let defs = parse_static_line_multi("Enchanted creature gets +2/+2 and can't be blocked.");
++    assert!(
++        defs.iter().any(|d| d.mode == StaticMode::CantBeBlocked),
++        "expected CantBeBlocked, got {:?}",
++        defs.iter().map(|d| &d.mode).collect::<Vec<_>>()
++    );
++}
++
++/// CR 105.4 + CR 509.1b + CR 608.2c: The split path must use the chosen-color
++/// qualifier parser before the generic type parser, matching the standalone
++/// "can't be blocked by <filter>" path.
++#[test]
++fn cant_be_blocked_static_split_keeps_chosen_color_filter() {
++    let defs = parse_static_line_multi(
++        "Enchanted creature gets +2/+2 and can't be blocked by creatures of that color.",
++    );
++    let filter = defs
++        .iter()
++        .find_map(|d| match &d.mode {
++            StaticMode::CantBeBlockedBy { filter } => Some(filter),
++            _ => None,
++        })
++        .expect("expected split CantBeBlockedBy static");
++
++    assert!(
++        matches!(
++            filter,
++            TargetFilter::Typed(tf)
++                if tf.properties
++                    .iter()
++                    .any(|prop| matches!(prop, FilterProp::IsChosenColor))
++        ),
++        "expected IsChosenColor blocker filter, got {filter:?}"
++    );
++}
++
++/// CR 509.1b: A trailing evasion condition belongs on the split
++/// `CantBeBlocked` companion, not only on standalone attached-subject forms.
++#[test]
++fn cant_be_blocked_static_split_keeps_trailing_condition() {
++    let defs = parse_static_line_multi(
++        "Enchanted creature gets +2/+2 and can't be blocked as long as you control a Gate.",
++    );
++    let condition = defs
++        .iter()
++        .find_map(|d| {
++            (d.mode == StaticMode::CantBeBlocked)
++                .then_some(d.condition.as_ref())
++                .flatten()
++        })
++        .expect("expected split CantBeBlocked static with condition");
++
++    assert!(
++        matches!(
++            condition,
++            StaticCondition::IsPresent {
++                filter: Some(TargetFilter::Typed(tf))
++            } if tf.get_subtype() == Some("Gate")
++        ),
++        "expected Gate condition, got {condition:?}"
++    );
++}
++
+ /// CR 118.9: Rooftop Storm grants {0} as an alternative MANA cost for Zombie
+ /// creature spells the controller casts.
+ #[test]

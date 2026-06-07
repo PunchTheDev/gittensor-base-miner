@@ -1,0 +1,490 @@
+diff --git a/src/services/eligibility-plan.ts b/src/services/eligibility-plan.ts
+new file mode 100644
+index 00000000..3b55939b
+--- /dev/null
++++ b/src/services/eligibility-plan.ts
+@@ -0,0 +1,141 @@
++import { sanitizePublicComment } from "../github/commands";
++import type { LinkedIssueMultiplierStatus, ScorePreviewResult, ScoreScenarioPreview } from "../scoring/preview";
++
++/**
++ * Structured eligibility plan derived from a {@link ScorePreviewResult}. Explains whether
++ * a candidate branch or PR is eligible to pursue based on linked issue state and branch
++ * signals, with public-safe summaries for contributor-facing surfaces and exact detail for
++ * authenticated planning surfaces.
++ *
++ * Advisory only — never files issues, opens PRs, comments, labels, closes, or merges.
++ * Local source content is not included; fail-closed on all source-upload paths.
++ */
++export type EligibilityPlan = {
++  /**
++   * Whether the branch/PR is fully eligible right now (branch eligible AND linked issue
++   * validated when standard mode is requested).
++   */
++  eligible: boolean;
++  /** Linked-issue multiplier status from the score preview. */
++  linkedIssueStatus: LinkedIssueMultiplierStatus | "not_required";
++  /** Branch eligibility status. */
++  branchEligibilityStatus: "eligible" | "ineligible" | "unknown" | "not_required";
++  /**
++   * Public-safe blocker descriptions (generic language, no scores or private counts).
++   * Drawn from the subset of `ScorePreviewResult.blockedBy` codes that relate to linked
++   * issues and branch eligibility.
++   */
++  blockers: string[];
++  /**
++   * Concrete steps to reach eligibility. Safe for contributor-facing display.
++   * Derived from recommendation actions and eligibility-related blocker codes.
++   */
++  cleanupPaths: string[];
++  /**
++   * Public-safe projection of what changes when the linked issue is validated, or null
++   * if the linkedIssueFixed scenario is not present or not relevant.
++   */
++  linkedIssueProjection: string | null;
++  /** One-sentence public-safe summary. */
++  publicSummary: string;
++};
++
++const ELIGIBILITY_BLOCKER_PUBLIC_TEXT: Record<string, string> = {
++  branch_ineligible: "Branch is not eligible for linked-issue assumptions; switch to an eligible branch.",
++  branch_eligibility_missing: "Branch eligibility metadata is missing; refresh branch/base metadata.",
++  linked_issue_invalid: "Linked issue context is invalid; verify the issue is open and not already solved by another PR.",
++  linked_issue_unvalidated: "Linked issue context is not yet validated; provide solved-by-PR evidence or wait for mirror sync.",
++};
++
++const ELIGIBILITY_BLOCKER_CODES = new Set(Object.keys(ELIGIBILITY_BLOCKER_PUBLIC_TEXT));
++
++const ELIGIBILITY_STATUS_SUMMARY: Record<string, string> = {
++  eligible: "This branch is eligible to pursue based on current linked issue and branch signals.",
++  ineligible_branch: "This branch is not eligible; resolve the branch blocker before opening a PR.",
++  invalid_link: "The linked issue is invalid or no longer open; verify issue state before proceeding.",
++  unvalidated_link: "Linked issue context is present but not yet validated; validation is needed before the multiplier applies.",
++  not_required: "Branch and linked issue eligibility are not required for this contribution type.",
++};
++
++function eligibilityStatusKey(plan: Pick<EligibilityPlan, "eligible" | "linkedIssueStatus" | "branchEligibilityStatus">): string {
++  if (plan.branchEligibilityStatus === "ineligible") return "ineligible_branch";
++  if (plan.linkedIssueStatus === "invalid") return "invalid_link";
++  if (plan.linkedIssueStatus === "raw" || plan.linkedIssueStatus === "plausible" || plan.linkedIssueStatus === "unavailable") return "unvalidated_link";
++  if (plan.linkedIssueStatus === "not_required" && plan.branchEligibilityStatus === "not_required") return "not_required";
++  if (plan.eligible) return "eligible";
++  // Reached when a linked issue is requested but eligibility is not yet confirmed
++  // (e.g. validated link with unknown/missing branch metadata).
++  return "unvalidated_link";
++}
++
++function linkedIssueProjectionFrom(scenarios: ScoreScenarioPreview[]): string | null {
++  const fixed = scenarios.find((s) => s.name === "linkedIssueFixed");
++  /* v8 ignore next -- buildScenarioPreviews always emits a linkedIssueFixed scenario. */
++  if (!fixed) return null;
++  const current = scenarios.find((s) => s.name === "current");
++  /* v8 ignore next -- buildScenarioPreviews always emits a current scenario. */
++  if (!current) return null;
++  if (fixed.linkedIssueMultiplier.eligible && !current.linkedIssueMultiplier.eligible) {
++    return "Validating the linked issue would enable the standard linked-issue contribution consideration.";
++  }
++  return null;
++}
++
++function eligibilityCleanupPaths(result: ScorePreviewResult): string[] {
++  const paths: string[] = [];
++  for (const blocker of result.blockedBy) {
++    if (!ELIGIBILITY_BLOCKER_CODES.has(blocker.code)) continue;
++    if (blocker.code === "branch_ineligible") {
++      paths.push("Switch to an eligible branch or remove linked-issue assumptions before proceeding.");
++    } else if (blocker.code === "branch_eligibility_missing") {
++      paths.push("Refresh branch/base eligibility metadata (e.g. run a local preflight) before relying on linked-issue projections.");
++    } else if (blocker.code === "linked_issue_invalid") {
++      paths.push("Check that the linked issue is still open and not already closed by another merged PR.");
++    } else if (blocker.code === "linked_issue_unvalidated") {
++      paths.push("Provide solved-by-PR evidence in the linked issue context, or wait for the official mirror to sync.");
++    }
++  }
++  return [...new Set(paths)].map((path) => sanitizePublicComment(path));
++}
++
++/**
++ * Derive a structured {@link EligibilityPlan} from a {@link ScorePreviewResult}.
++ *
++ * The function is pure and read-only. It does not upload source content, access the
++ * network, or modify any state. All public-facing fields are scrubbed through
++ * `sanitizePublicComment` so reward, score, wallet, hotkey, and trust language
++ * cannot reach contributor-facing surfaces.
++ */
++export function deriveEligibilityPlan(result: ScorePreviewResult): EligibilityPlan {
++  const linkedIssueStatus = result.linkedIssueMultiplier.status;
++  const branchEligibilityStatus = result.branchEligibility.status;
++  // Only affirm eligibility when the branch is positively confirmed (eligible or not required);
++  // "unknown" / missing metadata is treated as not-yet-eligible so the plan never overpromises.
++  const branchConfirmed = branchEligibilityStatus === "eligible" || branchEligibilityStatus === "not_required";
++  const eligible = result.linkedIssueMultiplier.eligible && branchConfirmed;
++
++  const blockers = result.blockedBy
++    .filter((b) => ELIGIBILITY_BLOCKER_CODES.has(b.code))
++    .map((b) => {
++      /* v8 ignore next -- the filter guarantees b.code is a known eligibility blocker key with public text. */
++      return ELIGIBILITY_BLOCKER_PUBLIC_TEXT[b.code] ?? sanitizePublicComment(b.detail);
++    });
++
++  const cleanupPaths = eligibilityCleanupPaths(result);
++  // A linked-issue projection only makes sense when a linked issue is actually requested.
++  const linkedIssueProjection = linkedIssueStatus === "not_required" ? null : linkedIssueProjectionFrom(result.scenarioPreviews);
++
++  const statusKey = eligibilityStatusKey({ eligible, linkedIssueStatus, branchEligibilityStatus });
++  /* v8 ignore next -- eligibilityStatusKey always returns one of the mapped ELIGIBILITY_STATUS_SUMMARY keys. */
++  const publicSummary = ELIGIBILITY_STATUS_SUMMARY[statusKey] ?? "Eligibility status could not be determined from available signals.";
++
++  return {
++    eligible,
++    linkedIssueStatus,
++    branchEligibilityStatus,
++    blockers,
++    cleanupPaths,
++    linkedIssueProjection,
++    publicSummary,
++  };
++}
+diff --git a/test/unit/eligibility-scenarios.test.ts b/test/unit/eligibility-scenarios.test.ts
+new file mode 100644
+index 00000000..777c29de
+--- /dev/null
++++ b/test/unit/eligibility-scenarios.test.ts
+@@ -0,0 +1,337 @@
++import { describe, expect, it } from "vitest";
++import { sanitizePublicComment } from "../../src/github/commands";
++import { buildScorePreview, type ScorePreviewInput } from "../../src/scoring/preview";
++import { deriveEligibilityPlan } from "../../src/services/eligibility-plan";
++import type { ScoringModelSnapshotRecord } from "../../src/types";
++
++const FORBIDDEN_PUBLIC_LANGUAGE =
++  /wallet|hotkey|coldkey|mnemonic|seed phrase|payout|reward estimate|raw trust|trust score|scoreability|private reviewability|estimated score|score estimate|farming/i;
++
++const snapshot: ScoringModelSnapshotRecord = {
++  id: "eligibility-test-model",
++  sourceKind: "test",
++  sourceUrl: "fixture://constants.py",
++  fetchedAt: "2026-06-03T00:00:00.000Z",
++  activeModel: "current_density_model",
++  constants: {
++    OSS_EMISSION_SHARE: 0.9,
++    MERGED_PR_BASE_SCORE: 25,
++    MIN_TOKEN_SCORE_FOR_BASE_SCORE: 5,
++    MAX_CODE_DENSITY_MULTIPLIER: 1.15,
++    MAX_CONTRIBUTION_BONUS: 25,
++    CONTRIBUTION_SCORE_FOR_FULL_BONUS: 1500,
++    STANDARD_ISSUE_MULTIPLIER: 1.33,
++    MAINTAINER_ISSUE_MULTIPLIER: 1.66,
++    MIN_CREDIBILITY: 0.8,
++    REVIEW_PENALTY_RATE: 0.15,
++    EXCESSIVE_PR_PENALTY_BASE_THRESHOLD: 2,
++    OPEN_PR_THRESHOLD_TOKEN_SCORE: 300,
++    MAX_OPEN_PR_THRESHOLD: 30,
++    OPEN_PR_COLLATERAL_PERCENT: 0.2,
++    SRC_TOK_SATURATION_SCALE: 58,
++  },
++  programmingLanguages: {},
++  registrySnapshotId: "registry-fixture",
++  warnings: [],
++  payload: {},
++};
++
++const repo = {
++  fullName: "octo/demo",
++  owner: "octo",
++  name: "demo",
++  isInstalled: true,
++  isRegistered: true,
++  isPrivate: false,
++  registryConfig: { repo: "octo/demo", emissionShare: 0.02, issueDiscoveryShare: 0, labelMultipliers: {}, maintainerCut: 0, raw: {} },
++};
++
++function preview(input: Partial<ScorePreviewInput> = {}) {
++  return buildScorePreview({
++    repo,
++    snapshot,
++    input: {
++      repoFullName: "octo/demo",
++      sourceTokenScore: 60,
++      totalTokenScore: 80,
++      sourceLines: 50,
++      openPrCount: 1,
++      credibility: 1,
++      metadataOnly: true,
++      ...input,
++    },
++  });
++}
++
++// ── Fixture: linked (validated) ────────────────────────────────────────────
++
++describe("eligible branch with validated linked issue", () => {
++  const result = preview({
++    linkedIssueMode: "standard",
++    linkedIssueContext: {
++      status: "validated",
++      source: "official_mirror",
++      issueNumbers: [42],
++      solvedByPullRequests: [],
++    },
++    branchEligibility: { status: "eligible", source: "github_metadata" },
++  });
++
++  it("derives eligible:true when linked issue is validated and branch is eligible", () => {
++    const plan = deriveEligibilityPlan(result);
++    expect(plan.eligible).toBe(true);
++    expect(plan.linkedIssueStatus).toBe("validated");
++    expect(plan.branchEligibilityStatus).toBe("eligible");
++    expect(plan.blockers).toHaveLength(0);
++    expect(plan.publicSummary).toMatch(/eligible/i);
++  });
++
++  it("emits no eligibility blockers in the underlying score preview result", () => {
++    const codes = result.blockedBy.map((b) => b.code);
++    expect(codes).not.toContain("linked_issue_invalid");
++    expect(codes).not.toContain("linked_issue_unvalidated");
++    expect(codes).not.toContain("branch_ineligible");
++    expect(codes).not.toContain("branch_eligibility_missing");
++  });
++
++  it("plan is free of forbidden public language", () => {
++    const plan = deriveEligibilityPlan(result);
++    expect(JSON.stringify(plan)).not.toMatch(FORBIDDEN_PUBLIC_LANGUAGE);
++  });
++});
++
++// ── Fixture: unlinked (mode:none) ─────────────────────────────────────────
++
++describe("unlinked — no linked issue configured", () => {
++  const result = preview({ linkedIssueMode: "none" });
++
++  it("derives eligible:false and not_required status when mode is none", () => {
++    const plan = deriveEligibilityPlan(result);
++    expect(plan.eligible).toBe(false);
++    expect(plan.linkedIssueStatus).toBe("not_required");
++    expect(plan.branchEligibilityStatus).toBe("not_required");
++    expect(plan.blockers).toHaveLength(0);
++    expect(plan.cleanupPaths).toHaveLength(0);
++    expect(plan.linkedIssueProjection).toBeNull();
++  });
++
++  it("public summary reflects unconstrained eligibility without exposing private context", () => {
++    const plan = deriveEligibilityPlan(result);
++    expect(plan.publicSummary).toMatch(/not required|not gated|eligibility/i);
++    expect(plan.publicSummary).not.toMatch(FORBIDDEN_PUBLIC_LANGUAGE);
++  });
++});
++
++// ── Fixture: closed-link (invalid) ────────────────────────────────────────
++
++describe("closed-link — linked issue is invalid (closed by another PR)", () => {
++  const result = preview({
++    linkedIssueMode: "standard",
++    linkedIssueContext: {
++      status: "invalid",
++      source: "official_mirror",
++      issueNumbers: [99],
++      reason: "Issue #99 is already solved by PR #101 from another contributor.",
++    },
++    branchEligibility: { status: "eligible", source: "github_metadata" },
++  });
++
++  it("derives eligible:false and exposes linked_issue_invalid blocker publicly", () => {
++    const plan = deriveEligibilityPlan(result);
++    expect(plan.eligible).toBe(false);
++    expect(plan.linkedIssueStatus).toBe("invalid");
++    expect(plan.blockers).toEqual(
++      expect.arrayContaining([expect.stringMatching(/invalid|already solved|no longer open/i)]),
++    );
++  });
++
++  it("cleanup path advises checking issue state without exposing private context", () => {
++    const plan = deriveEligibilityPlan(result);
++    expect(plan.cleanupPaths.length).toBeGreaterThan(0);
++    expect(plan.cleanupPaths.join(" ")).not.toMatch(FORBIDDEN_PUBLIC_LANGUAGE);
++    expect(plan.cleanupPaths.join(" ")).toMatch(/check|verify|open|closed/i);
++  });
++
++  it("underlying score preview emits linked_issue_invalid blocker", () => {
++    const codes = result.blockedBy.map((b) => b.code);
++    expect(codes).toContain("linked_issue_invalid");
++  });
++
++  it("linkedIssueFixed scenario projects what happens if the link is corrected", () => {
++    const fixed = result.scenarioPreviews.find((s) => s.name === "linkedIssueFixed");
++    expect(fixed).toBeDefined();
++    expect(fixed?.linkedIssueMultiplier.eligible).toBe(true);
++  });
++
++  it("plan is free of forbidden public language", () => {
++    const plan = deriveEligibilityPlan(result);
++    expect(JSON.stringify(plan)).not.toMatch(FORBIDDEN_PUBLIC_LANGUAGE);
++  });
++});
++
++// ── Fixture: raw/reopened link ─────────────────────────────────────────────
++
++describe("reopened-link — linked issue is raw (unvalidated, needs evidence)", () => {
++  const result = preview({
++    linkedIssueMode: "standard",
++    linkedIssueContext: {
++      status: "raw",
++      source: "user_supplied",
++      issueNumbers: [77],
++    },
++    branchEligibility: { status: "eligible", source: "github_metadata" },
++  });
++
++  it("derives eligible:false and unvalidated status", () => {
++    const plan = deriveEligibilityPlan(result);
++    expect(plan.eligible).toBe(false);
++    expect(plan.linkedIssueStatus).toBe("raw");
++    expect(plan.blockers).toEqual(
++      expect.arrayContaining([expect.stringMatching(/not yet validated|solved-by-PR|validation/i)]),
++    );
++  });
++
++  it("plan includes a projection when linkedIssueFixed scenario improves eligibility", () => {
++    const plan = deriveEligibilityPlan(result);
++    expect(plan.linkedIssueProjection).toBeTruthy();
++    expect(plan.linkedIssueProjection).not.toMatch(FORBIDDEN_PUBLIC_LANGUAGE);
++  });
++
++  it("underlying score preview emits linked_issue_unvalidated blocker", () => {
++    const codes = result.blockedBy.map((b) => b.code);
++    expect(codes).toContain("linked_issue_unvalidated");
++  });
++});
++
++// ── Fixture: plausible and unavailable link statuses ───────────────────────
++
++describe("plausible link — mirror sees the issue but solved-by-PR is not confirmed", () => {
++  const result = preview({
++    linkedIssueMode: "standard",
++    linkedIssueContext: { status: "plausible", source: "issue_quality", issueNumbers: [88] },
++    branchEligibility: { status: "eligible", source: "github_metadata" },
++  });
++
++  it("derives eligible:false with unvalidated status and summary", () => {
++    const plan = deriveEligibilityPlan(result);
++    expect(plan.eligible).toBe(false);
++    expect(plan.linkedIssueStatus).toBe("plausible");
++    expect(plan.publicSummary).toMatch(/not yet validated|validation is needed/i);
++  });
++
++  it("plan is free of forbidden public language", () => {
++    const plan = deriveEligibilityPlan(result);
++    expect(JSON.stringify(plan)).not.toMatch(FORBIDDEN_PUBLIC_LANGUAGE);
++  });
++});
++
++describe("unavailable link — mirror/cache data cannot confirm the linked issue", () => {
++  const result = preview({
++    linkedIssueMode: "standard",
++    linkedIssueContext: { status: "unavailable", source: "missing", issueNumbers: [90] },
++    branchEligibility: { status: "eligible", source: "github_metadata" },
++  });
++
++  it("derives eligible:false with unvalidated status and a blocker", () => {
++    const plan = deriveEligibilityPlan(result);
++    expect(plan.eligible).toBe(false);
++    expect(plan.linkedIssueStatus).toBe("unavailable");
++    expect(plan.publicSummary).toMatch(/not yet validated|validation is needed/i);
++    expect(plan.blockers).toEqual(
++      expect.arrayContaining([expect.stringMatching(/not yet validated|solved-by-PR|validation/i)]),
++    );
++  });
++});
++
++// ── Fixture: branch-ineligible ────────────────────────────────────────────
++
++describe("branch-ineligible — branch does not qualify for linked-issue assumptions", () => {
++  const result = preview({
++    linkedIssueMode: "standard",
++    linkedIssueContext: {
++      status: "validated",
++      source: "official_mirror",
++      issueNumbers: [55],
++      solvedByPullRequests: [56],
++    },
++    branchEligibility: { status: "ineligible", source: "github_metadata", reason: "Base branch is not a registered registry branch." },
++  });
++
++  it("derives eligible:false even when linked issue is validated", () => {
++    const plan = deriveEligibilityPlan(result);
++    expect(plan.eligible).toBe(false);
++    expect(plan.branchEligibilityStatus).toBe("ineligible");
++    expect(plan.blockers).toEqual(
++      expect.arrayContaining([expect.stringMatching(/branch.*(not eligible|ineligible|eligible branch)/i)]),
++    );
++  });
++
++  it("cleanup path advises switching to an eligible branch", () => {
++    const plan = deriveEligibilityPlan(result);
++    expect(plan.cleanupPaths.join(" ")).toMatch(/eligible branch|linked-issue/i);
++  });
++
++  it("underlying score preview emits branch_ineligible blocker", () => {
++    const codes = result.blockedBy.map((b) => b.code);
++    expect(codes).toContain("branch_ineligible");
++  });
++
++  it("plan is free of forbidden public language", () => {
++    const plan = deriveEligibilityPlan(result);
++    expect(JSON.stringify(plan)).not.toMatch(FORBIDDEN_PUBLIC_LANGUAGE);
++  });
++});
++
++// ── Fixture: missing branch eligibility metadata ───────────────────────────
++
++describe("branch-eligibility-missing — metadata not provided", () => {
++  const result = preview({
++    linkedIssueMode: "standard",
++    linkedIssueContext: { status: "validated", source: "official_mirror", issueNumbers: [10], solvedByPullRequests: [] },
++    // No branchEligibility supplied → evidence is missing
++  });
++
++  it("derives eligible:false and unknown branch status when metadata is absent", () => {
++    const plan = deriveEligibilityPlan(result);
++    expect(plan.eligible).toBe(false);
++    expect(plan.branchEligibilityStatus).toBe("unknown");
++    expect(plan.blockers).toEqual(
++      expect.arrayContaining([expect.stringMatching(/metadata.*missing|refresh/i)]),
++    );
++  });
++
++  it("underlying score preview emits branch_eligibility_missing blocker", () => {
++    const codes = result.blockedBy.map((b) => b.code);
++    expect(codes).toContain("branch_eligibility_missing");
++  });
++});
++
++// ── Public/private sanitizer tests ────────────────────────────────────────
++
++describe("public sanitizer tests for eligibility evidence summaries", () => {
++  it("all public fields across all fixture cases pass the sanitizePublicComment check", () => {
++    const cases = [
++      preview({ linkedIssueMode: "none" }),
++      preview({ linkedIssueMode: "standard", linkedIssueContext: { status: "validated", source: "official_mirror", issueNumbers: [1] }, branchEligibility: { status: "eligible", source: "github_metadata" } }),
++      preview({ linkedIssueMode: "standard", linkedIssueContext: { status: "invalid", source: "official_mirror", issueNumbers: [2] }, branchEligibility: { status: "eligible", source: "github_metadata" } }),
++      preview({ linkedIssueMode: "standard", linkedIssueContext: { status: "raw", source: "user_supplied", issueNumbers: [3] }, branchEligibility: { status: "eligible", source: "github_metadata" } }),
++      preview({ linkedIssueMode: "standard", linkedIssueContext: { status: "validated", source: "official_mirror", issueNumbers: [4] }, branchEligibility: { status: "ineligible", source: "github_metadata" } }),
++    ];
++    for (const result of cases) {
++      const plan = deriveEligibilityPlan(result);
++      const publicText = [...plan.blockers, ...plan.cleanupPaths, plan.publicSummary, plan.linkedIssueProjection ?? ""].join(" ");
++      expect(publicText).not.toMatch(FORBIDDEN_PUBLIC_LANGUAGE);
++      expect(publicText).toBe(sanitizePublicComment(publicText));
++    }
++  });
++
++  it("keeps local branch signals fail-closed — no local path or source content leaks", () => {
++    const result = preview({
++      linkedIssueMode: "standard",
++      linkedIssueContext: { status: "validated", source: "official_mirror", issueNumbers: [5] },
++      branchEligibility: { status: "eligible", source: "local_metadata", reason: "/Users/dev/.git HEAD ref" },
++    });
++    const plan = deriveEligibilityPlan(result);
++    expect(JSON.stringify(plan)).not.toMatch(/\/Users|\/home|\/tmp|[A-Z]:\\Users/);
++  });
++});

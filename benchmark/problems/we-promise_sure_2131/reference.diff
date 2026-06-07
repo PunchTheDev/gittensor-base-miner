@@ -1,0 +1,2840 @@
+diff --git a/mobile/lib/main.dart b/mobile/lib/main.dart
+index bc1b4afc62..6f28c77bda 100644
+--- a/mobile/lib/main.dart
++++ b/mobile/lib/main.dart
+@@ -5,6 +5,8 @@ import 'package:provider/provider.dart';
+ import 'providers/auth_provider.dart';
+ import 'providers/accounts_provider.dart';
+ import 'providers/categories_provider.dart';
++import 'providers/merchants_provider.dart';
++import 'providers/tags_provider.dart';
+ import 'providers/transactions_provider.dart';
+ import 'providers/chat_provider.dart';
+ import 'providers/theme_provider.dart';
+@@ -40,6 +42,8 @@ class SureApp extends StatelessWidget {
+         ChangeNotifierProvider(create: (_) => AuthProvider()),
+         ChangeNotifierProvider(create: (_) => ChatProvider()),
+         ChangeNotifierProvider(create: (_) => CategoriesProvider()),
++        ChangeNotifierProvider(create: (_) => MerchantsProvider()),
++        ChangeNotifierProvider(create: (_) => TagsProvider()),
+         ChangeNotifierProvider(create: (_) => ThemeProvider()),
+         ChangeNotifierProxyProvider<ConnectivityService, AccountsProvider>(
+           create: (_) => AccountsProvider(),
+diff --git a/mobile/lib/models/merchant.dart b/mobile/lib/models/merchant.dart
+new file mode 100644
+index 0000000000..a8ef8143d4
+--- /dev/null
++++ b/mobile/lib/models/merchant.dart
+@@ -0,0 +1,20 @@
++class Merchant {
++  final String id;
++  final String name;
++  final String? type;
++
++  Merchant({required this.id, required this.name, this.type});
++
++  factory Merchant.fromJson(Map<String, dynamic> json) {
++    final id = json['id']?.toString().trim();
++    if (id == null || id.isEmpty) {
++      throw FormatException('Merchant response is missing id: $json');
++    }
++
++    return Merchant(
++      id: id,
++      name: json['name']?.toString() ?? '',
++      type: json['type']?.toString(),
++    );
++  }
++}
+diff --git a/mobile/lib/models/offline_transaction.dart b/mobile/lib/models/offline_transaction.dart
+index 0f8a877f4d..1fafd40a5a 100644
+--- a/mobile/lib/models/offline_transaction.dart
++++ b/mobile/lib/models/offline_transaction.dart
+@@ -1,10 +1,12 @@
++import 'dart:convert';
++
+ import 'transaction.dart';
+ 
+ enum SyncStatus {
+-  synced,         // Transaction is synced with server
+-  pending,        // Transaction is waiting to be synced (create)
+-  failed,         // Last sync attempt failed
+-  pendingDelete,  // Transaction is waiting to be deleted on server
++  synced, // Transaction is synced with server
++  pending, // Transaction is waiting to be synced (create)
++  failed, // Last sync attempt failed
++  pendingDelete, // Transaction is waiting to be deleted on server
+ }
+ 
+ class OfflineTransaction extends Transaction {
+@@ -25,6 +27,13 @@ class OfflineTransaction extends Transaction {
+     super.notes,
+     super.categoryId,
+     super.categoryName,
++    super.categoryProvided = true,
++    super.merchantId,
++    super.merchantName,
++    super.merchantProvided = true,
++    super.tagIds,
++    super.tagNames,
++    super.tagsProvided = true,
+     this.syncStatus = SyncStatus.pending,
+     DateTime? createdAt,
+     DateTime? updatedAt,
+@@ -48,11 +57,23 @@ class OfflineTransaction extends Transaction {
+       notes: transaction.notes,
+       categoryId: transaction.categoryId,
+       categoryName: transaction.categoryName,
++      categoryProvided: transaction.categoryProvided,
++      merchantId: transaction.merchantId,
++      merchantName: transaction.merchantName,
++      merchantProvided: transaction.merchantProvided,
++      tagIds: transaction.tagIds,
++      tagNames: transaction.tagNames,
++      tagsProvided: transaction.tagsProvided,
+       syncStatus: syncStatus,
+     );
+   }
+ 
+   factory OfflineTransaction.fromDatabaseMap(Map<String, dynamic> map) {
++    final tagIds = _decodeStringList(map['tag_ids'] as String?);
++    final tagNames = _decodeStringList(map['tag_names'] as String?);
++    final tagsProvided =
++        map.containsKey('tag_ids') || map.containsKey('tag_names');
++
+     return OfflineTransaction(
+       id: map['server_id'] as String?,
+       localId: map['local_id'] as String,
+@@ -65,6 +86,11 @@ class OfflineTransaction extends Transaction {
+       notes: map['notes'] as String?,
+       categoryId: map['category_id'] as String?,
+       categoryName: map['category_name'] as String?,
++      merchantId: map['merchant_id'] as String?,
++      merchantName: map['merchant_name'] as String?,
++      tagIds: tagIds,
++      tagNames: tagNames,
++      tagsProvided: tagsProvided,
+       syncStatus: _parseSyncStatus(map['sync_status'] as String),
+       createdAt: DateTime.parse(map['created_at'] as String),
+       updatedAt: DateTime.parse(map['updated_at'] as String),
+@@ -84,6 +110,10 @@ class OfflineTransaction extends Transaction {
+       'notes': notes,
+       'category_id': categoryId,
+       'category_name': categoryName,
++      'merchant_id': merchantId,
++      'merchant_name': merchantName,
++      'tag_ids': jsonEncode(tagIds),
++      'tag_names': jsonEncode(tagNames),
+       'sync_status': _syncStatusToString(syncStatus),
+       'created_at': createdAt.toIso8601String(),
+       'updated_at': updatedAt.toIso8601String(),
+@@ -102,6 +132,82 @@ class OfflineTransaction extends Transaction {
+       notes: notes,
+       categoryId: categoryId,
+       categoryName: categoryName,
++      categoryProvided: categoryProvided,
++      merchantId: merchantId,
++      merchantName: merchantName,
++      merchantProvided: merchantProvided,
++      tagIds: tagIds,
++      tagNames: tagNames,
++      tagsProvided: tagsProvided,
++    );
++  }
++
++  Transaction toTransactionWithSubmittedUpdate({
++    String? name,
++    String? notes,
++    String? categoryId,
++    String? merchantId,
++    List<String>? tagIds,
++  }) {
++    final nextTagIds = tagIds ?? this.tagIds;
++    final tagNamesById = <String, String>{};
++    for (var i = 0; i < this.tagIds.length; i++) {
++      tagNamesById[this.tagIds[i]] = i < tagNames.length ? tagNames[i] : '';
++    }
++
++    final nextCategoryId = categoryId ?? this.categoryId;
++    final nextMerchantId = merchantId ?? this.merchantId;
++
++    return Transaction(
++      id: id,
++      accountId: accountId,
++      name: name ?? this.name,
++      date: date,
++      amount: amount,
++      currency: currency,
++      nature: nature,
++      notes: notes ?? this.notes,
++      categoryId: nextCategoryId,
++      categoryName: nextCategoryId == this.categoryId ? categoryName : null,
++      categoryProvided: true,
++      merchantId: nextMerchantId,
++      merchantName: nextMerchantId == this.merchantId ? merchantName : null,
++      merchantProvided: true,
++      tagIds: nextTagIds,
++      tagNames: nextTagIds.map((tagId) => tagNamesById[tagId] ?? '').toList(),
++      tagsProvided: true,
++    );
++  }
++
++  OfflineTransaction mergeServerTransaction(
++    Transaction transaction, {
++    required String accountId,
++  }) {
++    return OfflineTransaction(
++      id: transaction.id,
++      localId: localId,
++      accountId: accountId,
++      name: transaction.name,
++      date: transaction.date,
++      amount: transaction.amount,
++      currency: transaction.currency,
++      nature: transaction.nature,
++      notes: transaction.notes,
++      categoryId:
++          transaction.categoryProvided ? transaction.categoryId : categoryId,
++      categoryName: transaction.categoryProvided
++          ? transaction.categoryName
++          : categoryName,
++      merchantId:
++          transaction.merchantProvided ? transaction.merchantId : merchantId,
++      merchantName: transaction.merchantProvided
++          ? transaction.merchantName
++          : merchantName,
++      tagIds: transaction.tagsProvided ? transaction.tagIds : tagIds,
++      tagNames: transaction.tagsProvided ? transaction.tagNames : tagNames,
++      syncStatus: SyncStatus.synced,
++      createdAt: createdAt,
++      updatedAt: DateTime.now(),
+     );
+   }
+ 
+@@ -117,6 +223,13 @@ class OfflineTransaction extends Transaction {
+     String? notes,
+     String? categoryId,
+     String? categoryName,
++    bool? categoryProvided,
++    String? merchantId,
++    String? merchantName,
++    bool? merchantProvided,
++    List<String>? tagIds,
++    List<String>? tagNames,
++    bool? tagsProvided,
+     SyncStatus? syncStatus,
+     DateTime? createdAt,
+     DateTime? updatedAt,
+@@ -133,6 +246,13 @@ class OfflineTransaction extends Transaction {
+       notes: notes ?? this.notes,
+       categoryId: categoryId ?? this.categoryId,
+       categoryName: categoryName ?? this.categoryName,
++      categoryProvided: categoryProvided ?? this.categoryProvided,
++      merchantId: merchantId ?? this.merchantId,
++      merchantName: merchantName ?? this.merchantName,
++      merchantProvided: merchantProvided ?? this.merchantProvided,
++      tagIds: tagIds ?? this.tagIds,
++      tagNames: tagNames ?? this.tagNames,
++      tagsProvided: tagsProvided ?? this.tagsProvided,
+       syncStatus: syncStatus ?? this.syncStatus,
+       createdAt: createdAt ?? this.createdAt,
+       updatedAt: updatedAt ?? this.updatedAt,
+@@ -158,6 +278,26 @@ class OfflineTransaction extends Transaction {
+     }
+   }
+ 
++  static List<String> _decodeStringList(String? jsonText) {
++    if (jsonText == null || jsonText.isEmpty) {
++      return const [];
++    }
++
++    try {
++      final decoded = jsonDecode(jsonText);
++      if (decoded is List) {
++        return decoded
++            .where((item) => item != null)
++            .map((item) => item.toString())
++            .toList();
++      }
++    } catch (_) {
++      return const [];
++    }
++
++    return const [];
++  }
++
+   static String _syncStatusToString(SyncStatus status) {
+     switch (status) {
+       case SyncStatus.synced:
+diff --git a/mobile/lib/models/transaction.dart b/mobile/lib/models/transaction.dart
+index e20e536b37..d6e0b6a12c 100644
+--- a/mobile/lib/models/transaction.dart
++++ b/mobile/lib/models/transaction.dart
+@@ -9,6 +9,13 @@ class Transaction {
+   final String? notes;
+   final String? categoryId;
+   final String? categoryName;
++  final bool categoryProvided;
++  final String? merchantId;
++  final String? merchantName;
++  final bool merchantProvided;
++  final List<String> tagIds;
++  final List<String> tagNames;
++  final bool tagsProvided;
+ 
+   Transaction({
+     this.id,
+@@ -21,7 +28,21 @@ class Transaction {
+     this.notes,
+     this.categoryId,
+     this.categoryName,
+-  });
++    bool? categoryProvided,
++    this.merchantId,
++    this.merchantName,
++    bool? merchantProvided,
++    List<String> tagIds = const [],
++    List<String> tagNames = const [],
++    bool? tagsProvided,
++  })  : tagIds = List.unmodifiable(tagIds),
++        tagNames = List.unmodifiable(tagNames),
++        categoryProvided =
++            categoryProvided ?? (categoryId != null || categoryName != null),
++        merchantProvided =
++            merchantProvided ?? (merchantId != null || merchantName != null),
++        tagsProvided =
++            tagsProvided ?? (tagIds.isNotEmpty || tagNames.isNotEmpty);
+ 
+   factory Transaction.fromJson(Map<String, dynamic> json) {
+     // Handle both API formats:
+@@ -37,7 +58,8 @@ class Transaction {
+     // Handle classification (from backend) or nature (from mobile)
+     String nature = 'expense';
+     if (json['classification'] != null) {
+-      final classification = json['classification']?.toString().toLowerCase() ?? '';
++      final classification =
++          json['classification']?.toString().toLowerCase() ?? '';
+       nature = classification == 'income' ? 'income' : 'expense';
+     } else if (json['nature'] != null) {
+       nature = json['nature']?.toString() ?? 'expense';
+@@ -46,6 +68,9 @@ class Transaction {
+     // Parse category from API response
+     String? categoryId;
+     String? categoryName;
++    final categoryProvided = json.containsKey('category') ||
++        json.containsKey('category_id') ||
++        json.containsKey('category_name');
+     if (json['category'] != null && json['category'] is Map) {
+       categoryId = json['category']['id']?.toString();
+       categoryName = json['category']['name']?.toString();
+@@ -54,6 +79,51 @@ class Transaction {
+       categoryName = json['category_name']?.toString();
+     }
+ 
++    String? merchantId;
++    String? merchantName;
++    final merchantProvided = json.containsKey('merchant') ||
++        json.containsKey('merchant_id') ||
++        json.containsKey('merchant_name');
++    if (json['merchant'] != null && json['merchant'] is Map) {
++      merchantId = json['merchant']['id']?.toString();
++      merchantName = json['merchant']['name']?.toString();
++    } else if (json['merchant_id'] != null) {
++      merchantId = json['merchant_id']?.toString();
++      merchantName = json['merchant_name']?.toString();
++    }
++
++    final tagIds = <String>[];
++    final tagNames = <String>[];
++    final tagsProvided = json.containsKey('tags') ||
++        json.containsKey('tag_ids') ||
++        json.containsKey('tag_names');
++    if (json['tags'] is List) {
++      for (final tag in json['tags']) {
++        if (tag is Map) {
++          final id = tag['id']?.toString().trim();
++          if (id != null && id.isNotEmpty) {
++            tagIds.add(id);
++            tagNames.add(tag['name']?.toString() ?? '');
++          }
++        }
++      }
++    } else if (json['tag_ids'] is List) {
++      final rawIds = json['tag_ids'] as List;
++      final rawNames =
++          json['tag_names'] is List ? json['tag_names'] as List : const [];
++      for (var i = 0; i < rawIds.length; i++) {
++        final id = rawIds[i]?.toString().trim() ?? '';
++        if (id.isNotEmpty) {
++          tagIds.add(id);
++          tagNames
++              .add(i < rawNames.length ? rawNames[i]?.toString() ?? '' : '');
++        }
++      }
++    }
++    while (tagNames.length < tagIds.length) {
++      tagNames.add('');
++    }
++
+     return Transaction(
+       id: json['id']?.toString(),
+       accountId: accountId,
+@@ -65,6 +135,13 @@ class Transaction {
+       notes: json['notes']?.toString(),
+       categoryId: categoryId,
+       categoryName: categoryName,
++      categoryProvided: categoryProvided,
++      merchantId: merchantId,
++      merchantName: merchantName,
++      merchantProvided: merchantProvided,
++      tagIds: tagIds,
++      tagNames: tagNames,
++      tagsProvided: tagsProvided,
+     );
+   }
+ 
+@@ -80,6 +157,10 @@ class Transaction {
+       if (notes != null) 'notes': notes,
+       if (categoryId != null) 'category_id': categoryId,
+       if (categoryName != null) 'category_name': categoryName,
++      if (merchantId != null) 'merchant_id': merchantId,
++      if (merchantName != null) 'merchant_name': merchantName,
++      if (tagIds.isNotEmpty) 'tag_ids': tagIds,
++      if (tagNames.isNotEmpty) 'tag_names': tagNames,
+     };
+   }
+ 
+diff --git a/mobile/lib/models/transaction_tag.dart b/mobile/lib/models/transaction_tag.dart
+new file mode 100644
+index 0000000000..90315fca10
+--- /dev/null
++++ b/mobile/lib/models/transaction_tag.dart
+@@ -0,0 +1,15 @@
++class TransactionTag {
++  final String id;
++  final String name;
++  final String? color;
++
++  TransactionTag({required this.id, required this.name, this.color});
++
++  factory TransactionTag.fromJson(Map<String, dynamic> json) {
++    return TransactionTag(
++      id: json['id']?.toString() ?? '',
++      name: json['name']?.toString() ?? '',
++      color: json['color']?.toString(),
++    );
++  }
++}
+diff --git a/mobile/lib/providers/merchants_provider.dart b/mobile/lib/providers/merchants_provider.dart
+new file mode 100644
+index 0000000000..9964796468
+--- /dev/null
++++ b/mobile/lib/providers/merchants_provider.dart
+@@ -0,0 +1,62 @@
++import 'package:flutter/foundation.dart';
++import '../models/merchant.dart';
++import '../services/log_service.dart';
++import '../services/merchants_service.dart';
++
++class MerchantsProvider with ChangeNotifier {
++  final MerchantsService _merchantsService = MerchantsService();
++  final LogService _log = LogService.instance;
++
++  List<Merchant> _merchants = [];
++  bool _isLoading = false;
++  String? _error;
++  bool _hasFetched = false;
++
++  List<Merchant> get merchants => List.unmodifiable(_merchants);
++  bool get isLoading => _isLoading;
++  String? get error => _error;
++  bool get hasFetched => _hasFetched;
++
++  Future<void> fetchMerchants({
++    required String accessToken,
++    bool forceRefresh = false,
++  }) async {
++    if (_isLoading || (_hasFetched && !forceRefresh)) return;
++
++    _isLoading = true;
++    _error = null;
++    notifyListeners();
++
++    try {
++      final result = await _merchantsService.getMerchants(
++        accessToken: accessToken,
++      );
++
++      if (result['success'] == true) {
++        _merchants =
++            (result['merchants'] as List? ?? const []).cast<Merchant>();
++        _hasFetched = true;
++        _log.info(
++          'MerchantsProvider',
++          'Fetched ${_merchants.length} merchants',
++        );
++      } else {
++        _error = result['error'] as String?;
++        _log.error('MerchantsProvider', 'Failed to fetch merchants: $_error');
++      }
++    } catch (e) {
++      _error = 'Failed to load merchants';
++      _log.error('MerchantsProvider', 'Exception fetching merchants: $e');
++    } finally {
++      _isLoading = false;
++      notifyListeners();
++    }
++  }
++
++  void clear() {
++    _merchants = [];
++    _hasFetched = false;
++    _error = null;
++    notifyListeners();
++  }
++}
+diff --git a/mobile/lib/providers/tags_provider.dart b/mobile/lib/providers/tags_provider.dart
+new file mode 100644
+index 0000000000..944b7ff568
+--- /dev/null
++++ b/mobile/lib/providers/tags_provider.dart
+@@ -0,0 +1,56 @@
++import 'package:flutter/foundation.dart';
++import '../models/transaction_tag.dart';
++import '../services/log_service.dart';
++import '../services/tags_service.dart';
++
++class TagsProvider with ChangeNotifier {
++  final TagsService _tagsService = TagsService();
++  final LogService _log = LogService.instance;
++
++  List<TransactionTag> _tags = [];
++  bool _isLoading = false;
++  String? _error;
++  bool _hasFetched = false;
++
++  List<TransactionTag> get tags => List.unmodifiable(_tags);
++  bool get isLoading => _isLoading;
++  String? get error => _error;
++  bool get hasFetched => _hasFetched;
++
++  Future<void> fetchTags({
++    required String accessToken,
++    bool forceRefresh = false,
++  }) async {
++    if (_isLoading || (_hasFetched && !forceRefresh)) return;
++
++    _isLoading = true;
++    _error = null;
++    notifyListeners();
++
++    try {
++      final result = await _tagsService.getTags(accessToken: accessToken);
++
++      if (result['success'] == true) {
++        _tags = (result['tags'] as List? ?? const []).cast<TransactionTag>();
++        _hasFetched = true;
++        _log.info('TagsProvider', 'Fetched ${_tags.length} tags');
++      } else {
++        _error = result['error'] as String?;
++        _log.error('TagsProvider', 'Failed to fetch tags: $_error');
++      }
++    } catch (e) {
++      _error = 'Failed to load tags';
++      _log.error('TagsProvider', 'Exception fetching tags: $e');
++    } finally {
++      _isLoading = false;
++      notifyListeners();
++    }
++  }
++
++  void clear() {
++    _tags = [];
++    _hasFetched = false;
++    _error = null;
++    notifyListeners();
++  }
++}
+diff --git a/mobile/lib/providers/transactions_provider.dart b/mobile/lib/providers/transactions_provider.dart
+index 634f1f520c..07e04c68b3 100644
+--- a/mobile/lib/providers/transactions_provider.dart
++++ b/mobile/lib/providers/transactions_provider.dart
+@@ -32,10 +32,14 @@ class TransactionsProvider with ChangeNotifier {
+ 
+   bool get isLoading => _isLoading;
+   String? get error => _error;
+-  bool get hasPendingTransactions =>
+-      _transactions.any((t) => t.syncStatus == SyncStatus.pending || t.syncStatus == SyncStatus.pendingDelete);
+-  int get pendingCount =>
+-      _transactions.where((t) => t.syncStatus == SyncStatus.pending || t.syncStatus == SyncStatus.pendingDelete).length;
++  bool get hasPendingTransactions => _transactions.any((t) =>
++      t.syncStatus == SyncStatus.pending ||
++      t.syncStatus == SyncStatus.pendingDelete);
++  int get pendingCount => _transactions
++      .where((t) =>
++          t.syncStatus == SyncStatus.pending ||
++          t.syncStatus == SyncStatus.pendingDelete)
++      .length;
+ 
+   SyncService get syncService => _syncService;
+ 
+@@ -49,33 +53,31 @@ class TransactionsProvider with ChangeNotifier {
+ 
+   void _onConnectivityChanged() {
+     if (_isDisposed) return;
+-    
++
+     // Auto-sync when connectivity is restored
+     if (_connectivityService?.isOnline == true &&
+         hasPendingTransactions &&
+         _lastAccessToken != null &&
+         !_isAutoSyncing) {
+-      _log.info('TransactionsProvider', 'Connectivity restored, auto-syncing $pendingCount pending transactions');
++      _log.info('TransactionsProvider',
++          'Connectivity restored, auto-syncing $pendingCount pending transactions');
+       _isAutoSyncing = true;
+ 
+       // Fire and forget - we don't await to avoid blocking connectivity listener
+       // Use callbacks to handle completion and errors asynchronously
+-      syncTransactions(accessToken: _lastAccessToken!)
+-          .then((_) {
+-            if (!_isDisposed) {
+-              _log.info('TransactionsProvider', 'Auto-sync completed successfully');
+-            }
+-          })
+-          .catchError((e) {
+-            if (!_isDisposed) {
+-              _log.error('TransactionsProvider', 'Auto-sync failed: $e');
+-            }
+-          })
+-          .whenComplete(() {
+-            if (!_isDisposed) {
+-              _isAutoSyncing = false;
+-            }
+-          });
++      syncTransactions(accessToken: _lastAccessToken!).then((_) {
++        if (!_isDisposed) {
++          _log.info('TransactionsProvider', 'Auto-sync completed successfully');
++        }
++      }).catchError((e) {
++        if (!_isDisposed) {
++          _log.error('TransactionsProvider', 'Auto-sync failed: $e');
++        }
++      }).whenComplete(() {
++        if (!_isDisposed) {
++          _isAutoSyncing = false;
++        }
++      });
+     }
+   }
+ 
+@@ -100,29 +102,34 @@ class TransactionsProvider with ChangeNotifier {
+         accountId: accountId,
+       );
+ 
+-      _log.debug('TransactionsProvider', 'Loaded ${localTransactions.length} transactions from local storage (accountId: $accountId)');
++      _log.debug('TransactionsProvider',
++          'Loaded ${localTransactions.length} transactions from local storage (accountId: $accountId)');
+ 
+       _transactions = localTransactions;
+       notifyListeners();
+ 
+       // If online and force sync, or if local storage is empty, sync from server
+       final isOnline = _connectivityService?.isOnline ?? true;
+-      _log.debug('TransactionsProvider', 'Online: $isOnline, ForceSync: $forceSync, LocalEmpty: ${localTransactions.isEmpty}');
++      _log.debug('TransactionsProvider',
++          'Online: $isOnline, ForceSync: $forceSync, LocalEmpty: ${localTransactions.isEmpty}');
+ 
+       if (isOnline && (forceSync || localTransactions.isEmpty)) {
+-        _log.debug('TransactionsProvider', 'Syncing from server for accountId: $accountId');
++        _log.debug('TransactionsProvider',
++            'Syncing from server for accountId: $accountId');
+         final result = await _syncService.syncFromServer(
+           accessToken: accessToken,
+           accountId: accountId,
+         );
+ 
+         if (result.success) {
+-          _log.info('TransactionsProvider', 'Sync successful, synced ${result.syncedCount} transactions');
++          _log.info('TransactionsProvider',
++              'Sync successful, synced ${result.syncedCount} transactions');
+           // Reload from local storage after sync
+           final updatedTransactions = await _offlineStorage.getTransactions(
+             accountId: accountId,
+           );
+-          _log.debug('TransactionsProvider', 'After sync, loaded ${updatedTransactions.length} transactions from local storage');
++          _log.debug('TransactionsProvider',
++              'After sync, loaded ${updatedTransactions.length} transactions from local storage');
+           _transactions = updatedTransactions;
+           _error = null;
+         } else {
+@@ -151,13 +158,18 @@ class TransactionsProvider with ChangeNotifier {
+     String? notes,
+     String? categoryId,
+     String? categoryName,
++    String? merchantId,
++    String? merchantName,
++    List<String>? tagIds,
++    List<String>? tagNames,
+   }) async {
+     _lastAccessToken = accessToken; // Store for auto-sync
+ 
+     try {
+       final isOnline = _connectivityService?.isOnline ?? false;
+ 
+-      _log.info('TransactionsProvider', 'Creating transaction: $name, amount: $amount, online: $isOnline');
++      _log.info('TransactionsProvider',
++          'Creating transaction: $name, amount: $amount, online: $isOnline');
+ 
+       // ALWAYS save locally first (offline-first strategy)
+       final localTransaction = await _offlineStorage.saveTransaction(
+@@ -170,20 +182,27 @@ class TransactionsProvider with ChangeNotifier {
+         notes: notes,
+         categoryId: categoryId,
+         categoryName: categoryName,
++        merchantId: merchantId,
++        merchantName: merchantName,
++        tagIds: tagIds ?? const [],
++        tagNames: tagNames ?? const [],
+         syncStatus: SyncStatus.pending, // Start as pending
+       );
+ 
+-      _log.info('TransactionsProvider', 'Transaction saved locally with ID: ${localTransaction.localId}');
++      _log.info('TransactionsProvider',
++          'Transaction saved locally with ID: ${localTransaction.localId}');
+ 
+       // Reload transactions to show the new one immediately
+       await fetchTransactions(accessToken: accessToken, accountId: accountId);
+ 
+       // If online, try to upload in background
+       if (isOnline) {
+-        _log.info('TransactionsProvider', 'Attempting to upload transaction to server...');
++        _log.info('TransactionsProvider',
++            'Attempting to upload transaction to server...');
+ 
+         // Don't await - upload in background
+-        _transactionsService.createTransaction(
++        _transactionsService
++            .createTransaction(
+           accessToken: accessToken,
+           accountId: accountId,
+           name: name,
+@@ -193,11 +212,15 @@ class TransactionsProvider with ChangeNotifier {
+           nature: nature,
+           notes: notes,
+           categoryId: categoryId,
+-        ).then((result) async {
++          merchantId: merchantId,
++          tagIds: tagIds == null || tagIds.isEmpty ? null : tagIds,
++        )
++            .then((result) async {
+           if (_isDisposed) return;
+-          
++
+           if (result['success'] == true) {
+-            _log.info('TransactionsProvider', 'Transaction uploaded successfully');
++            _log.info(
++                'TransactionsProvider', 'Transaction uploaded successfully');
+             final serverTransaction = result['transaction'] as Transaction;
+             // Update local transaction with server ID and mark as synced
+             await _offlineStorage.updateTransactionSyncStatus(
+@@ -206,19 +229,22 @@ class TransactionsProvider with ChangeNotifier {
+               serverId: serverTransaction.id,
+             );
+             // Reload to update UI
+-            await fetchTransactions(accessToken: accessToken, accountId: accountId);
++            await fetchTransactions(
++                accessToken: accessToken, accountId: accountId);
+           } else {
+-            _log.warning('TransactionsProvider', 'Server upload failed: ${result['error']}. Transaction will sync later.');
++            _log.warning('TransactionsProvider',
++                'Server upload failed: ${result['error']}. Transaction will sync later.');
+           }
+         }).catchError((e) {
+           if (_isDisposed) return;
+-          
++
+           _log.error('TransactionsProvider', 'Exception during upload: $e');
+           _error = 'Failed to upload transaction. It will sync when online.';
+           notifyListeners();
+         });
+       } else {
+-        _log.info('TransactionsProvider', 'Offline: Transaction will sync when online');
++        _log.info('TransactionsProvider',
++            'Offline: Transaction will sync when online');
+       }
+ 
+       return true; // Always return true because it's saved locally
+@@ -230,6 +256,90 @@ class TransactionsProvider with ChangeNotifier {
+     }
+   }
+ 
++  /// Update an existing synced transaction. Edits are online-only because the
++  /// current offline queue supports create/delete but not pending updates.
++  Future<bool> updateTransaction({
++    required String accessToken,
++    required OfflineTransaction transaction,
++    String? name,
++    String? notes,
++    String? categoryId,
++    String? merchantId,
++    List<String>? tagIds,
++  }) async {
++    _lastAccessToken = accessToken;
++    _currentAccountId = transaction.accountId;
++    _isLoading = true;
++    _error = null;
++    notifyListeners();
++
++    try {
++      final transactionId = transaction.id;
++      if (transactionId == null || transactionId.isEmpty) {
++        _error = 'Only synced transactions can be edited from mobile.';
++        return false;
++      }
++
++      final isOnline = _connectivityService?.isOnline ?? false;
++      if (!isOnline) {
++        _error = 'Connect to the internet before editing synced transactions.';
++        return false;
++      }
++
++      final result = await _transactionsService.updateTransaction(
++        accessToken: accessToken,
++        transactionId: transactionId,
++        name: name,
++        notes: notes,
++        categoryId: categoryId,
++        merchantId: merchantId,
++        tagIds: tagIds,
++      );
++
++      if (result['success'] == true) {
++        var updatedTransaction = result['transaction'];
++        if (updatedTransaction is! Transaction) {
++          final refreshed = await _transactionsService.getTransaction(
++            accessToken: accessToken,
++            transactionId: transactionId,
++          );
++          updatedTransaction = refreshed['transaction'];
++        }
++
++        final transactionToCache = updatedTransaction is Transaction
++            ? updatedTransaction
++            : transaction.toTransactionWithSubmittedUpdate(
++                name: name,
++                notes: notes,
++                categoryId: categoryId,
++                merchantId: merchantId,
++                tagIds: tagIds,
++              );
++
++        await _offlineStorage.upsertTransactionFromServer(
++          transactionToCache,
++          accountId: transaction.accountId,
++        );
++        final updatedTransactions = await _offlineStorage.getTransactions(
++          accountId: transaction.accountId,
++        );
++        _transactions = updatedTransactions;
++        _error = null;
++        return true;
++      }
++
++      _error = result['error'] as String? ?? 'Failed to update transaction';
++      return false;
++    } catch (e) {
++      _log.error('TransactionsProvider', 'Failed to update transaction: $e');
++      _error = 'Something went wrong. Please try again.';
++      return false;
++    } finally {
++      _isLoading = false;
++      notifyListeners();
++    }
++  }
++
+   /// Delete a transaction
+   Future<bool> deleteTransaction({
+     required String accessToken,
+@@ -258,7 +368,8 @@ class TransactionsProvider with ChangeNotifier {
+         }
+       } else {
+         // Offline - mark for deletion and sync later
+-        _log.info('TransactionsProvider', 'Offline: Marking transaction for deletion');
++        _log.info('TransactionsProvider',
++            'Offline: Marking transaction for deletion');
+         await _offlineStorage.markTransactionForDeletion(transactionId);
+ 
+         // Reload from storage to update UI with pending delete status
+@@ -300,13 +411,15 @@ class TransactionsProvider with ChangeNotifier {
+           notifyListeners();
+           return true;
+         } else {
+-          _error = result['error'] as String? ?? 'Failed to delete transactions';
++          _error =
++              result['error'] as String? ?? 'Failed to delete transactions';
+           notifyListeners();
+           return false;
+         }
+       } else {
+         // Offline - mark all for deletion and sync later
+-        _log.info('TransactionsProvider', 'Offline: Marking ${transactionIds.length} transactions for deletion');
++        _log.info('TransactionsProvider',
++            'Offline: Marking ${transactionIds.length} transactions for deletion');
+         for (final id in transactionIds) {
+           await _offlineStorage.markTransactionForDeletion(id);
+         }
+@@ -320,7 +433,8 @@ class TransactionsProvider with ChangeNotifier {
+         return true;
+       }
+     } catch (e) {
+-      _log.error('TransactionsProvider', 'Failed to delete multiple transactions: $e');
++      _log.error(
++          'TransactionsProvider', 'Failed to delete multiple transactions: $e');
+       _error = 'Something went wrong. Please try again.';
+       notifyListeners();
+       return false;
+@@ -332,10 +446,12 @@ class TransactionsProvider with ChangeNotifier {
+     required String localId,
+     required SyncStatus syncStatus,
+   }) async {
+-    _log.info('TransactionsProvider', 'Undoing transaction $localId with status $syncStatus');
++    _log.info('TransactionsProvider',
++        'Undoing transaction $localId with status $syncStatus');
+ 
+     try {
+-      final success = await _offlineStorage.undoPendingTransaction(localId, syncStatus);
++      final success =
++          await _offlineStorage.undoPendingTransaction(localId, syncStatus);
+ 
+       if (success) {
+         // Reload from storage to update UI
+diff --git a/mobile/lib/screens/settings_screen.dart b/mobile/lib/screens/settings_screen.dart
+index 676926153b..137d8a00b8 100644
+--- a/mobile/lib/screens/settings_screen.dart
++++ b/mobile/lib/screens/settings_screen.dart
+@@ -4,6 +4,8 @@ import 'package:provider/provider.dart';
+ import 'package:url_launcher/url_launcher.dart';
+ import '../providers/auth_provider.dart';
+ import '../providers/categories_provider.dart';
++import '../providers/merchants_provider.dart';
++import '../providers/tags_provider.dart';
+ import '../providers/theme_provider.dart';
+ import '../services/offline_storage_service.dart';
+ import '../services/log_service.dart';
+@@ -146,6 +148,8 @@ class _SettingsScreenState extends State<SettingsScreen> {
+         await offlineStorage.clearAllData();
+         if (context.mounted) {
+           Provider.of<CategoriesProvider>(context, listen: false).clear();
++          Provider.of<MerchantsProvider>(context, listen: false).clear();
++          Provider.of<TagsProvider>(context, listen: false).clear();
+         }
+         log.info('Settings', 'Local data cleared successfully');
+ 
+@@ -230,6 +234,8 @@ class _SettingsScreenState extends State<SettingsScreen> {
+         await OfflineStorageService().clearAllData();
+         if (context.mounted) {
+           Provider.of<CategoriesProvider>(context, listen: false).clear();
++          Provider.of<MerchantsProvider>(context, listen: false).clear();
++          Provider.of<TagsProvider>(context, listen: false).clear();
+         }
+ 
+         if (!context.mounted) return;
+diff --git a/mobile/lib/screens/transaction_edit_screen.dart b/mobile/lib/screens/transaction_edit_screen.dart
+new file mode 100644
+index 0000000000..b7ccf89548
+--- /dev/null
++++ b/mobile/lib/screens/transaction_edit_screen.dart
+@@ -0,0 +1,419 @@
++import 'package:flutter/material.dart';
++import 'package:provider/provider.dart';
++import '../models/category.dart' as models;
++import '../models/merchant.dart';
++import '../models/offline_transaction.dart';
++import '../models/transaction_tag.dart';
++import '../providers/auth_provider.dart';
++import '../providers/categories_provider.dart';
++import '../providers/merchants_provider.dart';
++import '../providers/tags_provider.dart';
++import '../providers/transactions_provider.dart';
++
++class TransactionEditScreen extends StatefulWidget {
++  final OfflineTransaction transaction;
++
++  const TransactionEditScreen({super.key, required this.transaction});
++
++  @override
++  State<TransactionEditScreen> createState() => _TransactionEditScreenState();
++}
++
++class _TransactionEditScreenState extends State<TransactionEditScreen> {
++  static const _maxNameLength = 255;
++  static const _maxNotesLength = 2000;
++
++  final _formKey = GlobalKey<FormState>();
++  late final TextEditingController _nameController;
++  late final TextEditingController _notesController;
++  String? _selectedCategoryId;
++  String? _selectedMerchantId;
++  late Set<String> _selectedTagIds;
++  bool _isSaving = false;
++
++  @override
++  void initState() {
++    super.initState();
++    _nameController = TextEditingController(text: widget.transaction.name);
++    _notesController = TextEditingController(
++      text: widget.transaction.notes ?? '',
++    );
++    _selectedCategoryId = widget.transaction.categoryId;
++    _selectedMerchantId = widget.transaction.merchantId;
++    _selectedTagIds = widget.transaction.tagIds.toSet();
++    WidgetsBinding.instance.addPostFrameCallback((_) => _loadMetadata());
++  }
++
++  @override
++  void dispose() {
++    _nameController.dispose();
++    _notesController.dispose();
++    super.dispose();
++  }
++
++  Future<void> _loadMetadata() async {
++    final authProvider = Provider.of<AuthProvider>(context, listen: false);
++    final categoriesProvider = Provider.of<CategoriesProvider>(
++      context,
++      listen: false,
++    );
++    final merchantsProvider = Provider.of<MerchantsProvider>(
++      context,
++      listen: false,
++    );
++    final tagsProvider = Provider.of<TagsProvider>(context, listen: false);
++    final accessToken = await authProvider.getValidAccessToken();
++    if (accessToken == null || !mounted) return;
++
++    try {
++      await Future.wait([
++        categoriesProvider.fetchCategories(accessToken: accessToken),
++        merchantsProvider.fetchMerchants(accessToken: accessToken),
++        tagsProvider.fetchTags(accessToken: accessToken),
++      ]);
++    } catch (_) {
++      // Providers expose their own error state; avoid an uncaught async error.
++    }
++  }
++
++  Future<void> _save() async {
++    if (!_formKey.currentState!.validate() || widget.transaction.id == null) {
++      return;
++    }
++
++    setState(() {
++      _isSaving = true;
++    });
++
++    final authProvider = Provider.of<AuthProvider>(context, listen: false);
++    final transactionsProvider = Provider.of<TransactionsProvider>(
++      context,
++      listen: false,
++    );
++    final accessToken = await authProvider.getValidAccessToken();
++
++    if (accessToken == null) {
++      if (!mounted) return;
++
++      ScaffoldMessenger.of(context).showSnackBar(
++        const SnackBar(
++          content: Text('Session expired. Please login again.'),
++          backgroundColor: Colors.red,
++        ),
++      );
++      setState(() {
++        _isSaving = false;
++      });
++      return;
++    }
++
++    // Empty notes intentionally clear the server-side note.
++    final notesText = _notesController.text.trim();
++
++    final success = await transactionsProvider.updateTransaction(
++      accessToken: accessToken,
++      transaction: widget.transaction,
++      name: _nameController.text.trim(),
++      notes: notesText,
++      categoryId: _selectedCategoryId,
++      merchantId: _selectedMerchantId,
++      tagIds: _selectedTagIds.toList(),
++    );
++
++    if (!mounted) return;
++
++    setState(() {
++      _isSaving = false;
++    });
++
++    ScaffoldMessenger.of(context).showSnackBar(
++      SnackBar(
++        content: Text(
++          success
++              ? 'Transaction updated'
++              : transactionsProvider.error ?? 'Failed to update transaction',
++        ),
++        backgroundColor: success ? Colors.green : Colors.red,
++      ),
++    );
++
++    if (success) {
++      Navigator.pop(context, true);
++    }
++  }
++
++  String? _validateName(String? value) {
++    if (value == null || value.trim().isEmpty) {
++      return 'Name is required';
++    }
++
++    if (value.trim().length > _maxNameLength) {
++      return 'Name must be $_maxNameLength characters or fewer';
++    }
++
++    if (_containsControlCharacter(value)) {
++      return 'Name contains unsupported characters';
++    }
++
++    return null;
++  }
++
++  String? _validateNotes(String? value) {
++    if (value == null || value.trim().isEmpty) {
++      return null;
++    }
++
++    if (value.trim().length > _maxNotesLength) {
++      return 'Notes must be $_maxNotesLength characters or fewer';
++    }
++
++    if (_containsControlCharacter(value, allowWhitespace: true)) {
++      return 'Notes contain unsupported characters';
++    }
++
++    return null;
++  }
++
++  bool _containsControlCharacter(
++    String value, {
++    bool allowWhitespace = false,
++  }) {
++    for (final codeUnit in value.codeUnits) {
++      if (codeUnit == 127) return true;
++      if (codeUnit < 32) {
++        final allowedWhitespace = allowWhitespace &&
++            (codeUnit == 9 || codeUnit == 10 || codeUnit == 13);
++        if (!allowedWhitespace) return true;
++      }
++    }
++
++    return false;
++  }
++
++  List<DropdownMenuItem<String?>> _categoryItems(
++    List<models.Category> categories,
++  ) {
++    final items = <DropdownMenuItem<String?>>[];
++    if (_selectedCategoryId == null) {
++      items.add(
++        const DropdownMenuItem<String?>(
++          value: null,
++          child: Text('No category'),
++        ),
++      );
++    }
++
++    final hasCurrent = _selectedCategoryId == null ||
++        categories.any((category) => category.id == _selectedCategoryId);
++    if (!hasCurrent) {
++      items.add(
++        DropdownMenuItem<String?>(
++          value: _selectedCategoryId,
++          child: Text(widget.transaction.categoryName ?? 'Current category'),
++        ),
++      );
++    }
++
++    items.addAll(
++      categories.map((category) {
++        return DropdownMenuItem<String?>(
++          value: category.id,
++          child: Text(category.displayName),
++        );
++      }),
++    );
++
++    return items;
++  }
++
++  List<DropdownMenuItem<String?>> _merchantItems(List<Merchant> merchants) {
++    final items = <DropdownMenuItem<String?>>[];
++    if (_selectedMerchantId == null) {
++      items.add(
++        const DropdownMenuItem<String?>(
++          value: null,
++          child: Text('No merchant'),
++        ),
++      );
++    }
++
++    final hasCurrent = _selectedMerchantId == null ||
++        merchants.any((merchant) => merchant.id == _selectedMerchantId);
++    if (!hasCurrent) {
++      items.add(
++        DropdownMenuItem<String?>(
++          value: _selectedMerchantId,
++          child: Text(widget.transaction.merchantName ?? 'Current merchant'),
++        ),
++      );
++    }
++
++    items.addAll(
++      merchants.map((merchant) {
++        return DropdownMenuItem<String?>(
++          value: merchant.id,
++          child: Text(merchant.name),
++        );
++      }),
++    );
++
++    return items;
++  }
++
++  Widget _buildTags(List<TransactionTag> tags, {required bool enabled}) {
++    if (tags.isEmpty && _selectedTagIds.isEmpty) {
++      return const Text('No tags available');
++    }
++
++    final tagById = {for (final tag in tags) tag.id: tag};
++    final combinedTags = [...tags];
++    for (final selectedId in _selectedTagIds) {
++      if (!tagById.containsKey(selectedId)) {
++        final nameIndex = widget.transaction.tagIds.indexOf(selectedId);
++        final fallbackName =
++            nameIndex >= 0 && nameIndex < widget.transaction.tagNames.length
++                ? widget.transaction.tagNames[nameIndex]
++                : '';
++        combinedTags.add(
++          TransactionTag(
++            id: selectedId,
++            name: fallbackName.isNotEmpty ? fallbackName : 'Unknown tag',
++          ),
++        );
++      }
++    }
++
++    return Wrap(
++      spacing: 8,
++      runSpacing: 8,
++      children: combinedTags.map((tag) {
++        final selected = _selectedTagIds.contains(tag.id);
++        return FilterChip(
++          label: Text(tag.name),
++          selected: selected,
++          onSelected: enabled
++              ? (value) {
++                  setState(() {
++                    if (value) {
++                      _selectedTagIds.add(tag.id);
++                    } else {
++                      _selectedTagIds.remove(tag.id);
++                    }
++                  });
++                }
++              : null,
++        );
++      }).toList(),
++    );
++  }
++
++  @override
++  Widget build(BuildContext context) {
++    final colorScheme = Theme.of(context).colorScheme;
++    final canEdit = widget.transaction.id != null &&
++        widget.transaction.syncStatus == SyncStatus.synced;
++
++    return Scaffold(
++      appBar: AppBar(title: const Text('Edit Transaction')),
++      body: Form(
++        key: _formKey,
++        child: ListView(
++          padding: const EdgeInsets.all(16),
++          children: [
++            if (!canEdit) ...[
++              Card(
++                color: colorScheme.errorContainer,
++                child: Padding(
++                  padding: const EdgeInsets.all(16),
++                  child: Text(
++                    'Only synced transactions can be edited from mobile.',
++                    style: TextStyle(color: colorScheme.onErrorContainer),
++                  ),
++                ),
++              ),
++              const SizedBox(height: 16),
++            ],
++            TextFormField(
++              controller: _nameController,
++              enabled: canEdit && !_isSaving,
++              validator: _validateName,
++              maxLength: _maxNameLength,
++              decoration: const InputDecoration(
++                labelText: 'Name',
++                prefixIcon: Icon(Icons.label),
++              ),
++            ),
++            const SizedBox(height: 16),
++            TextFormField(
++              controller: _notesController,
++              enabled: canEdit && !_isSaving,
++              validator: _validateNotes,
++              maxLength: _maxNotesLength,
++              minLines: 2,
++              maxLines: 4,
++              decoration: const InputDecoration(
++                labelText: 'Notes',
++                prefixIcon: Icon(Icons.notes),
++              ),
++            ),
++            const SizedBox(height: 16),
++            Consumer<CategoriesProvider>(
++              builder: (context, categoriesProvider, _) {
++                return DropdownButtonFormField<String?>(
++                  value: _selectedCategoryId,
++                  decoration: const InputDecoration(
++                    labelText: 'Category',
++                    prefixIcon: Icon(Icons.category),
++                    helperText: 'Choose a replacement category',
++                  ),
++                  isExpanded: true,
++                  items: _categoryItems(categoriesProvider.categories),
++                  onChanged: canEdit && !_isSaving
++                      ? (value) => setState(() => _selectedCategoryId = value)
++                      : null,
++                );
++              },
++            ),
++            const SizedBox(height: 16),
++            Consumer<MerchantsProvider>(
++              builder: (context, merchantsProvider, _) {
++                return DropdownButtonFormField<String?>(
++                  value: _selectedMerchantId,
++                  decoration: const InputDecoration(
++                    labelText: 'Merchant',
++                    prefixIcon: Icon(Icons.storefront),
++                    helperText: 'Choose a replacement merchant',
++                  ),
++                  isExpanded: true,
++                  items: _merchantItems(merchantsProvider.merchants),
++                  onChanged: canEdit && !_isSaving
++                      ? (value) => setState(() => _selectedMerchantId = value)
++                      : null,
++                );
++              },
++            ),
++            const SizedBox(height: 24),
++            Text('Tags', style: Theme.of(context).textTheme.titleMedium),
++            const SizedBox(height: 8),
++            Consumer<TagsProvider>(
++              builder: (context, tagsProvider, _) =>
++                  _buildTags(tagsProvider.tags, enabled: canEdit && !_isSaving),
++            ),
++            const SizedBox(height: 32),
++            ElevatedButton.icon(
++              onPressed: canEdit && !_isSaving ? _save : null,
++              icon: _isSaving
++                  ? const SizedBox(
++                      width: 20,
++                      height: 20,
++                      child: CircularProgressIndicator(strokeWidth: 2),
++                    )
++                  : const Icon(Icons.save),
++              label: Text(_isSaving ? 'Saving...' : 'Save Changes'),
++            ),
++          ],
++        ),
++      ),
++    );
++  }
++}
+diff --git a/mobile/lib/screens/transactions_list_screen.dart b/mobile/lib/screens/transactions_list_screen.dart
+index 3d0411e381..9369fe35c1 100644
+--- a/mobile/lib/screens/transactions_list_screen.dart
++++ b/mobile/lib/screens/transactions_list_screen.dart
+@@ -6,6 +6,7 @@ import '../models/offline_transaction.dart';
+ import '../providers/auth_provider.dart';
+ import '../providers/categories_provider.dart';
+ import '../providers/transactions_provider.dart';
++import '../screens/transaction_edit_screen.dart';
+ import '../screens/transaction_form_screen.dart';
+ import '../widgets/category_filter.dart';
+ import '../widgets/sync_status_badge.dart';
+@@ -250,6 +251,19 @@ class _TransactionsListScreenState extends State<TransactionsListScreen> {
+     }
+   }
+ 
++  Future<void> _editTransaction(OfflineTransaction transaction) async {
++    final updated = await Navigator.push<bool>(
++      context,
++      MaterialPageRoute(
++        builder: (context) => TransactionEditScreen(transaction: transaction),
++      ),
++    );
++
++    if (updated == true && mounted) {
++      await _loadTransactions();
++    }
++  }
++
+   Future<bool> _confirmAndDeleteTransaction(Transaction transaction) async {
+     if (transaction.id == null) return false;
+ 
+@@ -579,6 +593,30 @@ class _TransactionsListScreenState extends State<TransactionsListScreen> {
+                                           color: colorScheme.onSurfaceVariant,
+                                         ),
+                                   ),
++                                  if (transaction.merchantName != null ||
++                                      transaction.tagNames.isNotEmpty) ...[
++                                    const SizedBox(height: 4),
++                                    Wrap(
++                                      spacing: 6,
++                                      runSpacing: 4,
++                                      children: [
++                                        if (transaction.merchantName != null)
++                                          Chip(
++                                            label: Text(transaction.merchantName!),
++                                            visualDensity: VisualDensity.compact,
++                                          ),
++                                        ...transaction.tagNames
++                                            .where((name) => name.isNotEmpty)
++                                            .map(
++                                              (name) => Chip(
++                                                label: Text(name),
++                                                visualDensity:
++                                                    VisualDensity.compact,
++                                              ),
++                                            ),
++                                      ],
++                                    ),
++                                  ],
+                                 ],
+                               ),
+                             ),
+@@ -596,12 +634,30 @@ class _TransactionsListScreenState extends State<TransactionsListScreen> {
+                                           compact: true,
+                                         ),
+                                       ),
+-                                    Text(
+-                                      '${displayInfo['prefix']}${displayInfo['displayAmount']}',
+-                                      style: Theme.of(context).textTheme.titleMedium?.copyWith(
+-                                            fontWeight: FontWeight.bold,
+-                                            color: displayInfo['color'] as Color,
+-                                          ),
++                                    if (!_isSelectionMode &&
++                                        transaction.syncStatus ==
++                                            SyncStatus.synced)
++                                      SizedBox(
++                                        width: 36,
++                                        height: 36,
++                                        child: IconButton(
++                                          icon: const Icon(Icons.edit),
++                                          tooltip: 'Edit transaction',
++                                          visualDensity: VisualDensity.compact,
++                                          padding: EdgeInsets.zero,
++                                          onPressed: () =>
++                                              _editTransaction(transaction),
++                                        ),
++                                      ),
++                                    Flexible(
++                                      child: Text(
++                                        '${displayInfo['prefix']}${displayInfo['displayAmount']}',
++                                        overflow: TextOverflow.ellipsis,
++                                        style: Theme.of(context).textTheme.titleMedium?.copyWith(
++                                              fontWeight: FontWeight.bold,
++                                              color: displayInfo['color'] as Color,
++                                            ),
++                                      ),
+                                     ),
+                                   ],
+                                 ),
+diff --git a/mobile/lib/services/database_helper.dart b/mobile/lib/services/database_helper.dart
+index fe893b85f4..d0145edbad 100644
+--- a/mobile/lib/services/database_helper.dart
++++ b/mobile/lib/services/database_helper.dart
+@@ -38,12 +38,13 @@ class DatabaseHelper {
+       throw StateError('sqflite database is not available on web.');
+     }
+     if (_database != null) return _database!;
+-    
++
+     try {
+       _database = await _initDB('sure_offline.db');
+       return _database!;
+     } catch (e, stackTrace) {
+-      _log.error('DatabaseHelper', 'Error initializing local database sure_offline.db: $e');
++      _log.error('DatabaseHelper',
++          'Error initializing local database sure_offline.db: $e');
+       FlutterError.reportError(
+         FlutterErrorDetails(
+           exception: e,
+@@ -63,12 +64,13 @@ class DatabaseHelper {
+ 
+       return await openDatabase(
+         path,
+-        version: 2,
++        version: 3,
+         onCreate: _createDB,
+         onUpgrade: _upgradeDB,
+       );
+     } catch (e, stackTrace) {
+-      _log.error('DatabaseHelper', 'Error opening database file "$filePath": $e');
++      _log.error(
++          'DatabaseHelper', 'Error opening database file "$filePath": $e');
+       FlutterError.reportError(
+         FlutterErrorDetails(
+           exception: e,
+@@ -97,6 +99,10 @@ class DatabaseHelper {
+           notes TEXT,
+           category_id TEXT,
+           category_name TEXT,
++          merchant_id TEXT,
++          merchant_name TEXT,
++          tag_ids TEXT DEFAULT '[]',
++          tag_names TEXT DEFAULT '[]',
+           sync_status TEXT NOT NULL,
+           created_at TEXT NOT NULL,
+           updated_at TEXT NOT NULL
+@@ -156,10 +162,32 @@ class DatabaseHelper {
+       final columns = await db.rawQuery('PRAGMA table_info(transactions)');
+       final columnNames = columns.map((c) => c['name'] as String).toSet();
+       if (!columnNames.contains('category_id')) {
+-        await db.execute('ALTER TABLE transactions ADD COLUMN category_id TEXT');
++        await db
++            .execute('ALTER TABLE transactions ADD COLUMN category_id TEXT');
+       }
+       if (!columnNames.contains('category_name')) {
+-        await db.execute('ALTER TABLE transactions ADD COLUMN category_name TEXT');
++        await db
++            .execute('ALTER TABLE transactions ADD COLUMN category_name TEXT');
++      }
++    }
++    if (oldVersion < 3) {
++      final columns = await db.rawQuery('PRAGMA table_info(transactions)');
++      final columnNames = columns.map((c) => c['name'] as String).toSet();
++      if (!columnNames.contains('merchant_id')) {
++        await db
++            .execute('ALTER TABLE transactions ADD COLUMN merchant_id TEXT');
++      }
++      if (!columnNames.contains('merchant_name')) {
++        await db
++            .execute('ALTER TABLE transactions ADD COLUMN merchant_name TEXT');
++      }
++      if (!columnNames.contains('tag_ids')) {
++        await db.execute(
++            "ALTER TABLE transactions ADD COLUMN tag_ids TEXT DEFAULT '[]'");
++      }
++      if (!columnNames.contains('tag_names')) {
++        await db.execute(
++            "ALTER TABLE transactions ADD COLUMN tag_names TEXT DEFAULT '[]'");
+       }
+     }
+   }
+@@ -173,7 +201,8 @@ class DatabaseHelper {
+       return localId;
+     }
+     final db = await database;
+-    _log.debug('DatabaseHelper', 'Inserting transaction: local_id=${transaction['local_id']}, account_id="${transaction['account_id']}", server_id=${transaction['server_id']}');
++    _log.debug('DatabaseHelper',
++        'Inserting transaction: local_id=${transaction['local_id']}, account_id="${transaction['account_id']}", server_id=${transaction['server_id']}');
+     await db.insert(
+       'transactions',
+       transaction,
+@@ -183,7 +212,8 @@ class DatabaseHelper {
+     return transaction['local_id'] as String;
+   }
+ 
+-  Future<List<Map<String, dynamic>>> getTransactions({String? accountId}) async {
++  Future<List<Map<String, dynamic>>> getTransactions(
++      {String? accountId}) async {
+     if (_useInMemoryStore) {
+       _ensureWebStoreReady();
+       final results = _memoryTransactions.values
+@@ -194,16 +224,19 @@ class DatabaseHelper {
+           .map((transaction) => Map<String, dynamic>.from(transaction))
+           .toList();
+       results.sort((a, b) {
+-        final dateCompare = _compareDesc(a['date'] as String?, b['date'] as String?);
++        final dateCompare =
++            _compareDesc(a['date'] as String?, b['date'] as String?);
+         if (dateCompare != 0) return dateCompare;
+-        return _compareDesc(a['created_at'] as String?, b['created_at'] as String?);
++        return _compareDesc(
++            a['created_at'] as String?, b['created_at'] as String?);
+       });
+       return results;
+     }
+     final db = await database;
+ 
+     if (accountId != null) {
+-      _log.debug('DatabaseHelper', 'Querying transactions WHERE account_id = "$accountId"');
++      _log.debug('DatabaseHelper',
++          'Querying transactions WHERE account_id = "$accountId"');
+       final results = await db.query(
+         'transactions',
+         where: 'account_id = ?',
+@@ -227,7 +260,9 @@ class DatabaseHelper {
+     if (_useInMemoryStore) {
+       _ensureWebStoreReady();
+       final transaction = _memoryTransactions[localId];
+-      return transaction != null ? Map<String, dynamic>.from(transaction) : null;
++      return transaction != null
++          ? Map<String, dynamic>.from(transaction)
++          : null;
+     }
+     final db = await database;
+     final results = await db.query(
+@@ -240,7 +275,8 @@ class DatabaseHelper {
+     return results.isNotEmpty ? results.first : null;
+   }
+ 
+-  Future<Map<String, dynamic>?> getTransactionByServerId(String serverId) async {
++  Future<Map<String, dynamic>?> getTransactionByServerId(
++      String serverId) async {
+     if (_useInMemoryStore) {
+       _ensureWebStoreReady();
+       for (final transaction in _memoryTransactions.values) {
+@@ -269,7 +305,8 @@ class DatabaseHelper {
+           .map((transaction) => Map<String, dynamic>.from(transaction))
+           .toList();
+       results.sort(
+-        (a, b) => _compareAsc(a['created_at'] as String?, b['created_at'] as String?),
++        (a, b) =>
++            _compareAsc(a['created_at'] as String?, b['created_at'] as String?),
+       );
+       return results;
+     }
+@@ -286,11 +323,13 @@ class DatabaseHelper {
+     if (_useInMemoryStore) {
+       _ensureWebStoreReady();
+       final results = _memoryTransactions.values
+-          .where((transaction) => transaction['sync_status'] == 'pending_delete')
++          .where(
++              (transaction) => transaction['sync_status'] == 'pending_delete')
+           .map((transaction) => Map<String, dynamic>.from(transaction))
+           .toList();
+       results.sort(
+-        (a, b) => _compareAsc(a['updated_at'] as String?, b['updated_at'] as String?),
++        (a, b) =>
++            _compareAsc(a['updated_at'] as String?, b['updated_at'] as String?),
+       );
+       return results;
+     }
+@@ -303,7 +342,8 @@ class DatabaseHelper {
+     );
+   }
+ 
+-  Future<int> updateTransaction(String localId, Map<String, dynamic> transaction) async {
++  Future<int> updateTransaction(
++      String localId, Map<String, dynamic> transaction) async {
+     if (_useInMemoryStore) {
+       _ensureWebStoreReady();
+       if (!_memoryTransactions.containsKey(localId)) {
+@@ -381,7 +421,8 @@ class DatabaseHelper {
+       return;
+     }
+     final db = await database;
+-    _log.debug('DatabaseHelper', 'Clearing only synced transactions, keeping pending/failed');
++    _log.debug('DatabaseHelper',
++        'Clearing only synced transactions, keeping pending/failed');
+     await db.delete(
+       'transactions',
+       where: 'sync_status = ?',
+diff --git a/mobile/lib/services/merchants_service.dart b/mobile/lib/services/merchants_service.dart
+new file mode 100644
+index 0000000000..3dbf7d7d15
+--- /dev/null
++++ b/mobile/lib/services/merchants_service.dart
+@@ -0,0 +1,18 @@
++import '../models/merchant.dart';
++import 'response_list_parser.dart';
++
++class MerchantsService {
++  Future<Map<String, dynamic>> getMerchants({
++    required String accessToken,
++  }) async {
++    return fetchApiList<Merchant>(
++      accessToken: accessToken,
++      path: '/api/v1/merchants',
++      key: 'merchants',
++      resultKey: 'merchants',
++      fromJson: Merchant.fromJson,
++      isValid: (merchant) => merchant.id.isNotEmpty,
++      failureMessage: 'Failed to fetch merchants',
++    );
++  }
++}
+diff --git a/mobile/lib/services/offline_storage_service.dart b/mobile/lib/services/offline_storage_service.dart
+index 06b0a687b6..520de7763f 100644
+--- a/mobile/lib/services/offline_storage_service.dart
++++ b/mobile/lib/services/offline_storage_service.dart
+@@ -21,12 +21,18 @@ class OfflineStorageService {
+     String? notes,
+     String? categoryId,
+     String? categoryName,
++    String? merchantId,
++    String? merchantName,
++    List<String> tagIds = const [],
++    List<String> tagNames = const [],
+     String? serverId,
+     SyncStatus syncStatus = SyncStatus.pending,
+   }) async {
+-    _log.info('OfflineStorage', 'saveTransaction called: name=$name, amount=$amount, accountId=$accountId, syncStatus=$syncStatus');
+-
+     final localId = _uuid.v4();
++
++    _log.info('OfflineStorage',
++        'saveTransaction called: localId=$localId, accountId=$accountId, syncStatus=$syncStatus');
++
+     final transaction = OfflineTransaction(
+       id: serverId,
+       localId: localId,
+@@ -39,12 +45,17 @@ class OfflineStorageService {
+       notes: notes,
+       categoryId: categoryId,
+       categoryName: categoryName,
++      merchantId: merchantId,
++      merchantName: merchantName,
++      tagIds: tagIds,
++      tagNames: tagNames,
+       syncStatus: syncStatus,
+     );
+ 
+     try {
+       await _dbHelper.insertTransaction(transaction.toDatabaseMap());
+-      _log.info('OfflineStorage', 'Transaction saved successfully with localId: $localId');
++      _log.info('OfflineStorage',
++          'Transaction saved successfully with localId: $localId');
+       return transaction;
+     } catch (e) {
+       _log.error('OfflineStorage', 'Failed to save transaction: $e');
+@@ -53,22 +64,27 @@ class OfflineStorageService {
+   }
+ 
+   Future<List<OfflineTransaction>> getTransactions({String? accountId}) async {
+-    _log.debug('OfflineStorage', 'getTransactions called with accountId: $accountId');
+-    final transactionMaps = await _dbHelper.getTransactions(accountId: accountId);
+-    _log.debug('OfflineStorage', 'Retrieved ${transactionMaps.length} transaction maps from database');
++    _log.debug(
++        'OfflineStorage', 'getTransactions called with accountId: $accountId');
++    final transactionMaps =
++        await _dbHelper.getTransactions(accountId: accountId);
++    _log.debug('OfflineStorage',
++        'Retrieved ${transactionMaps.length} transaction maps from database');
+ 
+     if (transactionMaps.isNotEmpty && accountId != null) {
+       _log.debug('OfflineStorage', 'Sample transaction account_ids:');
+       for (int i = 0; i < transactionMaps.take(3).length; i++) {
+         final map = transactionMaps[i];
+-        _log.debug('OfflineStorage', '  - Transaction ${map['server_id']}: account_id="${map['account_id']}"');
++        _log.debug('OfflineStorage',
++            '  - Transaction ${map['server_id']}: account_id="${map['account_id']}"');
+       }
+     }
+ 
+     final transactions = transactionMaps
+         .map((map) => OfflineTransaction.fromDatabaseMap(map))
+         .toList();
+-    _log.debug('OfflineStorage', 'Returning ${transactions.length} transactions');
++    _log.debug(
++        'OfflineStorage', 'Returning ${transactions.length} transactions');
+     return transactions;
+   }
+ 
+@@ -123,12 +139,14 @@ class OfflineStorageService {
+ 
+   /// Mark a transaction for pending deletion (offline delete)
+   Future<void> markTransactionForDeletion(String serverId) async {
+-    _log.info('OfflineStorage', 'Marking transaction $serverId for pending deletion');
++    _log.info(
++        'OfflineStorage', 'Marking transaction $serverId for pending deletion');
+ 
+     // Find the transaction by server ID
+     final existing = await getTransactionByServerId(serverId);
+     if (existing == null) {
+-      _log.warning('OfflineStorage', 'Transaction $serverId not found, cannot mark for deletion');
++      _log.warning('OfflineStorage',
++          'Transaction $serverId not found, cannot mark for deletion');
+       return;
+     }
+ 
+@@ -138,28 +156,35 @@ class OfflineStorageService {
+       updatedAt: DateTime.now(),
+     );
+ 
+-    await _dbHelper.updateTransaction(existing.localId, updated.toDatabaseMap());
+-    _log.info('OfflineStorage', 'Transaction ${existing.localId} marked as pending_delete');
++    await _dbHelper.updateTransaction(
++        existing.localId, updated.toDatabaseMap());
++    _log.info('OfflineStorage',
++        'Transaction ${existing.localId} marked as pending_delete');
+   }
+ 
+   /// Undo a pending transaction operation (either pending create or pending delete)
+-  Future<bool> undoPendingTransaction(String localId, SyncStatus currentStatus) async {
+-    _log.info('OfflineStorage', 'Undoing pending transaction $localId with status $currentStatus');
++  Future<bool> undoPendingTransaction(
++      String localId, SyncStatus currentStatus) async {
++    _log.info('OfflineStorage',
++        'Undoing pending transaction $localId with status $currentStatus');
+ 
+     final existing = await getTransactionByLocalId(localId);
+     if (existing == null) {
+-      _log.warning('OfflineStorage', 'Transaction $localId not found, cannot undo');
++      _log.warning(
++          'OfflineStorage', 'Transaction $localId not found, cannot undo');
+       return false;
+     }
+ 
+     if (currentStatus == SyncStatus.pending) {
+       // For pending creates: delete the transaction completely
+-      _log.info('OfflineStorage', 'Deleting pending create transaction $localId');
++      _log.info(
++          'OfflineStorage', 'Deleting pending create transaction $localId');
+       await deleteTransaction(localId);
+       return true;
+     } else if (currentStatus == SyncStatus.pendingDelete) {
+       // For pending deletes: restore to synced status
+-      _log.info('OfflineStorage', 'Restoring pending delete transaction $localId to synced');
++      _log.info('OfflineStorage',
++          'Restoring pending delete transaction $localId to synced');
+       final updated = existing.copyWith(
+         syncStatus: SyncStatus.synced,
+         updatedAt: DateTime.now(),
+@@ -168,21 +193,26 @@ class OfflineStorageService {
+       return true;
+     }
+ 
+-    _log.warning('OfflineStorage', 'Cannot undo transaction with status $currentStatus');
++    _log.warning(
++        'OfflineStorage', 'Cannot undo transaction with status $currentStatus');
+     return false;
+   }
+ 
+-  Future<void> syncTransactionsFromServer(List<Transaction> serverTransactions) async {
+-    _log.info('OfflineStorage', 'syncTransactionsFromServer called with ${serverTransactions.length} transactions from server');
++  Future<void> syncTransactionsFromServer(
++      List<Transaction> serverTransactions) async {
++    _log.info('OfflineStorage',
++        'syncTransactionsFromServer called with ${serverTransactions.length} transactions from server');
+ 
+     // Log first transaction's accountId for debugging
+     if (serverTransactions.isNotEmpty) {
+       final firstTx = serverTransactions.first;
+-      _log.info('OfflineStorage', 'First transaction: id=${firstTx.id}, accountId="${firstTx.accountId}", name="${firstTx.name}"');
++      _log.info('OfflineStorage',
++          'First transaction: id=${firstTx.id}, accountId="${firstTx.accountId}", name="${firstTx.name}"');
+     }
+ 
+     // Use upsert logic instead of clear + insert to preserve recently uploaded transactions
+-    _log.info('OfflineStorage', 'Upserting all transactions from server (preserving pending/failed)');
++    _log.info('OfflineStorage',
++        'Upserting all transactions from server (preserving pending/failed)');
+ 
+     int upsertedCount = 0;
+     int emptyAccountIdCount = 0;
+@@ -196,9 +226,11 @@ class OfflineStorageService {
+       }
+     }
+ 
+-    _log.info('OfflineStorage', 'Upserted $upsertedCount transactions from server');
++    _log.info(
++        'OfflineStorage', 'Upserted $upsertedCount transactions from server');
+     if (emptyAccountIdCount > 0) {
+-      _log.error('OfflineStorage', 'WARNING: $emptyAccountIdCount transactions had EMPTY accountId!');
++      _log.error('OfflineStorage',
++          'WARNING: $emptyAccountIdCount transactions had EMPTY accountId!');
+     }
+   }
+ 
+@@ -212,13 +244,15 @@ class OfflineStorageService {
+     }
+ 
+     // If accountId is provided and transaction.accountId is empty, use the provided one
+-    final effectiveAccountId = transaction.accountId.isEmpty && accountId != null
+-        ? accountId
+-        : transaction.accountId;
++    final effectiveAccountId =
++        transaction.accountId.isEmpty && accountId != null
++            ? accountId
++            : transaction.accountId;
+ 
+     // Log if transaction has empty accountId
+     if (transaction.accountId.isEmpty) {
+-      _log.warning('OfflineStorage', 'Transaction ${transaction.id} has empty accountId from server! Provided accountId: $accountId, effective: $effectiveAccountId');
++      _log.warning('OfflineStorage',
++          'Transaction ${transaction.id} has empty accountId from server! Provided accountId: $accountId, effective: $effectiveAccountId');
+     }
+ 
+     // Check if we already have this transaction
+@@ -226,31 +260,25 @@ class OfflineStorageService {
+ 
+     if (existing != null) {
+       // Update existing transaction, preserving its accountId if effectiveAccountId is empty
+-      final finalAccountId = effectiveAccountId.isEmpty ? existing.accountId : effectiveAccountId;
++      final finalAccountId =
++          effectiveAccountId.isEmpty ? existing.accountId : effectiveAccountId;
+ 
+       if (finalAccountId.isEmpty) {
+-        _log.error('OfflineStorage', 'CRITICAL: Updating transaction ${transaction.id} with EMPTY accountId!');
++        _log.error('OfflineStorage',
++            'CRITICAL: Updating transaction ${transaction.id} with EMPTY accountId!');
+       }
+ 
+-      final updated = OfflineTransaction(
+-        id: transaction.id,
+-        localId: existing.localId,
++      final updated = existing.mergeServerTransaction(
++        transaction,
+         accountId: finalAccountId,
+-        name: transaction.name,
+-        date: transaction.date,
+-        amount: transaction.amount,
+-        currency: transaction.currency,
+-        nature: transaction.nature,
+-        notes: transaction.notes,
+-        categoryId: transaction.categoryId ?? existing.categoryId,
+-        categoryName: transaction.categoryName ?? existing.categoryName,
+-        syncStatus: SyncStatus.synced,
+       );
+-      await _dbHelper.updateTransaction(existing.localId, updated.toDatabaseMap());
++      await _dbHelper.updateTransaction(
++          existing.localId, updated.toDatabaseMap());
+     } else {
+       // Insert new transaction
+       if (effectiveAccountId.isEmpty) {
+-        _log.error('OfflineStorage', 'CRITICAL: Inserting transaction ${transaction.id} with EMPTY accountId!');
++        _log.error('OfflineStorage',
++            'CRITICAL: Inserting transaction ${transaction.id} with EMPTY accountId!');
+       }
+ 
+       final offlineTransaction = OfflineTransaction(
+@@ -265,6 +293,10 @@ class OfflineStorageService {
+         notes: transaction.notes,
+         categoryId: transaction.categoryId,
+         categoryName: transaction.categoryName,
++        merchantId: transaction.merchantId,
++        merchantName: transaction.merchantName,
++        tagIds: transaction.tagIds,
++        tagNames: transaction.tagNames,
+         syncStatus: SyncStatus.synced,
+       );
+       await _dbHelper.insertTransaction(offlineTransaction.toDatabaseMap());
+@@ -291,15 +323,17 @@ class OfflineStorageService {
+   }
+ 
+   Future<void> saveAccounts(List<Account> accounts) async {
+-    final accountMaps = accounts.map((account) => {
+-      'id': account.id,
+-      'name': account.name,
+-      'balance': account.balance,
+-      'currency': account.currency,
+-      'classification': account.classification,
+-      'account_type': account.accountType,
+-      'synced_at': DateTime.now().toIso8601String(),
+-    }).toList();
++    final accountMaps = accounts
++        .map((account) => {
++              'id': account.id,
++              'name': account.name,
++              'balance': account.balance,
++              'currency': account.currency,
++              'classification': account.classification,
++              'account_type': account.accountType,
++              'synced_at': DateTime.now().toIso8601String(),
++            })
++        .toList();
+ 
+     await _dbHelper.insertAccounts(accountMaps);
+   }
+diff --git a/mobile/lib/services/response_list_parser.dart b/mobile/lib/services/response_list_parser.dart
+new file mode 100644
+index 0000000000..45763fae21
+--- /dev/null
++++ b/mobile/lib/services/response_list_parser.dart
+@@ -0,0 +1,91 @@
++import 'dart:convert';
++
++import 'package:http/http.dart' as http;
++
++import 'api_config.dart';
++
++List<Map<String, dynamic>> extractJsonObjectList(
++  dynamic responseData, {
++  String? key,
++}) {
++  final dynamic rawList;
++  if (responseData is List) {
++    rawList = responseData;
++  } else if (responseData is Map && key != null) {
++    rawList = responseData[key] is List ? responseData[key] : const [];
++  } else if (responseData is Map) {
++    final lists = responseData.values.whereType<List>();
++    rawList = lists.isEmpty ? const [] : lists.first;
++  } else {
++    rawList = const [];
++  }
++
++  return (rawList as List)
++      .whereType<Map>()
++      .map((item) => item.cast<String, dynamic>())
++      .toList();
++}
++
++Future<Map<String, dynamic>> fetchApiList<T>({
++  required String accessToken,
++  required String path,
++  required String key,
++  required String resultKey,
++  required T Function(Map<String, dynamic>) fromJson,
++  required bool Function(T) isValid,
++  required String failureMessage,
++}) async {
++  final url = Uri.parse('${ApiConfig.baseUrl}$path');
++
++  try {
++    final response = await http.get(
++      url,
++      headers: {
++        ...ApiConfig.getAuthHeaders(accessToken),
++        'Content-Type': 'application/json',
++      },
++    ).timeout(const Duration(seconds: 30));
++
++    if (response.statusCode == 200) {
++      final responseData = jsonDecode(response.body);
++      final items = <T>[];
++      for (final json in extractJsonObjectList(responseData, key: key)) {
++        try {
++          final item = fromJson(json);
++          if (isValid(item)) {
++            items.add(item);
++          }
++        } on FormatException {
++          // Skip malformed metadata records instead of failing the whole list.
++        }
++      }
++
++      return {'success': true, resultKey: items};
++    } else if (response.statusCode == 401) {
++      return {'success': false, 'error': 'unauthorized'};
++    }
++
++    return {
++      'success': false,
++      'error': extractErrorMessage(response.body, fallback: failureMessage),
++    };
++  } catch (e) {
++    return {'success': false, 'error': 'Network error: ${e.toString()}'};
++  }
++}
++
++String extractErrorMessage(String responseBody, {required String fallback}) {
++  try {
++    final responseData = jsonDecode(responseBody);
++    if (responseData is Map) {
++      final message = responseData['message'] ?? responseData['error'];
++      if (message != null && message.toString().trim().isNotEmpty) {
++        return message.toString();
++      }
++    }
++  } catch (_) {
++    // Fall through to the static caller-provided fallback.
++  }
++
++  return fallback;
++}
+diff --git a/mobile/lib/services/sync_service.dart b/mobile/lib/services/sync_service.dart
+index a5dab65439..c40ef467ee 100644
+--- a/mobile/lib/services/sync_service.dart
++++ b/mobile/lib/services/sync_service.dart
+@@ -126,6 +126,8 @@ class SyncService with ChangeNotifier {
+             nature: transaction.nature,
+             notes: transaction.notes,
+             categoryId: transaction.categoryId,
++            merchantId: transaction.merchantId,
++            tagIds: transaction.tagIds,
+           );
+ 
+           if (result['success'] == true) {
+diff --git a/mobile/lib/services/tags_service.dart b/mobile/lib/services/tags_service.dart
+new file mode 100644
+index 0000000000..da547015aa
+--- /dev/null
++++ b/mobile/lib/services/tags_service.dart
+@@ -0,0 +1,16 @@
++import '../models/transaction_tag.dart';
++import 'response_list_parser.dart';
++
++class TagsService {
++  Future<Map<String, dynamic>> getTags({required String accessToken}) async {
++    return fetchApiList<TransactionTag>(
++      accessToken: accessToken,
++      path: '/api/v1/tags',
++      key: 'tags',
++      resultKey: 'tags',
++      fromJson: TransactionTag.fromJson,
++      isValid: (tag) => tag.id.isNotEmpty,
++      failureMessage: 'Failed to fetch tags',
++    );
++  }
++}
+diff --git a/mobile/lib/services/transactions_service.dart b/mobile/lib/services/transactions_service.dart
+index 83af27de85..233bde1783 100644
+--- a/mobile/lib/services/transactions_service.dart
++++ b/mobile/lib/services/transactions_service.dart
+@@ -4,6 +4,11 @@ import '../models/transaction.dart';
+ import 'api_config.dart';
+ 
+ class TransactionsService {
++  final http.Client _client;
++
++  TransactionsService({http.Client? client})
++      : _client = client ?? http.Client();
++
+   Future<Map<String, dynamic>> createTransaction({
+     required String accessToken,
+     required String accountId,
+@@ -14,6 +19,8 @@ class TransactionsService {
+     required String nature,
+     String? notes,
+     String? categoryId,
++    String? merchantId,
++    List<String>? tagIds,
+   }) async {
+     final url = Uri.parse('${ApiConfig.baseUrl}/api/v1/transactions');
+ 
+@@ -27,18 +34,22 @@ class TransactionsService {
+         'nature': nature,
+         if (notes != null) 'notes': notes,
+         if (categoryId != null) 'category_id': categoryId,
++        if (merchantId != null) 'merchant_id': merchantId,
++        if (tagIds != null) 'tag_ids': tagIds,
+       }
+     };
+ 
+     try {
+-      final response = await http.post(
+-        url,
+-        headers: {
+-          ...ApiConfig.getAuthHeaders(accessToken),
+-          'Content-Type': 'application/json',
+-        },
+-        body: jsonEncode(body),
+-      ).timeout(const Duration(seconds: 30));
++      final response = await _client
++          .post(
++            url,
++            headers: {
++              ...ApiConfig.getAuthHeaders(accessToken),
++              'Content-Type': 'application/json',
++            },
++            body: jsonEncode(body),
++          )
++          .timeout(const Duration(seconds: 30));
+ 
+       if (response.statusCode == 200 || response.statusCode == 201) {
+         final responseData = jsonDecode(response.body);
+@@ -52,18 +63,13 @@ class TransactionsService {
+           'error': 'unauthorized',
+         };
+       } else {
+-        try {
+-          final responseData = jsonDecode(response.body);
+-          return {
+-            'success': false,
+-            'error': responseData['error'] ?? 'Failed to create transaction',
+-          };
+-        } catch (e) {
+-          return {
+-            'success': false,
+-            'error': 'Failed to create transaction: ${response.body}',
+-          };
+-        }
++        return {
++          'success': false,
++          'error': errorMessageFromResponseBody(
++            response.body,
++            fallback: 'Failed to create transaction',
++          ),
++        };
+       }
+     } catch (e) {
+       return {
+@@ -97,7 +103,7 @@ class TransactionsService {
+         : baseUri;
+ 
+     try {
+-      final response = await http.get(
++      final response = await _client.get(
+         url,
+         headers: {
+           ...ApiConfig.getAuthHeaders(accessToken),
+@@ -114,7 +120,8 @@ class TransactionsService {
+ 
+         if (responseData is List) {
+           transactionsJson = responseData;
+-        } else if (responseData is Map && responseData.containsKey('transactions')) {
++        } else if (responseData is Map &&
++            responseData.containsKey('transactions')) {
+           transactionsJson = responseData['transactions'];
+           // Extract pagination metadata if present
+           if (responseData.containsKey('pagination')) {
+@@ -124,9 +131,8 @@ class TransactionsService {
+           transactionsJson = [];
+         }
+ 
+-        final transactions = transactionsJson
+-            .map((json) => Transaction.fromJson(json))
+-            .toList();
++        final transactions =
++            transactionsJson.map((json) => Transaction.fromJson(json)).toList();
+ 
+         return {
+           'success': true,
+@@ -152,14 +158,141 @@ class TransactionsService {
+     }
+   }
+ 
++  Future<Map<String, dynamic>> getTransaction({
++    required String accessToken,
++    required String transactionId,
++  }) async {
++    final url =
++        Uri.parse('${ApiConfig.baseUrl}/api/v1/transactions/$transactionId');
++
++    try {
++      final response = await _client.get(
++        url,
++        headers: {
++          ...ApiConfig.getAuthHeaders(accessToken),
++          'Content-Type': 'application/json',
++        },
++      ).timeout(const Duration(seconds: 30));
++
++      if (response.statusCode == 200) {
++        final responseData = jsonDecode(response.body);
++        return {
++          'success': true,
++          'transaction': Transaction.fromJson(responseData),
++        };
++      } else if (response.statusCode == 401) {
++        return {
++          'success': false,
++          'error': 'unauthorized',
++        };
++      } else {
++        return {
++          'success': false,
++          'error': errorMessageFromResponseBody(
++            response.body,
++            fallback: 'Failed to fetch transaction',
++          ),
++        };
++      }
++    } catch (e) {
++      return {
++        'success': false,
++        'error': 'Network error: ${e.toString()}',
++      };
++    }
++  }
++
++  Future<Map<String, dynamic>> updateTransaction({
++    required String accessToken,
++    required String transactionId,
++    String? name,
++    String? date,
++    String? amount,
++    String? currency,
++    String? nature,
++    String? notes,
++    String? categoryId,
++    String? merchantId,
++    List<String>? tagIds,
++  }) async {
++    final url =
++        Uri.parse('${ApiConfig.baseUrl}/api/v1/transactions/$transactionId');
++
++    final transaction = <String, dynamic>{
++      if (name != null) 'name': name,
++      if (date != null) 'date': date,
++      if (amount != null) 'amount': amount,
++      if (currency != null) 'currency': currency,
++      if (nature != null) 'nature': nature,
++      if (notes != null) 'notes': notes,
++      if (categoryId != null) 'category_id': categoryId,
++      if (merchantId != null) 'merchant_id': merchantId,
++      if (tagIds != null) 'tag_ids': tagIds,
++    };
++
++    if (transaction.isEmpty) {
++      return {
++        'success': false,
++        'error': 'No fields to update',
++      };
++    }
++
++    try {
++      final response = await _client
++          .patch(
++            url,
++            headers: {
++              ...ApiConfig.getAuthHeaders(accessToken),
++              'Content-Type': 'application/json',
++            },
++            body: jsonEncode({'transaction': transaction}),
++          )
++          .timeout(const Duration(seconds: 30));
++
++      if (response.statusCode == 200 || response.statusCode == 204) {
++        if (response.body.trim().isEmpty) {
++          return {
++            'success': true,
++            'transaction': null,
++          };
++        }
++
++        final responseData = jsonDecode(response.body);
++        return {
++          'success': true,
++          'transaction': Transaction.fromJson(responseData),
++        };
++      } else if (response.statusCode == 401) {
++        return {
++          'success': false,
++          'error': 'unauthorized',
++        };
++      } else {
++        return {
++          'success': false,
++          'error': errorMessageFromResponseBody(
++            response.body,
++            fallback: 'Failed to update transaction',
++          ),
++        };
++      }
++    } catch (e) {
++      return {
++        'success': false,
++        'error': 'Network error: ${e.toString()}',
++      };
++    }
++  }
++
+   Future<Map<String, dynamic>> deleteTransaction({
+     required String accessToken,
+     required String transactionId,
+   }) async {
+-    final url = Uri.parse('${ApiConfig.baseUrl}/api/v1/transactions/$transactionId');
++    final url =
++        Uri.parse('${ApiConfig.baseUrl}/api/v1/transactions/$transactionId');
+ 
+     try {
+-      final response = await http.delete(
++      final response = await _client.delete(
+         url,
+         headers: {
+           ...ApiConfig.getAuthHeaders(accessToken),
+@@ -205,9 +338,9 @@ class TransactionsService {
+     try {
+       final results = await Future.wait(
+         transactionIds.map((id) => deleteTransaction(
+-          accessToken: accessToken,
+-          transactionId: id,
+-        )),
++              accessToken: accessToken,
++              transactionId: id,
++            )),
+       );
+ 
+       final allSuccess = results.every((result) => result['success'] == true);
+@@ -231,4 +364,72 @@ class TransactionsService {
+       };
+     }
+   }
++
++  static String errorMessageFromResponseBody(
++    String body, {
++    required String fallback,
++  }) {
++    try {
++      final responseData = jsonDecode(body);
++      if (responseData is! Map<String, dynamic>) return fallback;
++
++      final message = responseData['message'] ?? responseData['error'];
++      final errors = responseData['errors'];
++      final formattedErrors = _formatErrors(errors);
++
++      if (message != null && formattedErrors != null) {
++        return '${message.toString()}: $formattedErrors';
++      }
++
++      if (formattedErrors != null) return formattedErrors;
++      if (message != null) return message.toString();
++    } catch (_) {
++      return fallback;
++    }
++
++    return fallback;
++  }
++
++  static String? _formatErrors(dynamic errors) {
++    if (errors is List) {
++      final parts = errors
++          .map((error) => error?.toString().trim() ?? '')
++          .where((error) => error.isNotEmpty)
++          .toList();
++      return parts.isEmpty ? null : parts.join('; ');
++    }
++
++    if (errors is Map) {
++      final parts = <String>[];
++      for (final entry in errors.entries) {
++        final field = _humanizeField(entry.key.toString());
++        final value = entry.value;
++        if (value is List) {
++          for (final message in value) {
++            final text = message?.toString().trim() ?? '';
++            if (text.isNotEmpty) parts.add('$field $text');
++          }
++        } else {
++          final text = value?.toString().trim() ?? '';
++          if (text.isNotEmpty) parts.add('$field $text');
++        }
++      }
++      return parts.isEmpty ? null : parts.join('; ');
++    }
++
++    return null;
++  }
++
++  static String _humanizeField(String field) {
++    final words = field
++        .replaceAll('_', ' ')
++        .split(' ')
++        .where((word) => word.isNotEmpty)
++        .toList();
++    if (words.isEmpty) return field;
++
++    final first = words.first;
++    words[0] = first[0].toUpperCase() + first.substring(1);
++    return words.join(' ');
++  }
+ }
+diff --git a/mobile/test/models/transaction_metadata_test.dart b/mobile/test/models/transaction_metadata_test.dart
+new file mode 100644
+index 0000000000..b657279501
+--- /dev/null
++++ b/mobile/test/models/transaction_metadata_test.dart
+@@ -0,0 +1,308 @@
++import 'package:flutter_test/flutter_test.dart';
++import 'package:sure_mobile/models/offline_transaction.dart';
++import 'package:sure_mobile/models/transaction.dart';
++
++void main() {
++  group('Transaction metadata', () {
++    test('parses merchant and tags from API response', () {
++      final transaction = Transaction.fromJson({
++        'id': 'tx_1',
++        'account': {'id': 'acct_1'},
++        'name': 'Coffee',
++        'date': '2026-06-01',
++        'amount': r'$4.50',
++        'currency': 'USD',
++        'classification': 'expense',
++        'notes': 'latte',
++        'category': {'id': 'cat_1', 'name': 'Dining'},
++        'merchant': {'id': 'merchant_1', 'name': 'Cafe'},
++        'tags': [
++          {'id': 'tag_1', 'name': 'Work'},
++          {'id': 'tag_2', 'name': 'Travel'},
++        ],
++      });
++
++      expect(transaction.merchantId, 'merchant_1');
++      expect(transaction.merchantName, 'Cafe');
++      expect(transaction.tagIds, ['tag_1', 'tag_2']);
++      expect(transaction.tagNames, ['Work', 'Travel']);
++    });
++
++    test('round-trips merchant and tag metadata through offline maps', () {
++      final offlineTransaction = OfflineTransaction.fromTransaction(
++        Transaction(
++          id: 'tx_1',
++          accountId: 'acct_1',
++          name: 'Coffee',
++          date: '2026-06-01',
++          amount: r'$4.50',
++          currency: 'USD',
++          nature: 'expense',
++          merchantId: 'merchant_1',
++          merchantName: 'Cafe',
++          tagIds: const ['tag_1', 'tag_2'],
++          tagNames: const ['Work', 'Travel'],
++        ),
++        localId: 'local_1',
++      );
++
++      final restored = OfflineTransaction.fromDatabaseMap(
++        offlineTransaction.toDatabaseMap(),
++      );
++
++      expect(restored.merchantId, 'merchant_1');
++      expect(restored.merchantName, 'Cafe');
++      expect(restored.tagIds, ['tag_1', 'tag_2']);
++      expect(restored.tagNames, ['Work', 'Travel']);
++      expect(restored.syncStatus, SyncStatus.synced);
++    });
++
++    test('preserves omitted tag state for stored rows without tag columns', () {
++      final restored = OfflineTransaction.fromDatabaseMap({
++        'server_id': 'tx_1',
++        'local_id': 'local_1',
++        'account_id': 'acct_1',
++        'name': 'Coffee',
++        'date': '2026-06-01',
++        'amount': r'$4.50',
++        'currency': 'USD',
++        'nature': 'expense',
++        'notes': null,
++        'category_id': null,
++        'category_name': null,
++        'merchant_id': null,
++        'merchant_name': null,
++        'sync_status': 'synced',
++        'created_at': '2026-06-01T00:00:00.000',
++        'updated_at': '2026-06-01T00:00:00.000',
++      });
++
++      expect(restored.tagsProvided, false);
++      expect(restored.tagIds, isEmpty);
++      expect(restored.tagNames, isEmpty);
++    });
++
++    test('parses flat merchant and tag fields', () {
++      final transaction = Transaction.fromJson({
++        'id': 'tx_1',
++        'account_id': 'acct_1',
++        'name': 'Coffee',
++        'date': '2026-06-01',
++        'amount': r'$4.50',
++        'currency': 'USD',
++        'nature': 'expense',
++        'merchant_id': 'merchant_1',
++        'merchant_name': 'Cafe',
++        'tag_ids': ['tag_1', 'tag_2'],
++        'tag_names': ['Work', 'Travel'],
++      });
++
++      expect(transaction.merchantId, 'merchant_1');
++      expect(transaction.merchantName, 'Cafe');
++      expect(transaction.tagIds, ['tag_1', 'tag_2']);
++      expect(transaction.tagNames, ['Work', 'Travel']);
++    });
++
++    test('normalizes mismatched flat tag name lengths', () {
++      final shortNames = Transaction.fromJson({
++        'account_id': 'acct_1',
++        'name': 'Coffee',
++        'date': '2026-06-01',
++        'amount': r'$4.50',
++        'currency': 'USD',
++        'nature': 'expense',
++        'tag_ids': ['tag_1', 'tag_2'],
++        'tag_names': ['Work'],
++      });
++
++      final longNames = Transaction.fromJson({
++        'account_id': 'acct_1',
++        'name': 'Coffee',
++        'date': '2026-06-01',
++        'amount': r'$4.50',
++        'currency': 'USD',
++        'nature': 'expense',
++        'tag_ids': ['tag_1'],
++        'tag_names': ['Work', 'Ignored'],
++      });
++
++      expect(shortNames.tagNames, ['Work', '']);
++      expect(shortNames.tagIds, ['tag_1', 'tag_2']);
++      expect(longNames.tagNames, ['Work']);
++      expect(longNames.tagIds, ['tag_1']);
++    });
++
++    test('filters blank flat tag ids while preserving id-name pairing', () {
++      final transaction = Transaction.fromJson({
++        'account_id': 'acct_1',
++        'name': 'Coffee',
++        'date': '2026-06-01',
++        'amount': r'$4.50',
++        'currency': 'USD',
++        'nature': 'expense',
++        'tag_ids': ['', 'tag_2'],
++        'tag_names': ['Ignored', 'Travel'],
++      });
++
++      expect(transaction.tagIds, ['tag_2']);
++      expect(transaction.tagNames, ['Travel']);
++    });
++
++    test('distinguishes omitted tags from explicitly empty tags', () {
++      final withoutTags = Transaction.fromJson({
++        'account_id': 'acct_1',
++        'name': 'Coffee',
++        'date': '2026-06-01',
++        'amount': r'$4.50',
++        'currency': 'USD',
++        'nature': 'expense',
++      });
++
++      final clearedTags = Transaction.fromJson({
++        'account_id': 'acct_1',
++        'name': 'Coffee',
++        'date': '2026-06-01',
++        'amount': r'$4.50',
++        'currency': 'USD',
++        'nature': 'expense',
++        'tags': [],
++      });
++
++      expect(withoutTags.tagsProvided, false);
++      expect(clearedTags.tagsProvided, true);
++    });
++
++    test('distinguishes omitted metadata from explicitly cleared metadata', () {
++      final withoutMetadata = Transaction.fromJson({
++        'account_id': 'acct_1',
++        'name': 'Coffee',
++        'date': '2026-06-01',
++        'amount': r'$4.50',
++        'currency': 'USD',
++        'nature': 'expense',
++      });
++
++      final clearedMetadata = Transaction.fromJson({
++        'account_id': 'acct_1',
++        'name': 'Coffee',
++        'date': '2026-06-01',
++        'amount': r'$4.50',
++        'currency': 'USD',
++        'nature': 'expense',
++        'category': null,
++        'merchant': null,
++      });
++
++      expect(withoutMetadata.categoryProvided, false);
++      expect(withoutMetadata.merchantProvided, false);
++      expect(clearedMetadata.categoryProvided, true);
++      expect(clearedMetadata.categoryId, isNull);
++      expect(clearedMetadata.categoryName, isNull);
++      expect(clearedMetadata.merchantProvided, true);
++      expect(clearedMetadata.merchantId, isNull);
++      expect(clearedMetadata.merchantName, isNull);
++    });
++
++    test('server sync merge preserves omitted metadata and applies clears', () {
++      final existing = OfflineTransaction(
++        id: 'tx_1',
++        localId: 'local_1',
++        accountId: 'acct_1',
++        name: 'Coffee',
++        date: '2026-06-01',
++        amount: r'$4.50',
++        currency: 'USD',
++        nature: 'expense',
++        categoryId: 'cat_1',
++        categoryName: 'Dining',
++        merchantId: 'merchant_1',
++        merchantName: 'Cafe',
++        tagIds: const ['tag_1'],
++        tagNames: const ['Work'],
++      );
++
++      final omittedMetadata = existing.mergeServerTransaction(
++        Transaction.fromJson({
++          'id': 'tx_1',
++          'account_id': 'acct_1',
++          'name': 'Coffee',
++          'date': '2026-06-01',
++          'amount': r'$4.50',
++          'currency': 'USD',
++          'nature': 'expense',
++        }),
++        accountId: 'acct_1',
++      );
++
++      expect(omittedMetadata.categoryId, 'cat_1');
++      expect(omittedMetadata.categoryName, 'Dining');
++      expect(omittedMetadata.merchantId, 'merchant_1');
++      expect(omittedMetadata.merchantName, 'Cafe');
++      expect(omittedMetadata.tagIds, ['tag_1']);
++      expect(omittedMetadata.tagNames, ['Work']);
++
++      final clearedMetadata = existing.mergeServerTransaction(
++        Transaction.fromJson({
++          'id': 'tx_1',
++          'account_id': 'acct_1',
++          'name': 'Coffee',
++          'date': '2026-06-01',
++          'amount': r'$4.50',
++          'currency': 'USD',
++          'nature': 'expense',
++          'category': null,
++          'merchant': null,
++          'tags': [],
++        }),
++        accountId: 'acct_1',
++      );
++
++      expect(clearedMetadata.categoryId, isNull);
++      expect(clearedMetadata.categoryName, isNull);
++      expect(clearedMetadata.merchantId, isNull);
++      expect(clearedMetadata.merchantName, isNull);
++      expect(clearedMetadata.tagIds, isEmpty);
++      expect(clearedMetadata.tagNames, isEmpty);
++    });
++
++    test('submitted update fallback preserves account and unchanged labels',
++        () {
++      final existing = OfflineTransaction(
++        id: 'tx_1',
++        localId: 'local_1',
++        accountId: 'acct_1',
++        name: 'Coffee',
++        date: '2026-06-01',
++        amount: r'$4.50',
++        currency: 'USD',
++        nature: 'expense',
++        notes: 'latte',
++        categoryId: 'cat_1',
++        categoryName: 'Dining',
++        merchantId: 'merchant_1',
++        merchantName: 'Cafe',
++        tagIds: const ['tag_1', 'tag_2'],
++        tagNames: const ['Work', 'Travel'],
++      );
++
++      final updated = existing.toTransactionWithSubmittedUpdate(
++        name: 'Morning coffee',
++        notes: '',
++        categoryId: 'cat_2',
++        merchantId: 'merchant_1',
++        tagIds: const ['tag_2'],
++      );
++
++      expect(updated.id, 'tx_1');
++      expect(updated.accountId, 'acct_1');
++      expect(updated.name, 'Morning coffee');
++      expect(updated.notes, '');
++      expect(updated.categoryId, 'cat_2');
++      expect(updated.categoryName, isNull);
++      expect(updated.merchantId, 'merchant_1');
++      expect(updated.merchantName, 'Cafe');
++      expect(updated.tagIds, ['tag_2']);
++      expect(updated.tagNames, ['Travel']);
++    });
++  });
++}
+diff --git a/mobile/test/services/transactions_service_test.dart b/mobile/test/services/transactions_service_test.dart
+new file mode 100644
+index 0000000000..abc2e54a42
+--- /dev/null
++++ b/mobile/test/services/transactions_service_test.dart
+@@ -0,0 +1,79 @@
++import 'package:flutter_test/flutter_test.dart';
++import 'package:http/http.dart' as http;
++import 'package:http/testing.dart';
++import 'package:sure_mobile/services/transactions_service.dart';
++
++void main() {
++  group('TransactionsService', () {
++    test('preserves field-level update errors', () async {
++      final service = TransactionsService(
++        client: MockClient((request) async {
++          expect(request.method, 'PATCH');
++          return http.Response(
++            '{"message":"Transaction could not be updated",'
++            '"errors":{"name":["is too long"],'
++            '"notes":["contains unsupported characters"]}}',
++            422,
++          );
++        }),
++      );
++
++      final result = await service.updateTransaction(
++        accessToken: 'token',
++        transactionId: 'tx_1',
++        name: 'Coffee',
++      );
++
++      expect(result['success'], false);
++      expect(
++        result['error'],
++        'Transaction could not be updated: Name is too long; Notes contains unsupported characters',
++      );
++    });
++
++    test('returns null transaction for empty successful update responses',
++        () async {
++      final service = TransactionsService(
++        client: MockClient((request) async {
++          expect(request.method, 'PATCH');
++          return http.Response('', 204);
++        }),
++      );
++
++      final result = await service.updateTransaction(
++        accessToken: 'token',
++        transactionId: 'tx_1',
++        name: 'Coffee',
++      );
++
++      expect(result['success'], true);
++      expect(result['transaction'], isNull);
++    });
++
++    test('fetches one transaction after an empty update response', () async {
++      var requestCount = 0;
++      final service = TransactionsService(
++        client: MockClient((request) async {
++          requestCount += 1;
++          expect(request.method, 'GET');
++          return http.Response(
++            '{"id":"tx_1","account":{"id":"acct_1"},"name":"Coffee",'
++            '"date":"2026-06-01","amount":"\$4.50","currency":"USD",'
++            '"classification":"expense"}',
++            200,
++          );
++        }),
++      );
++
++      final result = await service.getTransaction(
++        accessToken: 'token',
++        transactionId: 'tx_1',
++      );
++
++      expect(requestCount, 1);
++      expect(result['success'], true);
++      expect(result['transaction'].name, 'Coffee');
++      expect(result['transaction'].accountId, 'acct_1');
++    });
++  });
++}

@@ -1,0 +1,400 @@
+diff --git a/packages/mcp/src/registry.d.ts b/packages/mcp/src/registry.d.ts
+index 414323fba2..85996e16eb 100644
+--- a/packages/mcp/src/registry.d.ts
++++ b/packages/mcp/src/registry.d.ts
+@@ -27,6 +27,11 @@ export function searchRegistry(
+   options?: RegistryArtifactLoaders,
+ ): Promise<RegistryToolResult>;
+ 
++export function planWorkflowToolbox(
++  args?: Record<string, unknown>,
++  options?: RegistryArtifactLoaders,
++): Promise<RegistryToolResult>;
++
+ export function getServerInfo(
+   args?: Record<string, unknown>,
+   options?: RegistryArtifactLoaders,
+@@ -197,6 +202,7 @@ export function callRegistryTool(
+ 
+ export {
+   SearchRegistryInputSchema,
++  PlanWorkflowToolboxInputSchema,
+   ServerInfoInputSchema,
+   ListCategoryEntriesInputSchema,
+   RecentUpdatesInputSchema,
+diff --git a/packages/mcp/src/registry.js b/packages/mcp/src/registry.js
+index 583589f866..c061387e80 100644
+--- a/packages/mcp/src/registry.js
++++ b/packages/mcp/src/registry.js
+@@ -761,7 +761,9 @@ function entryTrustSummary(entry) {
+     package: {
+       downloadUrl: source.downloadUrl,
+       downloadTrust: packageTrust,
+-      packageVerified: Boolean(entry.packageVerified),
++      packageVerified: Boolean(
++        entry.packageVerified || entry.trustSignals?.packageVerified,
++      ),
+       checksum:
+         entry.checksum ||
+         entry.packageChecksum ||
+@@ -945,35 +947,126 @@ function selectDiverseRankedEntries(ranked, limit) {
+ }
+ 
+ function toolboxFitReasons(entry, ranking) {
+-  const reasons = [...(ranking.reasons || [])];
++  const reasons = [...(ranking.reasons || []).slice(0, 4)];
++  if (entry.category) {
++    reasons.push(`${entry.category} workflow surface`);
++  }
++  if (entrySourceStatus(entry) === "available") {
++    reasons.push("source-backed metadata");
++  }
++  if (
++    entryPackageTrust(entry) === "first-party" ||
++    entry.packageVerified ||
++    entry.trustSignals?.packageVerified
++  ) {
++    reasons.push("first-party or verified package signal");
++  }
++  if (notes(entry.safetyNotes).length && notes(entry.privacyNotes).length) {
++    reasons.push("safety and privacy notes present");
++  } else if (notes(entry.safetyNotes).length) {
++    reasons.push("safety notes present");
++  } else if (notes(entry.privacyNotes).length) {
++    reasons.push("privacy notes present");
++  }
+   if (entry.installCommand || entry.downloadUrl || entry.configSnippet) {
+     reasons.push("actionable setup surface");
+   }
+   if ((entry.platforms || []).length) {
+-    reasons.push("platform compatibility metadata");
++    reasons.push(
++      `platform compatibility: ${(entry.platforms || []).slice(0, 3).join(", ")}`,
++    );
++  }
++  if ((entry.supportLevels || []).length) {
++    reasons.push("support levels documented");
+   }
+-  return unique(reasons).slice(0, 6);
++  if (entry.claimStatus === "verified" || entry.reviewedBy) {
++    reasons.push("review/provenance metadata");
++  }
++  return unique(reasons).slice(0, 8);
+ }
+ 
+ function toolboxCaveats(entry) {
+   const caveats = [];
++  const packageTrust = entryPackageTrust(entry);
++  const safetyNotes = notes(entry.safetyNotes);
++  const privacyNotes = notes(entry.privacyNotes);
+   if (entrySourceStatus(entry) !== "available") {
+     caveats.push("Source metadata is missing or incomplete.");
+   }
+-  if (entryPackageTrust(entry) === "external") {
++  if (packageTrust === "external") {
+     caveats.push("Package/download is external; verify upstream before use.");
+   }
+-  if (!notes(entry.safetyNotes).length) {
++  if (entry.downloadUrl && !entryTrustSummary(entry).package.checksum) {
++    caveats.push("Download checksum metadata is not present.");
++  }
++  if (!safetyNotes.length) {
+     caveats.push("No structured safety notes are present.");
+   }
+-  if (!notes(entry.privacyNotes).length) {
++  if (!privacyNotes.length) {
+     caveats.push("No structured privacy notes are present.");
+   }
+-  return caveats.slice(0, 4);
++  if (
++    ["mcp", "hooks", "commands", "skills", "statuslines"].includes(
++      entry.category,
++    )
++  ) {
++    caveats.push(
++      "Risk-bearing workflow surface; inspect commands, permissions, and data access before use.",
++    );
++  }
++  return unique(caveats).slice(0, 5);
++}
++
++function toolboxNextActions(entry) {
++  return [
++    `Inspect get_entry_detail with category=${entry.category} and slug=${entry.slug}.`,
++    `Run explain_entry_trust with category=${entry.category} and slug=${entry.slug}; this is still metadata review only.`,
++    "Use compare_entries with nearby candidates before recommending a final stack.",
++    `Use get_copyable_asset with category=${entry.category} and slug=${entry.slug} only after trust review.`,
++  ];
++}
++
++function toolboxCategoryMix(entries) {
++  const counts = new Map();
++  for (const entry of entries) {
++    const category = entry.category || "unknown";
++    counts.set(category, (counts.get(category) || 0) + 1);
++  }
++  return [...counts]
++    .map(([category, count]) => ({ category, count }))
++    .sort((left, right) => left.category.localeCompare(right.category));
++}
++
++function toolboxTrustSummary(entries) {
++  return {
++    sourceBacked: entries.filter(
++      (entry) => entry.trust?.source?.status === "available",
++    ).length,
++    firstPartyOrVerifiedPackages: entries.filter(
++      (entry) =>
++        entry.trust?.package?.downloadTrust === "first-party" ||
++        entry.trust?.package?.packageVerified,
++    ).length,
++    entriesWithSafetyNotes: entries.filter(
++      (entry) => entry.trust?.disclosures?.hasSafetyNotes,
++    ).length,
++    entriesWithPrivacyNotes: entries.filter(
++      (entry) => entry.trust?.disclosures?.hasPrivacyNotes,
++    ).length,
++    externalPackages: entries.filter(
++      (entry) => entry.trust?.package?.downloadTrust === "external",
++    ).length,
++    missingSource: entries.filter(
++      (entry) => entry.trust?.source?.status !== "available",
++    ).length,
++  };
+ }
+ 
+ export async function planWorkflowToolbox(args = {}, options = {}) {
+   const goal = String(args.goal || "").trim();
++  if (goal.length < 2) {
++    return invalid("Planner goal must be at least 2 characters.");
++  }
+   const query = normalizeText(goal);
+   const category = normalizeText(args.category);
+   const platform = normalizePlatform(args.platform);
+@@ -998,11 +1091,7 @@ export async function planWorkflowToolbox(args = {}, options = {}) {
+     searchReasons: item.reasons,
+     toolboxReasons: toolboxFitReasons(item.entry, item),
+     caveats: toolboxCaveats(item.entry),
+-    nextActions: [
+-      `Inspect get_entry_detail with category=${item.entry.category} and slug=${item.entry.slug}.`,
+-      `Run explain_entry_trust before copying install or config content.`,
+-      `Use compare_entries with nearby candidates before recommending a final stack.`,
+-    ],
++    nextActions: toolboxNextActions(item.entry),
+   }));
+ 
+   return {
+@@ -1012,10 +1101,19 @@ export async function planWorkflowToolbox(args = {}, options = {}) {
+     platform: platform || "",
+     count: selected.length,
+     entries: selected,
++    categoryMix: toolboxCategoryMix(selected),
++    trustSummary: toolboxTrustSummary(selected),
++    recommendedNextTools: [
++      "get_entry_detail",
++      "explain_entry_trust",
++      "compare_entries",
++      "get_copyable_asset",
++    ],
+     plannerNotes: [
+-      "This planner ranks public registry metadata only; it does not execute or install entries.",
++      "This planner is metadata review only; it is not install approval or malware scanning, and it does not execute or install entries.",
++      "Recommendations are bounded and category-diverse where matching entries allow it.",
+       "Prefer source-backed entries with safety/privacy notes for risk-bearing MCP, hooks, skills, commands, and statuslines.",
+-      "Use get_copyable_asset only after reviewing trust metadata and upstream source.",
++      "Use get_entry_detail, explain_entry_trust, compare_entries, and get_copyable_asset before relying on any entry.",
+     ],
+   };
+ }
+diff --git a/tests/mcp-server.test.ts b/tests/mcp-server.test.ts
+index 443c5245d6..b586618065 100644
+--- a/tests/mcp-server.test.ts
++++ b/tests/mcp-server.test.ts
+@@ -668,10 +668,21 @@ describe("HeyClaude read-only MCP helpers", () => {
+       goal: "skill workflow",
+       category: "skills",
+       count: expect.any(Number),
+-      plannerNotes: expect.arrayContaining([
+-        expect.stringContaining("does not execute or install"),
++      recommendedNextTools: expect.arrayContaining([
++        "get_entry_detail",
++        "explain_entry_trust",
++        "compare_entries",
++        "get_copyable_asset",
+       ]),
+-    });
++      categoryMix: expect.any(Array),
++      trustSummary: expect.any(Object),
++      plannerNotes: expect.any(Array),
++    });
++    const plannerNoteText = result.plannerNotes.join(" ");
++    expect(plannerNoteText).toContain("metadata review only");
++    expect(plannerNoteText).toContain("not install approval");
++    expect(plannerNoteText).toContain("malware scanning");
++    expect(plannerNoteText).toContain("does not execute or install");
+     expect(result.entries.length).toBeGreaterThan(0);
+     expect(result.entries.length).toBeLessThanOrEqual(3);
+     expect(result.entries[0]).toMatchObject({
+@@ -682,8 +693,123 @@ describe("HeyClaude read-only MCP helpers", () => {
+       caveats: expect.any(Array),
+       nextActions: expect.arrayContaining([
+         expect.stringContaining("get_entry_detail"),
++        expect.stringContaining("explain_entry_trust"),
++        expect.stringContaining("compare_entries"),
++        expect.stringContaining("get_copyable_asset"),
++      ]),
++    });
++  });
++
++  it("returns trust-aware planner metadata with bounded category diversity", async () => {
++    const readJsonArtifact = async (relativePath: string) => {
++      expect(relativePath).toBe("search-index.json");
++      return {
++        entries: [
++          {
++            category: "mcp",
++            slug: "workflow-audit-mcp",
++            title: "Workflow Audit MCP",
++            description: "Audits automation workflow plans.",
++            tags: ["automation", "workflow"],
++            keywords: ["audit"],
++            platforms: ["Claude"],
++            downloadUrl: "https://example.com/workflow-audit.tgz",
++            downloadTrust: "external",
++            safetyNotes: ["Runs an MCP server process for review."],
++            privacyNotes: ["Reads submitted workflow metadata."],
++            trustSignals: {
++              sourceStatus: "available",
++            },
++          },
++          {
++            category: "mcp",
++            slug: "workflow-source-mcp",
++            title: "Workflow Source MCP",
++            description: "Finds source context for automation workflow review.",
++            tags: ["automation", "workflow"],
++            keywords: ["source"],
++            platforms: ["Claude"],
++            trustSignals: {
++              packageVerified: true,
++              sourceStatus: "available",
++            },
++          },
++          {
++            category: "mcp",
++            slug: "workflow-third-mcp",
++            title: "Workflow Third MCP",
++            description: "Another automation workflow server.",
++            tags: ["automation", "workflow"],
++            keywords: ["third"],
++            platforms: ["Claude"],
++          },
++          {
++            category: "agents",
++            slug: "workflow-review-agent",
++            title: "Workflow Review Agent",
++            description: "Reviews automation workflow plans.",
++            tags: ["automation", "workflow"],
++            keywords: ["review"],
++            platforms: ["Claude"],
++          },
++        ],
++      };
++    };
++
++    const result = await planWorkflowToolbox(
++      { goal: "automation workflow", limit: 3 },
++      { readJsonArtifact },
++    );
++
++    expect(result).toMatchObject({
++      ok: true,
++      count: 3,
++      recommendedNextTools: [
++        "get_entry_detail",
++        "explain_entry_trust",
++        "compare_entries",
++        "get_copyable_asset",
++      ],
++      categoryMix: expect.arrayContaining([
++        { category: "agents", count: 1 },
++        { category: "mcp", count: 2 },
+       ]),
++      trustSummary: {
++        sourceBacked: 2,
++        firstPartyOrVerifiedPackages: 1,
++        entriesWithSafetyNotes: 1,
++        entriesWithPrivacyNotes: 1,
++        externalPackages: 1,
++        missingSource: 1,
++      },
+     });
++    expect(result.entries.map((entry: any) => entry.slug)).toEqual([
++      "workflow-audit-mcp",
++      "workflow-source-mcp",
++      "workflow-review-agent",
++    ]);
++    expect(result.entries[0].toolboxReasons).toEqual(
++      expect.arrayContaining([
++        "source-backed metadata",
++        "actionable setup surface",
++        "safety and privacy notes present",
++      ]),
++    );
++    expect(result.entries[0].caveats).toEqual(
++      expect.arrayContaining([
++        "Package/download is external; verify upstream before use.",
++        "Download checksum metadata is not present.",
++        "Risk-bearing workflow surface; inspect commands, permissions, and data access before use.",
++      ]),
++    );
++    expect(result.entries[0].nextActions).toEqual(
++      expect.arrayContaining([
++        expect.stringContaining("get_entry_detail"),
++        expect.stringContaining("explain_entry_trust"),
++        expect.stringContaining("compare_entries"),
++        expect.stringContaining("get_copyable_asset"),
++      ]),
++    );
+   });
+ 
+   it("does not fill planner results with unrelated trust-only matches", async () => {
+@@ -772,6 +898,38 @@ describe("HeyClaude read-only MCP helpers", () => {
+     expect(matched.searchScore).toBeGreaterThan(0);
+   });
+ 
++  it("rejects blank planner goals when called directly", async () => {
++    const readJsonArtifact = async () => {
++      throw new Error("Expected direct planner validation before artifact read.");
++    };
++
++    await expect(
++      planWorkflowToolbox({ goal: "   " }, { readJsonArtifact }),
++    ).resolves.toMatchObject({
++      ok: false,
++      error: {
++        code: "invalid_request",
++        message: "Planner goal must be at least 2 characters.",
++      },
++    });
++  });
++
++  it("rejects 1-character planner goals when called directly", async () => {
++    const readJsonArtifact = async () => {
++      throw new Error("Expected direct planner validation before artifact read.");
++    };
++
++    await expect(
++      planWorkflowToolbox({ goal: "x" }, { readJsonArtifact }),
++    ).resolves.toMatchObject({
++      ok: false,
++      error: {
++        code: "invalid_request",
++        message: "Planner goal must be at least 2 characters.",
++      },
++    });
++  });
++
+   it("clamps the planner runtime limit to 10 even when called directly", async () => {
+     // Direct runtime calls bypass the 1-10 input schema, so the tool must
+     // clamp internally. Categories are spread so diversity selection still

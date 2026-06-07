@@ -1,0 +1,87 @@
+diff --git a/crates/engine/src/parser/oracle_nom/condition.rs b/crates/engine/src/parser/oracle_nom/condition.rs
+index 4a6b1ad6c..26c91bcd5 100644
+--- a/crates/engine/src/parser/oracle_nom/condition.rs
++++ b/crates/engine/src/parser/oracle_nom/condition.rs
+@@ -1812,8 +1812,9 @@ fn creatures_you_controlled_left_battlefield_this_turn_ref() -> QuantityRef {
+     }
+ }
+ 
+-/// Parse "you control" condition patterns.
+-fn parse_control_conditions(input: &str) -> OracleResult<'_, StaticCondition> {
++/// Parse "you control" condition patterns. Exposed for rule-static parsers that
++/// attach a trailing "unless you control <X>" clause as a negated condition.
++pub(crate) fn parse_control_conditions(input: &str) -> OracleResult<'_, StaticCondition> {
+     alt((
+         // CR 201.2 + CR 603.4: "you control N or more [type] with different names"
+         // → QuantityComparison(ObjectCountDistinct[Name] >= N). Tried before the
+diff --git a/crates/engine/src/parser/oracle_static/evasion.rs b/crates/engine/src/parser/oracle_static/evasion.rs
+index f8e056f94..60f592a4a 100644
+--- a/crates/engine/src/parser/oracle_static/evasion.rs
++++ b/crates/engine/src/parser/oracle_static/evasion.rs
+@@ -893,6 +893,27 @@ pub(crate) fn parse_subject_rule_static(text: &str) -> Option<StaticDefinition>
+         return Some(def);
+     }
+ 
++    // CR 604.1 + CR 508.1d: a trailing "unless you control <X>" clause makes a
++    // rule-static (e.g. "attacks each combat if able") conditional — the
++    // requirement/restriction applies only while the controller does NOT control
++    // <X>. Class: Reckless Cohort ("…unless you control another Ally"), Marauding
++    // Maulhorn, and any rule-static with the same "unless you control" rider.
++    // Strip the clause, classify the base predicate, and attach the negated
++    // control presence via the shared `parse_control_conditions` building block.
++    let pred_tp = TextPair::new(predicate_text, &pred_lower);
++    if let Some((base, unless)) = pred_tp.split_around(" unless ") {
++        if let Ok(("", control)) = crate::parser::oracle_nom::condition::parse_control_conditions(
++            unless.lower.trim_end_matches('.'),
++        ) {
++            let predicate = parse_rule_static_predicate(base.original)?;
++            let mut def = lower_rule_static(predicate, affected, text);
++            def.condition = Some(StaticCondition::Not {
++                condition: Box::new(control),
++            });
++            return Some(def);
++        }
++    }
++
+     let predicate = parse_rule_static_predicate(predicate_text)?;
+     // CR 502.3: Extract trailing condition for CantUntap statics (e.g., "as long as [condition]")
+     if matches!(predicate, RuleStaticPredicate::CantUntap) {
+diff --git a/crates/engine/src/parser/oracle_static/tests.rs b/crates/engine/src/parser/oracle_static/tests.rs
+index 0421334fd..69ded1461 100644
+--- a/crates/engine/src/parser/oracle_static/tests.rs
++++ b/crates/engine/src/parser/oracle_static/tests.rs
+@@ -2988,6 +2988,34 @@ fn static_tarmogoyf_cda() {
+         }));
+ }
+ 
++#[test]
++fn attacks_each_combat_unless_you_control_is_conditional_must_attack() {
++    // CR 508.1d + CR 604.1: Reckless Cohort — "attacks each combat if able
++    // unless you control another Ally" is a MustAttack rule-static gated by a
++    // negated control-presence condition (the requirement applies only while you
++    // do NOT control another Ally).
++    let def = parse_static_line(
++        "This creature attacks each combat if able unless you control another Ally.",
++    )
++    .unwrap();
++    assert_eq!(def.mode, StaticMode::MustAttack);
++    assert_eq!(def.affected, Some(TargetFilter::SelfRef));
++    assert!(
++        matches!(def.condition, Some(StaticCondition::Not { .. })),
++        "expected a negated control-presence condition, got {:?}",
++        def.condition
++    );
++}
++
++#[test]
++fn attacks_each_combat_if_able_unconditional_has_no_condition() {
++    // Regression: the plain rule-static (no "unless") still parses to an
++    // unconditional MustAttack.
++    let def = parse_static_line("This creature attacks each combat if able.").unwrap();
++    assert_eq!(def.mode, StaticMode::MustAttack);
++    assert!(def.condition.is_none());
++}
++
+ #[test]
+ fn static_unlicensed_hearse_counts_cards_exiled_with_it() {
+     let def = parse_static_line(

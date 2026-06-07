@@ -1,0 +1,181 @@
+diff --git a/pyproject.toml b/pyproject.toml
+index 8ab74376f57..0a234879e37 100644
+--- a/pyproject.toml
++++ b/pyproject.toml
+@@ -54,6 +54,7 @@ test = [
+     "cython-test-exception-raiser >= 1.0.2, <2",
+     "PyHamcrest >= 2",
+     "hypothesis >= 6.56",
++    "httpx[http2] >= 0.27",
+ ]
+ 
+ # List of dependencies required to build the documentation and test the
+@@ -95,7 +96,7 @@ serial = [
+ ]
+ 
+ http2 = [
+-    "h2 >= 3.0, < 5.0",
++    "h2 >= 3.2, < 5.0",
+     "priority >= 1.1.0, < 2.0",
+ ]
+ 
+diff --git a/src/twisted/web/_http2.py b/src/twisted/web/_http2.py
+index 93c32723b54..301e9ea196b 100644
+--- a/src/twisted/web/_http2.py
++++ b/src/twisted/web/_http2.py
+@@ -35,6 +35,7 @@
+     IProtocol,
+     IPushProducer,
+     ISSLTransport,
++    ITCPTransport,
+     ITransport,
+ )
+ from twisted.internet.protocol import Protocol
+@@ -143,6 +144,8 @@ def connectionMade(self):
+         by the L{twisted.web.http._GenericHTTPChannelProtocol} during upgrade
+         to HTTP/2.
+         """
++        if ITCPTransport.providedBy(self.transport):
++            self.transport.setTcpNoDelay(True)
+         self.setTimeout(self.timeOut)
+         self.conn.initiate_connection()
+         self.transport.write(self.conn.data_to_send())
+diff --git a/src/twisted/web/_newclient.py b/src/twisted/web/_newclient.py
+index fa22c99d17f..32e12521288 100644
+--- a/src/twisted/web/_newclient.py
++++ b/src/twisted/web/_newclient.py
+@@ -35,7 +35,7 @@
+ 
+ from twisted.internet.defer import CancelledError, Deferred, fail, succeed
+ from twisted.internet.error import ConnectionDone
+-from twisted.internet.interfaces import IConsumer, IPushProducer
++from twisted.internet.interfaces import IConsumer, IPushProducer, ITCPTransport
+ from twisted.internet.protocol import Protocol
+ from twisted.logger import Logger
+ from twisted.protocols.basic import LineReceiver
+@@ -1498,6 +1498,10 @@ def __init__(self, quiescentCallback=lambda c: None):
+         self._quiescentCallback = quiescentCallback
+         self._abortDeferreds = []
+ 
++    def connectionMade(self) -> None:
++        if ITCPTransport.providedBy(self.transport):
++            self.transport.setTcpNoDelay(True)
++
+     @property
+     def state(self):
+         return self._state
+diff --git a/src/twisted/web/http.py b/src/twisted/web/http.py
+index 18710f51dcb..b00c68f5c0a 100644
+--- a/src/twisted/web/http.py
++++ b/src/twisted/web/http.py
+@@ -134,7 +134,13 @@
+ from twisted.internet import address, interfaces, protocol
+ from twisted.internet._producer_helpers import _PullToPush
+ from twisted.internet.defer import Deferred
+-from twisted.internet.interfaces import IAddress, IDelayedCall, IProtocol, IReactorTime
++from twisted.internet.interfaces import (
++    IAddress,
++    IDelayedCall,
++    IProtocol,
++    IReactorTime,
++    ITCPTransport,
++)
+ from twisted.internet.protocol import Protocol
+ from twisted.logger import Logger
+ from twisted.protocols import basic, policies
+@@ -2317,6 +2323,8 @@ def __init__(self):
+         self._transferDecoder = None
+ 
+     def connectionMade(self):
++        if ITCPTransport.providedBy(self.transport):
++            self.transport.setTcpNoDelay(True)
+         self.setTimeout(self.timeOut)
+         self._networkProducer = interfaces.IPushProducer(
+             self.transport, _NoPushProducer()
+diff --git a/src/twisted/web/newsfragments/12311.feature b/src/twisted/web/newsfragments/12311.feature
+new file mode 100644
+index 00000000000..2a4c7a4d908
+--- /dev/null
++++ b/src/twisted/web/newsfragments/12311.feature
+@@ -0,0 +1 @@
++twisted.web.client and twisted.web.server now disable the Nagle algorithm (enable TCP_NODELAY), reducing the latency of small HTTP queries.
+\ No newline at end of file
+diff --git a/src/twisted/web/test/test_http2.py b/src/twisted/web/test/test_http2.py
+index 317cc165d0a..610df7e3802 100644
+--- a/src/twisted/web/test/test_http2.py
++++ b/src/twisted/web/test/test_http2.py
+@@ -5,19 +5,25 @@
+ Test HTTP/2 support.
+ """
+ 
+-
+ import itertools
+ 
+ from zope.interface import directlyProvides, providedBy
+ 
++import httpx
++
+ from twisted.internet import defer, error, reactor, task
+ from twisted.internet.address import IPv4Address
+ from twisted.internet.testing import MemoryReactorClock, StringTransport
++from twisted.internet.threads import deferToThread
+ from twisted.python import failure
+ from twisted.python.compat import iterbytes
++from twisted.python.reflect import requireModule
+ from twisted.test.test_internet import DummyProducer
++from twisted.test.test_sslverify import certificatesForAuthorityAndServer
+ from twisted.trial import unittest
+ from twisted.web import http
++from twisted.web.server import Site
++from twisted.web.static import Data
+ from twisted.web.test.test_http import (
+     DelayedHTTPHandler,
+     DelayedHTTPHandlerProxy,
+@@ -2918,3 +2924,34 @@ def test_timeOutClientThatSendsOnlyInvalidFrames(self):
+         # Invalid frames don't reset any timeouts, so the above has
+         # forcibly disconnected us via abortConnection.
+         self.assertTrue(transport.disconnected)
++
++
++class EndToEndTests(unittest.TestCase):
++    """
++    Tests that run real TCP-based communication with a HTTP/2 server.
++    """
++
++    if skipH2 or not requireModule("OpenSSL"):
++        skip = skipH2
++
++    async def test_realRequest(self) -> None:
++        """
++        Twisted's HTTP/2 server can talk to a third-party HTTP/2 client.
++        """
++        _, serverCert = certificatesForAuthorityAndServer("test.local")
++        resource = Data(b"hello world", "application/octet-stream")
++        resource.isLeaf = True
++        port = reactor.listenSSL(0, Site(resource), serverCert.options())  # type: ignore[attr-defined]
++        portNum = port.getHost().port
++        self.addCleanup(port.stopListening)
++
++        def run_http2_query():
++            client = httpx.Client(http2=True, verify=False)
++            response = client.get(f"https://127.0.0.1:{portNum}/")
++            result = (response.http_version, response.content)
++            client.close()
++            return result
++
++        (httpVersion, content) = await deferToThread(run_http2_query)
++        self.assertEqual(httpVersion, "HTTP/2")
++        self.assertEqual(content, b"hello world")
+diff --git a/tox.ini b/tox.ini
+index 227916f3753..3e76a1e17f8 100644
+--- a/tox.ini
++++ b/tox.ini
+@@ -88,7 +88,7 @@ deps =
+     mindeps: appdirs == 1.4.0
+     mindeps: bcrypt == 3.1.3
+     # HTTP
+-    mindeps: h2 == 3.0
++    mindeps: h2 == 3.2
+     mindeps: priority == 1.1.0
+     # Tesing minimum deps
+     mindeps: cython-test-exception-raiser == 1.0.2

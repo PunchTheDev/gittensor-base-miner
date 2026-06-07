@@ -1,0 +1,854 @@
+diff --git a/apps/gittensory-ui/public/openapi.json b/apps/gittensory-ui/public/openapi.json
+index 73dde933..d1f39cc0 100644
+--- a/apps/gittensory-ui/public/openapi.json
++++ b/apps/gittensory-ui/public/openapi.json
+@@ -8408,6 +8408,92 @@
+           "summary"
+         ]
+       },
++      "SkippedPrAuditExport": {
++        "type": "object",
++        "properties": {
++          "generatedAt": {
++            "type": "string"
++          },
++          "limit": {
++            "type": "integer",
++            "minimum": 1,
++            "maximum": 100
++          },
++          "hasMore": {
++            "type": "boolean"
++          },
++          "filters": {
++            "type": "object",
++            "properties": {
++              "repoFullName": {
++                "type": "string",
++                "nullable": true
++              },
++              "reason": {
++                "type": "string",
++                "nullable": true,
++                "enum": [
++                  "surface_off",
++                  "missing_author",
++                  "bot_author",
++                  "maintainer_author",
++                  "miner_detection_unavailable",
++                  "not_official_gittensor_miner",
++                  null
++                ]
++              },
++              "since": {
++                "type": "string",
++                "nullable": true
++              }
++            },
++            "required": [
++              "repoFullName",
++              "reason",
++              "since"
++            ]
++          },
++          "items": {
++            "type": "array",
++            "items": {
++              "type": "object",
++              "properties": {
++                "repoFullName": {
++                  "type": "string"
++                },
++                "pullNumber": {
++                  "type": "integer",
++                  "minimum": 0,
++                  "exclusiveMinimum": true
++                },
++                "reason": {
++                  "type": "string"
++                },
++                "timestamp": {
++                  "type": "string"
++                },
++                "remediation": {
++                  "type": "string"
++                }
++              },
++              "required": [
++                "repoFullName",
++                "pullNumber",
++                "reason",
++                "timestamp",
++                "remediation"
++              ]
++            }
++          }
++        },
++        "required": [
++          "generatedAt",
++          "limit",
++          "hasMore",
++          "filters",
++          "items"
++        ]
++      },
+       "CommandPreviewResponse": {
+         "type": "object",
+         "properties": {
+@@ -13060,6 +13146,89 @@
+         ]
+       }
+     },
++    "/v1/app/skipped-pr-audit": {
++      "get": {
++        "parameters": [
++          {
++            "schema": {
++              "type": "string",
++              "example": "50"
++            },
++            "required": false,
++            "description": "Maximum rows to return, clamped from 1 to 100.",
++            "name": "limit",
++            "in": "query"
++          },
++          {
++            "schema": {
++              "type": "string",
++              "example": "JSONbored/gittensory"
++            },
++            "required": false,
++            "description": "Optional repository filter. Browser sessions must have control-panel access to this repo.",
++            "name": "repoFullName",
++            "in": "query"
++          },
++          {
++            "schema": {
++              "type": "string",
++              "enum": [
++                "surface_off",
++                "missing_author",
++                "bot_author",
++                "maintainer_author",
++                "miner_detection_unavailable",
++                "not_official_gittensor_miner"
++              ],
++              "example": "not_official_gittensor_miner"
++            },
++            "required": false,
++            "description": "Optional PR skip reason filter.",
++            "name": "reason",
++            "in": "query"
++          },
++          {
++            "schema": {
++              "type": "string",
++              "example": "2026-05-30T00:00:00.000Z"
++            },
++            "required": false,
++            "description": "Optional lower timestamp bound.",
++            "name": "since",
++            "in": "query"
++          }
++        ],
++        "responses": {
++          "200": {
++            "description": "Private bounded audit export for skipped PR public-surface decisions",
++            "content": {
++              "application/json": {
++                "schema": {
++                  "$ref": "#/components/schemas/SkippedPrAuditExport"
++                }
++              }
++            }
++          },
++          "400": {
++            "description": "Invalid query"
++          },
++          "401": {
++            "description": "Unauthorized"
++          },
++          "403": {
++            "description": "Insufficient app role or repository scope"
++          }
++        },
++        "security": [
++          {
++            "GittensoryBearer": []
++          },
++          {
++            "GittensorySessionCookie": []
++          }
++        ]
++      }
++    },
+     "/v1/app/commands/preview": {
+       "post": {
+         "responses": {
+diff --git a/src/api/routes.ts b/src/api/routes.ts
+index 94bd6d82..9efdea4c 100644
+--- a/src/api/routes.ts
++++ b/src/api/routes.ts
+@@ -59,6 +59,7 @@ import {
+   listDigestSubscriptionsForLogin,
+   listProductUsageDailyRollups,
+   listOpenPullRequests,
++  listPrVisibilitySkipAuditEvents,
+   listPullRequestFiles,
+   listPullRequestReviews,
+   listRecentMergedPullRequests,
+@@ -177,7 +178,7 @@ import { buildPullRequestReviewability, type PullRequestReviewability } from "..
+ import { buildLocalBranchAnalysis, findCurrentBranchPullRequest } from "../signals/local-branch";
+ import { MAX_LOCAL_SCORER_WARNING_CHARS, MAX_LOCAL_SCORER_WARNING_COUNT } from "../signals/local-scorer-diagnostics";
+ import { loadRepoFocusManifest } from "../signals/focus-manifest-loader";
+-import { buildRepoSettingsPreview } from "../signals/settings-preview";
++import { buildRepoSettingsPreview, type PublicSurfaceSkipReason } from "../signals/settings-preview";
+ import { buildGittensorConfigRecommendation, buildRegistrationReadiness, type InstallationHealthSummary } from "../signals/registration-readiness";
+ import { fileUpstreamDriftIssues, loadUpstreamStatus, refreshUpstreamDrift, registryHyperparameterDriftWarningsForRepo } from "../upstream/ruleset";
+ import type {
+@@ -238,6 +239,14 @@ async function recordRouteProductUsage(
+ 
+ const MAX_LOCAL_BRANCH_REF_CHARS = 256;
+ const MAX_LOCAL_BRANCH_TEXT_CHARS = 4000;
++const PR_VISIBILITY_SKIP_REASONS = [
++  "surface_off",
++  "missing_author",
++  "bot_author",
++  "maintainer_author",
++  "miner_detection_unavailable",
++  "not_official_gittensor_miner",
++] as const satisfies readonly PublicSurfaceSkipReason[];
+ 
+ const preflightSchema = z.object({
+   repoFullName: z.string().min(3),
+@@ -257,6 +266,15 @@ const localDiffPreflightSchema = preflightSchema.extend({
+   commitMessage: z.string().optional(),
+ });
+ 
++const skippedPrAuditQuerySchema = z
++  .object({
++    limit: z.coerce.number().int().optional(),
++    repoFullName: z.string().trim().min(3).max(200).optional(),
++    reason: z.enum(PR_VISIBILITY_SKIP_REASONS).optional(),
++    since: z.string().trim().min(1).max(64).optional(),
++  })
++  .strict();
++
+ const localBranchChangedFileSchema = z
+   .object({
+     path: z.string().min(1).max(MAX_LOCAL_BRANCH_REF_CHARS),
+@@ -838,6 +856,44 @@ export function createApp() {
+     });
+   });
+ 
++  app.get("/v1/app/skipped-pr-audit", async (c) => {
++    const identity = await authenticateRequestIdentity(c);
++    if (!identity) return c.json({ error: "unauthorized" }, 401);
++    const summary = await getRoleSummaryForIdentity(c.env, identity);
++    if (!summary.roles.some((role) => ["maintainer", "owner", "operator"].includes(role))) return c.json({ error: "insufficient_role" }, 403);
++
++    const parsed = skippedPrAuditQuerySchema.safeParse(c.req.query());
++    if (!parsed.success) return c.json({ error: "invalid_skipped_pr_audit_query", issues: parsed.error.issues }, 400);
++    const sinceIso = parsed.data.since ? toIsoQueryDate(parsed.data.since) : undefined;
++    if (parsed.data.since && !sinceIso) return c.json({ error: "invalid_since" }, 400);
++    const requestedRepo = parsed.data.repoFullName;
++    const repoFullNames = await skippedPrAuditRepoScope(c, identity, summary.roles, requestedRepo);
++    if (repoFullNames instanceof Response) return repoFullNames;
++    const page = await listPrVisibilitySkipAuditEvents(c.env, {
++      limit: clampInteger(parsed.data.limit ?? 50, 1, 100),
++      repoFullNames,
++      reason: parsed.data.reason,
++      sinceIso,
++    });
++    return c.json({
++      generatedAt: nowIso(),
++      limit: page.limit,
++      hasMore: page.hasMore,
++      filters: {
++        repoFullName: requestedRepo ?? null,
++        reason: parsed.data.reason ?? null,
++        since: sinceIso ?? null,
++      },
++      items: page.items.map((item) => ({
++        repoFullName: item.repoFullName,
++        pullNumber: item.pullNumber,
++        reason: item.reason,
++        timestamp: item.createdAt,
++        remediation: skippedPrAuditRemediation(item.reason),
++      })),
++    });
++  });
++
+   app.get("/v1/app/operator-dashboard", async (c) => {
+     const forbidden = await requireAppRole(c, ["operator"]);
+     if (forbidden) return forbidden;
+@@ -3338,6 +3394,45 @@ async function requireSessionRepoAccess(
+   return c.json({ error: "forbidden_repo" }, 403);
+ }
+ 
++async function skippedPrAuditRepoScope(
++  c: ProtectedRouteContext,
++  identity: AuthIdentity,
++  roles: ControlPanelRoleName[],
++  requestedRepo: string | undefined,
++): Promise<string[] | undefined | Response> {
++  if (identity.kind !== "session" || roles.includes("operator")) return requestedRepo ? [requestedRepo] : undefined;
++  const scope = await loadControlPanelAccessScope(c.env, identity.actor);
++  const scopedRepoNames = new Set(scope.repositoryFullNames.map((name) => name.toLowerCase()));
++  if (requestedRepo) {
++    return scopedRepoNames.has(requestedRepo.toLowerCase()) ? [requestedRepo] : c.json({ error: "forbidden_repo" }, 403);
++  }
++  return scope.repositoryFullNames;
++}
++
++function skippedPrAuditRemediation(reason: string): string {
++  switch (reason) {
++    case "surface_off":
++      return "Enable a PR public surface or check runs in repository settings if maintainers want Gittensory to post.";
++    case "missing_author":
++      return "Retry after GitHub provides a resolvable pull request author.";
++    case "bot_author":
++      return "No action needed; bot-authored pull requests are intentionally kept quiet.";
++    case "maintainer_author":
++      return "Enable maintainer-authored PRs in repository settings only if those PRs should receive public GitHub App output.";
++    case "miner_detection_unavailable":
++      return "Retry after official Gittensor miner detection recovers; Gittensory skips instead of guessing.";
++    case "not_official_gittensor_miner":
++      return "No public action is needed unless the author should be recognized as an official Gittensor miner.";
++    default:
++      return "Review repository settings and installation health before reprocessing the pull request.";
++  }
++}
++
++function toIsoQueryDate(value: string): string | undefined {
++  const timestamp = Date.parse(value);
++  return Number.isFinite(timestamp) ? new Date(timestamp).toISOString() : undefined;
++}
++
+ function requiresApiToken(path: string): boolean {
+   if (path === "/health") return false;
+   if (path === "/v1/mcp/compatibility") return false;
+diff --git a/src/db/repositories.ts b/src/db/repositories.ts
+index f0a66fe4..8436b121 100644
+--- a/src/db/repositories.ts
++++ b/src/db/repositories.ts
+@@ -1,4 +1,4 @@
+-import { and, desc, eq, gte, not, or, sql } from "drizzle-orm";
++import { and, desc, eq, gte, not, or, sql, type SQL } from "drizzle-orm";
+ import { getDb } from "./client";
+ import {
+   advisories,
+@@ -1395,6 +1395,74 @@ export async function hasRecentAuditEvent(env: Env, actor: string, eventType: st
+   return rows.length > 0;
+ }
+ 
++export type PrVisibilitySkipAuditEvent = {
++  repoFullName: string;
++  pullNumber: number;
++  reason: string;
++  outcome: AuditEventRecord["outcome"];
++  createdAt: string;
++};
++
++export type PrVisibilitySkipAuditPage = {
++  limit: number;
++  hasMore: boolean;
++  items: PrVisibilitySkipAuditEvent[];
++};
++
++export async function listPrVisibilitySkipAuditEvents(
++  env: Env,
++  options: {
++    limit?: number | undefined;
++    repoFullNames?: string[] | undefined;
++    reason?: string | undefined;
++    sinceIso?: string | undefined;
++  } = {},
++): Promise<PrVisibilitySkipAuditPage> {
++  const limit = clampInteger(options.limit ?? 50, 1, 100);
++  const scopedRepoNames = options.repoFullNames === undefined ? undefined : uniqueRepoNames(options.repoFullNames.map((name) => name.trim()).filter(Boolean));
++  if (scopedRepoNames !== undefined && scopedRepoNames.length === 0) return { limit, hasMore: false, items: [] };
++
++  const conditions: SQL[] = [eq(auditEvents.eventType, "github_app.pr_visibility_skipped")];
++  if (options.reason) conditions.push(eq(auditEvents.detail, options.reason));
++  if (options.sinceIso) conditions.push(gte(auditEvents.createdAt, options.sinceIso));
++  if (scopedRepoNames !== undefined) {
++    const repoFilters = scopedRepoNames.map((repoFullName) => {
++      const prefix = `${repoFullName.toLowerCase()}#`;
++      const upperBound = `${repoFullName.toLowerCase()}$`;
++      return sql`lower(${auditEvents.targetKey}) >= ${prefix} and lower(${auditEvents.targetKey}) < ${upperBound}`;
++    });
++    const repoFilter = or(...repoFilters);
++    if (repoFilter) conditions.push(repoFilter);
++  }
++
++  const rowLimit = Math.min(500, limit * 5 + 20);
++  const rows = await getDb(env.DB)
++    .select({
++      targetKey: auditEvents.targetKey,
++      detail: auditEvents.detail,
++      outcome: auditEvents.outcome,
++      createdAt: auditEvents.createdAt,
++    })
++    .from(auditEvents)
++    .where(and(...conditions))
++    .orderBy(desc(auditEvents.createdAt), desc(auditEvents.id))
++    .limit(rowLimit);
++  const items = rows.flatMap((row) => {
++    const target = parsePullRequestTargetKey(row.targetKey);
++    if (!target) return [];
++    return [
++      {
++        repoFullName: target.repoFullName,
++        pullNumber: target.pullNumber,
++        reason: row.detail ?? "skipped",
++        outcome: row.outcome as AuditEventRecord["outcome"],
++        createdAt: row.createdAt,
++      },
++    ];
++  });
++  return { limit, hasMore: items.length > limit, items: items.slice(0, limit) };
++}
++
+ export async function getFreshOfficialMinerDetection(env: Env, login: string, now = nowIso()): Promise<OfficialGittensorMinerDetection | null> {
+   const [row] = await getDb(env.DB).select().from(officialMinerDetections).where(and(eq(officialMinerDetections.login, login.toLowerCase()), gte(officialMinerDetections.expiresAt, now))).limit(1);
+   return row ? toOfficialMinerDetection(row) : null;
+@@ -1484,6 +1552,28 @@ function clampInteger(value: number, min: number, max: number): number {
+   return Math.min(max, Math.max(min, Math.round(value)));
+ }
+ 
++function uniqueRepoNames(values: string[]): string[] {
++  const seen = new Set<string>();
++  const result: string[] = [];
++  for (const value of values) {
++    const key = value.toLowerCase();
++    if (seen.has(key)) continue;
++    seen.add(key);
++    result.push(value);
++  }
++  return result;
++}
++
++function parsePullRequestTargetKey(targetKey: string | null | undefined): { repoFullName: string; pullNumber: number } | null {
++  if (!targetKey) return null;
++  const delimiter = targetKey.lastIndexOf("#");
++  if (delimiter <= 0 || delimiter === targetKey.length - 1) return null;
++  const repoFullName = targetKey.slice(0, delimiter);
++  const pullNumber = Number(targetKey.slice(delimiter + 1));
++  if (!repoFullName.includes("/") || !Number.isInteger(pullNumber) || pullNumber <= 0) return null;
++  return { repoFullName, pullNumber };
++}
++
+ function maxIso(left: string | null | undefined, right: string | null | undefined): string | null {
+   if (!left) return right ?? null;
+   if (!right) return left;
+diff --git a/src/openapi/schemas.ts b/src/openapi/schemas.ts
+index 9d03b249..060bb37b 100644
+--- a/src/openapi/schemas.ts
++++ b/src/openapi/schemas.ts
+@@ -628,6 +628,30 @@ export const RepoSettingsPreviewSchema = z
+   })
+   .openapi("RepoSettingsPreview");
+ 
++export const SkippedPrAuditExportSchema = z
++  .object({
++    generatedAt: z.string(),
++    limit: z.number().int().min(1).max(100),
++    hasMore: z.boolean(),
++    filters: z.object({
++      repoFullName: z.string().nullable(),
++      reason: z
++        .enum(["surface_off", "missing_author", "bot_author", "maintainer_author", "miner_detection_unavailable", "not_official_gittensor_miner"])
++        .nullable(),
++      since: z.string().nullable(),
++    }),
++    items: z.array(
++      z.object({
++        repoFullName: z.string(),
++        pullNumber: z.number().int().positive(),
++        reason: z.string(),
++        timestamp: z.string(),
++        remediation: z.string(),
++      }),
++    ),
++  })
++  .openapi("SkippedPrAuditExport");
++
+ export const CommandPreviewResponseSchema = z
+   .object({
+     generatedAt: z.string(),
+diff --git a/src/openapi/spec.ts b/src/openapi/spec.ts
+index 19b89006..9b7e109c 100644
+--- a/src/openapi/spec.ts
++++ b/src/openapi/spec.ts
+@@ -68,6 +68,7 @@ import {
+   ScorePreviewSchema,
+   ScoringModelSnapshotSchema,
+   SignalFidelitySchema,
++  SkippedPrAuditExportSchema,
+   SyncStatusSchema,
+   UpstreamDriftReportSchema,
+   UpstreamRulesetSnapshotSchema,
+@@ -119,6 +120,7 @@ export function buildOpenApiSpec() {
+   registry.register("RepositorySettings", RepositorySettingsSchema);
+   registry.register("InstallationRepair", InstallationRepairSchema);
+   registry.register("RepoSettingsPreview", RepoSettingsPreviewSchema);
++  registry.register("SkippedPrAuditExport", SkippedPrAuditExportSchema);
+   registry.register("CommandPreviewResponse", CommandPreviewResponseSchema);
+   registry.register("AgentRun", AgentRunSchema);
+   registry.register("AgentAction", AgentActionSchema);
+@@ -654,6 +656,36 @@ export function buildOpenApiSpec() {
+       403: { description: "Insufficient app role for requested report variant" },
+     },
+   });
++  registry.registerPath({
++    method: "get",
++    path: "/v1/app/skipped-pr-audit",
++    request: {
++      query: z.object({
++        limit: z.string().optional().openapi({
++          param: { description: "Maximum rows to return, clamped from 1 to 100." },
++          example: "50",
++        }),
++        repoFullName: z.string().optional().openapi({
++          param: { description: "Optional repository filter. Browser sessions must have control-panel access to this repo." },
++          example: "JSONbored/gittensory",
++        }),
++        reason: z.enum(["surface_off", "missing_author", "bot_author", "maintainer_author", "miner_detection_unavailable", "not_official_gittensor_miner"]).optional().openapi({
++          param: { description: "Optional PR skip reason filter." },
++          example: "not_official_gittensor_miner",
++        }),
++        since: z.string().optional().openapi({
++          param: { description: "Optional lower timestamp bound." },
++          example: "2026-05-30T00:00:00.000Z",
++        }),
++      }),
++    },
++    responses: {
++      200: { description: "Private bounded audit export for skipped PR public-surface decisions", content: { "application/json": { schema: SkippedPrAuditExportSchema } } },
++      400: { description: "Invalid query" },
++      401: { description: "Unauthorized" },
++      403: { description: "Insufficient app role or repository scope" },
++    },
++  });
+   registry.registerPath({
+     method: "post",
+     path: "/v1/app/commands/preview",
+diff --git a/src/queue/processors.ts b/src/queue/processors.ts
+index ba701ea3..5619d6c5 100644
+--- a/src/queue/processors.ts
++++ b/src/queue/processors.ts
+@@ -701,7 +701,6 @@ async function maybePublishPrPublicSurface(
+     minerStatus: "not_checked",
+   });
+   if (prelim.skipped) {
+-    if (prelim.skipReason === "surface_off") return;
+     await auditPrVisibilitySkip(env, repoFullName, pr.number, author, prelim.skipReason ?? "skipped", webhook.deliveryId);
+     return;
+   }
+diff --git a/test/integration/api.test.ts b/test/integration/api.test.ts
+index bb147be7..a50b6d5e 100644
+--- a/test/integration/api.test.ts
++++ b/test/integration/api.test.ts
+@@ -22,6 +22,7 @@ import {
+   upsertRepoLabel,
+   upsertRepoSyncSegment,
+   upsertRepoSyncState,
++  recordAuditEvent,
+   upsertIssueFromGitHub,
+   upsertPullRequestFromGitHub,
+   persistScoringModelSnapshot,
+@@ -2783,6 +2784,159 @@ describe("api routes", () => {
+     expect(operatorWeeklyReportMarkdownText).not.toMatch(FORBIDDEN_PUBLIC_REPORT_TERMS);
+   });
+ 
++  it("serves bounded private skipped PR audit exports with scoped access and redaction", async () => {
++    const app = createApp();
++    const env = createTestEnv({ ADMIN_GITHUB_LOGINS: "operator" });
++    await upsertInstallation(env, {
++      installation: {
++        id: 101,
++        account: { login: "repo-owner", id: 101, type: "User" },
++        repository_selection: "selected",
++        permissions: { metadata: "read", pull_requests: "read", issues: "write" },
++        events: ["pull_request", "repository"],
++      },
++    });
++    await upsertRepositoryFromGitHub(env, { name: "owned-repo", full_name: "repo-owner/owned-repo", private: false, default_branch: "main", owner: { login: "repo-owner" } }, 101);
++    await upsertInstallation(env, {
++      installation: {
++        id: 202,
++        account: { login: "victim-org", id: 202, type: "Organization" },
++        repository_selection: "selected",
++        permissions: { metadata: "read", pull_requests: "read", issues: "write" },
++        events: ["pull_request", "repository"],
++      },
++    });
++    await upsertRepositoryFromGitHub(env, { name: "secret-repo", full_name: "victim-org/secret-repo", private: true, default_branch: "main", owner: { login: "victim-org" } }, 202);
++    const secretMetadata = { deliveryId: "delivery-secret", token: "github_pat_should_not_export", privateNote: "wallet hotkey raw trust" };
++    await recordAuditEvent(env, {
++      eventType: "github_app.pr_visibility_skipped",
++      actor: "private-author",
++      targetKey: "repo-owner/owned-repo#3",
++      outcome: "completed",
++      detail: "not_official_gittensor_miner",
++      metadata: secretMetadata,
++      createdAt: "2026-05-28T00:00:01.000Z",
++    });
++    await recordAuditEvent(env, {
++      eventType: "github_app.pr_visibility_skipped",
++      actor: "missing-secret",
++      targetKey: "repo-owner/owned-repo#2",
++      outcome: "completed",
++      detail: "missing_author",
++      metadata: secretMetadata,
++      createdAt: "2026-05-28T00:00:00.500Z",
++    });
++    await recordAuditEvent(env, {
++      eventType: "github_app.pr_visibility_skipped",
++      actor: "legacy-secret",
++      targetKey: "repo-owner/owned-repo#1",
++      outcome: "completed",
++      detail: "legacy_skip_reason",
++      metadata: secretMetadata,
++      createdAt: "2026-05-28T00:00:00.250Z",
++    });
++    await recordAuditEvent(env, {
++      eventType: "github_app.pr_visibility_skipped",
++      actor: "bot-secret",
++      targetKey: "repo-owner/owned-repo#4",
++      outcome: "completed",
++      detail: "bot_author",
++      metadata: secretMetadata,
++      createdAt: "2026-05-28T00:00:02.000Z",
++    });
++    await recordAuditEvent(env, {
++      eventType: "github_app.pr_visibility_skipped",
++      actor: "detector-secret",
++      targetKey: "repo-owner/owned-repo#5",
++      outcome: "completed",
++      detail: "miner_detection_unavailable",
++      metadata: secretMetadata,
++      createdAt: "2026-05-28T00:00:03.000Z",
++    });
++    await recordAuditEvent(env, {
++      eventType: "github_app.pr_visibility_skipped",
++      actor: "surface-secret",
++      targetKey: "repo-owner/owned-repo#6",
++      outcome: "completed",
++      detail: "surface_off",
++      metadata: secretMetadata,
++      createdAt: "2026-05-28T00:00:04.000Z",
++    });
++    await recordAuditEvent(env, {
++      eventType: "github_app.pr_visibility_skipped",
++      actor: "victim-secret",
++      targetKey: "victim-org/secret-repo#7",
++      outcome: "completed",
++      detail: "maintainer_author",
++      metadata: secretMetadata,
++      createdAt: "2026-05-28T00:00:05.000Z",
++    });
++
++    expect((await app.request("/v1/app/skipped-pr-audit", {}, env)).status).toBe(401);
++    const { token: unknownToken } = await createSessionForGitHubUser(env, { login: "unknown-user", id: 404 });
++    expect((await app.request("/v1/app/skipped-pr-audit", { headers: { cookie: `gittensory_session=${unknownToken}` } }, env)).status).toBe(403);
++
++    const bounded = await app.request("/v1/app/skipped-pr-audit?limit=3", { headers: apiHeaders(env) }, env);
++    expect(bounded.status).toBe(200);
++    const boundedBody = (await bounded.json()) as {
++      limit: number;
++      hasMore: boolean;
++      items: Array<{ repoFullName: string; pullNumber: number; reason: string; timestamp: string; remediation: string }>;
++    };
++    expect(boundedBody.limit).toBe(3);
++    expect(boundedBody.hasMore).toBe(true);
++    expect(boundedBody.items).toEqual([
++      expect.objectContaining({ repoFullName: "victim-org/secret-repo", pullNumber: 7, reason: "maintainer_author" }),
++      expect.objectContaining({ repoFullName: "repo-owner/owned-repo", pullNumber: 6, reason: "surface_off" }),
++      expect.objectContaining({ repoFullName: "repo-owner/owned-repo", pullNumber: 5, reason: "miner_detection_unavailable" }),
++    ]);
++    expect(boundedBody.items[1]?.remediation).toContain("repository settings");
++    expect(JSON.stringify(boundedBody)).not.toMatch(/private-author|bot-secret|detector-secret|surface-secret|victim-secret|delivery-secret|github_pat|wallet|hotkey|raw trust/i);
++
++    const reasonFiltered = await app.request("/v1/app/skipped-pr-audit?reason=bot_author&limit=500", { headers: apiHeaders(env) }, env);
++    expect(reasonFiltered.status).toBe(200);
++    const reasonFilteredBody = (await reasonFiltered.json()) as { limit: number; hasMore: boolean; items: Array<{ reason: string; pullNumber: number }> };
++    expect(reasonFilteredBody.limit).toBe(100);
++    expect(reasonFilteredBody.hasMore).toBe(false);
++    expect(reasonFilteredBody.items).toEqual([expect.objectContaining({ reason: "bot_author", pullNumber: 4 })]);
++    const staticRepoFiltered = await app.request("/v1/app/skipped-pr-audit?repoFullName=repo-owner/owned-repo&limit=100", { headers: apiHeaders(env) }, env);
++    expect(staticRepoFiltered.status).toBe(200);
++    const staticRepoFilteredBody = (await staticRepoFiltered.json()) as { items: Array<{ reason: string; remediation: string }> };
++    expect(staticRepoFilteredBody.items).toEqual(
++      expect.arrayContaining([
++        expect.objectContaining({ reason: "missing_author", remediation: expect.stringContaining("resolvable pull request author") }),
++        expect.objectContaining({ reason: "legacy_skip_reason", remediation: expect.stringContaining("installation health") }),
++      ]),
++    );
++
++    const sinceFiltered = await app.request("/v1/app/skipped-pr-audit?since=2026-05-28T00:00:04.500Z", { headers: apiHeaders(env) }, env);
++    expect(sinceFiltered.status).toBe(200);
++    await expect(sinceFiltered.json()).resolves.toMatchObject({ items: [expect.objectContaining({ repoFullName: "victim-org/secret-repo", pullNumber: 7 })] });
++    expect((await app.request("/v1/app/skipped-pr-audit?since=not-a-date", { headers: apiHeaders(env) }, env)).status).toBe(400);
++    expect((await app.request("/v1/app/skipped-pr-audit?reason=unknown", { headers: apiHeaders(env) }, env)).status).toBe(400);
++
++    const { token: ownerToken } = await createSessionForGitHubUser(env, { login: "repo-owner", id: 101 });
++    const ownerHeaders = { cookie: `gittensory_session=${ownerToken}`, "content-type": "application/json" };
++    const ownerAudit = await app.request("/v1/app/skipped-pr-audit", { headers: ownerHeaders }, env);
++    expect(ownerAudit.status).toBe(200);
++    const ownerAuditBody = (await ownerAudit.json()) as { items: Array<{ repoFullName: string; reason: string }> };
++    expect(ownerAuditBody.items).toHaveLength(6);
++    expect(ownerAuditBody.items.map((item) => item.reason)).toEqual(
++      expect.arrayContaining(["not_official_gittensor_miner", "bot_author", "miner_detection_unavailable", "surface_off", "missing_author", "legacy_skip_reason"]),
++    );
++    expect(JSON.stringify(ownerAuditBody)).not.toContain("victim-org");
++
++    const forbiddenRepo = await app.request("/v1/app/skipped-pr-audit?repoFullName=victim-org/secret-repo", { headers: ownerHeaders }, env);
++    expect(forbiddenRepo.status).toBe(403);
++    await expect(forbiddenRepo.json()).resolves.toMatchObject({ error: "forbidden_repo" });
++    const ownedRepo = await app.request("/v1/app/skipped-pr-audit?repoFullName=repo-owner/owned-repo&reason=surface_off", { headers: ownerHeaders }, env);
++    expect(ownedRepo.status).toBe(200);
++    await expect(ownedRepo.json()).resolves.toMatchObject({
++      filters: { repoFullName: "repo-owner/owned-repo", reason: "surface_off" },
++      items: [expect.objectContaining({ repoFullName: "repo-owner/owned-repo", reason: "surface_off" })],
++    });
++  });
++
+   it("covers live app auth, validation, and internal job queue edge routes", async () => {
+     const app = createApp();
+     const sent: Array<{ message: unknown; options?: unknown }> = [];
+diff --git a/test/unit/queue.test.ts b/test/unit/queue.test.ts
+index ff024141..d2eba925 100644
+--- a/test/unit/queue.test.ts
++++ b/test/unit/queue.test.ts
+@@ -966,6 +966,50 @@ describe("queue processors", () => {
+     expect(skipped.results.map((event) => event.detail)).toEqual(expect.arrayContaining(["bot_author", "maintainer_author"]));
+   });
+ 
++  it("audits disabled public-surface skips without miner lookup", async () => {
++    const env = createTestEnv();
++    await upsertRepositorySettings(env, {
++      repoFullName: "JSONbored/gittensory",
++      commentMode: "off",
++      publicSurface: "off",
++      autoLabelEnabled: false,
++      checkRunMode: "off",
++    });
++    const calls = { fetch: 0 };
++    vi.stubGlobal("fetch", async () => {
++      calls.fetch += 1;
++      return new Response("unexpected fetch", { status: 500 });
++    });
++
++    await processJob(env, {
++      type: "github-webhook",
++      deliveryId: "surface-off-skip",
++      eventName: "pull_request",
++      payload: {
++        action: "opened",
++        installation: { id: 123, account: { login: "JSONbored", id: 1, type: "User" } },
++        repository: { name: "gittensory", full_name: "JSONbored/gittensory", private: true, owner: { login: "JSONbored" } },
++        pull_request: { number: 23, title: "Quiet repo work", state: "open", user: { login: "oktofeesh1" }, labels: [], body: "" },
++      },
++    });
++
++    expect(calls.fetch).toBe(0);
++    const skipped = await env.DB.prepare("select actor, target_key, detail, metadata_json from audit_events where event_type = ?").bind("github_app.pr_visibility_skipped").all<{
++      actor: string;
++      target_key: string;
++      detail: string;
++      metadata_json: string;
++    }>();
++    expect(skipped.results).toEqual([
++      expect.objectContaining({
++        actor: "oktofeesh1",
++        target_key: "JSONbored/gittensory#23",
++        detail: "surface_off",
++      }),
++    ]);
++    expect(JSON.stringify(skipped.results)).not.toMatch(/wallet|hotkey|raw trust|installation-token/i);
++  });
++
+   it("records webhook processing when public comment publishing fails after miner confirmation", async () => {
+     const env = createTestEnv({ GITHUB_APP_PRIVATE_KEY: await generatePrivateKeyPem() });
+     await persistRegistrySnapshot(
+diff --git a/test/unit/skipped-pr-audit.test.ts b/test/unit/skipped-pr-audit.test.ts
+new file mode 100644
+index 00000000..82bbdb64
+--- /dev/null
++++ b/test/unit/skipped-pr-audit.test.ts
+@@ -0,0 +1,73 @@
++import { describe, expect, it } from "vitest";
++import { listPrVisibilitySkipAuditEvents, recordAuditEvent } from "../../src/db/repositories";
++import { createTestEnv } from "../helpers/d1";
++
++describe("skipped PR audit repository export", () => {
++  it("bounds queries, scopes repositories, and skips malformed audit targets", async () => {
++    const env = createTestEnv();
++    await recordAuditEvent(env, {
++      eventType: "github_app.pr_visibility_skipped",
++      targetKey: "owner/re_po#7",
++      outcome: "completed",
++      detail: null,
++      createdAt: "2026-05-28T00:00:07.000Z",
++    });
++    await recordAuditEvent(env, {
++      eventType: "github_app.pr_visibility_skipped",
++      targetKey: "owner/reXpo#8",
++      outcome: "completed",
++      detail: "bot_author",
++      createdAt: "2026-05-28T00:00:08.000Z",
++    });
++    await recordAuditEvent(env, {
++      eventType: "github_app.pr_visibility_skipped",
++      targetKey: null,
++      outcome: "completed",
++      detail: "missing_target",
++      createdAt: "2026-05-28T00:00:09.000Z",
++    });
++    await recordAuditEvent(env, {
++      eventType: "github_app.pr_visibility_skipped",
++      targetKey: "bad-target",
++      outcome: "completed",
++      detail: "bad_target",
++      createdAt: "2026-05-28T00:00:10.000Z",
++    });
++    await recordAuditEvent(env, {
++      eventType: "github_app.pr_visibility_skipped",
++      targetKey: "owner/re_po#0",
++      outcome: "completed",
++      detail: "bad_number",
++      createdAt: "2026-05-28T00:00:11.000Z",
++    });
++    await recordAuditEvent(env, {
++      eventType: "github_app.pr_visibility_skipped",
++      targetKey: "owner/re_po#nan",
++      outcome: "completed",
++      detail: "bad_number",
++      createdAt: "2026-05-28T00:00:12.000Z",
++    });
++
++    const emptyScope = await listPrVisibilitySkipAuditEvents(env, { repoFullNames: [] });
++    expect(emptyScope).toMatchObject({ limit: 50, hasMore: false, items: [] });
++
++    const scoped = await listPrVisibilitySkipAuditEvents(env, {
++      limit: Number.NaN,
++      repoFullNames: ["owner/re_po", "OWNER/re_po"],
++    });
++    expect(scoped.limit).toBe(1);
++    expect(scoped.items).toEqual([
++      {
++        repoFullName: "owner/re_po",
++        pullNumber: 7,
++        reason: "skipped",
++        outcome: "completed",
++        createdAt: "2026-05-28T00:00:07.000Z",
++      },
++    ]);
++
++    const unscoped = await listPrVisibilitySkipAuditEvents(env);
++    expect(unscoped.limit).toBe(50);
++    expect(unscoped.items.map((item) => item.pullNumber)).toEqual([8, 7]);
++  });
++});

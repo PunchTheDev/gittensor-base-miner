@@ -1,0 +1,268 @@
+diff --git a/CHANGES/11992.contrib.rst b/CHANGES/11992.contrib.rst
+new file mode 100644
+index 00000000000..c56c2ab7059
+--- /dev/null
++++ b/CHANGES/11992.contrib.rst
+@@ -0,0 +1 @@
++Fixed flaky performance tests by using appropriate fixed thresholds that account for CI variability -- by :user:`rodrigobnogueira`.
+diff --git a/CONTRIBUTORS.txt b/CONTRIBUTORS.txt
+index 46a3f491a38..9d593e1e6a2 100644
+--- a/CONTRIBUTORS.txt
++++ b/CONTRIBUTORS.txt
+@@ -318,6 +318,7 @@ Raúl Cumplido
+ Required Field
+ Robert Lu
+ Robert Nikolich
++Rodrigo Nogueira
+ Roman Markeloff
+ Roman Podoliaka
+ Roman Postnov
+diff --git a/tests/conftest.py b/tests/conftest.py
+index 80b94ffa50a..5a9c26628d2 100644
+--- a/tests/conftest.py
++++ b/tests/conftest.py
+@@ -49,6 +49,18 @@
+     TRUSTME = False
+ 
+ 
++def pytest_configure(config: pytest.Config) -> None:
++    # On Windows with Python 3.10/3.11, proxy.py's threaded mode can leave
++    # sockets not fully released by the time pytest's unraisableexception
++    # plugin collects warnings during teardown. Suppress these warnings
++    # since they are not actionable and only affect older Python versions.
++    if os.name == "nt" and sys.version_info < (3, 12):
++        config.addinivalue_line(
++            "filterwarnings",
++            "ignore:Exception ignored in.*socket.*:pytest.PytestUnraisableExceptionWarning",
++        )
++
++
+ try:
+     if sys.platform == "win32":
+         import winloop as uvloop
+@@ -431,13 +443,14 @@ async def make_client_request(
+     loop: asyncio.AbstractEventLoop,
+ ) -> AsyncIterator[Callable[[str, URL, Unpack[ClientRequestArgs]], ClientRequest]]:
+     """Fixture to help creating test ClientRequest objects with defaults."""
+-    request = session = None
++    requests: list[ClientRequest] = []
++    sessions: list[ClientSession] = []
+ 
+     def maker(
+         method: str, url: URL, **kwargs: Unpack[ClientRequestArgs]
+     ) -> ClientRequest:
+-        nonlocal request, session
+         session = ClientSession()
++        sessions.append(session)
+         default_args: ClientRequestArgs = {
+             "loop": loop,
+             "params": {},
+@@ -462,14 +475,15 @@ def maker(
+             "server_hostname": None,
+         }
+         request = ClientRequest(method, url, **(default_args | kwargs))
++        requests.append(request)
+         return request
+ 
+     yield maker
+ 
+-    if request is not None:
+-        await request._close()
+-        assert session is not None
+-        await session.close()
++    await asyncio.gather(
++        *(request._close() for request in requests),
++        *(session.close() for session in sessions),
++    )
+ 
+ 
+ @pytest.fixture
+diff --git a/tests/test_client_middleware_digest_auth.py b/tests/test_client_middleware_digest_auth.py
+index c15bf1b422e..52e6f97050a 100644
+--- a/tests/test_client_middleware_digest_auth.py
++++ b/tests/test_client_middleware_digest_auth.py
+@@ -1332,12 +1332,18 @@ async def handler(request: Request) -> Response:
+ 
+ 
+ def test_regex_performance() -> None:
++    """Test that the regex pattern doesn't suffer from ReDoS issues."""
++    REGEX_TIME_THRESHOLD_SECONDS = 0.08
+     value = "0" * 54773 + "\\0=a"
++
+     start = time.perf_counter()
+     matches = _HEADER_PAIRS_PATTERN.findall(value)
+-    end = time.perf_counter()
++    elapsed = time.perf_counter() - start
+ 
+-    # If this is taking more than 10ms, there's probably a performance/ReDoS issue.
+-    assert (end - start) < 0.01
+-    # This example probably shouldn't produce a match either.
++    # If this is taking more time, there's probably a performance/ReDoS issue.
++    assert elapsed < REGEX_TIME_THRESHOLD_SECONDS, (
++        f"Regex took {elapsed * 1000:.1f}ms, "
++        f"expected <{REGEX_TIME_THRESHOLD_SECONDS * 1000:.0f}ms - potential ReDoS issue"
++    )
++    # This example shouldn't produce a match either.
+     assert not matches
+diff --git a/tests/test_cookie_helpers.py b/tests/test_cookie_helpers.py
+index 38a44972c09..767e1eaa34a 100644
+--- a/tests/test_cookie_helpers.py
++++ b/tests/test_cookie_helpers.py
+@@ -638,13 +638,18 @@ def test_cookie_pattern_matches_partitioned_attribute(test_string: str) -> None:
+ 
+ 
+ def test_cookie_pattern_performance() -> None:
++    """Test that the cookie pattern doesn't suffer from ReDoS issues."""
++    COOKIE_PATTERN_TIME_THRESHOLD_SECONDS = 0.08
+     value = "a" + "=" * 21651 + "\x00"
+     start = time.perf_counter()
+     match = helpers._COOKIE_PATTERN.match(value)
+-    end = time.perf_counter()
++    elapsed = time.perf_counter() - start
+ 
+-    # If this is taking more than 10ms, there's probably a performance/ReDoS issue.
+-    assert (end - start) < 0.01
++    # If this is taking more time, there's probably a performance/ReDoS issue.
++    assert elapsed < COOKIE_PATTERN_TIME_THRESHOLD_SECONDS, (
++        f"Pattern took {elapsed * 1000:.1f}ms, "
++        f"expected <{COOKIE_PATTERN_TIME_THRESHOLD_SECONDS * 1000:.0f}ms - potential ReDoS issue"
++    )
+     # This example shouldn't produce a match either.
+     assert match is None
+ 
+diff --git a/tests/test_imports.py b/tests/test_imports.py
+index 1579135d539..0d220a656ed 100644
+--- a/tests/test_imports.py
++++ b/tests/test_imports.py
+@@ -28,22 +28,6 @@ def test_web___all__(pytester: pytest.Pytester) -> None:
+     result.assert_outcomes(passed=0, errors=0)
+ 
+ 
+-_IS_CI_ENV = os.getenv("CI") == "true"
+-_XDIST_WORKER_COUNT = int(os.getenv("PYTEST_XDIST_WORKER_COUNT", 0))
+-_IS_XDIST_RUN = _XDIST_WORKER_COUNT > 1
+-
+-_TARGET_TIMINGS_BY_PYTHON_VERSION = {
+-    "3.12": (
+-        # 3.12+ is expected to be a bit slower due to performance trade-offs,
+-        # and even slower under pytest-xdist, especially in CI
+-        _XDIST_WORKER_COUNT * 100 * (1 if _IS_CI_ENV else 1.53)
+-        if _IS_XDIST_RUN
+-        else 295
+-    ),
+-}
+-_TARGET_TIMINGS_BY_PYTHON_VERSION["3.13"] = _TARGET_TIMINGS_BY_PYTHON_VERSION["3.12"]
+-
+-
+ @pytest.mark.internal
+ @pytest.mark.dev_mode
+ @pytest.mark.skipif(
+@@ -56,7 +40,10 @@ def test_import_time(pytester: pytest.Pytester) -> None:
+     Obviously, the time may vary on different machines and may need to be adjusted
+     from time to time, but this should provide an early warning if something is
+     added that significantly increases import time.
++
++    Runs 3 times and keeps the minimum time to reduce flakiness.
+     """
++    IMPORT_TIME_THRESHOLD_MS = 300 if sys.version_info >= (3, 12) else 200
+     root = Path(__file__).parent.parent
+     old_path = os.environ.get("PYTHONPATH")
+     os.environ["PYTHONPATH"] = os.pathsep.join([str(root)] + sys.path)
+@@ -66,18 +53,12 @@ def test_import_time(pytester: pytest.Pytester) -> None:
+     try:
+         for _ in range(3):
+             r = pytester.run(sys.executable, "-We", "-c", cmd)
+-
+-            assert not r.stderr.str()
+-            runtime_ms = int(r.stdout.str())
+-            if runtime_ms < best_time_ms:
+-                best_time_ms = runtime_ms
++            assert not r.stderr.str(), r.stderr.str()
++            best_time_ms = min(best_time_ms, int(r.stdout.str()))
+     finally:
+         if old_path is None:
+             os.environ.pop("PYTHONPATH")
+         else:
+             os.environ["PYTHONPATH"] = old_path
+ 
+-    expected_time = _TARGET_TIMINGS_BY_PYTHON_VERSION.get(
+-        f"{sys.version_info.major}.{sys.version_info.minor}", 200
+-    )
+-    assert best_time_ms < expected_time
++    assert best_time_ms < IMPORT_TIME_THRESHOLD_MS
+diff --git a/tests/test_proxy_functional.py b/tests/test_proxy_functional.py
+index dc30bd36f5c..7c92b840790 100644
+--- a/tests/test_proxy_functional.py
++++ b/tests/test_proxy_functional.py
+@@ -21,6 +21,7 @@
+ from aiohttp.client import _RequestOptions
+ from aiohttp.client_exceptions import ClientConnectionError
+ from aiohttp.pytest_plugin import AiohttpRawServer, AiohttpServer
++from aiohttp.test_utils import TestServer
+ 
+ ASYNCIO_SUPPORTS_TLS_IN_TLS = sys.version_info >= (3, 11)
+ 
+@@ -244,24 +245,34 @@ async def test_https_proxy_unsupported_tls_in_tls(
+ # otherwise this test will fail because the proxy will die with an error.
+ async def test_uvloop_secure_https_proxy(
+     client_ssl_ctx: ssl.SSLContext,
++    ssl_ctx: ssl.SSLContext,
+     secure_proxy_url: URL,
+     uvloop_loop: asyncio.AbstractEventLoop,
+ ) -> None:
+     """Ensure HTTPS sites are accessible through a secure proxy without warning when using uvloop."""
++    payload = str(uuid4())
++
++    async def handler(request: web.Request) -> web.Response:
++        return web.Response(text=payload)
++
++    app = web.Application()
++    app.router.add_route("GET", "/", handler)
++    server = TestServer(app, host="127.0.0.1")
++    await server.start_server(ssl=ssl_ctx)
++
++    url = URL.build(scheme="https", host=server.host, port=server.port)
+     conn = aiohttp.TCPConnector(force_close=True)
+     sess = aiohttp.ClientSession(connector=conn)
+     try:
+-        url = URL("https://example.com")
+-
+         async with sess.get(
+             url, proxy=secure_proxy_url, ssl=client_ssl_ctx
+         ) as response:
+             assert response.status == 200
+-            # Ensure response body is read to completion
+-            await response.read()
++            assert await response.text() == payload
+     finally:
+         await sess.close()
+         await conn.close()
++        await server.close()
+         await asyncio.sleep(0)
+         await asyncio.sleep(0.1)
+ 
+diff --git a/tests/test_web_request.py b/tests/test_web_request.py
+index cd18a90015e..9dec08a7b5f 100644
+--- a/tests/test_web_request.py
++++ b/tests/test_web_request.py
+@@ -601,13 +601,17 @@ def test_single_forwarded_header() -> None:
+ 
+ 
+ def test_forwarded_re_performance() -> None:
++    FORWARDED_RE_TIME_THRESHOLD_SECONDS = 0.08
+     value = "{" + "f" * 54773 + "z\x00a=v"
+     start = time.perf_counter()
+     match = _FORWARDED_PAIR_RE.match(value)
+-    end = time.perf_counter()
++    elapsed = time.perf_counter() - start
+ 
+-    # If this is taking more than 10ms, there's probably a performance/ReDoS issue.
+-    assert (end - start) < 0.01
++    # If this is taking more time, there's probably a performance/ReDoS issue.
++    assert elapsed < FORWARDED_RE_TIME_THRESHOLD_SECONDS, (
++        f"Regex took {elapsed * 1000:.1f}ms, "
++        f"expected <{FORWARDED_RE_TIME_THRESHOLD_SECONDS * 1000:.0f}ms - potential ReDoS issue"
++    )
+     # This example shouldn't produce a match either.
+     assert match is None
+ 

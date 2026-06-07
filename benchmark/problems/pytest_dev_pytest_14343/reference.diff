@@ -1,0 +1,105 @@
+diff --git a/changelog/14343.bugfix.rst b/changelog/14343.bugfix.rst
+new file mode 100644
+index 00000000000..a52028d9f86
+--- /dev/null
++++ b/changelog/14343.bugfix.rst
+@@ -0,0 +1 @@
++Fixed use of insecure temporary directory (CVE-2025-71176).
+diff --git a/src/_pytest/tmpdir.py b/src/_pytest/tmpdir.py
+index 855ad273ecf..66ca9f190e3 100644
+--- a/src/_pytest/tmpdir.py
++++ b/src/_pytest/tmpdir.py
+@@ -9,6 +9,7 @@
+ from pathlib import Path
+ import re
+ from shutil import rmtree
++import stat
+ import tempfile
+ from typing import Any
+ from typing import final
+@@ -170,16 +171,37 @@ def getbasetemp(self) -> Path:
+             # Also, to keep things private, fixup any world-readable temp
+             # rootdir's permissions. Historically 0o755 was used, so we can't
+             # just error out on this, at least for a while.
++            # Don't follow symlinks, otherwise we're open to symlink-swapping
++            # TOCTOU vulnerability.
++            # This check makes us vulnerable to a DoS - a user can `mkdir
++            # /tmp/pytest-of-otheruser` and then `otheruser` will fail this
++            # check. For now we don't consider it a real problem. otheruser can
++            # change their TMPDIR or --basetemp, and maybe give the prankster a
++            # good scolding.
+             uid = get_user_id()
+             if uid is not None:
+-                rootdir_stat = rootdir.stat()
++                stat_follow_symlinks = (
++                    False if os.stat in os.supports_follow_symlinks else True
++                )
++                rootdir_stat = rootdir.stat(follow_symlinks=stat_follow_symlinks)
++                if stat.S_ISLNK(rootdir_stat.st_mode):
++                    raise OSError(
++                        f"The temporary directory {rootdir} is a symbolic link. "
++                        "Fix this and try again."
++                    )
+                 if rootdir_stat.st_uid != uid:
+                     raise OSError(
+                         f"The temporary directory {rootdir} is not owned by the current user. "
+                         "Fix this and try again."
+                     )
+                 if (rootdir_stat.st_mode & 0o077) != 0:
+-                    os.chmod(rootdir, rootdir_stat.st_mode & ~0o077)
++                    chmod_follow_symlinks = (
++                        False if os.chmod in os.supports_follow_symlinks else True
++                    )
++                    rootdir.chmod(
++                        rootdir_stat.st_mode & ~0o077,
++                        follow_symlinks=chmod_follow_symlinks,
++                    )
+             keep = self._retention_count
+             if self._retention_policy == "none":
+                 keep = 0
+diff --git a/testing/test_tmpdir.py b/testing/test_tmpdir.py
+index 12891d81488..096527e6273 100644
+--- a/testing/test_tmpdir.py
++++ b/testing/test_tmpdir.py
+@@ -5,6 +5,7 @@
+ import dataclasses
+ import os
+ from pathlib import Path
++import shutil
+ import stat
+ import sys
+ from typing import cast
+@@ -619,3 +620,33 @@ def test_tmp_path_factory_fixes_up_world_readable_permissions(
+ 
+     # After - fixed.
+     assert (basetemp.parent.stat().st_mode & 0o077) == 0
++
++
++@pytest.mark.skipif(
++    not hasattr(os, "getuid") or os.stat not in os.supports_follow_symlinks,
++    reason="checks unix permissions and symlinks",
++)
++def test_tmp_path_factory_doesnt_follow_symlinks(
++    tmp_path: Path, monkeypatch: MonkeyPatch
++) -> None:
++    """Verify that if a /tmp/pytest-of-foo directory is a symbolic link,
++    it is rejected (#13669, CVE-2025-71176)."""
++    attacker_controlled = tmp_path / "attacker_controlled"
++    attacker_controlled.mkdir()
++
++    # Use the test's tmp_path as the system temproot (/tmp).
++    monkeypatch.setenv("PYTEST_DEBUG_TEMPROOT", str(tmp_path))
++
++    # First just get the pytest-of-user path.
++    tmp_factory = TempPathFactory(None, 3, "all", lambda *args: None, _ispytest=True)
++    pytest_of_user = tmp_factory.getbasetemp().parent
++    # Just for safety in the test, before we nuke it.
++    assert "pytest-of-" in str(pytest_of_user)
++    shutil.rmtree(pytest_of_user)
++
++    pytest_of_user.symlink_to(attacker_controlled)
++
++    # This now tries to use the directory when it's a symlink.
++    tmp_factory = TempPathFactory(None, 3, "all", lambda *args: None, _ispytest=True)
++    with pytest.raises(OSError, match=r"temporary directory .* is a symbolic link"):
++        tmp_factory.getbasetemp()

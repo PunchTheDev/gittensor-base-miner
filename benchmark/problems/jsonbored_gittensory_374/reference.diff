@@ -1,0 +1,265 @@
+diff --git a/src/services/agent-orchestrator.ts b/src/services/agent-orchestrator.ts
+index 707c1200..5e1796cc 100644
+--- a/src/services/agent-orchestrator.ts
++++ b/src/services/agent-orchestrator.ts
+@@ -30,6 +30,7 @@ import { buildContributorOpenPrMonitor, type ContributorOpenPrMonitor } from "..
+ import { buildLocalBranchAnalysis, findCurrentBranchPullRequest, type LocalBranchAnalysis, type LocalBranchAnalysisInput } from "../signals/local-branch";
+ import { loadRepoFocusManifest } from "../signals/focus-manifest-loader";
+ import { withAgentActionExplanationCard } from "./agent-action-explanation-card";
++import { attachRecommendationSnapshots } from "./recommendation-snapshots";
+ import type {
+   AgentActionRecord,
+   AgentActionStatus,
+@@ -262,10 +263,11 @@ async function executeDecisionPackRun(env: Env, run: AgentRunRecord, kind: strin
+     kind === "explain_blockers"
+       ? buildBlockerActions(run, pack, decisions, { allowFallback: allowCrossRepoFallback })
+       : buildDecisionActions(run, pack, scopedDecisionActions);
+-  const contexts = [contextSnapshotFromPack(run.id, pack, decisions)];
+-  const selectedActionPortfolio = contexts[0]?.payload.actionPortfolio ?? null;
+-  await replaceAgentActions(env, run.id, actions);
+-  await persistAgentContextSnapshot(env, contexts[0]!);
++  const context = contextSnapshotFromPack(run.id, pack, decisions);
++  const actionsWithSnapshots = attachRecommendationSnapshots(actions, context);
++  const selectedActionPortfolio = context.payload.actionPortfolio ?? null;
++  await replaceAgentActions(env, run.id, actionsWithSnapshots);
++  await persistAgentContextSnapshot(env, context);
+   const dataQualityStatus = isStale ? "degraded" : pack.dataQuality.signalFidelity.status;
+   await updateAgentRun(env, run.id, {
+     status: "completed",
+@@ -310,7 +312,8 @@ async function executeLocalBranchRun(env: Env, run: AgentRunRecord, kind: string
+       dataQuality: (analysis.dataQuality ?? null) as unknown as JsonValue,
+     },
+   };
+-  await replaceAgentActions(env, run.id, actions);
++  const actionsWithSnapshots = attachRecommendationSnapshots(actions, context);
++  await replaceAgentActions(env, run.id, actionsWithSnapshots);
+   await persistAgentContextSnapshot(env, context);
+   await updateAgentRun(env, run.id, {
+     status: "completed",
+diff --git a/src/services/recommendation-snapshots.ts b/src/services/recommendation-snapshots.ts
+new file mode 100644
+index 00000000..3e3d0e38
+--- /dev/null
++++ b/src/services/recommendation-snapshots.ts
+@@ -0,0 +1,66 @@
++import type { AgentActionRecord, AgentContextSnapshotRecord, AgentActionType, JsonValue } from "../types";
++
++export type RecommendationSnapshotEnvelope = {
++  kind: "recommendation_snapshot";
++  version: 1;
++  snapshotId: string;
++  contextSnapshotId: string;
++  actionId: string;
++  runId: string;
++  actionType: AgentActionType;
++  generatedAt: string | null;
++  publicSafe: true;
++  target: {
++    repoFullName?: string;
++    pullNumber?: number;
++    issueNumber?: number;
++  };
++};
++
++export function recommendationSnapshotId(contextSnapshotId: string, actionId: string): string {
++  return `recommendation:${contextSnapshotId}:${actionId}`;
++}
++
++export function recommendationSnapshotEnvelope(
++  action: AgentActionRecord,
++  context: AgentContextSnapshotRecord,
++): RecommendationSnapshotEnvelope {
++  const target: RecommendationSnapshotEnvelope["target"] = {};
++  if (action.targetRepoFullName) target.repoFullName = action.targetRepoFullName;
++  if (action.targetPullNumber !== null && action.targetPullNumber !== undefined) target.pullNumber = action.targetPullNumber;
++  if (action.targetIssueNumber !== null && action.targetIssueNumber !== undefined) target.issueNumber = action.targetIssueNumber;
++  return {
++    kind: "recommendation_snapshot",
++    version: 1,
++    snapshotId: recommendationSnapshotId(context.id, action.id),
++    contextSnapshotId: context.id,
++    actionId: action.id,
++    runId: action.runId,
++    actionType: action.actionType,
++    generatedAt: context.createdAt ?? context.decisionPackVersion ?? null,
++    publicSafe: true,
++    target,
++  };
++}
++
++export function attachRecommendationSnapshot(
++  action: AgentActionRecord,
++  context: AgentContextSnapshotRecord,
++): AgentActionRecord {
++  const envelope = recommendationSnapshotEnvelope(action, context);
++  return {
++    ...action,
++    payload: {
++      ...action.payload,
++      recommendationSnapshotId: envelope.snapshotId,
++      recommendationSnapshot: envelope as unknown as JsonValue,
++    },
++  };
++}
++
++export function attachRecommendationSnapshots(
++  actions: AgentActionRecord[],
++  context: AgentContextSnapshotRecord,
++): AgentActionRecord[] {
++  return actions.map((action) => attachRecommendationSnapshot(action, context));
++}
+diff --git a/test/integration/api.test.ts b/test/integration/api.test.ts
+index e161e720..7ad1291c 100644
+--- a/test/integration/api.test.ts
++++ b/test/integration/api.test.ts
+@@ -687,6 +687,17 @@ describe("api routes", () => {
+       buckets: expect.arrayContaining([expect.objectContaining({ bucket: expect.any(String), actions: expect.any(Array) })]),
+     });
+     expect(agentPlanPayload.actions.length).toBeGreaterThan(0);
++    for (const action of agentPlanPayload.actions) {
++      expect(action.payload.recommendationSnapshotId).toEqual(expect.any(String));
++      expect(action.payload.recommendationSnapshot).toMatchObject({
++        kind: "recommendation_snapshot",
++        version: 1,
++        snapshotId: action.payload.recommendationSnapshotId,
++        contextSnapshotId: expect.any(String),
++        actionId: expect.any(String),
++        publicSafe: true,
++      });
++    }
+     expect(agentPlanPayload.actions[0]?.publicSafeSummary).not.toMatch(/wallet|hotkey|reward estimate|payout|farming|raw trust score/i);
+     expect(agentPlanPayload.actions[0]?.explanationCard).toMatchObject({
+       whyNow: expect.any(String),
+@@ -695,6 +706,8 @@ describe("api routes", () => {
+     });
+     expect(JSON.stringify(agentPlanPayload.actions[0]?.explanationCard?.publicSafe)).not.toMatch(/wallet|hotkey|reward estimate|payout|farming|raw trust score|private reviewability|public score estimate|scoreability/i);
+     expect(agentPlanPayload.actions[0]?.payload).toHaveProperty("decision");
++    expect(agentPlanPayload.actions[0]?.payload.recommendationSnapshot).toMatchObject({ target: { repoFullName: "entrius/allways-ui" } });
++    expect(JSON.stringify(agentPlanPayload.actions[0]?.payload.recommendationSnapshot)).not.toMatch(/wallet|hotkey|raw trust score|private reviewability|private scoreability|reward estimate|recommendationEvidence/i);
+     expect(agentPlanPayload.actions[0]?.payload.recommendationEvidence).toMatchObject({
+       confidence: expect.stringMatching(/^(high|medium|low)$/),
+       sourceSummary: expect.any(String),
+diff --git a/test/unit/recommendation-snapshots.test.ts b/test/unit/recommendation-snapshots.test.ts
+new file mode 100644
+index 00000000..05456b9f
+--- /dev/null
++++ b/test/unit/recommendation-snapshots.test.ts
+@@ -0,0 +1,118 @@
++import { describe, expect, it } from "vitest";
++import {
++  attachRecommendationSnapshot,
++  attachRecommendationSnapshots,
++  recommendationSnapshotEnvelope,
++  recommendationSnapshotId,
++} from "../../src/services/recommendation-snapshots";
++import type { AgentActionRecord, AgentContextSnapshotRecord } from "../../src/types";
++
++describe("recommendation snapshot envelopes", () => {
++  it("creates stable ids from the durable context snapshot and action ids", () => {
++    expect(recommendationSnapshotId("context-123", "run-1:00:choose_next_work")).toBe(
++      "recommendation:context-123:run-1:00:choose_next_work",
++    );
++  });
++
++  it("serializes only public-safe envelope fields", () => {
++    const envelope = recommendationSnapshotEnvelope(action(), context());
++    expect(envelope).toEqual({
++      kind: "recommendation_snapshot",
++      version: 1,
++      snapshotId: "recommendation:context-123:run-1:00:choose_next_work",
++      contextSnapshotId: "context-123",
++      actionId: "run-1:00:choose_next_work",
++      runId: "run-1",
++      actionType: "choose_next_work",
++      generatedAt: "2026-06-01T00:00:00.000Z",
++      publicSafe: true,
++      target: {
++        repoFullName: "JSONbored/gittensory",
++        pullNumber: 12,
++      },
++    });
++    expect(JSON.stringify(envelope)).not.toMatch(
++      /wallet|hotkey|coldkey|raw trust|private reviewability|private scoreability|reward estimate|payload|recommendationEvidence/i,
++    );
++  });
++
++  it("attaches the id and envelope without removing existing action payload", () => {
++    const attached = attachRecommendationSnapshot(
++      action({ payload: { decision: { repoFullName: "JSONbored/gittensory" } } }),
++      context(),
++    );
++    expect(attached.payload.decision).toEqual({ repoFullName: "JSONbored/gittensory" });
++    expect(attached.payload.recommendationSnapshotId).toBe("recommendation:context-123:run-1:00:choose_next_work");
++    expect(attached.payload.recommendationSnapshot).toMatchObject({
++      snapshotId: "recommendation:context-123:run-1:00:choose_next_work",
++      publicSafe: true,
++    });
++  });
++
++  it("attaches ids to every action in a packet", () => {
++    const attached = attachRecommendationSnapshots(
++      [
++        action({ id: "run-1:00:choose_next_work" }),
++        action({ id: "run-1:01:explain_repo_fit", actionType: "explain_repo_fit", targetPullNumber: null, targetIssueNumber: 7 }),
++      ],
++      context(),
++    );
++    expect(attached.map((item) => item.payload.recommendationSnapshotId)).toEqual([
++      "recommendation:context-123:run-1:00:choose_next_work",
++      "recommendation:context-123:run-1:01:explain_repo_fit",
++    ]);
++    expect(attached[1]?.payload.recommendationSnapshot).toMatchObject({
++      actionType: "explain_repo_fit",
++      target: { repoFullName: "JSONbored/gittensory", issueNumber: 7 },
++    });
++  });
++
++  it("falls back to context createdAt when no decision-pack version exists", () => {
++    expect(
++      recommendationSnapshotEnvelope(action({ targetRepoFullName: null, targetPullNumber: null }), {
++        ...context(),
++        decisionPackVersion: null,
++        createdAt: "2026-06-02T00:00:00.000Z",
++      }),
++    ).toMatchObject({
++      generatedAt: "2026-06-02T00:00:00.000Z",
++      target: {},
++    });
++  });
++});
++
++function action(overrides: Partial<AgentActionRecord> = {}): AgentActionRecord {
++  return {
++    id: "run-1:00:choose_next_work",
++    runId: "run-1",
++    actionType: "choose_next_work",
++    targetRepoFullName: "JSONbored/gittensory",
++    targetPullNumber: 12,
++    status: "recommended",
++    recommendation: "Pick narrow work.",
++    why: ["A durable recommendation snapshot can explain this later."],
++    blockedBy: [],
++    publicSafeSummary: "Pick narrow public work.",
++    approvalRequired: true,
++    safetyClass: "private",
++    payload: {},
++    createdAt: "2026-06-01T00:00:00.000Z",
++    ...overrides,
++  };
++}
++
++function context(overrides: Partial<AgentContextSnapshotRecord> = {}): AgentContextSnapshotRecord {
++  return {
++    id: "context-123",
++    runId: "run-1",
++    decisionPackVersion: "2026-06-01T00:00:00.000Z",
++    repoSignalSnapshotIds: [],
++    scoringModelId: "scoring-1",
++    freshnessWarnings: [],
++    payload: {
++      privateScoreability: "must-not-copy",
++      recommendationEvidence: { raw: "must-not-copy" },
++    },
++    ...overrides,
++  };
++}

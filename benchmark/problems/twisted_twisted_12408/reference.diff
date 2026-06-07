@@ -1,0 +1,144 @@
+diff --git a/src/twisted/internet/defer.py b/src/twisted/internet/defer.py
+index 00ae97ba181..85c7c319d43 100644
+--- a/src/twisted/internet/defer.py
++++ b/src/twisted/internet/defer.py
+@@ -49,7 +49,7 @@
+ from twisted.logger import Logger
+ from twisted.python import lockfile
+ from twisted.python.compat import _PYPY, cmp, comparable
+-from twisted.python.deprecate import deprecated, warnAboutFunction
++from twisted.python.deprecate import deprecated, deprecatedProperty, warnAboutFunction
+ from twisted.python.failure import Failure, _extraneous
+ 
+ log = Logger()
+@@ -469,12 +469,16 @@ def __init__(
+         @type canceller: a 1-argument callable which takes a L{Deferred}. The
+             return result is ignored.
+         """
+-        self.callbacks: List[_CallbackChain] = []
++        self._callbacks: List[_CallbackChain] = []
+         self._canceller = canceller
+         if self.debug:
+             self._debugInfo = DebugInfo()
+             self._debugInfo.creator = traceback.format_stack()[:-1]
+ 
++    @deprecatedProperty(Version("Twisted", "NEXT", 0, 0))
++    def callbacks(self) -> List[_CallbackChain]:
++        return self._callbacks
++
+     def addCallbacks(
+         self,
+         callback: Union[
+@@ -528,7 +532,7 @@ def addCallbacks(
+ 
+         # Note that this logic is duplicated in addCallbac/addErrback/addBoth
+         # for performance reasons.
+-        self.callbacks.append(
++        self._callbacks.append(
+             (
+                 (callback, callbackArgs, callbackKeywords),
+                 (errback, errbackArgs, errbackKeywords),
+@@ -622,7 +626,7 @@ def addCallback(self, callback: Any, *args: Any, **kwargs: Any) -> "Deferred[Any
+         """
+         # This could be implemented as a call to addCallbacks, but doing it
+         # directly is faster.
+-        self.callbacks.append(((callback, args, kwargs), (_failthru, (), {})))
++        self._callbacks.append(((callback, args, kwargs), (_failthru, (), {})))
+ 
+         if self.called:
+             self._runCallbacks()
+@@ -664,7 +668,7 @@ def addErrback(self, errback: Any, *args: Any, **kwargs: Any) -> "Deferred[Any]"
+         """
+         # This could be implemented as a call to addCallbacks, but doing it
+         # directly is faster.
+-        self.callbacks.append(((passthru, (), {}), (errback, args, kwargs)))
++        self._callbacks.append(((passthru, (), {}), (errback, args, kwargs)))
+ 
+         if self.called:
+             self._runCallbacks()
+@@ -754,7 +758,7 @@ def addBoth(self, callback: Any, *args: Any, **kwargs: Any) -> "Deferred[Any]":
+         # This could be implemented as a call to addCallbacks, but doing it
+         # directly is faster.
+         call = (callback, args, kwargs)
+-        self.callbacks.append((call, call))
++        self._callbacks.append((call, call))
+ 
+         if self.called:
+             self._runCallbacks()
+@@ -1048,8 +1052,8 @@ def _runCallbacks(self) -> None:
+ 
+             finished = True
+             current._chainedTo = None
+-            while current.callbacks:
+-                item = current.callbacks.pop(0)
++            while current._callbacks:
++                item = current._callbacks.pop(0)
+                 if not isinstance(current.result, Failure):
+                     callback, args, kwargs = item[0]
+                 else:
+@@ -1123,7 +1127,7 @@ def _runCallbacks(self) -> None:
+                             # running its callbacks right now.  Therefore we can
+                             # append to the callbacks list directly instead of
+                             # using addCallbacks.
+-                            currentResult.callbacks.append(current._continuation())
++                            currentResult._callbacks.append(current._continuation())
+                             break
+                         else:
+                             # Yep, it did.  Steal it.
+@@ -1990,9 +1994,9 @@ def _addCancelCallbackToDeferred(
+     @param it: The L{Deferred} to add the errback to.
+     @param status: a L{_CancellationStatus} tracking the current status of C{gen}
+     """
+-    it.callbacks, tmp = [], it.callbacks
++    it._callbacks, tmp = [], it._callbacks
+     it = it.addErrback(_handleCancelInlineCallbacks, status)
+-    it.callbacks.extend(tmp)
++    it._callbacks.extend(tmp)
+     it.errback(_InternalInlineCallbacksCancelledError())
+ 
+ 
+diff --git a/src/twisted/newsfragments/12407.removal b/src/twisted/newsfragments/12407.removal
+new file mode 100644
+index 00000000000..3c2d7e6fbaa
+--- /dev/null
++++ b/src/twisted/newsfragments/12407.removal
+@@ -0,0 +1 @@
++twisted.internet.defer.Deferred.callbacks attribute has been deprecated.
+diff --git a/src/twisted/python/deprecate.py b/src/twisted/python/deprecate.py
+index aba096d59c2..22b0d162aa9 100644
+--- a/src/twisted/python/deprecate.py
++++ b/src/twisted/python/deprecate.py
+@@ -310,7 +310,9 @@ def deprecatedFunction(*args: _P.args, **kwargs: _P.kwargs) -> _R:
+     return deprecationDecorator
+ 
+ 
+-def deprecatedProperty(version, replacement=None):
++def deprecatedProperty(
++    version: Version, replacement: str | Callable[..., object] | None = None
++) -> Callable[[Callable[_P, _R]], Callable[_P, _R]]:
+     """
+     Return a decorator that marks a property as deprecated. To deprecate a
+     regular callable or class, see L{deprecated}.
+diff --git a/src/twisted/test/test_defer.py b/src/twisted/test/test_defer.py
+index c209e4ee16a..2ae659771b6 100644
+--- a/src/twisted/test/test_defer.py
++++ b/src/twisted/test/test_defer.py
+@@ -218,6 +218,18 @@ def testTwoCallbacks(self) -> None:
+         self.assertEqual(self.callbackResults, (("hello",), {}))
+         self.assertEqual(self.callback2Results, (("hello",), {}))
+ 
++    def test_callbacksAttributeDeprecated(self) -> None:
++        deferred: Deferred[str] = Deferred()
++        deferred.callbacks
++
++        warnings = self.flushWarnings()
++        self.assertEqual(1, len(warnings))
++        self.assertIs(DeprecationWarning, warnings[0]["category"])
++        self.assertIn(
++            "twisted.internet.defer.Deferred.callbacks was deprecated in Twisted",
++            warnings[0]["message"],
++        )
++
+     def test_addCallbacksNoneErrback(self) -> None:
+         """
+         If given None for an errback, addCallbacks uses a pass-through.

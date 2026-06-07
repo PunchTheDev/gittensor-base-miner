@@ -1,0 +1,830 @@
+diff --git a/crates/engine/src/game/effects/become_copy.rs b/crates/engine/src/game/effects/become_copy.rs
+index 069c866017..0d83b1b77a 100644
+--- a/crates/engine/src/game/effects/become_copy.rs
++++ b/crates/engine/src/game/effects/become_copy.rs
+@@ -1341,4 +1341,187 @@ mod tests {
+             "Myriad attack trigger should be synthesized when keyword is granted"
+         );
+     }
++
++    // ── Issue #1514: Dark Depths copied by Thespian's Stage → Marit Lage ──────
++    //
++    // CR 707.2: A copy does not copy counters, so Thespian's Stage becoming a
++    // copy of Dark Depths produces a Dark Depths with ZERO ice counters. CR
++    // 603.8: the copied state-triggered ability ("When Dark Depths has no ice
++    // counters on it, sacrifice it. If you do, create Marit Lage") is re-checked
++    // when a player would receive priority; with no ice counters it fires
++    // immediately. Resolving the trigger sacrifices the copy and creates the
++    // 20/20 flying indestructible legendary Avatar token.
++    //
++    // This drives the real runtime path: BecomeCopy resolution → layer
++    // evaluation → check_state_triggers (via the priority window) → stack
++    // resolution of the Sacrifice + "if you do, create" chain.
++    #[test]
++    fn copying_dark_depths_with_zero_counters_creates_marit_lage() {
++        use crate::game::scenario::GameRunner;
++        use crate::parser::oracle::parse_oracle_text;
++        use crate::types::card_type::{CoreType, Supertype};
++        use crate::types::counter::CounterType;
++        use crate::types::game_state::WaitingFor;
++        use crate::types::keywords::Keyword;
++        use crate::types::triggers::TriggerMode;
++
++        const DARK_DEPTHS_TEXT: &str = "Dark Depths enters the battlefield with ten ice counters on it.\n{3}: Remove an ice counter from Dark Depths.\nWhen Dark Depths has no ice counters on it, sacrifice it. If you do, create Marit Lage, a legendary 20/20 black Avatar creature token with flying and indestructible.";
++
++        let parsed = parse_oracle_text(
++            DARK_DEPTHS_TEXT,
++            "Dark Depths",
++            &[],
++            &["Land".to_string()],
++            &[],
++        );
++        // Sanity: the parser yields the state-triggered "has no ice counters"
++        // ability that the copy must inherit (CR 603.8).
++        assert!(
++            parsed
++                .triggers
++                .iter()
++                .any(|t| t.mode == TriggerMode::StateCondition),
++            "Dark Depths must parse a StateCondition trigger; got {:?}",
++            parsed.triggers
++        );
++
++        let mut state = GameState::new_two_player(42);
++        state.phase = crate::types::phase::Phase::PreCombatMain;
++        state.turn_number = 2;
++        state.active_player = PlayerId(0);
++        state.priority_player = PlayerId(0);
++
++        // Helper to install Dark Depths' parsed printed abilities onto a land.
++        let install_dark_depths =
++            |state: &mut GameState, id: crate::types::identifiers::ObjectId| {
++                let obj = state.objects.get_mut(&id).unwrap();
++                obj.base_card_types = CardType {
++                    supertypes: vec![],
++                    core_types: vec![CoreType::Land],
++                    subtypes: vec![],
++                };
++                obj.card_types = obj.base_card_types.clone();
++                obj.base_abilities = Arc::new(parsed.abilities.clone());
++                obj.base_trigger_definitions = Arc::new(parsed.triggers.clone());
++                obj.base_replacement_definitions = Arc::new(parsed.replacements.clone());
++            };
++
++        // Target: a real Dark Depths on the battlefield with its 10 ice counters.
++        let dark_depths = create_object(
++            &mut state,
++            CardId(1),
++            PlayerId(0),
++            "Dark Depths".to_string(),
++            Zone::Battlefield,
++        );
++        state.objects.get_mut(&dark_depths).unwrap().base_name = "Dark Depths".to_string();
++        install_dark_depths(&mut state, dark_depths);
++        state
++            .objects
++            .get_mut(&dark_depths)
++            .unwrap()
++            .counters
++            .insert(CounterType::Generic("ice".to_string()), 10);
++
++        // Source: Thespian's Stage (a Land). Its "{2}, {T}: becomes a copy of
++        // target land, except it has this ability" produces a BecomeCopy effect.
++        let stage = create_object(
++            &mut state,
++            CardId(2),
++            PlayerId(0),
++            "Thespian's Stage".to_string(),
++            Zone::Battlefield,
++        );
++        {
++            let obj = state.objects.get_mut(&stage).unwrap();
++            obj.base_name = "Thespian's Stage".to_string();
++            obj.base_card_types = CardType {
++                supertypes: vec![],
++                core_types: vec![CoreType::Land],
++                subtypes: vec![],
++            };
++            obj.card_types = obj.base_card_types.clone();
++        }
++
++        evaluate_layers(&mut state);
++
++        // Thespian's Stage becomes a copy of Dark Depths (CR 707.2). The copy
++        // inherits Dark Depths' abilities but NOT its ice counters.
++        let mut events = Vec::new();
++        let ability = make_copy_ability(dark_depths, stage, PlayerId(0), None);
++        resolve(&mut state, &ability, &mut events).unwrap();
++        evaluate_layers(&mut state);
++
++        // The copy is a Dark Depths with zero ice counters and the state trigger.
++        let stage_obj = state.objects.get(&stage).unwrap();
++        assert_eq!(stage_obj.name, "Dark Depths", "copy is named Dark Depths");
++        assert_eq!(
++            stage_obj
++                .counters
++                .get(&CounterType::Generic("ice".to_string()))
++                .copied()
++                .unwrap_or(0),
++            0,
++            "CR 707.2: a copy does not copy counters — the Stage copy has no ice counters"
++        );
++        assert!(
++            stage_obj
++                .trigger_definitions
++                .iter_all()
++                .any(|t| t.mode == TriggerMode::StateCondition),
++            "the copy must inherit Dark Depths' state-triggered ability (CR 603.8)"
++        );
++
++        // Drive the runtime: granting priority runs `check_state_triggers`,
++        // which sees zero ice counters and puts the sacrifice trigger on the
++        // stack; resolving it sacrifices the copy and creates Marit Lage.
++        state.waiting_for = WaitingFor::Priority {
++            player: PlayerId(0),
++        };
++        // CR 603.8 + CR 117.1: state triggers are checked whenever a player would
++        // receive priority. Run the engine's state-trigger check (the same call
++        // the priority pipeline makes), which puts the sacrifice trigger on the
++        // stack, then drain the stack to resolve the Sacrifice + "if you do,
++        // create Marit Lage" chain.
++        crate::game::triggers::check_state_triggers(&mut state);
++        let mut runner = GameRunner::from_state(state);
++        runner.advance_until_stack_empty();
++        let state = runner.state();
++
++        // The copy must have been sacrificed (CR 603.8 → CR 701.21 Sacrifice).
++        assert!(
++            !state.battlefield.contains(&stage),
++            "the Dark Depths copy must be sacrificed when it has no ice counters"
++        );
++
++        // A Marit Lage token (legendary 20/20 black Avatar, flying + indestructible)
++        // must have been created (CR 111.1 / 707.2 combo payoff).
++        let marit_lage = state
++            .battlefield
++            .iter()
++            .filter_map(|id| state.objects.get(id))
++            .find(|obj| obj.is_token && obj.name == "Marit Lage")
++            .expect("Marit Lage token must be created");
++        assert_eq!(marit_lage.power, Some(20), "Marit Lage is 20 power");
++        assert_eq!(marit_lage.toughness, Some(20), "Marit Lage is 20 toughness");
++        assert!(
++            marit_lage
++                .card_types
++                .supertypes
++                .contains(&Supertype::Legendary),
++            "Marit Lage is legendary"
++        );
++        assert!(
++            marit_lage.card_types.subtypes.iter().any(|s| s == "Avatar"),
++            "Marit Lage is an Avatar"
++        );
++        assert!(
++            marit_lage.keywords.contains(&Keyword::Flying),
++            "Marit Lage has flying"
++        );
++        assert!(
++            marit_lage.keywords.contains(&Keyword::Indestructible),
++            "Marit Lage has indestructible"
++        );
++    }
+ }
+diff --git a/crates/engine/src/game/effects/destroy.rs b/crates/engine/src/game/effects/destroy.rs
+index 694e89dd8e..193177d6e7 100644
+--- a/crates/engine/src/game/effects/destroy.rs
++++ b/crates/engine/src/game/effects/destroy.rs
+@@ -292,8 +292,11 @@ pub fn resolve_all(
+ #[cfg(test)]
+ mod tests {
+     use super::*;
++    use crate::game::effects::resolve_ability_chain;
+     use crate::game::zones::create_object;
+-    use crate::types::ability::TargetFilter;
++    use crate::types::ability::{
++        AbilityCondition, PtValue, QuantityExpr, SubAbilityLink, TargetFilter,
++    };
+     use crate::types::card_type::CoreType;
+     use crate::types::identifiers::{CardId, ObjectId};
+     use crate::types::player::PlayerId;
+@@ -444,6 +447,101 @@ mod tests {
+         assert!(state.battlefield.contains(&obj_id));
+     }
+ 
++    fn make_if_you_do_token_rider(source_id: ObjectId) -> ResolvedAbility {
++        let mut rider = ResolvedAbility::new(
++            Effect::Token {
++                name: "Destroy Rider Token".to_string(),
++                power: PtValue::Fixed(1),
++                toughness: PtValue::Fixed(1),
++                types: vec!["Creature".to_string()],
++                colors: Vec::new(),
++                keywords: Vec::new(),
++                tapped: false,
++                count: QuantityExpr::Fixed { value: 1 },
++                owner: TargetFilter::Controller,
++                attach_to: None,
++                enters_attacking: false,
++                supertypes: Vec::new(),
++                static_abilities: Vec::new(),
++                enter_with_counters: Vec::new(),
++            },
++            Vec::new(),
++            source_id,
++            PlayerId(0),
++        )
++        .condition(AbilityCondition::effect_performed());
++        rider.sub_link = SubAbilityLink::SequentialSibling;
++        rider
++    }
++
++    fn destroy_with_if_you_do_rider(target: ObjectId) -> ResolvedAbility {
++        let mut ability = ResolvedAbility::new(
++            Effect::Destroy {
++                target: TargetFilter::Any,
++                cant_regenerate: false,
++            },
++            vec![TargetRef::Object(target)],
++            ObjectId(100),
++            PlayerId(0),
++        );
++        ability.sub_ability = Some(Box::new(make_if_you_do_token_rider(ObjectId(100))));
++        ability
++    }
++
++    /// CR 608.2c + CR 701.8a: a mandatory destroy instruction that actually
++    /// moves the target satisfies its following "if you do" rider.
++    #[test]
++    fn mandatory_destroy_if_you_do_rider_fires_when_destroyed() {
++        let mut state = GameState::new_two_player(42);
++        let obj_id = create_object(
++            &mut state,
++            CardId(1),
++            PlayerId(0),
++            "Mortal Bear".to_string(),
++            Zone::Battlefield,
++        );
++        let ability = destroy_with_if_you_do_rider(obj_id);
++        let mut events = Vec::new();
++
++        resolve_ability_chain(&mut state, &ability, &mut events, 0).unwrap();
++
++        assert!(!state.battlefield.contains(&obj_id));
++        assert!(state
++            .objects
++            .values()
++            .any(|obj| obj.is_token && obj.name == "Destroy Rider Token"));
++    }
++
++    /// CR 608.2c + CR 702.12b: a skipped destroy instruction did not happen,
++    /// so it must not satisfy a following "if you do" rider.
++    #[test]
++    fn mandatory_destroy_if_you_do_rider_skips_when_indestructible() {
++        let mut state = GameState::new_two_player(42);
++        let obj_id = create_object(
++            &mut state,
++            CardId(1),
++            PlayerId(0),
++            "Indestructible Bear".to_string(),
++            Zone::Battlefield,
++        );
++        state
++            .objects
++            .get_mut(&obj_id)
++            .unwrap()
++            .keywords
++            .push(crate::types::keywords::Keyword::Indestructible);
++        let ability = destroy_with_if_you_do_rider(obj_id);
++        let mut events = Vec::new();
++
++        resolve_ability_chain(&mut state, &ability, &mut events, 0).unwrap();
++
++        assert!(state.battlefield.contains(&obj_id));
++        assert!(!state
++            .objects
++            .values()
++            .any(|obj| obj.is_token && obj.name == "Destroy Rider Token"));
++    }
++
+     #[test]
+     fn destroy_emits_creature_destroyed_event() {
+         let mut state = GameState::new_two_player(42);
+@@ -877,8 +975,7 @@ mod tests {
+     // `QuantityRef::TrackedSetSize` resolve against the correct count.
+     // ---------------------------------------------------------------------
+ 
+-    use crate::game::effects::resolve_ability_chain;
+-    use crate::types::ability::{QuantityExpr, QuantityRef, TypeFilter, TypedFilter};
++    use crate::types::ability::{QuantityRef, TypeFilter, TypedFilter};
+ 
+     /// Builds the Fumigate-shape chain: `DestroyAll(creatures)` followed by
+     /// `GainLife(amount = TrackedSetSize, player = Controller)`.
+diff --git a/crates/engine/src/game/effects/mod.rs b/crates/engine/src/game/effects/mod.rs
+index 4606e11aad..5404b6d0fc 100644
+--- a/crates/engine/src/game/effects/mod.rs
++++ b/crates/engine/src/game/effects/mod.rs
+@@ -9,7 +9,7 @@ use crate::types::ability::{
+     PlayerFilter, PlayerScope, QuantityExpr, QuantityRef, RepeatContinuation, ResolvedAbility,
+     SharedQuality, SharedQualityRelation, SubAbilityLink, TargetFilter, TargetRef,
+ };
+-use crate::types::events::GameEvent;
++use crate::types::events::{GameEvent, PlayerActionKind};
+ use crate::types::game_state::{
+     AutoMayChoice, CastOfferKind, ClauseMinimumSnapshot, DayNight, GameState, LKISnapshot,
+     MayTriggerAutoChoiceKey, PendingContinuation, WaitingFor, ZoneChangeRecord,
+@@ -1050,6 +1050,35 @@ fn condition_depends_on_effect_performed(condition: &AbilityCondition) -> bool {
+     }
+ }
+ 
++/// CR 608.2c: Whether a parent effect computes its own "if you do" outcome
++/// signal (`optional_effect_performed`) rather than that signal meaning "the
++/// mandatory action occurred."
++///
++/// For most effects, "[Action]. If you do, [rider]." means the rider fires iff
++/// the action was performed. An *optional* ("you may") parent sets the flag when
++/// the controller accepts. A handful of effects instead compute the flag from a
++/// random/choice OUTCOME — a coin flip's win/loss, a clash's win/tie, a dig's
++/// kept selection — and resolve their gated branch against that computed flag
++/// (see `flip_coin.rs`, `clash.rs`, `engine_resolution_choices.rs`). For those,
++/// a mandatory parent does NOT imply "performed" (a lost flip is mandatory but
++/// did not "win"), so the default-true rule below must exclude them.
++fn effect_manages_own_outcome_flag(effect: &Effect) -> bool {
++    // Redundant-but-safe: coin/die win-loss riders gate on `EventOutcomeWon` /
++    // `WhenYouDo`, which are NOT in `condition_depends_on_effect_performed`, so
++    // the seed-block guard above would already skip them. Excluding the
++    // FlipCoin*/RollDie/Clash/Dig set here is defensive belt-and-suspenders — a
++    // future reader should not assume those paths depend on this exclusion.
++    matches!(
++        effect,
++        Effect::FlipCoin { .. }
++            | Effect::FlipCoins { .. }
++            | Effect::FlipCoinUntilLose { .. }
++            | Effect::Clash
++            | Effect::RollDie { .. }
++            | Effect::Dig { .. }
++    )
++}
++
+ fn should_resolve_subability_on_optional_decline(ability: &ResolvedAbility) -> bool {
+     match ability.condition {
+         Some(AbilityCondition::Not { ref condition })
+@@ -2147,6 +2176,123 @@ fn affected_objects_from_events(
+     }
+ }
+ 
++fn mandatory_parent_effect_performed(effect: &Effect, events: &[GameEvent]) -> bool {
++    match effect {
++        Effect::Destroy { .. } | Effect::DestroyAll { .. } => events.iter().any(|event| {
++            matches!(
++                event,
++                GameEvent::ZoneChanged {
++                    from: Some(crate::types::zones::Zone::Battlefield),
++                    ..
++                }
++            )
++        }),
++        Effect::Sacrifice { .. } => events
++            .iter()
++            .any(|event| matches!(event, GameEvent::PermanentSacrificed { .. })),
++        Effect::Mill { .. }
++        | Effect::ChangeZone { .. }
++        | Effect::Bounce { .. }
++        | Effect::BounceAll { .. }
++        | Effect::ExileTop { .. }
++        | Effect::ExileFromTopUntil { .. } => events
++            .iter()
++            .any(|event| matches!(event, GameEvent::ZoneChanged { .. })),
++        Effect::Counter { .. } | Effect::CounterAll { .. } => events
++            .iter()
++            .any(|event| matches!(event, GameEvent::SpellCountered { .. })),
++        Effect::DealDamage { .. } | Effect::DamageAll { .. } | Effect::Fight { .. } => events
++            .iter()
++            .any(|event| matches!(event, GameEvent::DamageDealt { .. })),
++        Effect::Discard { .. } => events
++            .iter()
++            .any(|event| matches!(event, GameEvent::Discarded { .. })),
++        Effect::AddCounter { .. }
++        | Effect::PutCounter { .. }
++        | Effect::PutCounterAll { .. }
++        | Effect::MultiplyCounter { .. }
++        | Effect::MoveCounters { .. } => events
++            .iter()
++            .any(|event| matches!(event, GameEvent::CounterAdded { .. })),
++        Effect::RemoveCounter { .. } => events
++            .iter()
++            .any(|event| matches!(event, GameEvent::CounterRemoved { .. })),
++        Effect::Token { .. } => events
++            .iter()
++            .any(|event| matches!(event, GameEvent::TokenCreated { .. })),
++        Effect::Tap { .. } | Effect::TapAll { .. } => events
++            .iter()
++            .any(|event| matches!(event, GameEvent::PermanentTapped { .. })),
++        Effect::Untap { .. } | Effect::UntapAll { .. } => events
++            .iter()
++            .any(|event| matches!(event, GameEvent::PermanentUntapped { .. })),
++        Effect::GainLife { .. } => events
++            .iter()
++            .any(|event| matches!(event, GameEvent::LifeChanged { amount, .. } if *amount > 0)),
++        Effect::LoseLife { .. } => events
++            .iter()
++            .any(|event| matches!(event, GameEvent::LifeChanged { amount, .. } if *amount < 0)),
++        Effect::Draw { .. } => events
++            .iter()
++            .any(|event| matches!(event, GameEvent::CardDrawn { .. })),
++        Effect::Scry { .. } => events.iter().any(|event| {
++            matches!(
++                event,
++                GameEvent::PlayerPerformedAction {
++                    action: PlayerActionKind::Scry,
++                    ..
++                }
++            )
++        }),
++        Effect::Surveil { .. } => events.iter().any(|event| {
++            matches!(
++                event,
++                GameEvent::PlayerPerformedAction {
++                    action: PlayerActionKind::Surveil,
++                    ..
++                }
++            )
++        }),
++        Effect::Investigate => events.iter().any(|event| {
++            matches!(
++                event,
++                GameEvent::PlayerPerformedAction {
++                    action: PlayerActionKind::Investigate,
++                    ..
++                }
++            )
++        }),
++        Effect::Proliferate => events.iter().any(|event| {
++            matches!(
++                event,
++                GameEvent::PlayerPerformedAction {
++                    action: PlayerActionKind::Proliferate,
++                    ..
++                }
++            )
++        }),
++        Effect::Shuffle { .. } => events.iter().any(|event| {
++            matches!(
++                event,
++                GameEvent::PlayerPerformedAction {
++                    action: PlayerActionKind::ShuffledLibrary,
++                    ..
++                }
++            )
++        }),
++        Effect::SearchLibrary { .. } => events.iter().any(|event| {
++            matches!(
++                event,
++                GameEvent::PlayerPerformedAction {
++                    action: PlayerActionKind::SearchedLibrary,
++                    ..
++                }
++            )
++        }),
++        _ => true,
++    }
++}
++
+ pub(crate) fn publish_tracked_set(state: &mut GameState, affected_ids: Vec<ObjectId>) {
+     // CR 603.7 + CR 608.2c: Chain unification. If an ancestor in this
+     // resolution chain already published a tracked set, extend that set with
+@@ -3976,6 +4122,52 @@ fn resolve_chain_body(
+     let effect_context_object =
+         parent_referent_context_from_events(state, &events[events_before..]);
+ 
++    // CR 608.2c: "[Mandatory action]. If you do, [rider]." — seed the
++    // performed-flag for a mandatory parent whose action just occurred.
++    //
++    // The "if you do" gate (`EffectOutcome { OptionalEffectPerformed }`) means
++    // "if the preceding instruction's event happened." For an *optional* parent
++    // ("you may …") the flag is set when the controller accepts; for effects
++    // that compute their own win/loss/selection outcome (coin flip, clash, dig —
++    // see `effect_manages_own_outcome_flag`) the branch handlers set it; for an
++    // unless-pay / "if a player does" alternative the payment flow sets it. But a
++    // plain *mandatory* action (Sacrifice, Mill, Destroy, …) whose rider is a
++    // SEPARATE SENTENCE ("Sacrifice it. If you do, create Marit Lage.") has no
++    // such hook — and per CR 608.2c that sentence is the next printed
++    // instruction, gating on whether the prior action happened. We restrict to
++    // `SubAbilityLink::SequentialSibling` precisely so the within-clause
++    // `ContinuationStep` alternatives that ride on a payment / opponent choice
++    // (unless-pay, `IfAPlayerDoes`) are NOT affected. When the action was not
++    // signalled as failed (`cost_payment_failed_flag`, e.g. nothing eligible to
++    // sacrifice), set the flag on the parent's context so it propagates to the
++    // sub via `apply_parent_chain_context` and survives the sub's own chain-body
++    // condition re-check. Covers the whole mandatory-rider class, not one card.
++    // NOTE: this seed fires for any `EffectOutcome`-gated `SequentialSibling`,
++    // including a `CurrentScopeSucceeded` gate. Seeding `optional_effect_performed`
++    // there is a harmless no-op: a `CurrentScopeSucceeded` rider resolves against
++    // `!cost_payment_failed_flag` (not this flag), and that guard already requires
++    // `!cost_payment_failed_flag` — the same condition gating this seed.
++    let mandatory_rider_owned;
++    let ability = if !ability.optional
++        && !ability.context.optional_effect_performed
++        && !state.cost_payment_failed_flag
++        && mandatory_parent_effect_performed(&ability.effect, &events[events_before..])
++        && !effect_manages_own_outcome_flag(&ability.effect)
++        && ability.sub_ability.as_ref().is_some_and(|sub| {
++            sub.sub_link == SubAbilityLink::SequentialSibling
++                && sub
++                    .condition
++                    .as_ref()
++                    .is_some_and(condition_depends_on_effect_performed)
++        }) {
++        let mut owned = ability.clone();
++        owned.context.optional_effect_performed = true;
++        mandatory_rider_owned = owned;
++        &mandatory_rider_owned
++    } else {
++        ability
++    };
++
+     // Follow typed sub_ability chain, propagating parent targets when sub has none.
+     // This allows sub-abilities like "its controller gains life" to access the object
+     // targeted by the parent (e.g. the exiled creature in Swords to Plowshares).
+diff --git a/crates/engine/src/game/effects/sacrifice.rs b/crates/engine/src/game/effects/sacrifice.rs
+index 20fd197daf..a0bd5c2cd2 100644
+--- a/crates/engine/src/game/effects/sacrifice.rs
++++ b/crates/engine/src/game/effects/sacrifice.rs
+@@ -1601,4 +1601,77 @@ mod tests {
+             other => panic!("expected EffectZoneChoice, got {other:?}"),
+         }
+     }
++
++    /// CR 608.2c: "[Mandatory action]. If you do, [rider]." — a mandatory effect
++    /// that performs its action satisfies the `IfYouDo`
++    /// (`EffectOutcome { OptionalEffectPerformed }`) gate on its sibling, even
++    /// though there was no "you may" decision. Regression for issue #1514: Dark
++    /// Depths' "sacrifice it. If you do, create Marit Lage" never created the
++    /// token because the mandatory sacrifice left `optional_effect_performed`
++    /// false. Building-block test on the `Sacrifice` → `Token` chain (covers the
++    /// whole mandatory-rider class, not just Dark Depths).
++    #[test]
++    fn mandatory_sacrifice_if_you_do_rider_fires() {
++        use crate::types::ability::{AbilityCondition, PtValue, SubAbilityLink};
++
++        let mut state = GameState::new_two_player(42);
++        let victim = create_object(
++            &mut state,
++            CardId(1),
++            PlayerId(0),
++            "Doomed Permanent".to_string(),
++            Zone::Battlefield,
++        );
++
++        // "Sacrifice it. If you do, create a 1/1 token." — a mandatory sacrifice
++        // with an `IfYouDo`-gated Token sibling, exactly the shape the parser
++        // emits for Dark Depths' Marit Lage rider.
++        let mut rider = ResolvedAbility::new(
++            Effect::Token {
++                name: "Test Token".to_string(),
++                power: PtValue::Fixed(1),
++                toughness: PtValue::Fixed(1),
++                types: vec!["Creature".to_string()],
++                colors: vec![],
++                keywords: vec![],
++                tapped: false,
++                count: QuantityExpr::Fixed { value: 1 },
++                owner: TargetFilter::Controller,
++                attach_to: None,
++                enters_attacking: false,
++                supertypes: vec![],
++                static_abilities: vec![],
++                enter_with_counters: vec![],
++            },
++            vec![],
++            ObjectId(100),
++            PlayerId(0),
++        )
++        .condition(AbilityCondition::effect_performed());
++        rider.sub_link = SubAbilityLink::SequentialSibling;
++
++        let mut ability = make_sacrifice_ability(victim);
++        ability.sub_ability = Some(Box::new(rider));
++
++        let tokens_before = state.battlefield.len();
++        let mut events = Vec::new();
++        resolve_ability_chain(&mut state, &ability, &mut events, 0).unwrap();
++
++        // The victim was sacrificed and the IfYouDo rider created the token.
++        assert!(
++            !state.battlefield.contains(&victim),
++            "mandatory sacrifice must remove the victim"
++        );
++        let created = state
++            .battlefield
++            .iter()
++            .filter_map(|id| state.objects.get(id))
++            .any(|obj| obj.is_token && obj.name == "Test Token");
++        assert!(
++            created,
++            "the mandatory-sacrifice IfYouDo rider must create the token \
++             (battlefield went from {tokens_before} to {})",
++            state.battlefield.len()
++        );
++    }
+ }
+diff --git a/crates/engine/src/parser/oracle_effect/imperative.rs b/crates/engine/src/parser/oracle_effect/imperative.rs
+index ed9ae34abc..b95d5cef57 100644
+--- a/crates/engine/src/parser/oracle_effect/imperative.rs
++++ b/crates/engine/src/parser/oracle_effect/imperative.rs
+@@ -1799,6 +1799,7 @@ pub(super) fn parse_search_and_creation_ast(
+                 power,
+                 toughness,
+                 types,
++                supertypes,
+                 colors,
+                 keywords,
+                 tapped,
+@@ -1813,6 +1814,7 @@ pub(super) fn parse_search_and_creation_ast(
+                     power: Some(power),
+                     toughness: Some(toughness),
+                     types,
++                    supertypes,
+                     colors,
+                     keywords,
+                     tapped,
+@@ -2000,7 +2002,8 @@ pub(super) fn lower_search_and_creation_ast(ast: SearchCreationImperativeAst) ->
+             owner: TargetFilter::Controller,
+             attach_to: token.attach_to,
+             enters_attacking: token.enters_attacking,
+-            supertypes: vec![],
++            // CR 205.4a: Preserve parsed token supertypes (legendary/snow).
++            supertypes: token.supertypes,
+             static_abilities: token.static_abilities,
+             enter_with_counters: vec![],
+         },
+diff --git a/crates/engine/src/parser/oracle_effect/token.rs b/crates/engine/src/parser/oracle_effect/token.rs
+index f8c0a5d282..d5b162d6ba 100644
+--- a/crates/engine/src/parser/oracle_effect/token.rs
++++ b/crates/engine/src/parser/oracle_effect/token.rs
+@@ -12,6 +12,7 @@ use crate::types::ability::{
+     ContinuousModification, ControllerRef, Effect, FilterProp, PtValue, QuantityExpr, QuantityRef,
+     StaticDefinition, TargetFilter,
+ };
++use crate::types::card_type::Supertype;
+ use crate::types::keywords::Keyword;
+ use crate::types::mana::ManaColor;
+ use crate::types::zones::Zone;
+@@ -127,7 +128,9 @@ pub(super) fn try_parse_token(_lower: &str, text: &str, ctx: &mut ParseContext)
+         owner: TargetFilter::Controller,
+         attach_to: token.attach_to,
+         enters_attacking: token.enters_attacking,
+-        supertypes: vec![],
++        // CR 205.4a: Carry parsed supertypes (e.g. "legendary" for Marit Lage)
++        // onto the token so the legend rule (CR 704.5j) applies.
++        supertypes: token.supertypes,
+         static_abilities: token.static_abilities,
+         enter_with_counters: vec![],
+     })
+@@ -328,7 +331,8 @@ pub(crate) fn parse_token_description(text: &str) -> Option<TokenDescription> {
+         break;
+     }
+ 
+-    rest = strip_token_supertypes(rest);
++    let (supertypes, rest_after_supertypes) = strip_token_supertypes(rest);
++    rest = rest_after_supertypes;
+ 
+     let (mut power, mut toughness, rest) =
+         if let Ok((rest, (power, toughness))) = nom_primitives::parse_pt_value.parse(rest) {
+@@ -445,6 +449,7 @@ pub(crate) fn parse_token_description(text: &str) -> Option<TokenDescription> {
+         power,
+         toughness,
+         types,
++        supertypes,
+         colors,
+         keywords,
+         tapped,
+@@ -502,20 +507,29 @@ fn parse_named_token_preamble(text: &str) -> Option<(String, &str)> {
+     Some((name.to_string(), rest))
+ }
+ 
+-fn strip_token_supertypes(mut text: &str) -> &str {
++/// CR 205.4a: Strip leading supertype words from the token description and
++/// return the captured supertypes alongside the remaining text. Previously the
++/// supertypes were discarded; capturing them lets legendary/snow tokens (Marit
++/// Lage etc.) carry their supertype through to `Effect::Token` — load-bearing
++/// for the legend rule (CR 704.5j).
++fn strip_token_supertypes(mut text: &str) -> (Vec<Supertype>, &str) {
++    let mut supertypes = Vec::new();
+     loop {
+         let trimmed = text.trim_start();
+         let trimmed_lower = trimmed.to_lowercase();
+-        let Some((_, stripped)) = nom_on_lower(trimmed, &trimmed_lower, |i| {
++        let Some((supertype, stripped)) = nom_on_lower(trimmed, &trimmed_lower, |i| {
+             alt((
+-                value((), tag("legendary ")),
+-                value((), tag("snow ")),
+-                value((), tag("basic ")),
++                value(Supertype::Legendary, tag("legendary ")),
++                value(Supertype::Snow, tag("snow ")),
++                value(Supertype::Basic, tag("basic ")),
+             ))
+             .parse(i)
+         }) else {
+-            return trimmed;
++            return (supertypes, trimmed);
+         };
++        if !supertypes.contains(&supertype) {
++            supertypes.push(supertype);
++        }
+         text = stripped;
+     }
+ }
+@@ -1508,6 +1522,45 @@ mod tests {
+         );
+     }
+ 
++    /// CR 205.4a + CR 704.5j: A "legendary" (or "snow"/"basic") supertype in the
++    /// inline token grammar must be captured onto `Effect::Token.supertypes`, not
++    /// silently stripped. Covers the whole class of legendary tokens (Marit Lage
++    /// from Dark Depths, the Pia Nalaar Construct, etc.) so the legend rule
++    /// applies. Building-block-level: exercises the supertype-capture path, not a
++    /// single card's full Oracle text.
++    #[test]
++    fn token_captures_legendary_supertype() {
++        use crate::types::card_type::Supertype;
++
++        let effect = try_parse_token(
++            "create marit lage, a legendary 20/20 black avatar creature token with flying and indestructible",
++            "create Marit Lage, a legendary 20/20 black Avatar creature token with flying and indestructible",
++            &mut ParseContext::default(),
++        )
++        .expect("expected Token effect");
++        let Effect::Token {
++            name,
++            supertypes,
++            power,
++            toughness,
++            keywords,
++            ..
++        } = effect
++        else {
++            panic!("expected Token effect, got {effect:?}");
++        };
++        assert_eq!(name, "Marit Lage");
++        assert_eq!(
++            supertypes,
++            vec![Supertype::Legendary],
++            "the 'legendary' supertype must be captured, not discarded"
++        );
++        assert_eq!(power, PtValue::Fixed(20));
++        assert_eq!(toughness, PtValue::Fixed(20));
++        assert!(keywords.contains(&Keyword::Flying));
++        assert!(keywords.contains(&Keyword::Indestructible));
++    }
++
+     #[test]
+     fn token_with_cant_block_produces_static() {
+         let effect = try_parse_token(
+diff --git a/crates/engine/src/parser/oracle_ir/ast.rs b/crates/engine/src/parser/oracle_ir/ast.rs
+index 942aad498a..058ffd6f3e 100644
+--- a/crates/engine/src/parser/oracle_ir/ast.rs
++++ b/crates/engine/src/parser/oracle_ir/ast.rs
+@@ -8,6 +8,7 @@ use crate::types::ability::{
+     PaymentCost, PlayerFilter, PtStat, PtValue, QuantityExpr, SearchDestinationSplit,
+     SearchSelectionConstraint, StaticDefinition, TargetFilter,
+ };
++use crate::types::card_type::Supertype;
+ use crate::types::counter::CounterType;
+ use crate::types::game_state::DistributionUnit;
+ use crate::types::keywords::Keyword;
+@@ -61,6 +62,11 @@ pub(crate) struct TokenDescription {
+     pub(crate) power: Option<crate::types::ability::PtValue>,
+     pub(crate) toughness: Option<crate::types::ability::PtValue>,
+     pub(crate) types: Vec<String>,
++    /// CR 205.4a: Supertypes parsed from the inline token grammar (e.g. the
++    /// "legendary" in "a legendary 20/20 black Avatar creature token"). Captured
++    /// rather than discarded so legendary/snow tokens (Marit Lage, etc.) carry
++    /// their supertype — load-bearing for the legend rule (CR 704.5j).
++    pub(crate) supertypes: Vec<Supertype>,
+     pub(crate) colors: Vec<ManaColor>,
+     pub(crate) keywords: Vec<Keyword>,
+     pub(crate) tapped: bool,
+diff --git a/crates/engine/src/parser/oracle_replacement.rs b/crates/engine/src/parser/oracle_replacement.rs
+index 4b05fc97d3..5a6afbdef1 100644
+--- a/crates/engine/src/parser/oracle_replacement.rs
++++ b/crates/engine/src/parser/oracle_replacement.rs
+@@ -4507,7 +4507,7 @@ fn token_description_to_spec(
+     token: &crate::parser::oracle_ir::ast::TokenDescription,
+ ) -> Option<crate::types::proposed_event::TokenSpec> {
+     use crate::types::ability::PtValue;
+-    use crate::types::card_type::{CoreType, Supertype};
++    use crate::types::card_type::CoreType;
+     use crate::types::proposed_event::TokenSpec;
+ 
+     // Split parsed `types` into core_types vs subtypes by checking CoreType::from_str.
+@@ -4549,7 +4549,9 @@ fn token_description_to_spec(
+             toughness,
+             core_types,
+             subtypes,
+-            supertypes: Vec::<Supertype>::new(),
++            // CR 205.4a: Carry parsed supertypes (legendary/snow) onto the
++            // appended-token spec rather than dropping them.
++            supertypes: token.supertypes.clone(),
+             colors: token.colors.clone(),
+             keywords: token.keywords.clone(),
+         },

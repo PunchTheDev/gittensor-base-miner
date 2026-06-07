@@ -1,0 +1,794 @@
+diff --git a/src/raycast/local-repo-analyzer.ts b/src/raycast/local-repo-analyzer.ts
+new file mode 100644
+index 00000000..c9a6e45d
+--- /dev/null
++++ b/src/raycast/local-repo-analyzer.ts
+@@ -0,0 +1,321 @@
++import { execFileSync } from "node:child_process";
++
++export type RaycastBranchAnalysisFetch = (
++  input: string,
++  init?: {
++    method?: string;
++    headers?: Record<string, string>;
++    body?: string;
++  },
++) => Promise<{
++  ok: boolean;
++  status: number;
++  statusText?: string;
++  json: () => Promise<unknown>;
++}>;
++
++export type RaycastGitRunner = (cwd: string, args: string[]) => string[];
++
++export type RaycastChangedFileMetadata = {
++  path: string;
++  previousPath?: string | undefined;
++  additions?: number | undefined;
++  deletions?: number | undefined;
++  status?: "added" | "modified" | "deleted" | "renamed" | "copied" | "unknown" | undefined;
++  binary?: boolean | undefined;
++};
++
++export type RaycastLocalRepoMetadata = {
++  login: string;
++  repoFullName: string;
++  baseRef: string;
++  headRef: string;
++  branchName: string;
++  baseSha?: string | undefined;
++  headSha?: string | undefined;
++  mergeBaseSha?: string | undefined;
++  remoteTrackingSha?: string | undefined;
++  commitMessages: string[];
++  changedFiles: RaycastChangedFileMetadata[];
++  linkedIssues: number[];
++  testFileCount: number;
++  validationHints: string[];
++  warnings: string[];
++  sourceUpload: {
++    enabled: false;
++    mode: "metadata_only";
++  };
++};
++
++export type RaycastBranchAnalysisResult =
++  | {
++      status: "ready";
++      metadata: RaycastLocalRepoMetadata;
++      analysis: unknown;
++    }
++  | {
++      status: "api_error";
++      metadata: RaycastLocalRepoMetadata;
++      error: string;
++      rerunGuidance: string;
++    };
++
++export function collectRaycastLocalRepoMetadata(input: {
++  cwd: string;
++  login: string;
++  repoFullName?: string | undefined;
++  baseRef?: string | undefined;
++  branchName?: string | undefined;
++  body?: string | undefined;
++  linkedIssues?: number[] | undefined;
++  validationHints?: string[] | undefined;
++  sourceUploadMode?: "metadata_only" | "source_upload" | undefined;
++  git?: RaycastGitRunner | undefined;
++}): RaycastLocalRepoMetadata {
++  if (input.sourceUploadMode === "source_upload") {
++    throw new Error("Raycast branch analysis supports metadata-only mode; source upload mode is rejected.");
++  }
++  const git = input.git ?? gitLines;
++  const baseRef = input.baseRef ?? git(input.cwd, ["symbolic-ref", "--short", "refs/remotes/origin/HEAD"])[0]?.replace(/^origin\//, "") ?? "main";
++  const remoteUrl = git(input.cwd, ["config", "--get", "remote.origin.url"])[0] ?? "";
++  const repoFullName = input.repoFullName ?? parseGitHubRemote(remoteUrl);
++  if (!repoFullName) throw new Error("Could not infer repoFullName from the git remote; pass repoFullName explicitly.");
++  const branchName = input.branchName ?? git(input.cwd, ["branch", "--show-current"])[0] ?? "local-branch";
++  const headRef = git(input.cwd, ["rev-parse", "--abbrev-ref", "HEAD"])[0] ?? branchName;
++  const baseSha = git(input.cwd, ["rev-parse", "--verify", baseRef])[0];
++  const headSha = git(input.cwd, ["rev-parse", "--verify", "HEAD"])[0];
++  const mergeBaseSha = git(input.cwd, ["merge-base", baseRef, "HEAD"])[0];
++  const remoteTrackingSha = collectRemoteTrackingSha(input.cwd, baseRef, git);
++  const changedFiles = collectChangedFiles(input.cwd, baseRef, git);
++  const commitMessages = git(input.cwd, ["log", "--format=%s%n%b", `${baseRef}..HEAD`]).slice(0, 30);
++  const linkedIssues = uniquePositiveInts([
++    ...(input.linkedIssues ?? []),
++    ...extractLinkedIssues([branchName, input.body, ...commitMessages].filter(Boolean).join("\n")),
++  ]);
++  const testFileCount = changedFiles.filter((file) => isTestFile(file.path)).length;
++  const validationHints = [
++    ...buildValidationHints(changedFiles, testFileCount),
++    ...(input.validationHints ?? []),
++  ];
++  const warnings = buildMetadataWarnings({ baseRef, baseSha, mergeBaseSha, remoteTrackingSha });
++  return stripUndefined({
++    login: input.login,
++    repoFullName,
++    baseRef,
++    headRef,
++    branchName,
++    baseSha,
++    headSha,
++    mergeBaseSha,
++    remoteTrackingSha,
++    commitMessages,
++    changedFiles,
++    linkedIssues,
++    testFileCount,
++    validationHints,
++    warnings,
++    sourceUpload: { enabled: false, mode: "metadata_only" },
++  });
++}
++
++export async function runRaycastBranchAnalysisCommand(input: {
++  apiOrigin: string;
++  sessionToken: string;
++  cwd: string;
++  login: string;
++  repoFullName?: string | undefined;
++  baseRef?: string | undefined;
++  body?: string | undefined;
++  fetchImpl: RaycastBranchAnalysisFetch;
++  git?: RaycastGitRunner | undefined;
++}): Promise<RaycastBranchAnalysisResult> {
++  const metadata = collectRaycastLocalRepoMetadata(input);
++  const payload = branchAnalysisPayload(metadata);
++  try {
++    const analysis = await postJson(input, "/v1/local/branch-analysis", payload);
++    return { status: "ready", metadata, analysis };
++  } catch (error) {
++    return {
++      status: "api_error",
++      metadata,
++      error: error instanceof Error ? error.message : String(error),
++      rerunGuidance: "Retry when the Gittensory API is reachable; the local metadata payload was not expanded with source contents.",
++    };
++  }
++}
++
++export function branchAnalysisPayload(metadata: RaycastLocalRepoMetadata): Record<string, unknown> {
++  return stripUndefined({
++    login: metadata.login,
++    repoFullName: metadata.repoFullName,
++    baseRef: metadata.baseRef,
++    headRef: metadata.headRef,
++    branchName: metadata.branchName,
++    baseSha: metadata.baseSha,
++    headSha: metadata.headSha,
++    mergeBaseSha: metadata.mergeBaseSha,
++    remoteTrackingSha: metadata.remoteTrackingSha,
++    commitMessages: metadata.commitMessages,
++    changedFiles: metadata.changedFiles,
++    linkedIssues: metadata.linkedIssues,
++    ciStatusHints: metadata.validationHints,
++    localScorer: {
++      mode: "metadata_only",
++      warnings: metadata.warnings,
++    },
++  });
++}
++
++export function parseGitHubRemote(remoteUrl: string): string | undefined {
++  const trimmed = String(remoteUrl ?? "").trim();
++  const patterns = [
++    /^git@github\.com:([^/]+)\/(.+?)(?:\.git)?$/i,
++    /^https:\/\/github\.com\/([^/]+)\/(.+?)(?:\.git)?$/i,
++    /^ssh:\/\/git@github\.com\/([^/]+)\/(.+?)(?:\.git)?$/i,
++  ];
++  for (const pattern of patterns) {
++    const match = trimmed.match(pattern);
++    if (match?.[1] && match[2]) return `${match[1]}/${match[2].replace(/\.git$/i, "")}`;
++  }
++  return undefined;
++}
++
++async function postJson(
++  input: { apiOrigin: string; sessionToken: string; fetchImpl: RaycastBranchAnalysisFetch },
++  path: string,
++  body: Record<string, unknown>,
++): Promise<unknown> {
++  const url = new URL(path, input.apiOrigin);
++  const response = await input.fetchImpl(url.toString(), {
++    method: "POST",
++    headers: {
++      accept: "application/json",
++      authorization: `Bearer ${input.sessionToken}`,
++      "content-type": "application/json",
++    },
++    body: JSON.stringify(body),
++  });
++  const payload = await response.json().catch(() => ({}));
++  if (!response.ok) throw new Error(errorFromPayload(payload, response));
++  return payload;
++}
++
++function collectChangedFiles(cwd: string, baseRef: string, git: RaycastGitRunner): RaycastChangedFileMetadata[] {
++  const numstat = new Map(parseNumstat(cwd, baseRef, git).map((entry) => [entry.path, entry]));
++  return git(cwd, ["diff", "--name-status", "-M", baseRef, "--"]).map((row) => {
++    const fields = row.split(/\t/);
++    const code = fields[0] ?? "";
++    const pathPair = code.startsWith("R") || code.startsWith("C");
++    const path = pathPair ? fields[2] ?? fields[1] ?? "" : fields[1] ?? "";
++    const stats = numstat.get(path) ?? { additions: 0, deletions: 0, binary: false };
++    return stripUndefined({
++      path,
++      previousPath: pathPair ? fields[1] : undefined,
++      additions: stats.additions,
++      deletions: stats.deletions,
++      status: statusFromCode(code),
++      binary: stats.binary,
++    });
++  });
++}
++
++function parseNumstat(cwd: string, baseRef: string, git: RaycastGitRunner): Array<{ path: string; additions: number; deletions: number; binary: boolean }> {
++  return git(cwd, ["diff", "--numstat", "-M", baseRef, "--"]).map((row) => {
++    const fields = row.split(/\t/);
++    const additions = fields[0] === "-" ? 0 : Number(fields[0] ?? 0);
++    const deletions = fields[1] === "-" ? 0 : Number(fields[1] ?? 0);
++    return {
++      path: normalizeNumstatPath(fields.slice(2).join("\t")),
++      additions: Number.isFinite(additions) ? additions : 0,
++      deletions: Number.isFinite(deletions) ? deletions : 0,
++      binary: fields[0] === "-" || fields[1] === "-",
++    };
++  });
++}
++
++function collectRemoteTrackingSha(cwd: string, baseRef: string, git: RaycastGitRunner): string | undefined {
++  const trackingRef = baseRef.includes("/") ? baseRef : `origin/${baseRef}`;
++  return git(cwd, ["rev-parse", "--verify", trackingRef])[0];
++}
++
++function buildMetadataWarnings(args: {
++  baseRef: string;
++  baseSha?: string | undefined;
++  mergeBaseSha?: string | undefined;
++  remoteTrackingSha?: string | undefined;
++}): string[] {
++  return [
++    ...(args.remoteTrackingSha && args.mergeBaseSha && args.mergeBaseSha !== args.remoteTrackingSha
++      ? [`Base ${args.baseRef} appears stale relative to remote tracking SHA ${shortSha(args.remoteTrackingSha)}.`]
++      : []),
++    ...(args.remoteTrackingSha && args.baseSha && args.baseSha !== args.remoteTrackingSha
++      ? [`Local base ref ${args.baseRef} differs from remote tracking SHA ${shortSha(args.remoteTrackingSha)}.`]
++      : []),
++  ];
++}
++
++function buildValidationHints(files: RaycastChangedFileMetadata[], testFileCount: number): string[] {
++  const paths = files.map((file) => file.path);
++  return [
++    ...(testFileCount > 0 ? [`${testFileCount} changed test file(s) detected.`] : ["No changed test files detected; include focused validation before requesting review."]),
++    ...(paths.some((path) => /^\.github\/workflows\//i.test(path)) ? ["Workflow files changed; required-check behavior may change."] : []),
++    ...(paths.some((path) => /(^|\/)(package\.json|package-lock\.json|pnpm-lock\.yaml|pyproject\.toml|go\.mod|Cargo\.toml|Makefile|Dockerfile)$/i.test(path))
++      ? ["Build or dependency manifests changed; rerun the repository's standard validation gate."]
++      : []),
++    ...(files.some((file) => file.binary) ? ["Binary file metadata detected; review binary diffs locally before relying on metadata-only analysis."] : []),
++  ];
++}
++
++function gitLines(cwd: string, args: string[]): string[] {
++  try {
++    return execFileSync("git", args, { cwd, encoding: "utf8", stdio: ["ignore", "pipe", "ignore"], timeout: 5000 })
++      .split("\n")
++      .map((line) => line.trim())
++      .filter(Boolean);
++  } catch {
++    return [];
++  }
++}
++
++function extractLinkedIssues(text: string): number[] {
++  return [...text.matchAll(/(?:#|(?:fixes|closes|resolves)\s+#)(\d+)/gi)].map((match) => Number(match[1])).filter((value) => Number.isInteger(value) && value > 0);
++}
++
++function statusFromCode(code: string): RaycastChangedFileMetadata["status"] {
++  if (code.startsWith("A")) return "added";
++  if (code.startsWith("M")) return "modified";
++  if (code.startsWith("D")) return "deleted";
++  if (code.startsWith("R")) return "renamed";
++  if (code.startsWith("C")) return "copied";
++  return "unknown";
++}
++
++function normalizeNumstatPath(value: string): string {
++  const rename = value.match(/^(?:.*\{(.+?) => (.+?)\}.*)$/);
++  if (rename?.[2]) return value.replace(/\{(.+?) => (.+?)\}/, rename[2]);
++  return value;
++}
++
++function isTestFile(path: string): boolean {
++  return /(^|\/)(test|tests|spec|__tests__)\/|(^|\/)[^/]+_test\.(go|py|rb)$|(^|\/)[^/]+_spec\.rb$|\.(test|spec)\.(ts|tsx|js|jsx|py|rb|rs)$/i.test(path);
++}
++
++function errorFromPayload(payload: unknown, response: { status: number; statusText?: string }): string {
++  const error = payload && typeof payload === "object" ? (payload as Record<string, unknown>).error : undefined;
++  if (typeof error === "string") {
++    return error;
++  }
++  return `${response.status} ${response.statusText ?? "Raycast branch analysis request failed"}`;
++}
++
++function shortSha(value: string): string {
++  return value.slice(0, 12);
++}
++
++function uniquePositiveInts(values: number[]): number[] {
++  return [...new Set(values.filter((value) => Number.isInteger(value) && value > 0))].sort((left, right) => left - right);
++}
++
++function stripUndefined<T extends Record<string, unknown>>(value: T): T {
++  return Object.fromEntries(Object.entries(value).filter(([, entry]) => entry !== undefined)) as T;
++}
+diff --git a/test/unit/raycast-local-repo-analyzer.test.ts b/test/unit/raycast-local-repo-analyzer.test.ts
+new file mode 100644
+index 00000000..d65ab78e
+--- /dev/null
++++ b/test/unit/raycast-local-repo-analyzer.test.ts
+@@ -0,0 +1,461 @@
++import { execFileSync } from "node:child_process";
++import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
++import { tmpdir } from "node:os";
++import { join } from "node:path";
++import { afterEach, describe, expect, it, vi } from "vitest";
++import {
++  branchAnalysisPayload,
++  collectRaycastLocalRepoMetadata,
++  parseGitHubRemote,
++  runRaycastBranchAnalysisCommand,
++  type RaycastBranchAnalysisFetch,
++  type RaycastGitRunner,
++} from "../../src/raycast/local-repo-analyzer";
++
++const TOKEN = `gts_${"c".repeat(64)}`;
++let tempDir: string | null = null;
++
++describe("Raycast local repo analyzer", () => {
++  afterEach(() => {
++    if (tempDir) rmSync(tempDir, { recursive: true, force: true });
++    tempDir = null;
++  });
++
++  it("parses GitHub remotes without keeping local paths", () => {
++    expect(parseGitHubRemote("git@github.com:JSONbored/gittensory.git")).toBe("JSONbored/gittensory");
++    expect(parseGitHubRemote("https://github.com/JSONbored/gittensory.git")).toBe("JSONbored/gittensory");
++    expect(parseGitHubRemote("ssh://git@github.com/JSONbored/gittensory.git")).toBe("JSONbored/gittensory");
++    expect(parseGitHubRemote("/tmp/local/repo")).toBeUndefined();
++    expect(parseGitHubRemote(undefined as unknown as string)).toBeUndefined();
++  });
++
++  it("requires an explicit repo name when the GitHub remote cannot be inferred", () => {
++    expect(() =>
++      collectRaycastLocalRepoMetadata({
++        cwd: "/tmp/private-checkout",
++        login: "jsonbored",
++        git: fakeGit({
++          "config --get remote.origin.url": "file:///tmp/private-checkout\n",
++        }).git,
++      }),
++    ).toThrow(/repoFullName/i);
++  });
++
++  it("collects metadata-only git state with renamed, binary, deleted, stale-base, tests, hints, and linked issues", () => {
++    const { git, calls } = fakeGit({
++      "symbolic-ref --short refs/remotes/origin/HEAD": "origin/main\n",
++      "config --get remote.origin.url": "git@github.com:JSONbored/gittensory.git\n",
++      "branch --show-current": "feat/raycast-116\n",
++      "rev-parse --abbrev-ref HEAD": "feat/raycast-116\n",
++      "rev-parse --verify main": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\n",
++      "rev-parse --verify HEAD": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb\n",
++      "merge-base main HEAD": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\n",
++      "rev-parse --verify origin/main": "cccccccccccccccccccccccccccccccccccccccc\n",
++      "diff --name-status -M main --": [
++        "M\tsrc/raycast/local-repo-analyzer.ts",
++        "R100\tsrc/old-name.ts\tsrc/new-name.ts",
++        "D\tsrc/delete-me.ts",
++        "M\tassets/logo.png",
++        "M\ttest/unit/raycast-local-repo-analyzer.test.ts",
++        "M\tpackage.json",
++      ].join("\n"),
++      "diff --numstat -M main --": [
++        "14\t2\tsrc/raycast/local-repo-analyzer.ts",
++        "3\t1\tsrc/new-name.ts",
++        "0\t9\tsrc/delete-me.ts",
++        "-\t-\tassets/logo.png",
++        "28\t0\ttest/unit/raycast-local-repo-analyzer.test.ts",
++        "1\t0\tpackage.json",
++      ].join("\n"),
++      "log --format=%s%n%b main..HEAD": "feat: add Raycast analyzer\n\nCloses #116\n",
++    });
++
++    const metadata = collectRaycastLocalRepoMetadata({
++      cwd: "/tmp/private-checkout",
++      login: "jsonbored",
++      body: "Follow-up for #116",
++      git,
++    });
++
++    expect(metadata).toMatchObject({
++      login: "jsonbored",
++      repoFullName: "JSONbored/gittensory",
++      baseRef: "main",
++      headRef: "feat/raycast-116",
++      branchName: "feat/raycast-116",
++      baseSha: "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
++      headSha: "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
++      mergeBaseSha: "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
++      remoteTrackingSha: "cccccccccccccccccccccccccccccccccccccccc",
++      linkedIssues: [116],
++      testFileCount: 1,
++      sourceUpload: { enabled: false, mode: "metadata_only" },
++    });
++    expect(metadata.changedFiles).toEqual([
++      { path: "src/raycast/local-repo-analyzer.ts", additions: 14, deletions: 2, status: "modified", binary: false },
++      { path: "src/new-name.ts", previousPath: "src/old-name.ts", additions: 3, deletions: 1, status: "renamed", binary: false },
++      { path: "src/delete-me.ts", additions: 0, deletions: 9, status: "deleted", binary: false },
++      { path: "assets/logo.png", additions: 0, deletions: 0, status: "modified", binary: true },
++      { path: "test/unit/raycast-local-repo-analyzer.test.ts", additions: 28, deletions: 0, status: "modified", binary: false },
++      { path: "package.json", additions: 1, deletions: 0, status: "modified", binary: false },
++    ]);
++    expect(metadata.warnings.join("\n")).toMatch(/stale.*cccccccccccc/i);
++    expect(metadata.validationHints).toEqual(
++      expect.arrayContaining([
++        "1 changed test file(s) detected.",
++        "Build or dependency manifests changed; rerun the repository's standard validation gate.",
++        "Binary file metadata detected; review binary diffs locally before relying on metadata-only analysis.",
++      ]),
++    );
++    expect(JSON.stringify(metadata)).not.toMatch(/private-checkout|sourceContents|content|diffText|wallet|hotkey/i);
++    expect(calls.map((call) => call.split(" ")[0]).join("\n")).not.toMatch(/^(cat|show|grep|archive)$/m);
++  });
++
++  it("rejects source upload mode before running git", () => {
++    const git = vi.fn<RaycastGitRunner>();
++
++    expect(() =>
++      collectRaycastLocalRepoMetadata({
++        cwd: "/tmp/private-checkout",
++        login: "jsonbored",
++        repoFullName: "JSONbored/gittensory",
++        sourceUploadMode: "source_upload",
++        git,
++      }),
++    ).toThrow(/metadata-only/i);
++    expect(git).not.toHaveBeenCalled();
++  });
++
++  it("accepts explicit metadata-only mode and handles copied, unknown, and brace-style renamed paths", () => {
++    const metadata = collectRaycastLocalRepoMetadata({
++      cwd: "/tmp/private-checkout",
++      login: "jsonbored",
++      repoFullName: "JSONbored/gittensory",
++      baseRef: "origin/main",
++      sourceUploadMode: "metadata_only",
++      linkedIssues: [116, 116],
++      validationHints: ["Run npm run test:ci before publishing."],
++      git: fakeGit({
++        "branch --show-current": "feat/raycast-116\n",
++        "rev-parse --abbrev-ref HEAD": "feat/raycast-116\n",
++        "rev-parse --verify origin/main": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\n",
++        "rev-parse --verify HEAD": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb\n",
++        "merge-base origin/main HEAD": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\n",
++        "diff --name-status -M origin/main --": [
++          "C100\tsrc/source.ts\tsrc/copied.ts",
++          "R100\tsrc/old-name.ts\tsrc/new-name.ts",
++          "T\tweird-mode.file",
++        ].join("\n"),
++        "diff --numstat -M origin/main --": [
++          "4\t0\tsrc/copied.ts",
++          "2\t1\tsrc/{old-name.ts => new-name.ts}",
++          "0\t0\tweird-mode.file",
++        ].join("\n"),
++        "log --format=%s%n%b origin/main..HEAD": "docs: branch analysis\n",
++      }).git,
++    });
++
++    expect(metadata.changedFiles).toEqual([
++      { path: "src/copied.ts", previousPath: "src/source.ts", additions: 4, deletions: 0, status: "copied", binary: false },
++      { path: "src/new-name.ts", previousPath: "src/old-name.ts", additions: 2, deletions: 1, status: "renamed", binary: false },
++      { path: "weird-mode.file", additions: 0, deletions: 0, status: "unknown", binary: false },
++    ]);
++    expect(metadata.linkedIssues).toEqual([116]);
++    expect(metadata.validationHints).toEqual(expect.arrayContaining(["Run npm run test:ci before publishing."]));
++  });
++
++  it("uses safe defaults and workflow hints when optional git metadata is absent", () => {
++    const metadata = collectRaycastLocalRepoMetadata({
++      cwd: "/tmp/private-checkout",
++      login: "jsonbored",
++      git: fakeGit({
++        "config --get remote.origin.url": "https://github.com/JSONbored/gittensory.git\n",
++        "rev-parse --verify HEAD": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb\n",
++        "diff --name-status -M main --": "M\t.github/workflows/ci.yml\nT\nR100\tsrc/old-only.ts",
++        "diff --numstat -M main --": "NaN\tNaN\t.github/workflows/ci.yml\n",
++        "log --format=%s%n%b main..HEAD": "feat: workflow tune\nRefs #9 and closes #7\n",
++      }).git,
++    });
++
++    expect(metadata).toMatchObject({
++      repoFullName: "JSONbored/gittensory",
++      baseRef: "main",
++      branchName: "local-branch",
++      headRef: "local-branch",
++      linkedIssues: [7, 9],
++    });
++    expect(metadata.changedFiles).toEqual([
++      { path: ".github/workflows/ci.yml", additions: 0, deletions: 0, status: "modified", binary: false },
++      { path: "", additions: 0, deletions: 0, status: "unknown", binary: false },
++      { path: "src/old-only.ts", previousPath: "src/old-only.ts", additions: 0, deletions: 0, status: "renamed", binary: false },
++    ]);
++    expect(metadata.validationHints).toEqual(expect.arrayContaining(["Workflow files changed; required-check behavior may change."]));
++  });
++
++  it("collects metadata from a real local git checkout without reading file contents", () => {
++    tempDir = mkdtempSync(join(tmpdir(), "raycast-local-git-"));
++    mkdirSync(join(tempDir, "src"), { recursive: true });
++    git(tempDir, ["init", "-b", "main"]);
++    git(tempDir, ["config", "user.email", "test@example.com"]);
++    git(tempDir, ["config", "user.name", "Test User"]);
++    git(tempDir, ["remote", "add", "origin", "https://github.com/JSONbored/gittensory.git"]);
++    writeFileSync(join(tempDir, "README.md"), "initial\n");
++    git(tempDir, ["add", "README.md"]);
++    git(tempDir, ["commit", "-m", "initial"]);
++    git(tempDir, ["checkout", "-b", "feat/raycast-116"]);
++    writeFileSync(join(tempDir, "src/index.ts"), "export const value = 116;\n");
++    git(tempDir, ["add", "src/index.ts"]);
++
++    const metadata = collectRaycastLocalRepoMetadata({
++      cwd: tempDir,
++      login: "jsonbored",
++      repoFullName: "JSONbored/gittensory",
++      baseRef: "main",
++    });
++
++    expect(metadata.branchName).toBe("feat/raycast-116");
++    expect(metadata.changedFiles).toEqual([
++      { path: "src/index.ts", additions: 1, deletions: 0, status: "added", binary: false },
++    ]);
++    expect(JSON.stringify(metadata)).not.toContain(tempDir);
++    expect(JSON.stringify(metadata)).not.toContain("export const value");
++  });
++
++  it("falls back to empty git metadata when git commands cannot run", () => {
++    const metadata = collectRaycastLocalRepoMetadata({
++      cwd: "/tmp/definitely-missing-gittensory-raycast-checkout",
++      login: "jsonbored",
++      repoFullName: "JSONbored/gittensory",
++      baseRef: "main",
++      branchName: "manual-branch",
++    });
++
++    expect(metadata).toMatchObject({
++      repoFullName: "JSONbored/gittensory",
++      branchName: "manual-branch",
++      headRef: "manual-branch",
++      changedFiles: [],
++      validationHints: ["No changed test files detected; include focused validation before requesting review."],
++      sourceUpload: { enabled: false, mode: "metadata_only" },
++    });
++  });
++
++  it("builds a branch-analysis API payload that excludes source upload fields", () => {
++    const metadata = collectRaycastLocalRepoMetadata({
++      cwd: "/tmp/private-checkout",
++      login: "jsonbored",
++      repoFullName: "JSONbored/gittensory",
++      baseRef: "origin/main",
++      git: fakeGit({
++        "branch --show-current": "feat/raycast-116\n",
++        "rev-parse --abbrev-ref HEAD": "feat/raycast-116\n",
++        "rev-parse --verify origin/main": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\n",
++        "rev-parse --verify HEAD": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb\n",
++        "merge-base origin/main HEAD": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\n",
++        "diff --name-status -M origin/main --": "M\tsrc/index.ts\n",
++        "diff --numstat -M origin/main --": "7\t1\tsrc/index.ts\n",
++        "log --format=%s%n%b origin/main..HEAD": "fix: small branch\n",
++      }).git,
++    });
++
++    const payload = branchAnalysisPayload(metadata);
++
++    expect(payload).toMatchObject({
++      login: "jsonbored",
++      repoFullName: "JSONbored/gittensory",
++      baseRef: "origin/main",
++      localScorer: { mode: "metadata_only" },
++    });
++    expect(JSON.stringify(payload)).not.toMatch(/sourceUpload|sourceContents|content|diffText|private-checkout/i);
++  });
++
++  it("posts metadata to the existing local branch-analysis API", async () => {
++    const { fetchImpl, calls } = fakeFetch({ status: "ready", summary: "analysis complete" });
++    const result = await runRaycastBranchAnalysisCommand({
++      apiOrigin: "https://api.gittensory.test",
++      sessionToken: TOKEN,
++      cwd: "/tmp/private-checkout",
++      login: "jsonbored",
++      repoFullName: "JSONbored/gittensory",
++      baseRef: "main",
++      fetchImpl,
++      git: fakeGit({
++        "branch --show-current": "feat/raycast-116\n",
++        "rev-parse --abbrev-ref HEAD": "feat/raycast-116\n",
++        "rev-parse --verify main": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\n",
++        "rev-parse --verify HEAD": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb\n",
++        "merge-base main HEAD": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\n",
++        "rev-parse --verify origin/main": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\n",
++        "diff --name-status -M main --": "M\tsrc/index.ts\n",
++        "diff --numstat -M main --": "7\t1\tsrc/index.ts\n",
++        "log --format=%s%n%b main..HEAD": "fix: small branch\n",
++      }).git,
++    });
++
++    expect(result.status).toBe("ready");
++    expect(calls).toHaveLength(1);
++    expect(calls[0]).toMatchObject({ method: "POST", path: "/v1/local/branch-analysis" });
++    expect(calls[0]?.headers.authorization).toBe(`Bearer ${TOKEN}`);
++    expect(calls[0]?.body).toMatchObject({
++      login: "jsonbored",
++      repoFullName: "JSONbored/gittensory",
++      changedFiles: [{ path: "src/index.ts", additions: 7, deletions: 1, status: "modified", binary: false }],
++      localScorer: { mode: "metadata_only" },
++    });
++  });
++
++  it("degrades cleanly when the branch-analysis API returns an error", async () => {
++    const { fetchImpl } = fakeFetch({ error: "api_down" }, 503);
++    const result = await runRaycastBranchAnalysisCommand({
++      apiOrigin: "https://api.gittensory.test",
++      sessionToken: TOKEN,
++      cwd: "/tmp/private-checkout",
++      login: "jsonbored",
++      repoFullName: "JSONbored/gittensory",
++      baseRef: "main",
++      fetchImpl,
++      git: fakeGit({
++        "branch --show-current": "feat/raycast-116\n",
++        "rev-parse --abbrev-ref HEAD": "feat/raycast-116\n",
++        "rev-parse --verify main": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\n",
++        "rev-parse --verify HEAD": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb\n",
++        "merge-base main HEAD": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\n",
++        "rev-parse --verify origin/main": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\n",
++        "diff --name-status -M main --": "M\tsrc/index.ts\n",
++        "diff --numstat -M main --": "7\t1\tsrc/index.ts\n",
++        "log --format=%s%n%b main..HEAD": "fix: small branch\n",
++      }).git,
++    });
++
++    expect(result).toMatchObject({
++      status: "api_error",
++      error: "api_down",
++      rerunGuidance: expect.stringContaining("metadata payload was not expanded with source contents"),
++      metadata: { sourceUpload: { enabled: false, mode: "metadata_only" } },
++    });
++  });
++
++  it("uses response status text when API errors are not structured", async () => {
++    const { fetchImpl } = fakeFetch("temporary outage", 502);
++    const result = await runRaycastBranchAnalysisCommand({
++      apiOrigin: "https://api.gittensory.test",
++      sessionToken: TOKEN,
++      cwd: "/tmp/private-checkout",
++      login: "jsonbored",
++      repoFullName: "JSONbored/gittensory",
++      baseRef: "main",
++      fetchImpl,
++      git: fakeGit({
++        "branch --show-current": "feat/raycast-116\n",
++        "rev-parse --abbrev-ref HEAD": "feat/raycast-116\n",
++        "rev-parse --verify main": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\n",
++        "rev-parse --verify HEAD": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb\n",
++        "merge-base main HEAD": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\n",
++        "rev-parse --verify origin/main": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\n",
++        "diff --name-status -M main --": "",
++        "diff --numstat -M main --": "",
++        "log --format=%s%n%b main..HEAD": "",
++      }).git,
++    });
++
++    expect(result).toMatchObject({
++      status: "api_error",
++      error: "502 Service unavailable",
++    });
++  });
++
++  it("keeps API degradation structured for thrown and status-only failures", async () => {
++    const thrown = await runRaycastBranchAnalysisCommand({
++      apiOrigin: "https://api.gittensory.test",
++      sessionToken: TOKEN,
++      cwd: "/tmp/private-checkout",
++      login: "jsonbored",
++      repoFullName: "JSONbored/gittensory",
++      baseRef: "main",
++      fetchImpl: vi.fn(async () => {
++        throw "network_down";
++      }),
++      git: fakeGit({
++        "branch --show-current": "feat/raycast-116\n",
++        "rev-parse --abbrev-ref HEAD": "feat/raycast-116\n",
++        "diff --name-status -M main --": "",
++        "diff --numstat -M main --": "",
++        "log --format=%s%n%b main..HEAD": "",
++      }).git,
++    });
++    expect(thrown).toMatchObject({ status: "api_error", error: "network_down" });
++
++    const statusOnly = await runRaycastBranchAnalysisCommand({
++      apiOrigin: "https://api.gittensory.test",
++      sessionToken: TOKEN,
++      cwd: "/tmp/private-checkout",
++      login: "jsonbored",
++      repoFullName: "JSONbored/gittensory",
++      baseRef: "main",
++      fetchImpl: vi.fn(async () => ({
++        ok: false,
++        status: 504,
++        async json() {
++          return "timeout";
++        },
++      })),
++      git: fakeGit({
++        "branch --show-current": "feat/raycast-116\n",
++        "rev-parse --abbrev-ref HEAD": "feat/raycast-116\n",
++        "diff --name-status -M main --": "",
++        "diff --numstat -M main --": "",
++        "log --format=%s%n%b main..HEAD": "",
++      }).git,
++    });
++    expect(statusOnly).toMatchObject({
++      status: "api_error",
++      error: "504 Raycast branch analysis request failed",
++    });
++  });
++});
++
++function fakeGit(responses: Record<string, string>): { git: RaycastGitRunner; calls: string[] } {
++  const calls: string[] = [];
++  return {
++    calls,
++    git: (_cwd, args) => {
++      const key = args.join(" ");
++      calls.push(key);
++      return (responses[key] ?? "")
++        .split("\n")
++        .map((line) => line.trim())
++        .filter(Boolean);
++    },
++  };
++}
++
++function fakeFetch(payload: unknown, status = 200): {
++  fetchImpl: RaycastBranchAnalysisFetch;
++  calls: Array<{ method: string; path: string; headers: Record<string, string>; body: unknown }>;
++} {
++  const calls: Array<{ method: string; path: string; headers: Record<string, string>; body: unknown }> = [];
++  return {
++    calls,
++    fetchImpl: vi.fn(async (input, init) => {
++      const url = new URL(input);
++      calls.push({
++        method: init?.method ?? "GET",
++        path: url.pathname,
++        headers: init?.headers ?? {},
++        body: init?.body ? JSON.parse(init.body) : null,
++      });
++      return {
++        ok: status >= 200 && status < 300,
++        status,
++        statusText: status === 200 ? "OK" : "Service unavailable",
++        async json() {
++          return payload;
++        },
++      };
++    }),
++  };
++}
++
++function git(cwd: string, args: string[]) {
++  execFileSync("git", args, { cwd, stdio: ["ignore", "ignore", "ignore"] });
++}

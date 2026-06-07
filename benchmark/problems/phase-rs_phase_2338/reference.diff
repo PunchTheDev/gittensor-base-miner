@@ -1,0 +1,354 @@
+diff --git a/crates/engine/src/game/casting.rs b/crates/engine/src/game/casting.rs
+index d3d8c7734..b163e395e 100644
+--- a/crates/engine/src/game/casting.rs
++++ b/crates/engine/src/game/casting.rs
+@@ -35513,6 +35513,74 @@ mod tests {
+             );
+         }
+ 
++        /// Issue #1957 regression: the PRINTED static "You may cast creature
++        /// spells as though they had flash." (Vivien, Champion of the Wilds)
++        /// must let the controller cast a CREATURE spell at instant speed —
++        /// and must NOT grant flash timing to a non-creature spell.
++        ///
++        /// CR 601.3b + CR 702.8a: this parses to a battlefield `CastWithKeyword
++        /// { Flash }` static carrying a creature spell filter, read by
++        /// `granted_spell_keywords`. The bug was that the line parsed to the
++        /// dead `CastWithFlash` mode (no filter, never consumed) — so the grant
++        /// silently did nothing.
++        #[test]
++        fn vivien_creature_flash_static_scopes_to_creature_spells() {
++            let mut state = setup_game_at_main_phase();
++
++            // P0 controls Vivien, Champion of the Wilds (only the static line
++            // matters here). Install the parsed static onto a battlefield object.
++            let vivien = create_object(
++                &mut state,
++                CardId(900),
++                PlayerId(0),
++                "Vivien, Champion of the Wilds".to_string(),
++                Zone::Battlefield,
++            );
++            let parsed = parse_oracle_text(
++                "You may cast creature spells as though they had flash.",
++                "Vivien, Champion of the Wilds",
++                &[],
++                &["Planeswalker".to_string()],
++                &["Vivien".to_string()],
++            );
++            assert_eq!(
++                parsed.statics.len(),
++                1,
++                "the flash-permission line must parse to exactly one static, got {:?}",
++                parsed.statics
++            );
++            state.objects.get_mut(&vivien).unwrap().static_definitions =
++                parsed.statics.clone().into();
++
++            // A creature spell and a sorcery in P0's hand.
++            let creature = create_object(
++                &mut state,
++                CardId(901),
++                PlayerId(0),
++                "Test Creature".to_string(),
++                Zone::Hand,
++            );
++            {
++                let obj = state.objects.get_mut(&creature).unwrap();
++                obj.card_types.core_types.push(CoreType::Creature);
++                obj.mana_cost = ManaCost::generic(1);
++            }
++            let sorcery = sorcery_in_hand(&mut state, PlayerId(0), CardId(902));
++
++            // CR 601.3b: the creature spell gains flash timing via the static.
++            assert!(
++                effective_spell_keyword_kinds(&state, PlayerId(0), creature)
++                    .contains(&KeywordKind::Flash),
++                "creature spell must gain Flash from Vivien's static"
++            );
++            // The filter scopes to creature spells — the sorcery is unaffected.
++            assert!(
++                !effective_spell_keyword_kinds(&state, PlayerId(0), sorcery)
++                    .contains(&KeywordKind::Flash),
++                "sorcery must NOT gain Flash (static is creature-scoped)"
++            );
++        }
++
+         /// (g) CR 611.2c regression lock: the grant is bound to the grantee via
+         /// the outer `SpecificPlayer` gate, so it must survive an opponent GAINING
+         /// CONTROL of Teferi (not just Teferi leaving play — that is test (b)).
+diff --git a/crates/engine/src/parser/oracle_ir/snapshots/engine__parser__oracle_ir__snapshot_tests__leyline_of_anticipation_ir.snap b/crates/engine/src/parser/oracle_ir/snapshots/engine__parser__oracle_ir__snapshot_tests__leyline_of_anticipation_ir.snap
+index 257c8b868..28ac347f9 100644
+--- a/crates/engine/src/parser/oracle_ir/snapshots/engine__parser__oracle_ir__snapshot_tests__leyline_of_anticipation_ir.snap
++++ b/crates/engine/src/parser/oracle_ir/snapshots/engine__parser__oracle_ir__snapshot_tests__leyline_of_anticipation_ir.snap
+@@ -33,8 +33,19 @@ expression: "&ir"
+     },
+     {
+       "PreLoweredStatic": {
+-        "mode": "CastWithFlash",
+-        "affected": null,
++        "mode": {
++          "CastWithKeyword": {
++            "keyword": "Flash"
++          }
++        },
++        "affected": {
++          "type": "Typed",
++          "type_filters": [
++            "Card"
++          ],
++          "controller": "You",
++          "properties": []
++        },
+         "modifications": [],
+         "condition": null,
+         "affected_zone": null,
+diff --git a/crates/engine/src/parser/oracle_ir/snapshots/engine__parser__oracle_ir__snapshot_tests__leyline_of_anticipation_lowered.snap b/crates/engine/src/parser/oracle_ir/snapshots/engine__parser__oracle_ir__snapshot_tests__leyline_of_anticipation_lowered.snap
+index 9727b5e72..96bd392b4 100644
+--- a/crates/engine/src/parser/oracle_ir/snapshots/engine__parser__oracle_ir__snapshot_tests__leyline_of_anticipation_lowered.snap
++++ b/crates/engine/src/parser/oracle_ir/snapshots/engine__parser__oracle_ir__snapshot_tests__leyline_of_anticipation_lowered.snap
+@@ -33,8 +33,19 @@ expression: "&lowered"
+   "triggers": [],
+   "statics": [
+     {
+-      "mode": "CastWithFlash",
+-      "affected": null,
++      "mode": {
++        "CastWithKeyword": {
++          "keyword": "Flash"
++        }
++      },
++      "affected": {
++        "type": "Typed",
++        "type_filters": [
++          "Card"
++        ],
++        "controller": "You",
++        "properties": []
++      },
+       "modifications": [],
+       "condition": null,
+       "affected_zone": null,
+diff --git a/crates/engine/src/parser/oracle_static/dispatch.rs b/crates/engine/src/parser/oracle_static/dispatch.rs
+index dba0d3fb0..4d59e8ec2 100644
+--- a/crates/engine/src/parser/oracle_static/dispatch.rs
++++ b/crates/engine/src/parser/oracle_static/dispatch.rs
+@@ -1825,15 +1825,12 @@ pub(crate) fn parse_static_line_inner(
+         return Some(def);
+     }
+ 
+-    // --- "as though it/they had flash" (CR 702.8a) ---
+-    if nom_primitives::scan_contains(tp.lower, "as though it had flash")
+-        || nom_primitives::scan_contains(tp.lower, "as though they had flash")
+-    {
+-        return Some(
+-            StaticDefinition::new(StaticMode::CastWithFlash)
+-                .description(text.to_string())
+-                .active_zones(vec![Zone::Battlefield]),
+-        );
++    // --- "You may cast [type] spells as though they had flash" (CR 601.3b / CR 702.8a) ---
++    // Emits `CastWithKeyword { Flash }` with the spell-type filter — the only
++    // static mode the flash-timing path (granted_spell_keywords) reads, and the
++    // one that preserves the "creature spells" restriction (issue #1957).
++    if let Some(def) = parse_cast_as_though_flash_static(&tp, &text) {
++        return Some(def);
+     }
+ 
+     // --- "[Type] spells you cast [from zone] have [keyword]" (CR 702.51a) ---
+diff --git a/crates/engine/src/parser/oracle_static/keyword_grant.rs b/crates/engine/src/parser/oracle_static/keyword_grant.rs
+index 8e86feb00..b976544d5 100644
+--- a/crates/engine/src/parser/oracle_static/keyword_grant.rs
++++ b/crates/engine/src/parser/oracle_static/keyword_grant.rs
+@@ -311,6 +311,81 @@ pub(crate) fn parse_spells_have_keyword(tp: &TextPair<'_>, text: &str) -> Option
+     None
+ }
+ 
++/// Parse the static permission "You may cast [type] spells as though they had
++/// flash." (Leyline of Anticipation, Vedalken Orrery, Vivien, Champion of the
++/// Wilds' first ability).
++///
++/// CR 601.3b: An effect that lets a player cast a spell "as though it had flash"
++/// lets that player begin to cast it at instant speed. CR 702.8a: flash means
++/// the spell may be cast any time its controller could cast an instant.
++///
++/// This must emit `StaticMode::CastWithKeyword { keyword: Flash }` with the
++/// spell-type filter in `affected` — that is the ONLY static mode the
++/// flash-timing path (`granted_spell_keywords` in casting.rs) actually reads.
++/// The legacy `StaticMode::CastWithFlash` carries no spell filter and is never
++/// consumed by that path, so it silently dropped both the timing grant and the
++/// "creature spells" restriction (issue #1957). Mirrors the activated/triggered
++/// `try_parse_cast_as_though_flash_permission` (oracle_effect) so the static and
++/// duration-scoped forms share one filter-construction contract.
++pub(crate) fn parse_cast_as_though_flash_static(
++    tp: &TextPair<'_>,
++    text: &str,
++) -> Option<StaticDefinition> {
++    let (type_text, all_players) = nom_on_lower(tp.original, tp.lower, |i| {
++        let (i, all_players) = alt((
++            value(false, tag::<_, _, OracleError<'_>>("you may ")),
++            value(true, tag("players may ")),
++            value(true, tag("any player may ")),
++            value(false, tag("")),
++        ))
++        .parse(i)?;
++        let (i, _) = tag("cast ").parse(i)?;
++        // "[type] spells as though they had flash" — the bare "spells" form
++        // (no type prefix) grants flash to every spell (Leyline of Anticipation).
++        let (i, type_part) = alt((
++            value("", tag("spells as though they had flash")),
++            map(
++                terminated(
++                    take_until(" spells as though they had flash"),
++                    tag(" spells as though they had flash"),
++                ),
++                str::trim,
++            ),
++        ))
++        .parse(i)?;
++        let (i, _) = opt(tag(".")).parse(i)?;
++        let (i, _) = eof.parse(i)?;
++        Ok((i, (type_part.to_string(), all_players)))
++    })?
++    .0;
++
++    // CR 601.3b: scope the grant to the spell class. A bare "spells" grant
++    // applies to every spell the controller casts; a typed grant ("creature
++    // spells") constrains to that type. "Players may" / "Any player may" forms
++    // intentionally remain unscoped, while "you may" forms recurse through
++    // `TargetFilter::Or` via `apply_spell_keyword_subject_constraints`.
++    let base_filter = if type_text.is_empty() {
++        TargetFilter::Typed(TypedFilter::card())
++    } else {
++        let phrase = format!("{type_text} spells");
++        parse_type_phrase(&phrase).0
++    };
++    let affected = if all_players {
++        base_filter
++    } else {
++        apply_spell_keyword_subject_constraints(base_filter, None, None, Vec::new())
++    };
++
++    Some(
++        StaticDefinition::new(StaticMode::CastWithKeyword {
++            keyword: Keyword::Flash,
++        })
++        .affected(affected)
++        .description(text.to_string())
++        .active_zones(vec![Zone::Battlefield]),
++    )
++}
++
+ pub(crate) fn apply_spell_keyword_subject_constraints(
+     filter: TargetFilter,
+     zone_filter: Option<FilterProp>,
+diff --git a/crates/engine/src/parser/oracle_static/tests.rs b/crates/engine/src/parser/oracle_static/tests.rs
+index 90a52d763..bda225f6f 100644
+--- a/crates/engine/src/parser/oracle_static/tests.rs
++++ b/crates/engine/src/parser/oracle_static/tests.rs
+@@ -4442,9 +4442,104 @@ fn static_players_cant_gain_life() {
+ 
+ #[test]
+ fn static_cast_as_though_flash() {
+-    // CR 702.8a: Flash-granting static
++    // CR 601.3b + CR 702.8a: "You may cast [type] spells as though they had
++    // flash" must emit a `CastWithKeyword { Flash }` static — the only mode the
++    // flash-timing path (granted_spell_keywords) reads — with the spell-type
++    // filter preserved. Issue #1957: Vivien, Champion of the Wilds restricts the
++    // grant to CREATURE spells, and the dead `CastWithFlash` mode dropped both
++    // the timing grant and the type restriction.
+     let def = parse_static_line("You may cast creature spells as though they had flash.").unwrap();
+-    assert_eq!(def.mode, StaticMode::CastWithFlash);
++    assert_eq!(
++        def.mode,
++        StaticMode::CastWithKeyword {
++            keyword: Keyword::Flash
++        }
++    );
++    let Some(TargetFilter::Typed(tf)) = &def.affected else {
++        panic!(
++            "affected must be a Typed creature filter, got {:?}",
++            def.affected
++        );
++    };
++    assert!(
++        tf.type_filters.contains(&TypeFilter::Creature),
++        "filter must constrain to creature spells, got {:?}",
++        tf.type_filters
++    );
++    assert_eq!(
++        tf.controller,
++        Some(ControllerRef::You),
++        "grant must scope to spells you cast"
++    );
++    assert_eq!(def.active_zones, vec![Zone::Battlefield]);
++}
++
++#[test]
++fn static_cast_as_though_flash_all_spells() {
++    // CR 601.3b: the bare "spells" form (Leyline of Anticipation, Vedalken
++    // Orrery) grants flash to every spell the controller casts.
++    let def = parse_static_line("You may cast spells as though they had flash.").unwrap();
++    assert_eq!(
++        def.mode,
++        StaticMode::CastWithKeyword {
++            keyword: Keyword::Flash
++        }
++    );
++    assert_eq!(
++        def.affected,
++        Some(TargetFilter::Typed(
++            TypedFilter::card().controller(ControllerRef::You)
++        ))
++    );
++}
++
++#[test]
++fn static_cast_as_though_flash_compound_spell_types_scope_each_leg_to_you() {
++    let def = parse_static_line(
++        "You may cast legendary spells and artifact spells as though they had flash.",
++    )
++    .unwrap();
++    assert_eq!(
++        def.mode,
++        StaticMode::CastWithKeyword {
++            keyword: Keyword::Flash
++        }
++    );
++    let Some(TargetFilter::Or { filters }) = &def.affected else {
++        panic!("expected Or affected filter, got {:?}", def.affected);
++    };
++    assert!(
++        filters.iter().all(|filter| matches!(
++            filter,
++            TargetFilter::Typed(TypedFilter {
++                controller: Some(ControllerRef::You),
++                ..
++            })
++        )),
++        "each disjunct must be scoped to spells you cast, got {filters:?}"
++    );
++}
++
++#[test]
++fn static_cast_as_though_flash_players_may_forms_are_unscoped() {
++    for text in [
++        "Players may cast enchantment spells as though they had flash.",
++        "Any player may cast Sliver spells as though they had flash.",
++    ] {
++        let def = parse_static_line(text).unwrap();
++        assert_eq!(
++            def.mode,
++            StaticMode::CastWithKeyword {
++                keyword: Keyword::Flash
++            }
++        );
++        match &def.affected {
++            Some(TargetFilter::Typed(tf)) => {
++                assert_eq!(tf.controller, None, "{text}: must apply to every player");
++            }
++            other => panic!("{text}: expected Typed affected filter, got {other:?}"),
++        }
++    }
+ }
+ 
+ #[test]

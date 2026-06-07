@@ -1,0 +1,863 @@
+diff --git a/celery/app/amqp.py b/celery/app/amqp.py
+index e6aae3f8b3c..575117d13e1 100644
+--- a/celery/app/amqp.py
++++ b/celery/app/amqp.py
+@@ -249,9 +249,13 @@ def Queues(self, queues, create_missing=None,
+         if max_priority is None:
+             max_priority = conf.task_queue_max_priority
+         if not queues and conf.task_default_queue:
++            queue_arguments = None
++            if conf.task_default_queue_type == 'quorum':
++                queue_arguments = {'x-queue-type': 'quorum'}
+             queues = (Queue(conf.task_default_queue,
+                             exchange=self.default_exchange,
+-                            routing_key=default_routing_key),)
++                            routing_key=default_routing_key,
++                            queue_arguments=queue_arguments),)
+         autoexchange = (self.autoexchange if autoexchange is None
+                         else autoexchange)
+         return self.queues_cls(
+diff --git a/celery/app/defaults.py b/celery/app/defaults.py
+index 523b56d72f6..b9aaf66ef65 100644
+--- a/celery/app/defaults.py
++++ b/celery/app/defaults.py
+@@ -261,6 +261,7 @@ def __repr__(self):
+         inherit_parent_priority=Option(False, type='bool'),
+         default_delivery_mode=Option(2, type='string'),
+         default_queue=Option('celery'),
++        default_queue_type=Option('classic', type='string'),
+         default_exchange=Option(None, type='string'),  # taken from queue
+         default_exchange_type=Option('direct'),
+         default_routing_key=Option(None, type='string'),  # taken from queue
+@@ -345,6 +346,7 @@ def __repr__(self):
+         task_log_format=Option(DEFAULT_TASK_LOG_FMT),
+         timer=Option(type='string'),
+         timer_precision=Option(1.0, type='float'),
++        detect_quorum_queues=Option(True, type='bool'),
+     ),
+ )
+ 
+diff --git a/celery/worker/consumer/tasks.py b/celery/worker/consumer/tasks.py
+index b4e4aee99ec..12f9b6a33b5 100644
+--- a/celery/worker/consumer/tasks.py
++++ b/celery/worker/consumer/tasks.py
+@@ -1,7 +1,13 @@
+ """Worker Task Consumer Bootstep."""
++
++from __future__ import annotations
++
++import warnings
++
+ from kombu.common import QoS, ignore_errors
+ 
+ from celery import bootsteps
++from celery.exceptions import CeleryWarning
+ from celery.utils.log import get_logger
+ 
+ from .mingle import Mingle
+@@ -12,6 +18,16 @@
+ debug = logger.debug
+ 
+ 
++ETA_TASKS_NO_GLOBAL_QOS_WARNING = """
++Detected quorum queue "%r", disabling global QoS.
++With global QoS disabled, ETA tasks may not function as expected. Instead of adjusting
++the prefetch count dynamically, ETA tasks will occupy the prefetch buffer, potentially
++blocking other tasks from being consumed. To mitigate this, either set a high prefetch
++count or avoid using quorum queues until the ETA mechanism is updated to support a
++disabled global QoS, which is required for quorum queues.
++"""
++
++
+ class Tasks(bootsteps.StartStopStep):
+     """Bootstep starting the task message consumer."""
+ 
+@@ -25,10 +41,7 @@ def start(self, c):
+         """Start task consumer."""
+         c.update_strategies()
+ 
+-        # - RabbitMQ 3.3 completely redefines how basic_qos works...
+-        # This will detect if the new qos semantics is in effect,
+-        # and if so make sure the 'apply_global' flag is set on qos updates.
+-        qos_global = not c.connection.qos_semantics_matches_spec
++        qos_global = self.qos_global(c)
+ 
+         # set initial prefetch count
+         c.connection.default_channel.basic_qos(
+@@ -63,3 +76,44 @@ def shutdown(self, c):
+     def info(self, c):
+         """Return task consumer info."""
+         return {'prefetch_count': c.qos.value if c.qos else 'N/A'}
++
++    def qos_global(self, c) -> bool:
++        """Determine if global QoS should be applied.
++
++        Additional information:
++            https://www.rabbitmq.com/docs/consumer-prefetch
++            https://www.rabbitmq.com/docs/quorum-queues#global-qos
++        """
++        # - RabbitMQ 3.3 completely redefines how basic_qos works...
++        # This will detect if the new qos semantics is in effect,
++        # and if so make sure the 'apply_global' flag is set on qos updates.
++        qos_global = not c.connection.qos_semantics_matches_spec
++
++        if c.app.conf.worker_detect_quorum_queues:
++            using_quorum_queues, qname = self.detect_quorum_queues(c)
++            if using_quorum_queues:
++                qos_global = False
++                # The ETA tasks mechanism requires additional work for Celery to fully support
++                # quorum queues. Warn the user that ETA tasks may not function as expected until
++                # this is done so we can at least support quorum queues partially for now.
++                warnings.warn(ETA_TASKS_NO_GLOBAL_QOS_WARNING % (qname,), CeleryWarning)
++
++        return qos_global
++
++    def detect_quorum_queues(self, c) -> tuple[bool, str]:
++        """Detect if any of the queues are quorum queues.
++
++        Returns:
++            tuple[bool, str]: A tuple containing a boolean indicating if any of the queues are quorum queues
++            and the name of the first quorum queue found or an empty string if no quorum queues were found.
++        """
++        is_rabbitmq_broker = c.app.conf.broker_url.startswith(("amqp", "pyamqp"))
++
++        if is_rabbitmq_broker:
++            queues = c.app.amqp.queues
++            for qname in queues:
++                qarguments = queues[qname].queue_arguments or {}
++                if qarguments.get("x-queue-type") == "quorum":
++                    return True, qname
++
++        return False, ""
+diff --git a/docs/userguide/configuration.rst b/docs/userguide/configuration.rst
+index f5c3f280aa4..1250f4ff16e 100644
+--- a/docs/userguide/configuration.rst
++++ b/docs/userguide/configuration.rst
+@@ -137,6 +137,7 @@ have been moved into a new  ``task_`` prefix.
+ ``CELERY_DEFAULT_EXCHANGE``                :setting:`task_default_exchange`
+ ``CELERY_DEFAULT_EXCHANGE_TYPE``           :setting:`task_default_exchange_type`
+ ``CELERY_DEFAULT_QUEUE``                   :setting:`task_default_queue`
++``CELERY_DEFAULT_QUEUE_TYPE``              :setting:`task_default_queue_type`
+ ``CELERY_DEFAULT_RATE_LIMIT``              :setting:`task_default_rate_limit`
+ ``CELERY_DEFAULT_ROUTING_KEY``             :setting:`task_default_routing_key`
+ ``CELERY_EAGER_PROPAGATES``                :setting:`task_eager_propagates`
+@@ -176,6 +177,7 @@ have been moved into a new  ``task_`` prefix.
+ ``CELERY_WORKER_TASK_LOG_FORMAT``          :setting:`worker_task_log_format`
+ ``CELERYD_TIMER``                          :setting:`worker_timer`
+ ``CELERYD_TIMER_PRECISION``                :setting:`worker_timer_precision`
++``CELERYD_DETECT_QUORUM_QUEUES``           :setting:`worker_detect_quorum_queues`
+ ========================================== ==============================================
+ 
+ Configuration Directives
+@@ -2606,6 +2608,42 @@ that queue.
+ 
+     :ref:`routing-changing-default-queue`
+ 
++.. setting:: task_default_queue_type
++
++``task_default_queue_type``
++~~~~~~~~~~~~~~~~~~~~~~~~~~~
++
++.. versionadded:: 5.5
++
++Default: ``"classic"``.
++
++This setting is used to allow changing the default queue type for the
++:setting:`task_default_queue` queue. The other viable option is ``"quorum"`` which
++is only supported by RabbitMQ and sets the queue type to ``quorum`` using the ``x-queue-type``
++queue argument.
++
++If the :setting:`worker_detect_quorum_queues` setting is enabled, the worker will
++automatically detect the queue type and disable the global QoS accordingly.
++
++.. warning::
++
++    When using quorum queues, ETA tasks may not function as expected. Instead of adjusting
++    the prefetch count dynamically, ETA tasks will occupy the prefetch buffer, potentially
++    blocking other tasks from being consumed. To mitigate this, either set a high prefetch
++    count or avoid using quorum queues until the ETA mechanism is updated to support a
++    disabled global QoS, which is required for quorum queues.
++
++.. warning::
++
++    Quorum queues require confirm publish to be enabled.
++    Use :setting:`broker_transport_options` to enable confirm publish by setting:
++
++    .. code-block:: python
++
++        broker_transport_options = {"confirm_publish": True}
++
++    For more information, see `RabbitMQ documentation <https://www.rabbitmq.com/docs/quorum-queues#use-cases>`_.
++
+ .. setting:: task_default_exchange
+ 
+ ``task_default_exchange``
+@@ -3225,6 +3263,18 @@ are recorded as such in the result backend as long as :setting:`task_ignore_resu
+     will be set to ``True`` by default as the current behavior leads to more
+     problems than it solves.
+ 
++.. setting:: worker_detect_quorum_queues
++
++``worker_detect_quorum_queues``
++~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
++
++.. versionadded:: 5.5
++
++Default: Enabled.
++
++Automatically detect if any of the queues in :setting:`task_queues` are quorum queues
++(including the :setting:`task_default_queue`) and disable the global QoS if any quorum queue is detected.
++
+ .. _conf-events:
+ 
+ Events
+diff --git a/examples/quorum-queues/declare_queue.py b/examples/quorum-queues/declare_queue.py
+new file mode 100755
+index 00000000000..4eaff0b88cb
+--- /dev/null
++++ b/examples/quorum-queues/declare_queue.py
+@@ -0,0 +1,15 @@
++"""Create a quorum queue using Kombu."""
++
++from kombu import Connection, Exchange, Queue
++
++my_quorum_queue = Queue(
++    "my-quorum-queue",
++    Exchange("default"),
++    routing_key="default",
++    queue_arguments={"x-queue-type": "quorum"},
++)
++
++with Connection("amqp://guest@localhost//") as conn:
++    channel = conn.channel()
++    my_quorum_queue.maybe_bind(conn)
++    my_quorum_queue.declare()
+diff --git a/examples/quorum-queues/myapp.py b/examples/quorum-queues/myapp.py
+new file mode 100644
+index 00000000000..41698f3ce0f
+--- /dev/null
++++ b/examples/quorum-queues/myapp.py
+@@ -0,0 +1,149 @@
++"""myapp.py
++
++Usage::
++
++   (window1)$ python myapp.py worker -l INFO
++
++   (window2)$ celery shell
++   >>> from myapp import example
++   >>> example()
++
++
++You can also specify the app to use with the `celery` command,
++using the `-A` / `--app` option::
++
++    $ celery -A myapp worker -l INFO
++
++With the `-A myproj` argument the program will search for an app
++instance in the module ``myproj``.  You can also specify an explicit
++name using the fully qualified form::
++
++    $ celery -A myapp:app worker -l INFO
++
++"""
++
++import os
++from datetime import UTC, datetime, timedelta
++
++from declare_queue import my_quorum_queue
++
++from celery import Celery
++from celery.canvas import group
++
++app = Celery("myapp", broker="amqp://guest@localhost//")
++
++# Use custom queue (Optional) or set the default queue type to "quorum"
++# app.conf.task_queues = (my_quorum_queue,)  # uncomment to use custom queue
++app.conf.task_default_queue_type = "quorum"  # comment to use classic queue
++
++# Required by Quorum Queues: https://www.rabbitmq.com/docs/quorum-queues#use-cases
++app.conf.broker_transport_options = {"confirm_publish": True}
++
++# Reduce qos to 4 (Optional, useful for testing)
++app.conf.worker_prefetch_multiplier = 1
++app.conf.worker_concurrency = 4
++
++# Reduce logs (Optional, useful for testing)
++app.conf.worker_heartbeat = None
++app.conf.broker_heartbeat = 0
++
++
++def is_using_quorum_queues(app) -> bool:
++    queues = app.amqp.queues
++    for qname in queues:
++        qarguments = queues[qname].queue_arguments or {}
++        if qarguments.get("x-queue-type") == "quorum":
++            return True
++
++    return False
++
++
++@app.task
++def add(x, y):
++    return x + y
++
++
++@app.task
++def identity(x):
++    return x
++
++
++def example():
++    queue = my_quorum_queue.name if my_quorum_queue in (app.conf.task_queues or {}) else "celery"
++
++    while True:
++        print("Celery Quorum Queue Example")
++        print("===========================")
++        print("1. Send a simple identity task")
++        print("1.1 Send an ETA identity task")
++        print("2. Send a group of add tasks")
++        print("3. Inspect the active queues")
++        print("4. Shutdown Celery worker")
++        print("Q. Quit")
++        print("Q! Exit")
++        choice = input("Enter your choice (1-4 or Q): ")
++
++        if choice == "1" or choice == "1.1":
++            queue_type = "Quorum" if is_using_quorum_queues(app) else "Classic"
++            payload = f"Hello, {queue_type} Queue!"
++            eta = datetime.now(UTC) + timedelta(seconds=30)
++            if choice == "1.1":
++                result = identity.si(payload).apply_async(queue=queue, eta=eta)
++            else:
++                result = identity.si(payload).apply_async(queue=queue)
++            print()
++            print(f"Task sent with ID: {result.id}")
++            print("Task type: identity")
++
++            if choice == "1.1":
++                print(f"ETA: {eta}")
++
++            print(f"Payload: {payload}")
++
++        elif choice == "2":
++            tasks = [
++                (1, 2),
++                (3, 4),
++                (5, 6),
++            ]
++            result = group(
++                add.s(*tasks[0]),
++                add.s(*tasks[1]),
++                add.s(*tasks[2]),
++            ).apply_async(queue=queue)
++            print()
++            print("Group of tasks sent.")
++            print(f"Group result ID: {result.id}")
++            for i, task_args in enumerate(tasks, 1):
++                print(f"Task {i} type: add")
++                print(f"Payload: {task_args}")
++
++        elif choice == "3":
++            active_queues = app.control.inspect().active_queues()
++            print()
++            print("Active queues:")
++            for worker, queues in active_queues.items():
++                print(f"Worker: {worker}")
++                for q in queues:
++                    print(f"  - {q['name']}")
++
++        elif choice == "4":
++            print("Shutting down Celery worker...")
++            app.control.shutdown()
++
++        elif choice.lower() == "q":
++            print("Quitting test()")
++            break
++
++        elif choice.lower() == "q!":
++            print("Exiting...")
++            os.abort()
++
++        else:
++            print("Invalid choice. Please enter a number between 1 and 4 or Q to quit.")
++
++        print("\n" + "#" * 80 + "\n")
++
++
++if __name__ == "__main__":
++    app.start()
+diff --git a/examples/quorum-queues/setup_cluster.sh b/examples/quorum-queues/setup_cluster.sh
+new file mode 100755
+index 00000000000..f59501e9277
+--- /dev/null
++++ b/examples/quorum-queues/setup_cluster.sh
+@@ -0,0 +1,117 @@
++#!/bin/bash
++
++ERLANG_COOKIE="MYSECRETCOOKIE"
++
++cleanup() {
++    echo "Stopping and removing existing RabbitMQ containers..."
++    docker stop rabbit1 rabbit2 rabbit3 2>/dev/null
++    docker rm rabbit1 rabbit2 rabbit3 2>/dev/null
++
++    echo "Removing existing Docker network..."
++    docker network rm rabbitmq-cluster 2>/dev/null
++}
++
++wait_for_container() {
++    local container_name=$1
++    local retries=20
++    local count=0
++
++    until [ "$(docker inspect -f {{.State.Running}} $container_name)" == "true" ]; do
++        sleep 1
++        count=$((count + 1))
++        if [ $count -ge $retries ]; then
++            echo "Error: Container $container_name did not start in time."
++            exit 1
++        fi
++    done
++}
++
++wait_for_rabbitmq() {
++    local container_name=$1
++    local retries=10
++    local count=0
++
++    until docker exec -it $container_name rabbitmqctl status; do
++        sleep 1
++        count=$((count + 1))
++        if [ $count -ge $retries ]; then
++            echo "Error: RabbitMQ in container $container_name did not start in time."
++            exit 1
++        fi
++    done
++}
++
++setup_cluster() {
++    echo "Creating Docker network for RabbitMQ cluster..."
++    docker network create rabbitmq-cluster
++
++    echo "Starting rabbit1 container..."
++    docker run -d --rm --name rabbit1 --hostname rabbit1 --net rabbitmq-cluster \
++        -e RABBITMQ_NODENAME=rabbit@rabbit1 \
++        -e RABBITMQ_ERLANG_COOKIE=$ERLANG_COOKIE \
++        --net-alias rabbit1 \
++        -p 15672:15672 -p 5672:5672 rabbitmq:3-management
++
++    sleep 5
++    wait_for_container rabbit1
++    wait_for_rabbitmq rabbit1
++
++    # echo "Installing netcat in rabbit1 for debugging purposes..."
++    # docker exec -it rabbit1 bash -c "apt-get update && apt-get install -y netcat"
++
++    echo "Starting rabbit2 container..."
++    docker run -d --rm --name rabbit2 --hostname rabbit2 --net rabbitmq-cluster \
++        -e RABBITMQ_NODENAME=rabbit@rabbit2 \
++        -e RABBITMQ_ERLANG_COOKIE=$ERLANG_COOKIE \
++        --net-alias rabbit2 \
++        -p 15673:15672 -p 5673:5672 rabbitmq:3-management
++
++    sleep 5
++    wait_for_container rabbit2
++    wait_for_rabbitmq rabbit2
++
++    # echo "Installing netcat in rabbit2 for debugging purposes..."
++    # docker exec -it rabbit2 bash -c "apt-get update && apt-get install -y netcat"
++
++    echo "Starting rabbit3 container..."
++    docker run -d --rm --name rabbit3 --hostname rabbit3 --net rabbitmq-cluster \
++        -e RABBITMQ_NODENAME=rabbit@rabbit3 \
++        -e RABBITMQ_ERLANG_COOKIE=$ERLANG_COOKIE \
++        --net-alias rabbit3 \
++        -p 15674:15672 -p 5674:5672 rabbitmq:3-management
++
++    sleep 5
++    wait_for_container rabbit3
++    wait_for_rabbitmq rabbit3
++
++    # echo "Installing netcat in rabbit3 for debugging purposes..."
++    # docker exec -it rabbit3 bash -c "apt-get update && apt-get install -y netcat"
++
++    echo "Joining rabbit2 to the cluster..."
++    docker exec -it rabbit2 rabbitmqctl stop_app
++    docker exec -it rabbit2 rabbitmqctl reset
++    docker exec -it rabbit2 rabbitmqctl join_cluster rabbit@rabbit1
++    if [ $? -ne 0 ]; then
++        echo "Error: Failed to join rabbit2 to the cluster."
++        exit 1
++    fi
++    docker exec -it rabbit2 rabbitmqctl start_app
++
++    echo "Joining rabbit3 to the cluster..."
++    docker exec -it rabbit3 rabbitmqctl stop_app
++    docker exec -it rabbit3 rabbitmqctl reset
++    docker exec -it rabbit3 rabbitmqctl join_cluster rabbit@rabbit1
++    if [ $? -ne 0 ]; then
++        echo "Error: Failed to join rabbit3 to the cluster."
++        exit 1
++    fi
++    docker exec -it rabbit3 rabbitmqctl start_app
++
++    echo "Verifying cluster status from rabbit1..."
++    docker exec -it rabbit1 rabbitmqctl cluster_status
++}
++
++cleanup
++setup_cluster
++
++echo "RabbitMQ cluster setup is complete."
+diff --git a/examples/quorum-queues/test_cluster.sh b/examples/quorum-queues/test_cluster.sh
+new file mode 100755
+index 00000000000..c0b36bce521
+--- /dev/null
++++ b/examples/quorum-queues/test_cluster.sh
+@@ -0,0 +1,41 @@
++#!/bin/bash
++
++QUEUE_NAME="my-quorum-queue"
++VHOST="/"
++
++remove_existing_queue() {
++  docker exec -it rabbit1 rabbitmqctl delete_queue $QUEUE_NAME
++}
++
++create_quorum_queue() {
++  docker exec -it rabbit1 rabbitmqadmin declare queue name=$QUEUE_NAME durable=true arguments='{"x-queue-type":"quorum"}'
++}
++
++verify_quorum_queue() {
++  docker exec -it rabbit1 rabbitmqctl list_queues name type durable auto_delete arguments | grep $QUEUE_NAME
++}
++
++send_test_message() {
++  docker exec -it rabbit1 rabbitmqadmin publish exchange=amq.default routing_key=$QUEUE_NAME payload='Hello, RabbitMQ!'
++}
++
++receive_test_message() {
++  docker exec -it rabbit1 rabbitmqadmin get queue=$QUEUE_NAME ackmode=ack_requeue_false
++}
++
++echo "Removing existing quorum queue if it exists..."
++remove_existing_queue
++
++echo "Creating quorum queue..."
++create_quorum_queue
++
++echo "Verifying quorum queue..."
++verify_quorum_queue
++
++echo "Sending test message..."
++send_test_message
++
++echo "Receiving test message..."
++receive_test_message
++
++echo "Quorum queue setup and message test completed successfully."
+diff --git a/t/smoke/tests/quorum_queues/__init__.py b/t/smoke/tests/quorum_queues/__init__.py
+new file mode 100644
+index 00000000000..e69de29bb2d
+diff --git a/t/smoke/tests/quorum_queues/conftest.py b/t/smoke/tests/quorum_queues/conftest.py
+new file mode 100644
+index 00000000000..9111a97dd5a
+--- /dev/null
++++ b/t/smoke/tests/quorum_queues/conftest.py
+@@ -0,0 +1,119 @@
++from __future__ import annotations
++
++import os
++
++import pytest
++from pytest_celery import RABBITMQ_PORTS, CeleryBrokerCluster, RabbitMQContainer, RabbitMQTestBroker, defaults
++from pytest_docker_tools import build, container, fxtr
++
++from celery import Celery
++from t.smoke.workers.dev import SmokeWorkerContainer
++
++###############################################################################
++# RabbitMQ Management Broker
++###############################################################################
++
++
++class RabbitMQManagementBroker(RabbitMQTestBroker):
++    def get_management_url(self) -> str:
++        """Opening this link during debugging allows you to see the
++        RabbitMQ management UI in your browser.
++
++        Usage from a test:
++        >>> celery_setup.broker.get_management_url()
++
++        Open from a browser and login with guest:guest.
++        """
++        ports = self.container.attrs["NetworkSettings"]["Ports"]
++        ip = ports["15672/tcp"][0]["HostIp"]
++        port = ports["15672/tcp"][0]["HostPort"]
++        return f"http://{ip}:{port}"
++
++
++@pytest.fixture
++def default_rabbitmq_broker_image() -> str:
++    return "rabbitmq:management"
++
++
++@pytest.fixture
++def default_rabbitmq_broker_ports() -> dict:
++    # Expose the management UI port
++    ports = RABBITMQ_PORTS.copy()
++    ports.update({"15672/tcp": None})
++    return ports
++
++
++@pytest.fixture
++def celery_rabbitmq_broker(default_rabbitmq_broker: RabbitMQContainer) -> RabbitMQTestBroker:
++    broker = RabbitMQManagementBroker(default_rabbitmq_broker)
++    yield broker
++    broker.teardown()
++
++
++@pytest.fixture
++def celery_broker_cluster(celery_rabbitmq_broker: RabbitMQTestBroker) -> CeleryBrokerCluster:
++    cluster = CeleryBrokerCluster(celery_rabbitmq_broker)
++    yield cluster
++    cluster.teardown()
++
++
++###############################################################################
++# Worker Configuration
++###############################################################################
++
++
++class QuorumWorkerContainer(SmokeWorkerContainer):
++    @classmethod
++    def log_level(cls) -> str:
++        return "INFO"
++
++    @classmethod
++    def worker_queue(cls) -> str:
++        return "celery"
++
++
++@pytest.fixture
++def default_worker_container_cls() -> type[SmokeWorkerContainer]:
++    return QuorumWorkerContainer
++
++
++@pytest.fixture(scope="session")
++def default_worker_container_session_cls() -> type[SmokeWorkerContainer]:
++    return QuorumWorkerContainer
++
++
++celery_dev_worker_image = build(
++    path=".",
++    dockerfile="t/smoke/workers/docker/dev",
++    tag="t/smoke/worker:dev",
++    buildargs=QuorumWorkerContainer.buildargs(),
++)
++
++
++default_worker_container = container(
++    image="{celery_dev_worker_image.id}",
++    ports=fxtr("default_worker_ports"),
++    environment=fxtr("default_worker_env"),
++    network="{default_pytest_celery_network.name}",
++    volumes={
++        # Volume: Worker /app
++        "{default_worker_volume.name}": defaults.DEFAULT_WORKER_VOLUME,
++        # Mount: Celery source
++        os.path.abspath(os.getcwd()): {
++            "bind": "/celery",
++            "mode": "rw",
++        },
++    },
++    wrapper_class=QuorumWorkerContainer,
++    timeout=defaults.DEFAULT_WORKER_CONTAINER_TIMEOUT,
++    command=fxtr("default_worker_command"),
++)
++
++
++@pytest.fixture
++def default_worker_app(default_worker_app: Celery) -> Celery:
++    app = default_worker_app
++    app.conf.broker_transport_options = {"confirm_publish": True}
++    app.conf.task_default_queue_type = "quorum"
++
++    return app
+diff --git a/t/smoke/tests/quorum_queues/test_quorum_queues.py b/t/smoke/tests/quorum_queues/test_quorum_queues.py
+new file mode 100644
+index 00000000000..7748dce982d
+--- /dev/null
++++ b/t/smoke/tests/quorum_queues/test_quorum_queues.py
+@@ -0,0 +1,36 @@
++import requests
++from pytest_celery import RESULT_TIMEOUT, CeleryTestSetup
++from requests.auth import HTTPBasicAuth
++
++from celery.canvas import group
++from t.integration.tasks import add, identity
++from t.smoke.tests.quorum_queues.conftest import RabbitMQManagementBroker
++
++
++class test_broker_configuration:
++    def test_queue_type(self, celery_setup: CeleryTestSetup):
++        broker: RabbitMQManagementBroker = celery_setup.broker
++        api = broker.get_management_url() + "/api/queues"
++        response = requests.get(api, auth=HTTPBasicAuth("guest", "guest"))
++        assert response.status_code == 200
++        res = response.json()
++        assert isinstance(res, list)
++        worker_queue = next((queue for queue in res if queue["name"] == celery_setup.worker.worker_queue), None)
++        assert worker_queue is not None, f'"{celery_setup.worker.worker_queue}" queue not found'
++        queue_type = worker_queue.get("type")
++        assert queue_type == "quorum", f'"{celery_setup.worker.worker_queue}" queue is not a quorum queue'
++
++
++class test_quorum_queues:
++    def test_signature(self, celery_setup: CeleryTestSetup):
++        sig = identity.si("test_signature").set(queue=celery_setup.worker.worker_queue)
++        assert sig.delay().get(timeout=RESULT_TIMEOUT) == "test_signature"
++
++    def test_group(self, celery_setup: CeleryTestSetup):
++        sig = group(
++            group(add.si(1, 1), add.si(2, 2)),
++            group([add.si(1, 1), add.si(2, 2)]),
++            group(s for s in [add.si(1, 1), add.si(2, 2)]),
++        )
++        res = sig.apply_async(queue=celery_setup.worker.worker_queue)
++        assert res.get(timeout=RESULT_TIMEOUT) == [2, 4, 2, 4, 2, 4]
+diff --git a/t/unit/app/test_amqp.py b/t/unit/app/test_amqp.py
+index acbeecea08a..1293eb5d15e 100644
+--- a/t/unit/app/test_amqp.py
++++ b/t/unit/app/test_amqp.py
+@@ -137,17 +137,19 @@ def test_with_max_priority(self, queues_kwargs, qname, q, expected):
+ 
+ class test_default_queues:
+ 
++    @pytest.mark.parametrize('default_queue_type', ['classic', 'quorum'])
+     @pytest.mark.parametrize('name,exchange,rkey', [
+         ('default', None, None),
+         ('default', 'exchange', None),
+         ('default', 'exchange', 'routing_key'),
+         ('default', None, 'routing_key'),
+     ])
+-    def test_setting_default_queue(self, name, exchange, rkey):
++    def test_setting_default_queue(self, name, exchange, rkey, default_queue_type):
+         self.app.conf.task_queues = {}
+         self.app.conf.task_default_exchange = exchange
+         self.app.conf.task_default_routing_key = rkey
+         self.app.conf.task_default_queue = name
++        self.app.conf.task_default_queue_type = default_queue_type
+         assert self.app.amqp.queues.default_exchange.name == exchange or name
+         queues = dict(self.app.amqp.queues)
+         assert len(queues) == 1
+@@ -156,6 +158,11 @@ def test_setting_default_queue(self, name, exchange, rkey):
+         assert queue.exchange.type == 'direct'
+         assert queue.routing_key == rkey or name
+ 
++        if default_queue_type == 'quorum':
++            assert queue.queue_arguments == {'x-queue-type': 'quorum'}
++        else:
++            assert queue.queue_arguments is None
++
+ 
+ class test_default_exchange:
+ 
+diff --git a/t/unit/worker/test_consumer.py b/t/unit/worker/test_consumer.py
+index 6613bd2a40e..3b8cb2a8322 100644
+--- a/t/unit/worker/test_consumer.py
++++ b/t/unit/worker/test_consumer.py
+@@ -9,14 +9,14 @@
+ 
+ from celery import bootsteps
+ from celery.contrib.testing.mocks import ContextMock
+-from celery.exceptions import WorkerShutdown, WorkerTerminate
++from celery.exceptions import CeleryWarning, WorkerShutdown, WorkerTerminate
+ from celery.utils.collections import LimitedSet
+ from celery.worker.consumer.agent import Agent
+ from celery.worker.consumer.consumer import CANCEL_TASKS_BY_DEFAULT, CLOSE, TERMINATE, Consumer
+ from celery.worker.consumer.gossip import Gossip
+ from celery.worker.consumer.heart import Heart
+ from celery.worker.consumer.mingle import Mingle
+-from celery.worker.consumer.tasks import Tasks
++from celery.worker.consumer.tasks import ETA_TASKS_NO_GLOBAL_QOS_WARNING, Tasks
+ from celery.worker.state import active_requests
+ 
+ 
+@@ -543,8 +543,13 @@ def test_start_heartbeat_interval(self):
+ 
+ class test_Tasks:
+ 
++    def setup_method(self):
++        self.c = Mock()
++        self.c.app.conf.worker_detect_quorum_queues = True
++        self.c.connection.qos_semantics_matches_spec = False
++
+     def test_stop(self):
+-        c = Mock()
++        c = self.c
+         tasks = Tasks(c)
+         assert c.task_consumer is None
+         assert c.qos is None
+@@ -553,10 +558,59 @@ def test_stop(self):
+         tasks.stop(c)
+ 
+     def test_stop_already_stopped(self):
+-        c = Mock()
++        c = self.c
+         tasks = Tasks(c)
+         tasks.stop(c)
+ 
++    def test_detect_quorum_queues_positive(self):
++        c = self.c
++        c.app.amqp.queues = {"celery": Mock(queue_arguments={"x-queue-type": "quorum"})}
++        tasks = Tasks(c)
++        result, name = tasks.detect_quorum_queues(c)
++        assert result
++        assert name == "celery"
++
++    def test_detect_quorum_queues_negative(self):
++        c = self.c
++        c.app.amqp.queues = {"celery": Mock(queue_arguments=None)}
++        tasks = Tasks(c)
++        result, name = tasks.detect_quorum_queues(c)
++        assert not result
++        assert name == ""
++
++    def test_detect_quorum_queues_not_rabbitmq(self):
++        c = self.c
++        c.app.conf.broker_url = "redis://"
++        tasks = Tasks(c)
++        result, name = tasks.detect_quorum_queues(c)
++        assert not result
++        assert name == ""
++
++    def test_qos_global_worker_detect_quorum_queues_false(self):
++        c = self.c
++        c.app.conf.worker_detect_quorum_queues = False
++        tasks = Tasks(c)
++        assert tasks.qos_global(c) is True
++
++    def test_qos_global_worker_detect_quorum_queues_true_no_quorum_queues(self):
++        c = self.c
++        c.app.amqp.queues = {"celery": Mock(queue_arguments=None)}
++        tasks = Tasks(c)
++        assert tasks.qos_global(c) is True
++
++    def test_qos_global_worker_detect_quorum_queues_true_with_quorum_queues(self):
++        c = self.c
++        c.app.amqp.queues = {"celery": Mock(queue_arguments={"x-queue-type": "quorum"})}
++        tasks = Tasks(c)
++        assert tasks.qos_global(c) is False
++
++    def test_qos_global_eta_warning(self):
++        c = self.c
++        c.app.amqp.queues = {"celery": Mock(queue_arguments={"x-queue-type": "quorum"})}
++        tasks = Tasks(c)
++        with pytest.warns(CeleryWarning, match=ETA_TASKS_NO_GLOBAL_QOS_WARNING % "celery"):
++            tasks.qos_global(c)
++
+ 
+ class test_Agent:
+ 

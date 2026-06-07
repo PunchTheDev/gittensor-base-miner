@@ -1,0 +1,330 @@
+diff --git a/crates/engine/src/game/turns.rs b/crates/engine/src/game/turns.rs
+index 13ea8fc4a..749fbe18d 100644
+--- a/crates/engine/src/game/turns.rs
++++ b/crates/engine/src/game/turns.rs
+@@ -702,27 +702,21 @@ pub fn execute_untap_with_choices(
+         })
+         .collect();
+ 
+-    // CR 302.6: Also check intrinsic CantUntap statics on objects
+-    // (permanent "doesn't untap" from auras/enchantments).
++    // CR 502.3 + CR 604.1: Also check permanent-sourced CantUntap
++    // statics, including attached-subject restrictions from Auras/enchantments.
+     let intrinsic_cant_untap: HashSet<ObjectId> = state
+         .battlefield
+         .iter()
+         .copied()
+         .filter(|id| {
+             state.objects.get(id).is_some_and(|obj| {
+-                // CR 702.26b + CR 604.1: `active_static_definitions` owns the gating.
+                 obj.controller == active
+-                    && super::functioning_abilities::active_static_definitions(state, obj).any(
+-                        |sd| {
+-                            sd.mode == StaticMode::CantUntap
+-                                && super::static_abilities::check_static_ability(
+-                                    state,
+-                                    StaticMode::CantUntap,
+-                                    &super::static_abilities::StaticCheckContext {
+-                                        target_id: Some(*id),
+-                                        ..Default::default()
+-                                    },
+-                                )
++                    && super::static_abilities::check_static_ability(
++                        state,
++                        StaticMode::CantUntap,
++                        &super::static_abilities::StaticCheckContext {
++                            target_id: Some(*id),
++                            ..Default::default()
+                         },
+                     )
+             })
+@@ -3158,6 +3152,65 @@ mod tests {
+             .any(|e| matches!(e, GameEvent::PermanentUntapped { object_id } if *object_id == id)));
+     }
+ 
++    #[test]
++    fn execute_untap_honors_attached_subject_cant_untap_from_parser() {
++        use crate::game::effects::attach::attach_to;
++        use crate::types::card_type::CoreType;
++
++        let mut state = setup();
++        state.active_player = PlayerId(0);
++
++        let host = create_object(
++            &mut state,
++            CardId(1),
++            PlayerId(0),
++            "Locked Bear".to_string(),
++            Zone::Battlefield,
++        );
++        {
++            let obj = state.objects.get_mut(&host).unwrap();
++            obj.card_types.core_types.push(CoreType::Creature);
++            obj.base_card_types = obj.card_types.clone();
++            obj.tapped = true;
++        }
++
++        let aura = create_object(
++            &mut state,
++            CardId(2),
++            PlayerId(0),
++            "Flood the Engine".to_string(),
++            Zone::Battlefield,
++        );
++        {
++            let defs = crate::parser::oracle_static::parse_static_line_multi(
++                "Enchanted permanent loses all abilities and doesn't untap during its controller's untap step.",
++            );
++            let obj = state.objects.get_mut(&aura).unwrap();
++            obj.card_types.core_types.push(CoreType::Enchantment);
++            obj.card_types.subtypes.push("Aura".to_string());
++            obj.base_card_types = obj.card_types.clone();
++            for def in defs.iter().cloned() {
++                obj.static_definitions.push(def);
++            }
++            Arc::make_mut(&mut obj.base_static_definitions).extend(defs);
++        }
++        attach_to(&mut state, aura, host);
++
++        let mut events = Vec::new();
++        execute_untap(&mut state, &mut events);
++
++        assert!(
++            state.objects[&host].tapped,
++            "attached CantUntap static must keep the enchanted permanent tapped"
++        );
++        assert!(
++            !events.iter().any(|event| {
++                matches!(event, GameEvent::PermanentUntapped { object_id } if *object_id == host)
++            }),
++            "skipped untap must not emit PermanentUntapped"
++        );
++    }
++
+     fn install_may_choose_not_to_untap_static(state: &mut GameState, source_id: ObjectId) {
+         use crate::types::ability::StaticDefinition;
+         let def = StaticDefinition::new(StaticMode::MayChooseNotToUntap);
+diff --git a/crates/engine/src/parser/oracle_static/evasion.rs b/crates/engine/src/parser/oracle_static/evasion.rs
+index 0b55a90e9..b3b4ad4b4 100644
+--- a/crates/engine/src/parser/oracle_static/evasion.rs
++++ b/crates/engine/src/parser/oracle_static/evasion.rs
+@@ -584,6 +584,87 @@ pub(crate) fn try_split_and_cant_block(text: &str) -> Option<Vec<StaticDefinitio
+     Some(defs)
+ }
+ 
++/// CR 502.3: Decompose `"<continuous grant> and doesn't untap during [its
++/// controller's] untap step"` into the first conjunct's static(s) plus a
++/// `CantUntap` static sharing the same `affected` (and any trailing "as long
++/// as …" condition).
++///
++/// Without this split the trailing untap restriction was dropped: Flood the
++/// Engine ("Enchanted permanent loses all abilities and doesn't untap during
++/// its controller's untap step.") parsed to only the loses-all-abilities def,
++/// so the enchanted permanent untapped normally — the lock vanished. Mirrors
++/// `try_split_and_cant_block`. Requiring a recognized untap-step phrase keeps
++/// this disjoint from the one-time "during their next untap step" effect, and
++/// the `defs.is_empty()` guard leaves the "enters tapped and doesn't untap"
++/// replacement+static compound (issue #292) to its own earlier carve-out.
++pub(crate) fn try_split_and_doesnt_untap(text: &str) -> Option<Vec<StaticDefinition>> {
++    type VE<'a> = OracleError<'a>;
++    let lower = text.to_lowercase();
++
++    let (before, _matched, rest) = nom_primitives::scan_preceded(&lower, |i: &str| {
++        // Match both the ASCII and typographic U+2019 apostrophe.
++        let (i, _) = alt((
++            tag::<_, _, VE>("and doesn't untap during"),
++            tag::<_, _, VE>("and doesn\u{2019}t untap during"),
++        ))
++        .parse(i)?;
++        // Require a recognized permanent-static untap-step phrase to follow, so
++        // we only split the standing form (not a one-time "during their next
++        // untap step", which is an effect, not a CantUntap static).
++        let (i, _) = preceded(
++            space0,
++            alt((
++                tag::<_, _, VE>("its controller's untap step"),
++                tag::<_, _, VE>("its controller\u{2019}s untap step"),
++                tag::<_, _, VE>("their controllers' untap steps"),
++                tag::<_, _, VE>("their controllers\u{2019} untap steps"),
++                tag::<_, _, VE>("your untap step"),
++            )),
++        )
++        .parse(i)?;
++        Ok((i, ()))
++    })?;
++
++    // CR 502.3: only split when the untap clause is terminal or carries a
++    // recognized "as long as …"/"if …" rider (routed to the companion below).
++    // Decline any other trailing clause ("… untap step, then …") rather than
++    // silently dropping it — parity with the sibling `try_split_and_cant_block`
++    // terminal guard.
++    let tail = rest.trim_start().trim_end_matches('.').trim();
++    let recognized_rider = tail.is_empty()
++        || alt((tag::<_, _, VE>("as long as "), tag::<_, _, VE>("if ")))
++            .parse(tail)
++            .is_ok();
++    if !recognized_rider {
++        return None;
++    }
++
++    let cut_end = before
++        .trim_end_matches(|ch: char| ch == ',' || ch.is_whitespace())
++        .len();
++    let line_a = format!("{}.", text[..cut_end].trim_end_matches('.'));
++    let mut defs = parse_static_line_multi(&line_a);
++    if defs.is_empty() {
++        return None;
++    }
++    for def in &mut defs {
++        def.description = Some(text.to_string());
++    }
++
++    let affected = defs[0].affected.clone()?;
++    // CR 502.3: a trailing "as long as …"/"if …" rider on the untap clause
++    // belongs on the CantUntap companion; otherwise inherit the grant's gate.
++    let condition = extract_cant_untap_condition(&lower).or_else(|| defs[0].condition.clone());
++    let mut companion = StaticDefinition::new(StaticMode::CantUntap)
++        .affected(affected)
++        .description(text.to_string());
++    if let Some(condition) = condition {
++        companion = companion.condition(condition);
++    }
++    defs.push(companion);
++    Some(defs)
++}
++
+ /// CR 508.1c: Decompose `"<continuous grant> and can't attack"` into the first
+ /// conjunct's static(s) plus a `CantAttack` static sharing the same `affected`
+ /// (and any `condition`).
+diff --git a/crates/engine/src/parser/oracle_static/mod.rs b/crates/engine/src/parser/oracle_static/mod.rs
+index ed5cda88a..32d920e65 100644
+--- a/crates/engine/src/parser/oracle_static/mod.rs
++++ b/crates/engine/src/parser/oracle_static/mod.rs
+@@ -101,7 +101,8 @@ mod support {
+         parse_rule_static_separator_nom, try_parse_compound_subtypes,
+         try_parse_scoped_must_attack_block, try_split_and_can_attack_despite_defender,
+         try_split_and_can_block_additional, try_split_and_cant_attack,
+-        try_split_and_cant_be_blocked, try_split_and_cant_block, try_split_and_must_attack_block,
++        try_split_and_cant_be_blocked, try_split_and_cant_block, try_split_and_doesnt_untap,
++        try_split_and_must_attack_block,
+     };
+     pub(super) use super::grammar::*;
+     pub(super) use super::keyword_grant::{
+diff --git a/crates/engine/src/parser/oracle_static/shared.rs b/crates/engine/src/parser/oracle_static/shared.rs
+index 14da855b0..e87b692a5 100644
+--- a/crates/engine/src/parser/oracle_static/shared.rs
++++ b/crates/engine/src/parser/oracle_static/shared.rs
+@@ -630,6 +630,14 @@ pub(crate) fn parse_static_line_multi_inner(text: &str) -> Vec<StaticDefinition>
+         return defs;
+     }
+ 
++    // CR 502.3: "<grant> and doesn't untap during its controller's untap step"
++    // pairs a continuous grant with an untap restriction under one subject (Flood
++    // the Engine). Split so the CantUntap clause is not dropped. (The "enters
++    // tapped and doesn't untap" replacement+static compound is carved out earlier.)
++    if let Some(defs) = try_split_and_doesnt_untap(&stripped) {
++        return defs;
++    }
++
+     // CR 509.1b + CR 604.1 + CR 611.3a + CR 613.1f: Attached-subject grant lines
+     // ("enchanted creature ...", "equipped creature ...") may decompose into more
+     // than one StaticDefinition (e.g. CantBeBlocked + Continuous{AddKeyword}).
+diff --git a/crates/engine/src/parser/oracle_static/static_helpers.rs b/crates/engine/src/parser/oracle_static/static_helpers.rs
+index 177d08446..072a478b0 100644
+--- a/crates/engine/src/parser/oracle_static/static_helpers.rs
++++ b/crates/engine/src/parser/oracle_static/static_helpers.rs
+@@ -795,6 +795,7 @@ pub(crate) fn extract_cant_untap_condition(lower: &str) -> Option<StaticConditio
+         "its controller's untap step",
+         "its controller\u{2019}s untap step",
+         "their controllers' untap steps",
++        "their controllers\u{2019} untap steps",
+         "your untap step",
+     ];
+     let mut after_untap = None;
+diff --git a/crates/engine/src/parser/oracle_static/tests.rs b/crates/engine/src/parser/oracle_static/tests.rs
+index 438d1d137..0bfe8d615 100644
+--- a/crates/engine/src/parser/oracle_static/tests.rs
++++ b/crates/engine/src/parser/oracle_static/tests.rs
+@@ -173,6 +173,82 @@ fn cant_block_static_splits_self_reference() {
+     assert_eq!(cant.affected, Some(TargetFilter::SelfRef));
+ }
+ 
++/// CR 502.3: Flood the Engine — "Enchanted permanent loses all abilities and
++/// doesn't untap during its controller's untap step." must decompose into BOTH
++/// the loses-all-abilities grant AND a `CantUntap` static affecting the
++/// enchanted permanent. Previously the untap restriction was dropped, so the
++/// permanent untapped normally and the lock did nothing.
++#[test]
++fn doesnt_untap_static_splits_from_grant() {
++    let defs = parse_static_line_multi(
++        "Enchanted permanent loses all abilities and doesn't untap during its controller's untap step.",
++    );
++    assert!(
++        defs.iter().any(|d| d.mode == StaticMode::CantUntap),
++        "expected a CantUntap static, got {:?}",
++        defs.iter().map(|d| &d.mode).collect::<Vec<_>>()
++    );
++    assert!(
++        defs.iter()
++            .any(|d| matches!(d.mode, StaticMode::Continuous)),
++        "the loses-all-abilities grant must be preserved"
++    );
++}
++
++/// CR 502.3: A P/T pump compounded with the untap restriction also splits, with
++/// the `CantUntap` static affecting the same subject.
++#[test]
++fn doesnt_untap_static_splits_from_pump() {
++    let defs = parse_static_line_multi(
++        "Enchanted creature gets +1/+1 and doesn't untap during its controller's untap step.",
++    );
++    let cant = defs
++        .iter()
++        .find(|d| d.mode == StaticMode::CantUntap)
++        .expect("expected a CantUntap static");
++    assert!(
++        cant.affected.is_some(),
++        "CantUntap companion must share the grant's affected set"
++    );
++    assert!(
++        defs.iter()
++            .any(|d| matches!(d.mode, StaticMode::Continuous)),
++        "the +1/+1 grant must be preserved"
++    );
++}
++
++/// CR 502.3: A trailing "as long as …" rider on the untap clause attaches to
++/// the `CantUntap` companion, not the grant.
++#[test]
++fn doesnt_untap_static_split_keeps_trailing_condition() {
++    let defs = parse_static_line_multi(
++        "Enchanted creature gets +1/+1 and doesn't untap during its controller's untap step as long as you control a Swamp.",
++    );
++    let cant = defs
++        .iter()
++        .find(|d| d.mode == StaticMode::CantUntap)
++        .expect("expected a CantUntap static");
++    assert!(
++        cant.condition.is_some(),
++        "the 'as long as …' rider must attach to the CantUntap companion"
++    );
++}
++
++/// CR 502.3: The split declines (rather than silently dropping a clause) when
++/// an unrecognized clause trails the untap-step phrase — parity with the
++/// sibling `try_split_and_cant_block` terminal guard.
++#[test]
++fn doesnt_untap_static_split_declines_unknown_tail() {
++    let defs = parse_static_line_multi(
++        "Enchanted creature gets +1/+1 and doesn't untap during its controller's untap step, then its controller loses 1 life.",
++    );
++    assert!(
++        !defs.iter().any(|d| d.mode == StaticMode::CantUntap),
++        "unrecognized trailing clause must make the split decline, got {:?}",
++        defs.iter().map(|d| &d.mode).collect::<Vec<_>>()
++    );
++}
++
+ /// CR 508.1c: Cagemail — "Enchanted creature gets +2/+2 and can't attack." must
+ /// decompose into BOTH the P/T grant AND a `CantAttack` static affecting the
+ /// enchanted creature. Previously the "can't attack" drawback was dropped,

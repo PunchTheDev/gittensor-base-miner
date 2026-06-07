@@ -1,0 +1,771 @@
+diff --git a/crates/engine/src/game/combat.rs b/crates/engine/src/game/combat.rs
+index 9d8d6dc8c6..ab158b1d44 100644
+--- a/crates/engine/src/game/combat.rs
++++ b/crates/engine/src/game/combat.rs
+@@ -1522,6 +1522,34 @@ fn attack_target_matches_defended_scope(
+ ///    override (CR 702.3b)
+ ///  - `has_summoning_sickness(obj)` (CR 302.6)
+ pub fn creature_must_attack(state: &GameState, obj_id: ObjectId) -> bool {
++    let attackable_players = attackable_player_targets(state);
++    creature_must_attack_with_attackable_players(state, obj_id, &attackable_players)
++}
++
++fn attackable_player_targets(state: &GameState) -> Vec<PlayerId> {
++    get_valid_attack_targets(state)
++        .into_iter()
++        .filter_map(|target| match target {
++            AttackTarget::Player(pid) => Some(pid),
++            _ => None,
++        })
++        .collect()
++}
++
++fn must_attack_players_for_creature(state: &GameState, obj: &GameObject) -> Vec<PlayerId> {
++    super::functioning_abilities::active_static_definitions(state, obj)
++        .filter_map(|sd| match sd.mode {
++            StaticMode::MustAttackPlayer { player } => Some(player),
++            _ => None,
++        })
++        .collect()
++}
++
++fn creature_must_attack_with_attackable_players(
++    state: &GameState,
++    obj_id: ObjectId,
++    attackable_players: &[PlayerId],
++) -> bool {
+     let Some(obj) = state.objects.get(&obj_id) else {
+         return false;
+     };
+@@ -1546,7 +1574,10 @@ pub fn creature_must_attack(state: &GameState, obj_id: ObjectId) -> bool {
+         );
+     // CR 701.15b: Goaded creatures must attack each combat if able.
+     let is_goaded = !goading_players_for_creature(state, obj_id).is_empty();
+-    if !has_must_attack && !is_goaded {
++    let has_attackable_must_attack_player = must_attack_players_for_creature(state, obj)
++        .iter()
++        .any(|player| attackable_players.contains(player));
++    if !has_must_attack && !is_goaded && !has_attackable_must_attack_player {
+         return false;
+     }
+     // Exemptions: tapped, defender (no override), summoning sick.
+@@ -1587,13 +1618,14 @@ pub fn declare_attackers(
+ ) -> Result<(), String> {
+     let attacker_ids: Vec<ObjectId> = attacks.iter().map(|(id, _)| *id).collect();
+     validate_attackers(state, &attacker_ids)?;
++    let attackable_players = attackable_player_targets(state);
+ 
+     // CR 508.1d / CR 701.15b: Creatures that must attack each combat if able.
+     // `creature_must_attack` is the single authority for the requirement +
+     // exemption logic; this loop only adds the "already declared?" check and
+     // the rejection error text.
+     for &obj_id in &state.battlefield {
+-        if !creature_must_attack(state, obj_id) {
++        if !creature_must_attack_with_attackable_players(state, obj_id, &attackable_players) {
+             continue;
+         }
+         // Already declared as attacker — constraint satisfied
+@@ -1683,14 +1715,6 @@ pub fn declare_attackers(
+     // legal. The previous check counted every non-eliminated player, wrongly
+     // forcing the creature off a goading player toward a target it could not
+     // actually attack.
+-    let attackable_players: Vec<PlayerId> = get_valid_attack_targets(state)
+-        .into_iter()
+-        .filter_map(|target| match target {
+-            AttackTarget::Player(pid) => Some(pid),
+-            _ => None,
+-        })
+-        .collect();
+-
+     for (attacker_id, target) in attacks {
+         if let AttackTarget::Player(defending_pid) = target {
+             let goading_players = goading_players_for_creature(state, *attacker_id);
+@@ -1713,6 +1737,30 @@ pub fn declare_attackers(
+         }
+     }
+ 
++    // CR 508.1b + CR 508.1d: MustAttackPlayer requires attacking the specified
++    // player directly when that player is a legal attack target. CR 508.5 maps
++    // planeswalker/battle attacks to a defending player for effects that ask for
++    // "defending player"; it does not make "attack a planeswalker that player
++    // controls" satisfy an effect that specifically says to attack that player.
++    for (attacker_id, target) in attacks {
++        let Some(obj) = state.objects.get(attacker_id) else {
++            continue;
++        };
++        for req_player in must_attack_players_for_creature(state, obj) {
++            // Only enforce when the creature can legally attack the required player.
++            if !attackable_players.contains(&req_player) {
++                continue;
++            }
++            let attacks_required_player =
++                matches!(target, AttackTarget::Player(pid) if *pid == req_player);
++            if !attacks_required_player {
++                return Err(format!(
++                    "{attacker_id:?} must attack {req_player:?} this combat if able (CR 508.1d)"
++                ));
++            }
++        }
++    }
++
+     // CR 508.1f: Tap attackers. CR 508.1k: Creatures become attacking creatures.
+     for &id in &attacker_ids {
+         if let Some(obj) = state.objects.get_mut(&id) {
+@@ -2680,6 +2728,24 @@ mod tests {
+         id
+     }
+ 
++    fn create_planeswalker(state: &mut GameState, owner: PlayerId, name: &str) -> ObjectId {
++        let id = create_object(
++            state,
++            CardId(state.next_object_id),
++            owner,
++            name.to_string(),
++            crate::types::zones::Zone::Battlefield,
++        );
++        state
++            .objects
++            .get_mut(&id)
++            .unwrap()
++            .card_types
++            .core_types
++            .push(CoreType::Planeswalker);
++        id
++    }
++
+     #[test]
+     fn valid_attacker_succeeds() {
+         let mut state = setup();
+@@ -5166,6 +5232,84 @@ mod tests {
+         assert!(attacks_other_player.is_ok());
+     }
+ 
++    #[test]
++    fn must_attack_player_enforces_specific_player() {
++        // CR 508.1d: a creature with MustAttackPlayer{P2} must attack P2 when
++        // P2 is a legal target; attacking a different player is illegal.
++        let mut state = GameState::new(crate::types::format::FormatConfig::standard(), 3, 42);
++        state.turn_number = 2;
++        state.active_player = PlayerId(0);
++        state.phase = crate::types::phase::Phase::DeclareAttackers;
++        let attacker = create_creature(&mut state, PlayerId(0), "Lured Bear", 2, 2);
++        state
++            .objects
++            .get_mut(&attacker)
++            .unwrap()
++            .static_definitions
++            .push(StaticDefinition::new(StaticMode::MustAttackPlayer {
++                player: PlayerId(2),
++            }));
++
++        // Attacking the wrong player (P1) while P2 is a legal target: illegal.
++        let wrong = declare_attackers(
++            &mut state,
++            &[(attacker, AttackTarget::Player(PlayerId(1)))],
++            &mut vec![],
++        );
++        assert!(wrong.is_err());
++        assert!(wrong.unwrap_err().contains("must attack"));
++
++        // Attacking the required player (P2): legal.
++        let right = declare_attackers(
++            &mut state,
++            &[(attacker, AttackTarget::Player(PlayerId(2)))],
++            &mut vec![],
++        );
++        assert!(right.is_ok());
++    }
++
++    #[test]
++    fn must_attack_player_omitted_creature_fails() {
++        let mut state = setup_combat_phase();
++        let attacker = create_creature(&mut state, PlayerId(0), "Lured Bear", 2, 2);
++        state
++            .objects
++            .get_mut(&attacker)
++            .unwrap()
++            .static_definitions
++            .push(StaticDefinition::new(StaticMode::MustAttackPlayer {
++                player: PlayerId(1),
++            }));
++
++        let result = declare_attackers(&mut state, &[], &mut vec![]);
++        assert!(result.is_err());
++        assert!(result.unwrap_err().contains("must attack"));
++    }
++
++    #[test]
++    fn must_attack_player_requires_attacking_player_not_planeswalker() {
++        let mut state = setup_combat_phase();
++        let attacker = create_creature(&mut state, PlayerId(0), "Lured Bear", 2, 2);
++        state
++            .objects
++            .get_mut(&attacker)
++            .unwrap()
++            .static_definitions
++            .push(StaticDefinition::new(StaticMode::MustAttackPlayer {
++                player: PlayerId(1),
++            }));
++        let planeswalker = create_planeswalker(&mut state, PlayerId(1), "Required Player's Walker");
++
++        let result = declare_attackers(
++            &mut state,
++            &[(attacker, AttackTarget::Planeswalker(planeswalker))],
++            &mut vec![],
++        );
++
++        assert!(result.is_err());
++        assert!(result.unwrap_err().contains("must attack"));
++    }
++
+     #[test]
+     fn goad_enforcement_tapped_creature_exempt() {
+         let mut state = setup_combat_phase();
+diff --git a/crates/engine/src/game/coverage.rs b/crates/engine/src/game/coverage.rs
+index 88192b2a2e..50d7c79f8d 100644
+--- a/crates/engine/src/game/coverage.rs
++++ b/crates/engine/src/game/coverage.rs
+@@ -73,6 +73,10 @@ fn is_data_carrying_static(mode: &StaticMode) -> bool {
+             // the attacker that must be blocked (Provoke). Enforced by direct
+             // match in combat.rs declare-blockers validation.
+             | StaticMode::MustBlockAttacker { .. }
++            // CR 508.1d: MustAttackPlayer carries the `PlayerId` that must be
++            // attacked (Alluring Siren). Enforced by direct match in combat.rs
++            // declare-attackers validation.
++            | StaticMode::MustAttackPlayer { .. }
+             // CR 509.1b: CantBeBlockedByMoreThan carries the blocker maximum
+             // (Stalking Tiger). Enforced in combat.rs declare-blockers validation.
+             | StaticMode::CantBeBlockedByMoreThan { .. }
+@@ -1606,6 +1610,7 @@ fn effect_details(effect: &Effect) -> Vec<(String, String)> {
+         | Effect::PhaseOut { target }
+         | Effect::PhaseIn { target }
+         | Effect::ForceBlock { target }
++        | Effect::ForceAttack { target, .. }
+         | Effect::Transform { target }
+         | Effect::Shuffle { target }
+         | Effect::Reveal { target }
+diff --git a/crates/engine/src/game/effects/force_attack.rs b/crates/engine/src/game/effects/force_attack.rs
+new file mode 100644
+index 0000000000..a1755a3f60
+--- /dev/null
++++ b/crates/engine/src/game/effects/force_attack.rs
+@@ -0,0 +1,124 @@
++use super::{effect_object_targets, resolve_player_for_context_ref};
++use crate::types::ability::{
++    ContinuousModification, Effect, EffectError, EffectKind, ResolvedAbility, TargetFilter,
++};
++use crate::types::events::GameEvent;
++use crate::types::game_state::GameState;
++use crate::types::statics::StaticMode;
++
++/// CR 508.1d: Force attack — the target creature must attack the required player
++/// this turn/combat if able.
++pub fn resolve(
++    state: &mut GameState,
++    ability: &ResolvedAbility,
++    events: &mut Vec<GameEvent>,
++) -> Result<(), EffectError> {
++    let Effect::ForceAttack {
++        target,
++        required_player,
++        duration,
++    } = &ability.effect
++    else {
++        return Ok(());
++    };
++
++    let player = resolve_player_for_context_ref(state, ability, required_player);
++    for obj_id in effect_object_targets(target, &ability.targets) {
++        if !state.objects.contains_key(&obj_id) {
++            continue;
++        }
++
++        state.add_transient_continuous_effect(
++            ability.source_id,
++            ability.controller,
++            duration.clone(),
++            TargetFilter::SpecificObject { id: obj_id },
++            vec![ContinuousModification::AddStaticMode {
++                mode: StaticMode::MustAttackPlayer { player },
++            }],
++            None,
++        );
++    }
++
++    events.push(GameEvent::EffectResolved {
++        kind: EffectKind::ForceAttack,
++        source_id: ability.source_id,
++    });
++    Ok(())
++}
++
++#[cfg(test)]
++mod tests {
++    use super::*;
++    use crate::game::zones::create_object;
++    use crate::types::ability::{Duration, TargetRef};
++    use crate::types::identifiers::{CardId, ObjectId};
++    use crate::types::player::PlayerId;
++    use crate::types::zones::Zone;
++
++    fn make_force_attack_ability(
++        source: ObjectId,
++        target: ObjectId,
++        controller: PlayerId,
++        duration: Duration,
++    ) -> ResolvedAbility {
++        ResolvedAbility::new(
++            Effect::ForceAttack {
++                target: TargetFilter::Any,
++                required_player: TargetFilter::Controller,
++                duration,
++            },
++            vec![TargetRef::Object(target)],
++            source,
++            controller,
++        )
++    }
++
++    #[test]
++    fn force_attack_grants_must_attack_player_for_controller() {
++        let mut state = GameState::new_two_player(42);
++        let source = create_object(
++            &mut state,
++            CardId(1),
++            PlayerId(0),
++            "Siren".to_string(),
++            Zone::Battlefield,
++        );
++        let target = create_object(
++            &mut state,
++            CardId(2),
++            PlayerId(1),
++            "Bear".to_string(),
++            Zone::Battlefield,
++        );
++
++        let ability =
++            make_force_attack_ability(source, target, PlayerId(0), Duration::UntilEndOfCombat);
++        let mut events = Vec::new();
++        resolve(&mut state, &ability, &mut events).unwrap();
++
++        let effect = state
++            .transient_continuous_effects
++            .iter()
++            .find(|ce| ce.affected == TargetFilter::SpecificObject { id: target })
++            .expect("force attack should create a transient effect for the target");
++
++        assert_eq!(effect.duration, Duration::UntilEndOfCombat);
++        assert!(effect.modifications.iter().any(|m| {
++            matches!(
++                m,
++                ContinuousModification::AddStaticMode {
++                    mode: StaticMode::MustAttackPlayer { player },
++                } if *player == PlayerId(0)
++            )
++        }));
++
++        assert!(events.iter().any(|event| matches!(
++            event,
++            GameEvent::EffectResolved {
++                kind: EffectKind::ForceAttack,
++                source_id,
++            } if *source_id == source
++        )));
++    }
++}
+diff --git a/crates/engine/src/game/effects/mod.rs b/crates/engine/src/game/effects/mod.rs
+index c40b6dd3d3..2941b0f126 100644
+--- a/crates/engine/src/game/effects/mod.rs
++++ b/crates/engine/src/game/effects/mod.rs
+@@ -82,6 +82,7 @@ pub mod explore;
+ pub mod extra_turn;
+ pub mod fight;
+ pub mod flip_coin;
++pub mod force_attack;
+ pub mod force_block;
+ pub mod gain_control;
+ pub mod gift_delivery;
+@@ -1732,6 +1733,7 @@ pub fn resolve_effect(
+         Effect::PhaseOut { .. } => phase_out::resolve(state, ability, events),
+         Effect::PhaseIn { .. } => phase_out::resolve_phase_in(state, ability, events),
+         Effect::ForceBlock { .. } => force_block::resolve(state, ability, events),
++        Effect::ForceAttack { .. } => force_attack::resolve(state, ability, events),
+         Effect::SolveCase => solve_case::resolve(state, ability, events),
+         Effect::BecomePrepared { .. } => prepare::resolve_become_prepared(state, ability, events),
+         Effect::BecomeUnprepared { .. } => {
+@@ -2673,6 +2675,7 @@ fn extract_event_context_filter(effect: &Effect) -> Option<&TargetFilter> {
+         | Effect::Connive { target, .. }
+         | Effect::PhaseOut { target, .. }
+         | Effect::ForceBlock { target, .. }
++        | Effect::ForceAttack { target, .. }
+         | Effect::PutAtLibraryPosition { target, .. }
+         | Effect::PutOnTopOrBottom { target, .. }
+         | Effect::ChangeTargets { target, .. }
+diff --git a/crates/engine/src/game/printed_cards.rs b/crates/engine/src/game/printed_cards.rs
+index 37804483aa..abf4ea1632 100644
+--- a/crates/engine/src/game/printed_cards.rs
++++ b/crates/engine/src/game/printed_cards.rs
+@@ -745,6 +745,7 @@ fn walk_effect(effect: &Effect, out: &mut Vec<String>) {
+         | Effect::PhaseOut { .. }
+         | Effect::PhaseIn { .. }
+         | Effect::ForceBlock { .. }
++        | Effect::ForceAttack { .. }
+         | Effect::SolveCase
+         | Effect::BecomePrepared { .. }
+         | Effect::BecomeUnprepared { .. }
+diff --git a/crates/engine/src/game/trigger_index.rs b/crates/engine/src/game/trigger_index.rs
+index 2dc625ca4f..f156249a46 100644
+--- a/crates/engine/src/game/trigger_index.rs
++++ b/crates/engine/src/game/trigger_index.rs
+@@ -709,6 +709,7 @@ fn keys_from_effect_kind(kind: EffectKind, push: &mut impl FnMut(TriggerEventKey
+         | EffectKind::PhaseOut
+         | EffectKind::PhaseIn
+         | EffectKind::ForceBlock
++        | EffectKind::ForceAttack
+         | EffectKind::SolveCase
+         | EffectKind::BecomePrepared
+         | EffectKind::BecomeUnprepared
+diff --git a/crates/engine/src/parser/oracle_effect/imperative.rs b/crates/engine/src/parser/oracle_effect/imperative.rs
+index 8a8f24dde1..17fbb83e26 100644
+--- a/crates/engine/src/parser/oracle_effect/imperative.rs
++++ b/crates/engine/src/parser/oracle_effect/imperative.rs
+@@ -6477,6 +6477,11 @@ fn lower_imperative_family_effect(ast: ImperativeFamilyAst) -> Effect {
+         ImperativeFamilyAst::ForceBlock => Effect::ForceBlock {
+             target: TargetFilter::Any,
+         },
++        ImperativeFamilyAst::ForceAttack { duration } => Effect::ForceAttack {
++            target: TargetFilter::Any,
++            required_player: TargetFilter::Controller,
++            duration,
++        },
+         // CR 701.15a: Goad target creature. Subject injection fills target from parsed text.
+         ImperativeFamilyAst::Goad => Effect::Goad {
+             target: TargetFilter::Any,
+@@ -7020,15 +7025,11 @@ fn try_parse_adapt(lower: &str) -> Option<Effect> {
+     Some(Effect::Adapt { count })
+ }
+ 
+-/// CR 508.1d: Parse "attacks/attack [player] this turn/combat if able" as a temporary MustAttack.
++/// CR 508.1d: Parse "attacks/attack [player] this turn/combat if able" requirements.
+ ///
+-/// Handles bare forms ("attacks this turn if able") and player-targeted forms
+-/// ("attacks you this turn if able", "attacks that opponent this combat if able",
+-/// "attacks target opponent this turn if able"). The player target is currently
+-/// not enforced at runtime — MustAttack forces the creature to attack if able,
+-/// but the specific-player constraint requires additional engine support.
+-///
+-/// Emits a `GenericEffect` with `StaticMode::MustAttack` and the appropriate duration.
++/// Bare forms ("attacks this turn if able") emit a temporary `MustAttack`.
++/// Player-bound "attacks you ..." forms emit `ForceAttack`, whose resolver binds
++/// "you" to the resolving ability controller and grants `MustAttackPlayer`.
+ fn try_parse_attack_if_able(lower: &str) -> Option<ImperativeFamilyAst> {
+     let trimmed = lower.trim_end_matches('.');
+ 
+@@ -7059,51 +7060,34 @@ fn try_parse_attack_if_able(lower: &str) -> Option<ImperativeFamilyAst> {
+         }));
+     }
+ 
+-    // Second try: player-targeted forms — "attacks [player] this turn/combat if able".
+-    // Strip verb prefix, skip over the player phrase, then match the duration suffix.
+-    let rest = if let Ok((r, _)) =
+-        alt((tag::<_, _, OracleError<'_>>("attacks "), tag("attack "))).parse(trimmed)
+-    {
+-        r
+-    } else {
+-        return None;
+-    };
++    let targeted: Result<(&str, Duration), nom::Err<OracleError<'_>>> = (
++        alt((tag("attacks"), tag("attack"))),
++        preceded(tag(" "), tag("you")),
++        preceded(
++            tag(" "),
++            alt((
++                value(Duration::UntilEndOfTurn, tag("this turn if able")),
++                value(
++                    Duration::UntilEndOfCombat,
++                    alt((
++                        tag("this combat if able"),
++                        tag("that combat if able"),
++                        tag("each combat if able"),
++                    )),
++                ),
++            )),
++        ),
++    )
++        .map(|(_, _, duration)| duration)
++        .parse(trimmed);
+ 
+-    // Match duration suffix: "this turn if able" or "this combat if able"
+-    let duration_suffix: Result<(&str, Duration), nom::Err<OracleError<'_>>> = alt((
+-        value(Duration::UntilEndOfTurn, tag(" this turn if able")),
+-        value(Duration::UntilEndOfCombat, tag(" this combat if able")),
+-        value(Duration::UntilEndOfCombat, tag(" each combat if able")),
+-    ))
+-    .parse(rest);
+-
+-    // If a duration suffix is found somewhere in the remaining text,
+-    // the player phrase is whatever sits between the verb and the suffix.
+-    if duration_suffix.is_err() {
+-        // Try scanning for the suffix by finding it anywhere after the verb
+-        for (suffix_tag, dur) in [
+-            (" this turn if able", Duration::UntilEndOfTurn),
+-            (" this combat if able", Duration::UntilEndOfCombat),
+-            (" each combat if able", Duration::UntilEndOfCombat),
+-        ] {
+-            if rest.ends_with(suffix_tag) {
+-                return Some(ImperativeFamilyAst::GainKeyword(Effect::GenericEffect {
+-                    static_abilities: vec![must_attack_static_definition()],
+-                    duration: Some(dur),
+-                    target: None,
+-                }));
+-            }
++    if let Ok((rest, duration)) = targeted {
++        if rest.is_empty() {
++            return Some(ImperativeFamilyAst::ForceAttack { duration });
+         }
+-        return None;
+     }
+ 
+-    let (_, duration) = duration_suffix.ok()?;
+-
+-    Some(ImperativeFamilyAst::GainKeyword(Effect::GenericEffect {
+-        static_abilities: vec![must_attack_static_definition()],
+-        duration: Some(duration),
+-        target: None,
+-    }))
++    None
+ }
+ 
+ /// CR 508.1d: Build the `StaticDefinition` for a transient "attacks if able"
+@@ -9939,6 +9923,21 @@ mod tests {
+         }
+     }
+ 
++    #[test]
++    fn parse_attack_you_this_combat_if_able() {
++        let result = try_parse_attack_if_able("attacks you this combat if able");
++        assert!(
++            result.is_some(),
++            "Should parse 'attacks you this combat if able'"
++        );
++        match result.unwrap() {
++            ImperativeFamilyAst::ForceAttack { duration } => {
++                assert_eq!(duration, Duration::UntilEndOfCombat);
++            }
++            other => panic!("Expected ForceAttack, got {other:?}"),
++        }
++    }
++
+     /// CR 508.1d / CR 509.1c: the standalone-combat-requirement recognizer
+     /// used to gate the conjunction split. Recognizes both attack and
+     /// must-be-blocked forms, and rejects non-requirements.
+diff --git a/crates/engine/src/parser/oracle_effect/mod.rs b/crates/engine/src/parser/oracle_effect/mod.rs
+index 3060410653..0682bdb91f 100644
+--- a/crates/engine/src/parser/oracle_effect/mod.rs
++++ b/crates/engine/src/parser/oracle_effect/mod.rs
+@@ -9070,6 +9070,7 @@ fn replace_target_with_parent(effect: &mut Effect) {
+         | Effect::Connive { target, .. }
+         | Effect::PhaseOut { target }
+         | Effect::ForceBlock { target }
++        | Effect::ForceAttack { target, .. }
+             if !matches!(target, TargetFilter::ParentTargetController) =>
+         {
+             *target = TargetFilter::ParentTarget;
+@@ -10173,6 +10174,7 @@ fn inject_subject_target(effect: &mut Effect, subject: &SubjectPhraseAst) {
+         | Effect::PhaseOut { target }
+         | Effect::PhaseIn { target }
+         | Effect::ForceBlock { target }
++        | Effect::ForceAttack { target, .. }
+         | Effect::Suspect { target }
+         | Effect::Goad { target }
+         | Effect::Mill { target, .. }
+@@ -12217,6 +12219,7 @@ fn rewrite_parent_targets_to_tracked_set(effect: &mut Effect) {
+         | Effect::Connive { target, .. }
+         | Effect::PhaseOut { target }
+         | Effect::ForceBlock { target }
++        | Effect::ForceAttack { target, .. }
+         | Effect::CastCopyOfCard { target, .. }
+         | Effect::CopyTokenOf { target, .. }
+         | Effect::PutCounter { target, .. }
+@@ -12443,6 +12446,7 @@ pub(crate) fn each_target_filter_mut(effect: &mut Effect, f: &mut impl FnMut(&mu
+         | Effect::Connive { target, .. }
+         | Effect::PhaseOut { target }
+         | Effect::ForceBlock { target }
++        | Effect::ForceAttack { target, .. }
+         | Effect::Draw { target, .. }
+         | Effect::Discard { target, .. }
+         | Effect::Mill { target, .. }
+@@ -26852,6 +26856,23 @@ mod tests {
+         );
+     }
+ 
++    #[test]
++    fn force_attack_you_this_combat_targets_creature() {
++        let e = parse_effect("Target creature attacks you this combat if able");
++        assert!(
++            matches!(
++                e,
++                Effect::ForceAttack {
++                    target: TargetFilter::Typed(_),
++                    required_player: TargetFilter::Controller,
++                    duration: Duration::UntilEndOfCombat,
++                }
++            ),
++            "Expected ForceAttack with typed target and controller requirement, got {:?}",
++            e
++        );
++    }
++
+     #[test]
+     fn force_block_blocks_it_this_combat() {
+         // "target creature blocks it this combat if able" (e.g., Avalanche Tusker)
+diff --git a/crates/engine/src/parser/oracle_effect/sequence.rs b/crates/engine/src/parser/oracle_effect/sequence.rs
+index 89a707aa62..f41fc3e864 100644
+--- a/crates/engine/src/parser/oracle_effect/sequence.rs
++++ b/crates/engine/src/parser/oracle_effect/sequence.rs
+@@ -2894,6 +2894,7 @@ pub(super) fn clause_is_dig_lookback_transparent(effect: &Effect) -> bool {
+         | Effect::PhaseOut { .. }
+         | Effect::PhaseIn { .. }
+         | Effect::ForceBlock { .. }
++        | Effect::ForceAttack { .. }
+         | Effect::SolveCase
+         | Effect::BecomePrepared { .. }
+         | Effect::BecomeUnprepared { .. }
+diff --git a/crates/engine/src/parser/oracle_ir/ast.rs b/crates/engine/src/parser/oracle_ir/ast.rs
+index b2265f27e2..5bdd62794f 100644
+--- a/crates/engine/src/parser/oracle_ir/ast.rs
++++ b/crates/engine/src/parser/oracle_ir/ast.rs
+@@ -365,6 +365,10 @@ pub(crate) enum ImperativeFamilyAst {
+     Connive,
+     /// CR 509.1g: Block this turn if able.
+     ForceBlock,
++    /// CR 508.1d: Attack the source controller this turn/combat if able.
++    ForceAttack {
++        duration: Duration,
++    },
+     /// CR 701.15a: Goad target creature.
+     Goad,
+     /// CR 701.12a: Exchange control of two target permanents. Carries a distinct
+diff --git a/crates/engine/src/types/ability.rs b/crates/engine/src/types/ability.rs
+index adf5cefd5c..d2c194684e 100644
+--- a/crates/engine/src/types/ability.rs
++++ b/crates/engine/src/types/ability.rs
+@@ -6314,6 +6314,15 @@ pub enum Effect {
+         #[serde(default = "default_target_filter_any")]
+         target: TargetFilter,
+     },
++    /// CR 508.1d: Target creature must attack the required player this turn/combat if able.
++    ForceAttack {
++        #[serde(default = "default_target_filter_any")]
++        target: TargetFilter,
++        #[serde(default = "default_target_filter_controller")]
++        required_player: TargetFilter,
++        #[serde(default = "default_duration_until_end_of_turn")]
++        duration: Duration,
++    },
+     /// CR 719.2: Solve the source Case — it becomes solved.
+     SolveCase,
+     /// CR 702.xxx: Prepare (Strixhaven) — mark the target creature as prepared.
+@@ -7141,6 +7150,10 @@ fn default_quantity_one() -> QuantityExpr {
+     QuantityExpr::Fixed { value: 1 }
+ }
+ 
++fn default_duration_until_end_of_turn() -> Duration {
++    Duration::UntilEndOfTurn
++}
++
+ fn default_comparator_ge() -> Comparator {
+     Comparator::GE
+ }
+@@ -7753,6 +7766,7 @@ impl Effect {
+             | Effect::PhaseOut { target, .. }
+             | Effect::PhaseIn { target, .. }
+             | Effect::ForceBlock { target, .. }
++            | Effect::ForceAttack { target, .. }
+             | Effect::BecomePrepared { target, .. }
+             | Effect::BecomeUnprepared { target, .. }
+             | Effect::CastFromZone { target, .. }
+@@ -8072,6 +8086,7 @@ pub fn effect_variant_name(effect: &Effect) -> &str {
+         Effect::PhaseOut { .. } => "PhaseOut",
+         Effect::PhaseIn { .. } => "PhaseIn",
+         Effect::ForceBlock { .. } => "ForceBlock",
++        Effect::ForceAttack { .. } => "ForceAttack",
+         Effect::SolveCase => "SolveCase",
+         Effect::BecomePrepared { .. } => "BecomePrepared",
+         Effect::BecomeUnprepared { .. } => "BecomeUnprepared",
+@@ -8254,6 +8269,7 @@ pub enum EffectKind {
+     PhaseOut,
+     PhaseIn,
+     ForceBlock,
++    ForceAttack,
+     SolveCase,
+     /// CR 702.xxx: Prepare (Strixhaven) — mark target creature as prepared.
+     BecomePrepared,
+@@ -8447,6 +8463,7 @@ impl From<&Effect> for EffectKind {
+             Effect::PhaseOut { .. } => EffectKind::PhaseOut,
+             Effect::PhaseIn { .. } => EffectKind::PhaseIn,
+             Effect::ForceBlock { .. } => EffectKind::ForceBlock,
++            Effect::ForceAttack { .. } => EffectKind::ForceAttack,
+             Effect::SolveCase => EffectKind::SolveCase,
+             Effect::BecomePrepared { .. } => EffectKind::BecomePrepared,
+             Effect::BecomeUnprepared { .. } => EffectKind::BecomeUnprepared,
+diff --git a/crates/engine/src/types/statics.rs b/crates/engine/src/types/statics.rs
+index 120ef67a28..cd274cadb4 100644
+--- a/crates/engine/src/types/statics.rs
++++ b/crates/engine/src/types/statics.rs
+@@ -11,6 +11,7 @@ use super::identifiers::ObjectId;
+ use super::keywords::Keyword;
+ use super::mana::{ManaColor, ManaCost, StepEndManaAction};
+ use super::phase::Phase;
++use super::player::PlayerId;
+ use super::zones::Zone;
+ 
+ /// CR 109.5 + CR 102.1: The "who" axis of a continuous prohibition static.
+@@ -592,6 +593,16 @@ pub enum StaticMode {
+     /// runtime-implemented; other arms are inert.
+     PlayerProtection(super::keywords::ProtectionTarget),
+     MustAttack,
++    /// CR 508.1d: This creature must attack a *specific* player if able ("target
++    /// creature attacks you this combat if able"; Alluring Siren, Dulcet Sirens).
++    /// Unlike the generic
++    /// [`MustAttack`] (attack any defender), this carries the `PlayerId` that must
++    /// be attacked. Data-carrying variant — not registry-registered (see
++    /// `coverage::is_data_carrying_static`); enforced by direct pattern-match in
++    /// `combat.rs` declare-attackers validation. Mirrors [`MustBlockAttacker`].
++    MustAttackPlayer {
++        player: PlayerId,
++    },
+     MustBlock,
+     /// CR 702.39a / CR 509.1c: This creature must block a *specific* attacker if
+     /// able (Provoke; "target creature blocks ~ this turn if able"). Unlike the
+@@ -1074,6 +1085,7 @@ impl Hash for StaticMode {
+             }
+             StaticMode::ExtraBlockers { count } => count.hash(state),
+             StaticMode::MustBlockAttacker { attacker } => attacker.hash(state),
++            StaticMode::MustAttackPlayer { player } => player.hash(state),
+             StaticMode::MaxAttackersEachCombat { max }
+             | StaticMode::MaxBlockersEachCombat { max } => max.hash(state),
+             StaticMode::RevealTopOfLibrary { all_players } => all_players.hash(state),
+@@ -1204,6 +1216,9 @@ impl fmt::Display for StaticMode {
+                 write!(f, "PlayerProtection({target:?})")
+             }
+             StaticMode::MustAttack => write!(f, "MustAttack"),
++            StaticMode::MustAttackPlayer { player } => {
++                write!(f, "MustAttackPlayer({player:?})")
++            }
+             StaticMode::MustBlock => write!(f, "MustBlock"),
+             StaticMode::MustBlockAttacker { attacker } => {
+                 write!(f, "MustBlockAttacker({attacker:?})")
+diff --git a/crates/phase-ai/src/policies/redundancy_avoidance.rs b/crates/phase-ai/src/policies/redundancy_avoidance.rs
+index 612e457b84..aaa0152fbb 100644
+--- a/crates/phase-ai/src/policies/redundancy_avoidance.rs
++++ b/crates/phase-ai/src/policies/redundancy_avoidance.rs
+@@ -387,6 +387,7 @@ fn redundancy_delta(
+         | Effect::PhaseOut { .. }
+         | Effect::PhaseIn { .. }
+         | Effect::ForceBlock { .. }
++        | Effect::ForceAttack { .. }
+         | Effect::SolveCase
+         | Effect::SetClassLevel { .. }
+         | Effect::CreateDelayedTrigger { .. }

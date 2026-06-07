@@ -1,0 +1,424 @@
+diff --git a/src/github/app.ts b/src/github/app.ts
+index c9c1d1d3..46a6cb75 100644
+--- a/src/github/app.ts
++++ b/src/github/app.ts
+@@ -16,6 +16,10 @@ type CheckRunListResponse = {
+   }>;
+ };
+ 
++export type CheckRunOutcome =
++  | { kind: "published"; id: number; html_url?: string }
++  | { kind: "permission_missing"; warning: string };
++
+ export async function createInstallationToken(env: Env, installationId: number): Promise<string> {
+   const jwt = await createAppJwt(env);
+   const response = await fetch(`https://api.github.com/app/installations/${installationId}/access_tokens`, {
+@@ -65,47 +69,73 @@ export async function createOrUpdateCheckRun(
+   installationId: number,
+   repoFullName: string,
+   advisory: Advisory,
+-): Promise<CheckRunResponse | null> {
++  detailLevel: "minimal" | "standard" | "deep" = "minimal",
++): Promise<CheckRunOutcome | null> {
+   if (!advisory.headSha) return null;
+   const [owner, repo] = repoFullName.split("/");
+   if (!owner || !repo) throw new Error(`Invalid repository full name: ${repoFullName}`);
+ 
+   const token = await createInstallationToken(env, installationId);
+   const octokit = new Octokit({ auth: token });
+-  const output = formatCheckRunOutput(advisory);
++  const output = formatCheckRunOutput(advisory, detailLevel);
+ 
+-  const existing = await octokit.request("GET /repos/{owner}/{repo}/commits/{ref}/check-runs", {
+-    owner,
+-    repo,
+-    ref: advisory.headSha,
+-    check_name: "Gittensory",
+-    filter: "latest",
+-    per_page: 1,
+-  });
+-  const existingCheckRun = (existing.data as CheckRunListResponse).check_runs?.[0];
+-  if (existingCheckRun) {
+-    const response = await octokit.request("PATCH /repos/{owner}/{repo}/check-runs/{check_run_id}", {
++  try {
++    const existing = await octokit.request("GET /repos/{owner}/{repo}/commits/{ref}/check-runs", {
++      owner,
++      repo,
++      ref: advisory.headSha,
++      check_name: "Gittensory",
++      filter: "latest",
++      per_page: 1,
++    });
++    const existingCheckRun = (existing.data as CheckRunListResponse).check_runs?.[0];
++    if (existingCheckRun) {
++      const response = await octokit.request("PATCH /repos/{owner}/{repo}/check-runs/{check_run_id}", {
++        owner,
++        repo,
++        check_run_id: existingCheckRun.id,
++        name: "Gittensory",
++        status: "completed",
++        conclusion: advisory.conclusion,
++        output,
++      });
++      const data = response.data as CheckRunResponse;
++      return publishedOutcome(data);
++    }
++
++    const response = await octokit.request("POST /repos/{owner}/{repo}/check-runs", {
+       owner,
+       repo,
+-      check_run_id: existingCheckRun.id,
+       name: "Gittensory",
++      head_sha: advisory.headSha,
+       status: "completed",
+       conclusion: advisory.conclusion,
+       output,
+     });
+-    return response.data as CheckRunResponse;
++    const data = response.data as CheckRunResponse;
++    return publishedOutcome(data);
++  } catch (error) {
++    if (isCheckRunPermissionError(error)) {
++      return {
++        kind: "permission_missing",
++        warning: "GitHub App Checks: write permission is missing. Enable it in the GitHub App settings and re-approve the installation.",
++      };
++    }
++    throw error;
+   }
++}
+ 
+-  const response = await octokit.request("POST /repos/{owner}/{repo}/check-runs", {
+-    owner,
+-    repo,
+-    name: "Gittensory",
+-    head_sha: advisory.headSha,
+-    status: "completed",
+-    conclusion: advisory.conclusion,
+-    output,
+-  });
+-  return response.data as CheckRunResponse;
++function publishedOutcome(data: CheckRunResponse): CheckRunOutcome {
++  const outcome: { kind: "published"; id: number; html_url?: string } = { kind: "published", id: data.id };
++  if (data.html_url) outcome.html_url = data.html_url;
++  return outcome;
++}
++
++function isCheckRunPermissionError(error: unknown): boolean {
++  if (typeof error !== "object" || error === null) return false;
++  const e = error as { status?: number; message?: string };
++  if (e.status === 403) return true;
++  return typeof e.message === "string" && /resource not accessible by integration|not have permission/i.test(e.message);
+ }
+ 
+ export function getInstallationId(payload: GitHubWebhookPayload): number | null {
+diff --git a/src/queue/processors.ts b/src/queue/processors.ts
+index 6c8ab648..e5e3f931 100644
+--- a/src/queue/processors.ts
++++ b/src/queue/processors.ts
+@@ -776,14 +776,17 @@ async function maybePublishPrPublicSurface(
+     });
+   }
+   if (decision.willCheckRun && advisory.headSha) {
+-    await createOrUpdateCheckRun(env, installationId, repoFullName, {
+-      ...advisory,
+-      conclusion: "success",
+-      severity: "info",
+-      title: "Gittensory context posted",
+-      summary: "Gittensory posted public-safe contributor context.",
+-      findings: [],
+-    });
++    const checkRunResult = await createOrUpdateCheckRun(env, installationId, repoFullName, advisory, settings.checkRunDetailLevel);
++    if (checkRunResult?.kind === "permission_missing") {
++      await recordAuditEvent(env, {
++        eventType: "github_app.check_run_permission_missing",
++        actor: author,
++        targetKey: `${repoFullName}#${pr.number}`,
++        outcome: "error",
++        detail: checkRunResult.warning,
++        metadata: { deliveryId: webhook.deliveryId, repoFullName },
++      });
++    }
+   }
+   await recordAuditEvent(env, {
+     eventType: "github_app.pr_public_surface_published",
+diff --git a/src/rules/advisory.ts b/src/rules/advisory.ts
+index c63e8194..bca7e712 100644
+--- a/src/rules/advisory.ts
++++ b/src/rules/advisory.ts
+@@ -85,12 +85,43 @@ export function buildIssueAdvisory(repo: RepositoryRecord | null, issue: IssueRe
+   return advisory("issue", targetKey, repoFullName, findings, "Issue advisory generated.", undefined, issue?.number);
+ }
+ 
+-export function formatCheckRunOutput(advisoryResult: Advisory): { title: string; summary: string; text: string } {
+-  return {
+-    title: advisoryResult.conclusion === "success" ? "Gittensory context checked" : "Gittensory context posted",
+-    summary: "Gittensory public check output is intentionally minimal. Detailed maintainer context is available only through private API/MCP surfaces.",
+-    text: "No detailed findings are published in check runs.",
+-  };
++const CHECK_RUN_FORBIDDEN_TERMS = /\b(reward|payout|farming|estimated score|raw trust score|wallet|hotkey|coldkey|reviewability|scoreability|private signal)\b/gi;
++
++function sanitizeForCheckRun(text: string): string {
++  return text.replace(CHECK_RUN_FORBIDDEN_TERMS, "[context]").replace(/\s+/g, " ").trim();
++}
++
++export function formatCheckRunOutput(
++  advisoryResult: Advisory,
++  detailLevel: "minimal" | "standard" | "deep" = "minimal",
++): { title: string; summary: string; text: string } {
++  const title = advisoryResult.conclusion === "success" ? "Gittensory context checked" : "Gittensory context posted";
++  const summary = "Gittensory public check output is intentionally minimal. Detailed maintainer context is available only through private API/MCP surfaces.";
++
++  if (detailLevel === "minimal" || advisoryResult.findings.length === 0) {
++    return { title, summary, text: "No detailed findings are published in check runs." };
++  }
++
++  const publicLines = advisoryResult.findings.map((f) => {
++    const label = f.severity === "warning" ? "⚠️" : "ℹ️";
++    const text = f.publicText ? sanitizeForCheckRun(f.publicText) : sanitizeForCheckRun(f.title);
++    return `${label} ${text}`;
++  });
++
++  if (detailLevel === "standard") {
++    return { title, summary, text: publicLines.join("\n") };
++  }
++
++  // deep: include action hints for findings that carry publicText
++  const deepLines = advisoryResult.findings.flatMap((f) => {
++    const label = f.severity === "warning" ? "⚠️" : "ℹ️";
++    const text = f.publicText ? sanitizeForCheckRun(f.publicText) : sanitizeForCheckRun(f.title);
++    const lines = [`${label} ${text}`];
++    if (f.publicText && f.action) lines.push(`  → ${sanitizeForCheckRun(f.action)}`);
++    return lines;
++  });
++
++  return { title, summary, text: deepLines.join("\n") };
+ }
+ 
+ function addRepoFindings(repo: RepositoryRecord, findings: AdvisoryFinding[]): void {
+diff --git a/test/unit/github-app.test.ts b/test/unit/github-app.test.ts
+index 82cbd6f3..be3f6a30 100644
+--- a/test/unit/github-app.test.ts
++++ b/test/unit/github-app.test.ts
+@@ -57,7 +57,7 @@ describe("GitHub check runs", () => {
+ 
+     const result = await createOrUpdateCheckRun(env, 123, "JSONbored/gittensory", advisory);
+ 
+-    expect(result?.id).toBe(42);
++    expect(result).toMatchObject({ kind: "published", id: 42 });
+     expect(calls.some((url) => url.includes("/app/installations/123/access_tokens"))).toBe(true);
+     expect(calls.some((url) => url.includes("/repos/JSONbored/gittensory/check-runs"))).toBe(true);
+   });
+@@ -114,10 +114,140 @@ describe("GitHub check runs", () => {
+ 
+     const result = await createOrUpdateCheckRun(env, 123, "JSONbored/gittensory", advisory);
+ 
+-    expect(result?.id).toBe(42);
++    expect(result).toMatchObject({ kind: "published", id: 42 });
+     expect(methods.some((call) => call.startsWith("PATCH ") && call.includes("/check-runs/42"))).toBe(true);
+   });
+ 
++  it("returns permission_missing outcome when GitHub returns 403", async () => {
++    const privateKey = await generatePrivateKeyPem();
++    vi.stubGlobal("fetch", async (input: RequestInfo | URL) => {
++      const url = input.toString();
++      if (url.includes("/access_tokens")) return Response.json({ token: "installation-token" });
++      if (url.includes("/commits/")) return Response.json({ total_count: 0, check_runs: [] });
++      if (url.includes("/check-runs")) return new Response(JSON.stringify({ message: "Resource not accessible by integration" }), { status: 403 });
++      return new Response("not found", { status: 404 });
++    });
++
++    const env = createTestEnv({ GITHUB_APP_PRIVATE_KEY: privateKey });
++    const advisory: Advisory = {
++      id: "advisory-403",
++      targetType: "pull_request",
++      targetKey: "JSONbored/gittensory#5",
++      repoFullName: "JSONbored/gittensory",
++      pullNumber: 5,
++      headSha: "def456",
++      conclusion: "neutral",
++      severity: "warning",
++      title: "Gittensory advisory available",
++      summary: "1 advisory finding generated.",
++      findings: [],
++      generatedAt: "2026-05-22T00:00:00.000Z",
++    };
++
++    const result = await createOrUpdateCheckRun(env, 123, "JSONbored/gittensory", advisory);
++
++    expect(result).toMatchObject({ kind: "permission_missing" });
++    expect((result as { kind: string; warning: string }).warning).toMatch(/Checks: write/i);
++  });
++
++  it("publishes check run with standard detail level and includes public-safe finding text", async () => {
++    const privateKey = await generatePrivateKeyPem();
++    let capturedBody: { output?: { text?: string } } = {};
++    vi.stubGlobal("fetch", async (input: RequestInfo | URL, init?: RequestInit) => {
++      const url = input.toString();
++      if (url.includes("/access_tokens")) return Response.json({ token: "installation-token" });
++      if (url.includes("/commits/")) return Response.json({ total_count: 0, check_runs: [] });
++      if (url.includes("/check-runs")) {
++        capturedBody = JSON.parse(String(init?.body)) as { output?: { text?: string } };
++        return Response.json({ id: 77, html_url: "https://github.com/checks/77" }, { status: 201 });
++      }
++      return new Response("not found", { status: 404 });
++    });
++
++    const env = createTestEnv({ GITHUB_APP_PRIVATE_KEY: privateKey });
++    const advisory: Advisory = {
++      id: "advisory-std",
++      targetType: "pull_request",
++      targetKey: "JSONbored/gittensory#9",
++      repoFullName: "JSONbored/gittensory",
++      pullNumber: 9,
++      headSha: "bbb999",
++      conclusion: "neutral",
++      severity: "warning",
++      title: "Gittensory advisory available",
++      summary: "1 advisory finding generated.",
++      findings: [{ code: "missing_linked_issue", title: "No linked issue detected", severity: "warning", detail: "No closing reference." }],
++      generatedAt: "2026-05-22T00:00:00.000Z",
++    };
++
++    const result = await createOrUpdateCheckRun(env, 123, "JSONbored/gittensory", advisory, "standard");
++
++    expect(result).toMatchObject({ kind: "published", id: 77 });
++    expect(capturedBody.output?.text).toMatch(/⚠️/);
++    expect(capturedBody.output?.text).not.toMatch(/reward|wallet|hotkey|trust score|reviewability|farming/i);
++  });
++
++  it("returns permission_missing for message-based 422 permission errors", async () => {
++    const privateKey = await generatePrivateKeyPem();
++    vi.stubGlobal("fetch", async (input: RequestInfo | URL) => {
++      const url = input.toString();
++      if (url.includes("/access_tokens")) return Response.json({ token: "installation-token" });
++      if (url.includes("/commits/")) return Response.json({ total_count: 0, check_runs: [] });
++      if (url.includes("/check-runs")) {
++        return new Response(JSON.stringify({ message: "Resource not accessible by integration" }), { status: 422 });
++      }
++      return new Response("not found", { status: 404 });
++    });
++
++    const env = createTestEnv({ GITHUB_APP_PRIVATE_KEY: privateKey });
++    const advisory: Advisory = {
++      id: "advisory-422",
++      targetType: "pull_request",
++      targetKey: "JSONbored/gittensory#6",
++      repoFullName: "JSONbored/gittensory",
++      pullNumber: 6,
++      headSha: "fff111",
++      conclusion: "neutral",
++      severity: "warning",
++      title: "Gittensory advisory available",
++      summary: "1 advisory finding generated.",
++      findings: [],
++      generatedAt: "2026-05-22T00:00:00.000Z",
++    };
++
++    const result = await createOrUpdateCheckRun(env, 123, "JSONbored/gittensory", advisory);
++    expect(result).toMatchObject({ kind: "permission_missing" });
++  });
++
++  it("rethrows non-permission errors from the check-run API", async () => {
++    const privateKey = await generatePrivateKeyPem();
++    vi.stubGlobal("fetch", async (input: RequestInfo | URL) => {
++      const url = input.toString();
++      if (url.includes("/access_tokens")) return Response.json({ token: "installation-token" });
++      if (url.includes("/commits/")) return Response.json({ total_count: 0, check_runs: [] });
++      if (url.includes("/check-runs")) return new Response("internal server error", { status: 500 });
++      return new Response("not found", { status: 404 });
++    });
++
++    const env = createTestEnv({ GITHUB_APP_PRIVATE_KEY: privateKey });
++    const advisory: Advisory = {
++      id: "advisory-500",
++      targetType: "pull_request",
++      targetKey: "JSONbored/gittensory#7",
++      repoFullName: "JSONbored/gittensory",
++      pullNumber: 7,
++      headSha: "aaa000",
++      conclusion: "neutral",
++      severity: "warning",
++      title: "Gittensory advisory available",
++      summary: "1 advisory finding generated.",
++      findings: [],
++      generatedAt: "2026-05-22T00:00:00.000Z",
++    };
++
++    await expect(createOrUpdateCheckRun(env, 123, "JSONbored/gittensory", advisory)).rejects.toThrow();
++  });
++
+   it("skips check creation when no head SHA is available", async () => {
+     const result = await createOrUpdateCheckRun(createTestEnv(), 123, "JSONbored/gittensory", {
+       id: "advisory-3",
+diff --git a/test/unit/rules.test.ts b/test/unit/rules.test.ts
+index 99120598..4963e9e0 100644
+--- a/test/unit/rules.test.ts
++++ b/test/unit/rules.test.ts
+@@ -193,6 +193,66 @@ describe("advisory rules", () => {
+     expect(formatCheckRunOutput({ ...uncachedPr, findings: [] }).text).toContain("No detailed findings are published");
+   });
+ 
++  it("formatCheckRunOutput respects detailLevel — minimal always omits findings text", () => {
++    const pr: PullRequestRecord = {
++      repoFullName: repo.fullName,
++      number: 50,
++      title: "PR with findings",
++      state: "open",
++      authorLogin: "contributor",
++      authorAssociation: "NONE",
++      labels: [],
++      linkedIssues: [],
++    };
++    const advisory = buildPullRequestAdvisory(repo, pr, { requireLinkedIssue: true, otherOpenPullRequests: [] });
++    expect(advisory.findings.length).toBeGreaterThan(0);
++
++    const minimal = formatCheckRunOutput(advisory, "minimal");
++    expect(minimal.text).toContain("No detailed findings are published");
++
++    const standard = formatCheckRunOutput(advisory, "standard");
++    expect(standard.text).not.toContain("No detailed findings are published");
++    expect(standard.text).toMatch(/⚠️|ℹ️/);
++
++    const deep = formatCheckRunOutput(advisory, "deep");
++    expect(deep.text).not.toContain("No detailed findings are published");
++    expect(deep.text).toMatch(/⚠️|ℹ️/);
++  });
++
++  it("formatCheckRunOutput sanitizes forbidden terms at every detail level", () => {
++    const poisonedAdvisory = buildPullRequestAdvisory(repo, null);
++    const poisoned = {
++      ...poisonedAdvisory,
++      findings: [
++        {
++          code: "test_finding",
++          title: "reward wallet hotkey trust score reviewability",
++          severity: "warning" as const,
++          detail: "private detail",
++          publicText: "reward and farming content near wallet hotkey",
++          action: "Check your scoreability and reviewability",
++        },
++      ],
++    };
++    for (const level of ["minimal", "standard", "deep"] as const) {
++      const out = formatCheckRunOutput(poisoned, level);
++      expect(out.title).not.toMatch(/reward|wallet|hotkey|trust score|reviewability|scoreability|farming/i);
++      expect(out.summary).not.toMatch(/reward|wallet|hotkey|trust score|reviewability|scoreability|farming/i);
++      expect(out.text).not.toMatch(/reward|wallet|hotkey|trust score|reviewability|scoreability|farming/i);
++    }
++  });
++
++  it("classifies critical-severity findings as action_required", () => {
++    const advisory = buildPullRequestAdvisory(null, null);
++    const withCritical = {
++      ...advisory,
++      findings: [{ code: "critical_test", title: "Critical finding", severity: "critical" as const, detail: "Something broke." }],
++    };
++    const output = formatCheckRunOutput(withCritical, "standard");
++    expect(output.title).toBe("Gittensory context posted");
++    expect(output.text).toMatch(/ℹ️|⚠️|Critical finding/);
++  });
++
+   it("separates issue-discovery-only issues from clean split-lane issue advisories", () => {
+     const issue: IssueRecord = {
+       repoFullName: repo.fullName,

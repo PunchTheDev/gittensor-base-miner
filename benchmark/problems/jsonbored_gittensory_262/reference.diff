@@ -1,0 +1,1347 @@
+diff --git a/package.json b/package.json
+index 5895666c..8df87416 100644
+--- a/package.json
++++ b/package.json
+@@ -20,7 +20,7 @@
+     "drizzle:generate": "drizzle-kit generate",
+     "build:mcp": "npm --workspace @jsonbored/gittensory-mcp run build",
+     "test:mcp-pack": "node scripts/check-mcp-package.mjs",
+-    "actionlint": "github-actionlint .github/workflows/*.yml",
++    "actionlint": "node scripts/actionlint.mjs",
+     "ui:dev": "npm run ui:preview",
+     "extension:build": "node scripts/build-extension.mjs",
+     "ui:build": "npm run ui:openapi && npm run extension:build && npm --workspace @jsonbored/gittensory-ui run build",
+diff --git a/scripts/actionlint.mjs b/scripts/actionlint.mjs
+new file mode 100644
+index 00000000..17952e8b
+--- /dev/null
++++ b/scripts/actionlint.mjs
+@@ -0,0 +1,16 @@
++import { execFileSync } from "node:child_process";
++import { readdirSync } from "node:fs";
++import { join } from "node:path";
++
++const workflowDir = ".github/workflows";
++const files = readdirSync(workflowDir)
++  .filter((name) => name.endsWith(".yml") || name.endsWith(".yaml"))
++  .map((name) => join(workflowDir, name));
++
++if (files.length === 0) {
++  console.error(`No workflow files found in ${workflowDir}`);
++  process.exit(1);
++}
++
++const bin = process.platform === "win32" ? "github-actionlint.cmd" : "github-actionlint";
++execFileSync(bin, files, { stdio: "inherit", shell: process.platform === "win32" });
+diff --git a/scripts/check-mcp-release-due.mjs b/scripts/check-mcp-release-due.mjs
+index 213d44c6..9f848a07 100644
+--- a/scripts/check-mcp-release-due.mjs
++++ b/scripts/check-mcp-release-due.mjs
+@@ -1,4 +1,3 @@
+-#!/usr/bin/env node
+ import { execFileSync, spawnSync } from "node:child_process";
+ import { readFileSync, writeFileSync } from "node:fs";
+ import { resolve } from "node:path";
+diff --git a/scripts/github-type-label.mjs b/scripts/github-type-label.mjs
+index a39f5d77..c4852aa4 100644
+--- a/scripts/github-type-label.mjs
++++ b/scripts/github-type-label.mjs
+@@ -1,5 +1,3 @@
+-#!/usr/bin/env node
+-
+ import { readFile } from "node:fs/promises";
+ import { pathToFileURL } from "node:url";
+ 
+diff --git a/src/github/commands.ts b/src/github/commands.ts
+index 991cf02c..c20bf52f 100644
+--- a/src/github/commands.ts
++++ b/src/github/commands.ts
+@@ -8,6 +8,7 @@ import { buildCollisionReport, buildQueueHealth, type CollisionCluster, type Que
+ 
+ const PUBLIC_MENTION_COMMAND_CATALOG = [
+   { id: "help", title: "Gittensory command help", description: "Show public-safe @gittensory command help." },
++  { id: "ask", title: "Gittensory contribution context Q&A", description: "Answer contribution-quality questions from connected cached sources with citations." },
+   { id: "preflight", title: "Gittensory preflight", description: "Summarize public PR hygiene and validation readiness." },
+   { id: "blockers", title: "Gittensory readiness blockers", description: "Explain public-safe readiness blockers." },
+   { id: "duplicate-check", title: "Gittensory duplicate & WIP check", description: "Summarize duplicate and in-progress overlap caution." },
+@@ -35,6 +36,7 @@ type SnapshotCommandName = Exclude<GittensoryMentionCommandName, "help" | "miner
+ export type GittensoryMentionCommand = {
+   name: GittensoryMentionCommandName;
+   raw: string;
++  question?: string | undefined;
+ };
+ 
+ type PublicAnswerCard = {
+@@ -60,6 +62,7 @@ const AGENT_COMMAND_FEEDBACK_MARKER = "gittensory-agent-command-answer";
+ const COMMAND_TITLES = Object.fromEntries(GITTENSORY_MENTION_COMMAND_CATALOG.map((command) => [command.id, command.title])) as Record<GittensoryMentionCommandName, string>;
+ 
+ const REFRESH_SECTION_TITLES: Record<SnapshotCommandName, string> = {
++  ask: "Contribution context snapshot refresh",
+   preflight: "Preflight snapshot refresh",
+   blockers: "Blocker snapshot refresh",
+   "duplicate-check": "Duplicate-check snapshot refresh",
+@@ -70,6 +73,7 @@ const REFRESH_SECTION_TITLES: Record<SnapshotCommandName, string> = {
+ };
+ 
+ const EMPTY_SECTION_TITLES: Record<SnapshotCommandName, string> = {
++  ask: "Contribution context Q&A",
+   preflight: "Preflight summary",
+   blockers: "Readiness blockers",
+   "duplicate-check": "Duplicate & WIP caution",
+@@ -128,11 +132,12 @@ export type MaintainerQueueDigest = {
+ 
+ export function parseGittensoryMentionCommand(body: string | null | undefined): GittensoryMentionCommand | null {
+   if (!body) return null;
+-  const match = body.match(/(?:^|\s)@gittensory(?:\s+([a-z-]+))?/i);
++  const match = body.match(/(?:^|\s)@gittensory(?:\s+([a-z-]+))?([^\n\r]*)/i);
+   if (!match) return null;
+   const requested = (match[1]?.toLowerCase() || "help") as GittensoryMentionCommandName;
+   const name = COMMANDS.has(requested) ? requested : "help";
+-  return { name, raw: match[0].trim() };
++  const question = name === "ask" ? (match[2] ?? "").trim() : undefined;
++  return { name, raw: match[0].trim(), question: question && question.length > 0 ? question : undefined };
+ }
+ 
+ export function isMaintainerAssociation(association: string | null | undefined): boolean {
+@@ -192,13 +197,14 @@ export function buildPublicAgentCommandComment(args: {
+   maintainerDigest?: MaintainerQueueDigest | null | undefined;
+ }): string {
+   const repoFullName = args.repo?.fullName ?? args.pullRequest?.repoFullName ?? "this repository";
+-  const sections = commandSections(args.command.name, args.bundle, args.officialMiner, args.maintainerDigest);
++  const sections = commandSections(args.command.name, args.bundle, args.officialMiner, args.maintainerDigest, args.command.question);
+   const card = buildPublicAnswerCard({
+     command: args.command.name,
+     sections,
+     bundle: args.bundle,
+     officialMiner: args.officialMiner,
+     actorKind: args.actorKind,
++    question: args.command.name === "ask" ? args.command.question : undefined,
+   });
+   const body = [
+     AGENT_COMMAND_COMMENT_MARKER,
+@@ -221,7 +227,11 @@ function buildPublicAnswerCard(args: {
+   bundle: AgentRunBundle | null | undefined;
+   officialMiner: GittensorContributorSnapshot | null | undefined;
+   actorKind: "maintainer" | "author";
++  question?: string | undefined;
+ }): PublicAnswerCard {
++  if (args.command === "ask") {
++    return buildAskPublicAnswerCard(args);
++  }
+   const [titleLine, ...contentLines] = args.sections;
+   const safeContent = contentLines.map(stripBulletPrefix).filter((line) => line.length > 0);
+   const findings = safeContent.length > 0 ? safeContent.slice(0, 5) : ["No public-safe findings are available from the current cached context."];
+@@ -236,6 +246,61 @@ function buildPublicAnswerCard(args: {
+   };
+ }
+ 
++function buildAskPublicAnswerCard(args: {
++  bundle: AgentRunBundle | null | undefined;
++  officialMiner: GittensorContributorSnapshot | null | undefined;
++  actorKind: "maintainer" | "author";
++  question?: string | undefined;
++}): PublicAnswerCard {
++  const title = "Contribution context Q&A";
++  if (args.bundle?.run.status === "needs_snapshot_refresh") {
++    return {
++      title,
++      summary: commandSummary("ask"),
++      findings: [
++        stripEmphasis(REFRESH_SECTION_TITLES.ask),
++        "Gittensory is refreshing connected contribution-context snapshots (cached issues, PRs, signals, and decision packs). Try @gittensory ask again shortly.",
++      ],
++      evidence: commandEvidence("ask", args.bundle, args.officialMiner, args.actorKind),
++      nextActions: commandNextActions("ask", args.bundle),
++      sourceNotes: commandSourceNotes("ask", args.bundle, args.officialMiner),
++    };
++  }
++
++  const contributingSources = prioritizeAskSources(collectAskContributingSources(args.bundle));
++  const citationLines = contributingSources.slice(0, 8).map((source) => stripBulletPrefix(formatAskCitation(source)));
++  const answerLines = pickActions(args.bundle, () => true)
++    .slice(0, 3)
++    .map((action) => (action.targetRepoFullName ? `${action.targetRepoFullName}: ${action.publicSafeSummary}` : action.publicSafeSummary))
++    .filter((line) => line.trim().length > 0)
++    .map((line) => publicBlockerDetail(line));
++  const questionText = sanitizePublicComment(
++    args.question?.trim() || "No specific question was provided; this response summarizes the closest cached contribution context.",
++  );
++  const findings = [
++    `Question: ${questionText}`,
++    ...(answerLines.length > 0 ? answerLines : ["No matching contribution-quality context is available in the current cached sources."]),
++    ...(citationLines.length > 0 ? citationLines : ["No concrete cached source reference is available for this response."]),
++  ];
++  const sourceEvidence = contributingSources.slice(0, 3).map((source) => {
++    const observed = source.generatedAt ? ` as of ${source.generatedAt}` : "";
++    return `Connected source ${source.label} (${source.origin}): freshness ${source.freshness}${observed}.`;
++  });
++  return {
++    title,
++    summary: commandSummary("ask"),
++    findings,
++    evidence: [...commandEvidence("ask", args.bundle, args.officialMiner, args.actorKind), ...sourceEvidence],
++    nextActions: commandNextActions("ask", args.bundle),
++    sourceNotes: commandSourceNotes("ask", args.bundle, args.officialMiner),
++    safeDetails: [
++      ...(citationLines.length > 4 ? citationLines.slice(4) : []),
++      "README/docs context is included only when connected repo sources and app permissions allow it.",
++      "Source contents are not sent to optional AI unless explicitly enabled.",
++    ],
++  };
++}
++
+ function renderPublicAnswerCard(card: PublicAnswerCard): string[] {
+   const lines = [
+     `**${sanitizePublicComment(card.title)}**`,
+@@ -271,6 +336,8 @@ function commandSummary(command: GittensoryMentionCommandName): string {
+   switch (command) {
+     case "help":
+       return "Available public commands and their safest use on a PR thread.";
++    case "ask":
++      return "Contribution-context Q&A from connected cached sources, scoped to contribution quality and repository policy.";
+     case "miner-context":
+       return "Public miner context from official Gittensor data when available.";
+     case "preflight":
+@@ -307,6 +374,10 @@ function commandEvidence(
+   actorKind: "maintainer" | "author",
+ ): string[] {
+   const evidence = [`Invocation authorized for ${actorKind} command use.`, "Output is sanitized before posting to GitHub."];
++  if (command === "ask") {
++    evidence.push("Answer scope is limited to contribution quality and repository policy.");
++    evidence.push("Sources are cited with freshness and public-boundary redaction.");
++  }
+   if (command === "miner-context") {
+     evidence.push(officialMiner ? "Official Gittensor miner context was available." : "Official Gittensor miner context was unavailable.");
+   }
+@@ -321,10 +392,16 @@ function commandEvidence(
+ }
+ 
+ function commandNextActions(command: GittensoryMentionCommandName, bundle: AgentRunBundle | null | undefined): string[] {
+-  if (bundle?.run.status === "needs_snapshot_refresh") return ["Retry after the contributor decision snapshot refresh completes."];
++  if (bundle?.run.status === "needs_snapshot_refresh") {
++    return command === "ask"
++      ? ["Retry @gittensory ask after the contribution context snapshot refresh completes."]
++      : ["Retry after the contributor decision snapshot refresh completes."];
++  }
+   switch (command) {
+     case "help":
+       return ["Comment one listed command on the PR thread when more context is needed."];
++    case "ask":
++      return ["Ask one concrete contribution-quality question per command for clearer cited guidance."];
+     case "miner-context":
+       return ["Use MCP or the authenticated control panel for private contributor planning."];
+     case "preflight":
+@@ -362,6 +439,8 @@ function commandSourceNotes(
+   const source =
+     command === "help"
+       ? "static command catalog"
++      : command === "ask"
++        ? askCommandSourceSummary(bundle)
+       : command === "miner-context"
+         ? officialMiner
+           ? "official Gittensor miner API"
+@@ -380,7 +459,9 @@ function publicFreshness(bundle: AgentRunBundle | null | undefined, command: Git
+   if (command === "help") return "shipped command list";
+   if (isMaintainerQueueDigestCommand(command)) return "cached queue digest generated at invocation time";
+   if (!bundle) return "no agent run was required or available";
+-  if (bundle.run.status === "needs_snapshot_refresh") return "snapshot refresh in progress";
++  if (bundle.run.status === "needs_snapshot_refresh") {
++    return command === "ask" ? "contribution context snapshot refresh in progress" : "snapshot refresh in progress";
++  }
+   return `agent run status ${publicStatus(bundle.run.status)}`;
+ }
+ 
+@@ -412,10 +493,13 @@ function commandSections(
+   bundle: AgentRunBundle | null | undefined,
+   officialMiner: GittensorContributorSnapshot | null | undefined,
+   maintainerDigest: MaintainerQueueDigest | null | undefined,
++  question?: string | undefined,
+ ): string[] {
+   switch (command) {
+     case "help":
+       return helpSections();
++    case "ask":
++      return askSections(bundle, question);
+     case "miner-context":
+       return minerContextSections(officialMiner);
+     case "preflight":
+@@ -446,6 +530,7 @@ function helpSections(): string[] {
+     "**Commands**",
+     "",
+     "- `@gittensory help` shows this command list.",
++    "- `@gittensory ask <question>` answers contribution-quality Q&A with source citations and freshness.",
+     "- `@gittensory preflight` summarizes public PR hygiene.",
+     "- `@gittensory blockers` explains public readiness blockers.",
+     "- `@gittensory duplicate-check` summarizes duplicate/WIP caution.",
+@@ -462,6 +547,266 @@ function helpSections(): string[] {
+   ];
+ }
+ 
++type AskContributingSource = {
++  key: string;
++  label: string;
++  origin: string;
++  generatedAt: string | null;
++  freshness: string;
++  detail: string;
++};
++
++function askSections(bundle: AgentRunBundle | null | undefined, question?: string): string[] {
++  if (bundle?.run.status === "needs_snapshot_refresh") {
++    return refreshSections("ask");
++  }
++  const sourceReferences = askSourceReferences(bundle);
++  const cited = pickActions(bundle, () => true)
++    .slice(0, 4)
++    .map((action) => action.targetRepoFullName ? `${action.targetRepoFullName}: ${action.publicSafeSummary}` : action.publicSafeSummary)
++    .filter((line) => line.trim().length > 0)
++    .map((line) => `- ${publicBlockerDetail(line)}`);
++  return [
++    "**Contribution context Q&A**",
++    "",
++    `- Question: ${sanitizePublicComment(question?.trim() || "No specific question was provided; this response summarizes the closest cached contribution context.")}`,
++    "",
++    "**Answer**",
++    "",
++    ...(cited.length > 0 ? cited : ["- No matching contribution-quality context is available in the current cached sources."]),
++    "",
++    "**Citations**",
++    "",
++    ...(sourceReferences.length > 0 ? sourceReferences : ["- No concrete cached source reference is available for this response."]),
++    "",
++    "**Policy**",
++    "",
++    "- README/docs context is included only when connected repo sources and app permissions allow it.",
++    "- Source contents are not sent to optional AI unless explicitly enabled.",
++  ];
++}
++
++const ASK_SOURCE_DISPLAY_PRIORITY = [
++  "contributor_decision_pack",
++  "open_pr_monitor",
++  "repo_decision",
++  "github_cache",
++  "official_gittensor",
++  "repo_focus_manifest",
++  "upstream_ruleset",
++  "issue_quality",
++  "computed",
++  "mirror",
++  "metadata_only",
++  "cached_signals",
++] as const;
++
++function prioritizeAskSources(sources: AskContributingSource[]): AskContributingSource[] {
++  const rank = (origin: string) => {
++    const index = ASK_SOURCE_DISPLAY_PRIORITY.indexOf(origin as (typeof ASK_SOURCE_DISPLAY_PRIORITY)[number]);
++    return index >= 0 ? index : ASK_SOURCE_DISPLAY_PRIORITY.length;
++  };
++  return [...sources].sort((left, right) => rank(left.origin) - rank(right.origin) || left.label.localeCompare(right.label));
++}
++
++function askSourceReferences(bundle: AgentRunBundle | null | undefined): string[] {
++  return prioritizeAskSources(collectAskContributingSources(bundle)).slice(0, 8).map(formatAskCitation);
++}
++
++function collectAskContributingSources(bundle: AgentRunBundle | null | undefined): AskContributingSource[] {
++  if (!bundle) return [];
++  const collected: AskContributingSource[] = [];
++  const seen = new Set<string>();
++  const add = (entry: AskContributingSource | null | undefined) => {
++    if (!entry) return;
++    const dedupeKey = `${entry.key}|${entry.origin}|${entry.freshness}|${entry.generatedAt ?? ""}|${entry.detail}`;
++    if (seen.has(dedupeKey)) return;
++    seen.add(dedupeKey);
++    collected.push(entry);
++  };
++  for (const snapshot of bundle.contextSnapshots) {
++    for (const entry of askSourcesFromContextSnapshot(snapshot)) add(entry);
++  }
++  for (const action of bundle.actions) {
++    for (const entry of askSourcesFromActionEvidence(action)) add(entry);
++  }
++  return collected;
++}
++
++function askCommandSourceSummary(bundle: AgentRunBundle | null | undefined): string {
++  const sources = collectAskContributingSources(bundle);
++  if (sources.length === 0) return "cached Gittensory agent context (no connected-source metadata in this run)";
++  return sources
++    .slice(0, 4)
++    .map((source) => source.label)
++    .join("; ");
++}
++
++function askSourcesFromContextSnapshot(snapshot: AgentRunBundle["contextSnapshots"][number]): AskContributingSource[] {
++  const payload = snapshot.payload ?? {};
++  const generatedAt = snapshot.createdAt ?? snapshot.decisionPackVersion ?? null;
++  const sources: AskContributingSource[] = [];
++  const graph = payload.evidenceGraph;
++  if (graph && typeof graph === "object" && !Array.isArray(graph)) {
++    const graphRecord = graph as Record<string, unknown>;
++    const graphGeneratedAt = typeof graphRecord.generatedAt === "string" ? graphRecord.generatedAt : generatedAt;
++    const graphSources = graphRecord.sources;
++    if (Array.isArray(graphSources)) {
++      for (const item of graphSources) {
++        if (!item || typeof item !== "object" || Array.isArray(item)) continue;
++        const record = item as Record<string, unknown>;
++        const kind = typeof record.source === "string" ? record.source : "connected_source";
++        sources.push({
++          key: `evidence_graph_${kind}`,
++          label: askSourceLabel(kind),
++          origin: kind,
++          generatedAt: typeof record.generatedAt === "string" ? record.generatedAt : graphGeneratedAt,
++          freshness: typeof record.freshness === "string" ? record.freshness : "unknown",
++          detail: typeof record.detail === "string" ? record.detail : "Connected contributor evidence graph source.",
++        });
++      }
++    }
++  }
++  const baseFreshness = readRecord(payload.baseFreshness);
++  if (baseFreshness) {
++    sources.push({
++      key: "base_freshness",
++      label: askSourceLabel("base_freshness"),
++      origin: "metadata_only",
++      generatedAt: typeof baseFreshness.observedAt === "string" ? baseFreshness.observedAt : generatedAt,
++      freshness: typeof baseFreshness.status === "string" ? baseFreshness.status : "unknown",
++      detail: "Repo/issue/PR sync freshness used for contribution-context answers.",
++    });
++  }
++  const branchEligibility = readRecord(payload.branchEligibility);
++  if (branchEligibility) {
++    sources.push({
++      key: "branch_eligibility",
++      label: askSourceLabel("branch_eligibility"),
++      origin: "metadata_only",
++      generatedAt,
++      freshness: branchEligibility.stale === true ? "stale" : branchEligibility.evidence === "missing" ? "missing" : "fresh",
++      detail: "Branch eligibility metadata from connected local/GitHub context.",
++    });
++  }
++  if (typeof payload.scoreabilityStatus === "string") {
++    sources.push({
++      key: "scoreability_status",
++      label: "contribution readiness metadata",
++      origin: "metadata_only",
++      generatedAt,
++      freshness: snapshotFreshnessFromWarnings(snapshot),
++      detail: `Contribution readiness status: ${payload.scoreabilityStatus}.`,
++    });
++  }
++  const dataQuality = readRecord(payload.dataQuality);
++  if (dataQuality && typeof dataQuality.status === "string") {
++    sources.push({
++      key: "signal_data_quality",
++      label: askSourceLabel("data_quality"),
++      origin: "cached_signals",
++      generatedAt,
++      freshness: dataQuality.status === "complete" ? "fresh" : String(dataQuality.status),
++      detail: "Signal fidelity and data-quality status for connected repo sources.",
++    });
++  }
++  if (snapshot.freshnessWarnings.length > 0) {
++    sources.push({
++      key: "freshness_warnings",
++      label: "snapshot freshness warnings",
++      origin: "cached_signals",
++      generatedAt,
++      freshness: "degraded",
++      detail: snapshot.freshnessWarnings.slice(0, 2).join(" "),
++    });
++  }
++  if (typeof payload.source === "string") {
++    sources.push({
++      key: "contributor_decision_pack",
++      label: askSourceLabel("contributor_decision_pack"),
++      origin: "contributor_decision_pack",
++      generatedAt: generatedAt ?? snapshot.decisionPackVersion ?? null,
++      freshness: snapshotFreshnessFromWarnings(snapshot),
++      detail: `Contributor decision pack (${payload.source}).`,
++    });
++  }
++  const openPrMonitor = readRecord(payload.openPrMonitor);
++  if (openPrMonitor) {
++    sources.push({
++      key: "open_pr_monitor",
++      label: askSourceLabel("open_pr_monitor"),
++      origin: "open_pr_monitor",
++      generatedAt,
++      freshness: typeof openPrMonitor.freshness === "string" ? openPrMonitor.freshness : "unknown",
++      detail: "Cached open PR and issue queue used for contribution-context answers.",
++    });
++  }
++  return sources;
++}
++
++function askSourcesFromActionEvidence(action: AgentActionRecord): AskContributingSource[] {
++  const evidence = readRecord(action.payload.recommendationEvidence);
++  if (!evidence || !Array.isArray(evidence.sources)) return [];
++  return evidence.sources
++    .map((raw) => {
++      if (!raw || typeof raw !== "object" || Array.isArray(raw)) return null;
++      const source = raw as Record<string, unknown>;
++      const name = typeof source.name === "string" ? source.name : "connected_source";
++      return {
++        key: name,
++        label: askSourceLabel(name),
++        origin: name,
++        generatedAt: typeof source.generatedAt === "string" ? source.generatedAt : null,
++        freshness: typeof source.freshness === "string" ? source.freshness : "unknown",
++        detail: typeof source.summary === "string" ? source.summary : "Connected recommendation evidence source.",
++      };
++    })
++    .filter((entry): entry is AskContributingSource => entry !== null);
++}
++
++function formatAskCitation(source: AskContributingSource): string {
++  const header = `Source: ${source.label}; origin: ${source.origin}; freshness: ${source.freshness}`;
++  const observed = source.generatedAt ? ` as of ${source.generatedAt}` : "";
++  const detail = source.detail ? ` — ${publicBlockerDetail(source.detail)}` : "";
++  return `- ${header}${observed}${detail}.`;
++}
++
++function askSourceLabel(name: string): string {
++  const labels: Record<string, string> = {
++    contributor_decision_pack: "contributor decision pack snapshot",
++    repo_decision: "repo decision snapshot",
++    official_contributor_stats: "official Gittensor contributor stats",
++    repo_outcome_history: "repo outcome history",
++    open_pr_monitor: "cached GitHub open PR/issue queue",
++    local_branch_metadata: "local branch metadata (metadata-only)",
++    base_branch_freshness: "local git branch freshness",
++    base_freshness: "repo sync freshness metadata",
++    branch_eligibility: "branch eligibility metadata",
++    github_branch_status: "cached GitHub branch status",
++    linked_issue_multiplier: "linked-issue policy context",
++    score_preview: "private score preview metadata",
++    data_quality: "signal data-quality status",
++    official_gittensor: "official Gittensor API/cache",
++    mirror: "Gittensor mirror registry snapshot",
++    github_cache: "cached GitHub issues, PRs, reviews, and checks",
++    computed: "derived Gittensory contribution signals",
++    repo_focus_manifest: "repo focus manifest",
++    issue_quality: "issue quality snapshot",
++    upstream_ruleset: "upstream ruleset status",
++  };
++  return labels[name] ?? name.replace(/_/g, " ");
++}
++
++function readRecord(value: unknown): Record<string, unknown> | null {
++  if (!value || typeof value !== "object" || Array.isArray(value)) return null;
++  return value as Record<string, unknown>;
++}
++
++function snapshotFreshnessFromWarnings(snapshot: AgentRunBundle["contextSnapshots"][number]): string {
++  if (snapshot.freshnessWarnings.some((warning) => /stale|rebuild/i.test(warning))) return "stale";
++  return "fresh";
++}
++
+ function minerContextSections(miner: GittensorContributorSnapshot | null | undefined): string[] {
+   if (!miner) {
+     return ["**Miner context**", "", "- Official miner context is unavailable for this public response."];
+@@ -615,11 +960,11 @@ function packetSections(bundle: AgentRunBundle | null | undefined): string[] {
+ }
+ 
+ function refreshSections(command: SnapshotCommandName): string[] {
+-  return [
+-    `**${REFRESH_SECTION_TITLES[command]}**`,
+-    "",
+-    "- Gittensory is refreshing the contributor decision snapshot. Try the command again shortly.",
+-  ];
++  const body =
++    command === "ask"
++      ? "- Gittensory is refreshing connected contribution-context snapshots (cached issues, PRs, signals, and decision packs). Try @gittensory ask again shortly."
++      : "- Gittensory is refreshing the contributor decision snapshot. Try the command again shortly.";
++  return [`**${REFRESH_SECTION_TITLES[command]}**`, "", body];
+ }
+ 
+ function emptySections(command: SnapshotCommandName): string[] {
+@@ -971,3 +1316,12 @@ function sanitizeReviewabilityTerm(value: string): string {
+     return prefix.endsWith("@gittensory ") ? match : "private context";
+   });
+ }
++
++/** @internal Exported for unit tests of ask citation helpers. */
++export const githubCommandsInternals = {
++  collectAskContributingSources,
++  formatAskCitation,
++  snapshotFreshnessFromWarnings,
++  refreshSections,
++  askSections,
++};
+diff --git a/src/queue/processors.ts b/src/queue/processors.ts
+index d7f76764..68638b58 100644
+--- a/src/queue/processors.ts
++++ b/src/queue/processors.ts
+@@ -972,7 +972,7 @@ async function maybeProcessGittensoryMentionCommand(env: Env, deliveryId: string
+         repoFullName,
+         issue,
+         pullRequest: cachedPullRequest,
+-      });
++      }, command.question);
+   const body = buildPublicAgentCommandComment({
+     command,
+     repo,
+@@ -1044,6 +1044,7 @@ async function buildMentionCommandBundle(
+     issue: NonNullable<GitHubWebhookPayload["issue"]>;
+     pullRequest: Awaited<ReturnType<typeof getPullRequest>>;
+   },
++  question?: string | undefined,
+ ) {
+   if (commandName === "help" || commandName === "miner-context") return null;
+   if (commandName === "blockers") return explainBlockersWithAgent(env, { login: context.login, repoFullName: context.repoFullName, surface: "github_comment" });
+@@ -1053,7 +1054,10 @@ async function buildMentionCommandBundle(
+     login: context.login,
+     repoFullName: context.repoFullName,
+     surface: "github_comment",
+-    objective: `Respond to @gittensory ${commandName} for ${context.repoFullName}#${context.issue.number}.`,
++    objective:
++      commandName === "ask" && question && question.trim().length > 0
++        ? `Respond to @gittensory ask for ${context.repoFullName}#${context.issue.number}. Question: ${question.trim().slice(0, 280)}`
++        : `Respond to @gittensory ${commandName} for ${context.repoFullName}#${context.issue.number}.`,
+   });
+ }
+ 
+diff --git a/test/unit/eligibility-scenarios.test.ts b/test/unit/eligibility-scenarios.test.ts
+index 777c29de..5cc877f2 100644
+--- a/test/unit/eligibility-scenarios.test.ts
++++ b/test/unit/eligibility-scenarios.test.ts
+@@ -201,6 +201,11 @@ describe("reopened-link — linked issue is raw (unvalidated, needs evidence)",
+     const codes = result.blockedBy.map((b) => b.code);
+     expect(codes).toContain("linked_issue_unvalidated");
+   });
++
++  it("cleanup path covers unvalidated linked-issue sync guidance", () => {
++    const plan = deriveEligibilityPlan(result);
++    expect(plan.cleanupPaths.join(" ")).toMatch(/solved-by-PR evidence|official mirror to sync/i);
++  });
+ });
+ 
+ // ── Fixture: plausible and unavailable link statuses ───────────────────────
+diff --git a/test/unit/github-commands.test.ts b/test/unit/github-commands.test.ts
+index 5c798922..07db76a1 100644
+--- a/test/unit/github-commands.test.ts
++++ b/test/unit/github-commands.test.ts
+@@ -8,12 +8,18 @@ import {
+   parseAgentCommandFeedbackContext,
+   parseGittensoryMentionCommand,
+   sanitizePublicComment,
++  githubCommandsInternals,
+ } from "../../src/github/commands";
+ 
+ describe("GitHub mention commands", () => {
+   it("parses only explicit @gittensory commands", () => {
+     expect(parseGittensoryMentionCommand(null)).toBeNull();
+     expect(parseGittensoryMentionCommand("@gittensory")?.name).toBe("help");
++    expect(parseGittensoryMentionCommand("@gittensory ask   ")).toMatchObject({ name: "ask", question: undefined });
++    expect(parseGittensoryMentionCommand("@gittensory ask what should I fix first?")).toMatchObject({
++      name: "ask",
++      question: "what should I fix first?",
++    });
+     expect(parseGittensoryMentionCommand("@gittensory preflight")?.name).toBe("preflight");
+     expect(parseGittensoryMentionCommand("please @gittensory duplicate-check now")?.name).toBe("duplicate-check");
+     expect(parseGittensoryMentionCommand("@gittensory reviewability")?.name).toBe("reviewability");
+@@ -220,6 +226,77 @@ describe("GitHub mention commands", () => {
+     expect(nextAction).toContain("### Gittensory next step");
+     expect(nextAction).toContain("**Recommended next step**");
+     expect(nextAction).toContain("After tests pass.");
++
++    const ask = buildPublicAgentCommandComment({
++      command: parseGittensoryMentionCommand("@gittensory ask what should I improve for contribution quality?")!,
++      repo: null,
++      issue: { number: 14, title: "PR", state: "open", pull_request: {} },
++      pullRequest: null,
++      actorKind: "author",
++      bundle: askCitedBundle(),
++    });
++    expect(ask).toContain("### Gittensory contribution context Q&A");
++    expect(ask).toContain("**Contribution context Q&A**");
++    expect(ask).toContain("Question: what should I improve for contribution quality?");
++    const askFindings = publicCardFindings(ask);
++    expect(askFindings).toContain("origin: contributor_decision_pack; freshness: fresh");
++    expect(askFindings).toContain("origin: open_pr_monitor; freshness: fresh");
++    expect(askFindings).toContain("origin: github_cache; freshness: fresh");
++    expect(askFindings).toContain("origin: official_gittensor; freshness: fresh");
++    expect(askFindings).toContain("signal data-quality status; origin: cached_signals");
++    expect(ask).toMatch(/Connected source contributor decision pack snapshot \(contributor_decision_pack\): freshness fresh/);
++    expect(ask).toContain("README/docs context is included only when connected repo sources");
++    expect(ask).not.toContain("source: action choose_next_work");
++    expect(ask).not.toContain("**Source coverage**");
++    expect(ask).not.toContain("**Citations**");
++    expect(ask).toContain("contributor decision pack snapshot");
++    expect(ask).toContain("cached GitHub open PR/issue queue");
++    expect(ask).toContain("Freshness: agent run status completed.");
++
++    const askWithTargets = buildPublicAgentCommandComment({
++      command: parseGittensoryMentionCommand("@gittensory ask what should I clean up before review?")!,
++      repo: null,
++      issue: { number: 15, title: "PR", state: "open", pull_request: {} },
++      pullRequest: null,
++      actorKind: "author",
++      bundle: askCitedBundle({
++        actions: [
++          {
++            id: "ask-target-action",
++            runId: "run-ask-cited",
++            actionType: "prepare_pr_packet",
++            targetRepoFullName: "owner/repo",
++            targetPullNumber: 88,
++            targetIssueNumber: 34,
++            status: "recommended",
++            recommendation: "Prepare packet",
++            why: [],
++            blockedBy: [],
++            publicSafeSummary: "Prepare a concise packet and verify linked context.",
++            approvalRequired: false,
++            safetyClass: "public_safe",
++            payload: {
++              recommendationEvidence: {
++                confidence: "high",
++                sourceSummary: "Packet evidence",
++                freshness: "fresh",
++                sources: [
++                  {
++                    name: "repo_focus_manifest",
++                    source: "github_cache",
++                    generatedAt: "2026-06-01T12:00:00.000Z",
++                    freshness: "fresh",
++                    summary: "Repo focus manifest for owner/repo.",
++                  },
++                ],
++              },
++            },
++          },
++        ],
++      }),
++    });
++    expect(publicCardFindings(askWithTargets)).toContain("Source: repo focus manifest; origin: repo_focus_manifest; freshness: fresh");
++    expect(askWithTargets).toContain("owner/repo: Prepare a concise packet and verify linked context.");
+   });
+ 
+   it("does not publish private blocker why details", () => {
+@@ -372,6 +449,45 @@ describe("GitHub mention commands", () => {
+     });
+     expect(duplicateRefresh).toContain("**Duplicate-check snapshot refresh**");
+ 
++    const askRefresh = buildPublicAgentCommandComment({
++      command: parseGittensoryMentionCommand("@gittensory ask should I update linked issue context?")!,
++      repo: null,
++      issue: { number: 35, title: "PR", state: "open", pull_request: {} },
++      pullRequest: null,
++      actorKind: "author",
++      bundle: {
++        run: {
++          id: "run-ask-refresh",
++          objective: "refresh",
++          actorLogin: "oktofeesh1",
++          surface: "github_comment",
++          mode: "copilot",
++          status: "needs_snapshot_refresh",
++          dataQualityStatus: "unknown",
++          payload: {},
++        },
++        actions: [],
++        contextSnapshots: [],
++        summary: "refresh",
++      },
++    });
++    const askRefreshFindings = publicCardFindings(askRefresh);
++    expect(askRefreshFindings).toContain("Contribution context snapshot refresh");
++    expect(askRefreshFindings).toContain("Try @gittensory ask again shortly");
++    expect(askRefresh).not.toMatch(/next-action snapshot refresh/i);
++    expect(askRefresh).toContain("Retry @gittensory ask after the contribution context snapshot refresh completes.");
++    expect(askRefresh).toContain("Freshness: contribution context snapshot refresh in progress.");
++
++    const nextActionRefresh = buildPublicAgentCommandComment({
++      command: parseGittensoryMentionCommand("@gittensory next-action")!,
++      repo: null,
++      issue: { number: 36, title: "PR", state: "open", pull_request: {} },
++      pullRequest: null,
++      actorKind: "author",
++      bundle: refreshBundle(),
++    });
++    expect(nextActionRefresh).toContain("**Next-action snapshot refresh**");
++
+     const empty = buildPublicAgentCommandComment({
+       command: parseGittensoryMentionCommand("@gittensory next-action")!,
+       repo: null,
+@@ -397,6 +513,195 @@ describe("GitHub mention commands", () => {
+     expect(empty).toContain("**Recommended next step**");
+     expect(empty).toContain("No public-safe context is available");
+ 
++    const askNoQuestion = buildPublicAgentCommandComment({
++      command: parseGittensoryMentionCommand("@gittensory ask")!,
++      repo: null,
++      issue: { number: 36, title: "PR", state: "open", pull_request: {} },
++      pullRequest: null,
++      actorKind: "author",
++      bundle: {
++        run: {
++          id: "run-ask-empty",
++          objective: "empty",
++          actorLogin: "oktofeesh1",
++          surface: "github_comment",
++          mode: "copilot",
++          status: "completed",
++          dataQualityStatus: "complete",
++          payload: {},
++        },
++        actions: [],
++        contextSnapshots: [],
++        summary: "empty",
++      },
++    });
++    expect(askNoQuestion).toContain("No specific question was provided");
++    expect(askNoQuestion).toContain("No matching contribution-quality context is available");
++
++    const askMetadata = buildPublicAgentCommandComment({
++      command: parseGittensoryMentionCommand("@gittensory ask what blocks contribution readiness?")!,
++      repo: null,
++      issue: { number: 37, title: "PR", state: "open", pull_request: {} },
++      pullRequest: null,
++      actorKind: "author",
++      bundle: {
++        run: completedRun("run-ask-meta"),
++        actions: [
++          {
++            id: "ask-meta-action",
++            runId: "run-ask-meta",
++            actionType: "explain_score_blockers",
++            status: "blocked",
++            recommendation: "Resolve blockers",
++            why: [],
++            blockedBy: [],
++            publicSafeSummary: "Resolve queue pressure before opening more work.",
++            approvalRequired: true,
++            safetyClass: "private",
++            payload: {
++              recommendationEvidence: {
++                confidence: "low",
++                sourceSummary: "Mixed metadata",
++                freshness: "stale",
++                sources: [null, []],
++              },
++            },
++          },
++        ],
++        contextSnapshots: [
++          {
++            id: "snap-ask-meta",
++            runId: "run-ask-meta",
++            repoSignalSnapshotIds: [],
++            freshnessWarnings: ["decision pack is stale; rebuild enqueued"],
++            payload: {
++              baseFreshness: { status: "stale", observedAt: "2026-06-01T10:00:00.000Z" },
++              branchEligibility: { stale: true },
++              scoreabilityStatus: "blocked",
++              dataQuality: { status: "partial" },
++              evidenceGraph: {
++                sources: [null, "invalid", { detail: "Graph source without explicit origin." }],
++              },
++            },
++          },
++          {
++            id: "snap-ask-meta-missing",
++            runId: "run-ask-meta",
++            repoSignalSnapshotIds: [],
++            freshnessWarnings: ["partial signal coverage only"],
++            payload: {
++              branchEligibility: { evidence: "missing" },
++              scoreabilityStatus: "ready",
++              baseFreshness: {},
++            },
++          },
++          {
++            id: "snap-ask-meta-fresh",
++            runId: "run-ask-meta",
++            repoSignalSnapshotIds: [],
++            freshnessWarnings: [],
++            payload: {
++              branchEligibility: { stale: false, evidence: "present" },
++            },
++          },
++          {
++            id: "snap-ask-meta-graph-shape",
++            runId: "run-ask-meta",
++            repoSignalSnapshotIds: [],
++            freshnessWarnings: [],
++            payload: {
++              evidenceGraph: { sources: "not-an-array" },
++            },
++          },
++        ],
++        summary: "ask metadata",
++      },
++    });
++    expect(askMetadata).toContain("repo sync freshness metadata");
++    expect(askMetadata).toContain("branch eligibility metadata");
++    expect(askMetadata).toContain("contribution readiness metadata");
++    expect(publicCardFindings(askMetadata)).toContain("freshness: partial");
++    expect(askMetadata).not.toContain("No concrete cached source reference is available for this response.");
++
++    const askNoSources = buildPublicAgentCommandComment({
++      command: parseGittensoryMentionCommand("@gittensory ask what is the repo policy?")!,
++      repo: null,
++      issue: { number: 38, title: "PR", state: "open", pull_request: {} },
++      pullRequest: null,
++      actorKind: "author",
++    });
++    expect(askNoSources).toContain("cached Gittensory agent context (no connected-source metadata in this run)");
++
++    const askEvidenceOnly = buildPublicAgentCommandComment({
++      command: parseGittensoryMentionCommand("@gittensory ask what should I verify locally?")!,
++      repo: null,
++      issue: { number: 39, title: "PR", state: "open", pull_request: {} },
++      pullRequest: null,
++      actorKind: "author",
++      bundle: {
++        run: completedRun("run-ask-evidence-only"),
++        actions: [
++          {
++            id: "ask-evidence-only",
++            runId: "run-ask-evidence-only",
++            actionType: "preflight_branch",
++            status: "ready",
++            recommendation: "Preflight",
++            why: [],
++            blockedBy: [],
++            publicSafeSummary: "Run local branch preflight first.",
++            approvalRequired: false,
++            safetyClass: "private",
++            payload: {
++              recommendationEvidence: {
++                confidence: "medium",
++                sourceSummary: "Branch metadata",
++                freshness: "fresh",
++                sources: [{ name: "custom_unknown_source" }],
++              },
++            },
++          },
++        ],
++        contextSnapshots: [],
++        summary: "ask evidence only",
++      },
++    });
++    expect(askEvidenceOnly).toContain("origin: custom_unknown_source");
++    expect(askEvidenceOnly).toContain("custom unknown source");
++
++    const askFallbackCitations = buildPublicAgentCommandComment({
++      command: parseGittensoryMentionCommand("@gittensory ask what is missing?")!,
++      repo: null,
++      issue: { number: 40, title: "PR", state: "open", pull_request: {} },
++      pullRequest: null,
++      actorKind: "author",
++      bundle: {
++        run: completedRun("run-ask-fallback-citations"),
++        actions: [
++          {
++            id: "ask-fallback-citations",
++            runId: "run-ask-fallback-citations",
++            actionType: "choose_next_work",
++            status: "recommended",
++            recommendation: "Next",
++            why: [],
++            blockedBy: [],
++            publicSafeSummary: "Use cached queue context before opening new work.",
++            approvalRequired: false,
++            safetyClass: "private",
++            payload: {},
++          },
++        ],
++        contextSnapshots: [],
++        summary: "ask fallback citations",
++      },
++    });
++    expect(askFallbackCitations).toContain("No concrete cached source reference is available for this response.");
++    expect(publicCardFindings(askFallbackCitations)).toContain("No concrete cached source reference is available for this response.");
++    const askFallbackDetails = askFallbackCitations.slice(askFallbackCitations.indexOf("Additional safe details"));
++    expect(askFallbackDetails).toContain("README/docs context is included only when connected repo sources");
++    expect(askFallbackDetails).not.toMatch(/origin: /);
++
+     const noBundle = buildPublicAgentCommandComment({
+       command: parseGittensoryMentionCommand("@gittensory preflight")!,
+       repo: null,
+@@ -1105,6 +1410,56 @@ describe("GitHub mention commands", () => {
+     });
+     expect(defensiveSummary).toContain("Use the authenticated maintainer dashboard and private API");
+     expect(defensiveDigest.needsAuthorPullRequests.find((pr) => pr.number === 18)?.reasons).toContain("Maintainer-authored PR; review as repo stewardship.");
++
++    const unavailableDigest = buildPublicAgentCommandComment({
++      command: parseGittensoryMentionCommand("@gittensory review-now")!,
++      repo: { fullName: "owner/repo" } as any,
++      issue: { number: 102, title: "Digest", state: "open", pull_request: {} },
++      pullRequest: null,
++      actorKind: "maintainer",
++      maintainerDigest: null,
++    });
++    expect(unavailableDigest).toContain("Cached queue context is unavailable for this command.");
++
++    const emptyReviewNow = buildPublicAgentCommandComment({
++      command: parseGittensoryMentionCommand("@gittensory review-now")!,
++      repo: { fullName: "owner/repo" } as any,
++      issue: { number: 103, title: "Digest", state: "open", pull_request: {} },
++      pullRequest: null,
++      actorKind: "maintainer",
++      maintainerDigest: { ...digest, reviewNowPullRequests: [] },
++    });
++    expect(emptyReviewNow).toContain("No cached PR currently looks ready for detailed review.");
++
++    const emptyDuplicateClusters = buildPublicAgentCommandComment({
++      command: parseGittensoryMentionCommand("@gittensory duplicate-clusters")!,
++      repo: { fullName: "owner/repo" } as any,
++      issue: { number: 104, title: "Digest", state: "open", pull_request: {} },
++      pullRequest: null,
++      actorKind: "maintainer",
++      maintainerDigest: { ...digest, duplicateClusters: [] },
++    });
++    expect(emptyDuplicateClusters).toContain("No duplicate or WIP cluster is visible from cached metadata.");
++
++    const emptyConfirmed = buildPublicAgentCommandComment({
++      command: parseGittensoryMentionCommand("@gittensory confirmed-miners")!,
++      repo: { fullName: "owner/repo" } as any,
++      issue: { number: 105, title: "Digest", state: "open", pull_request: {} },
++      pullRequest: null,
++      actorKind: "maintainer",
++      maintainerDigest: { ...digest, confirmedMinerPullRequests: [] },
++    });
++    expect(emptyConfirmed).toContain("No cached confirmed-miner PRs are visible in this queue.");
++
++    const emptyNeedsAuthor = buildPublicAgentCommandComment({
++      command: parseGittensoryMentionCommand("@gittensory needs-author")!,
++      repo: { fullName: "owner/repo" } as any,
++      issue: { number: 106, title: "Digest", state: "open", pull_request: {} },
++      pullRequest: null,
++      actorKind: "maintainer",
++      maintainerDigest: { ...digest, needsAuthorPullRequests: [] },
++    });
++    expect(emptyNeedsAuthor).toContain("No cached PR currently needs obvious author cleanup first.");
+   });
+ 
+   it("neutralizes attacker-controlled queue digest titles in public comments", () => {
+@@ -1161,8 +1516,219 @@ describe("GitHub mention commands", () => {
+       expect(body).toContain("&lt;b&gt;x&lt;/b&gt;");
+     }
+   });
++
++  it("falls back to repository placeholder when queue digest has no source records", () => {
++    const digest = buildMaintainerQueueDigest({
++      repo: null,
++      issues: [],
++      pullRequests: [],
++      recentMergedPullRequests: [],
++    });
++    expect(digest.repoFullName).toBe("this repository");
++    expect(digest.reviewNowPullRequests).toHaveLength(0);
++    expect(digest.needsAuthorPullRequests).toHaveLength(0);
++  });
+ });
+ 
++describe("ask citation helpers", () => {
++  it("uses contribution-context refresh wording for ask snapshot rebuilds", () => {
++    const refresh = githubCommandsInternals.refreshSections("ask");
++    expect(refresh.join("\n")).toContain("Contribution context snapshot refresh");
++    expect(refresh.join("\n")).toContain("Try @gittensory ask again shortly");
++    expect(refresh.join("\n")).not.toContain("next-action");
++
++    const sections = githubCommandsInternals.askSections(
++      {
++        run: { ...completedRun("run-ask-sections"), status: "needs_snapshot_refresh" },
++        actions: [],
++        contextSnapshots: [],
++        summary: "refresh",
++      },
++      "What should I fix?",
++    );
++    expect(sections.join("\n")).toContain("Try @gittensory ask again shortly");
++  });
++
++  it("collects connected-source metadata and formats concrete citations", () => {
++    const sources = githubCommandsInternals.collectAskContributingSources({
++      run: completedRun("run-ask-internals"),
++      actions: [
++        {
++          id: "ask-internal-action",
++          runId: "run-ask-internals",
++          actionType: "choose_next_work",
++          status: "recommended",
++          recommendation: "Next",
++          why: [],
++          blockedBy: [],
++          publicSafeSummary: "Use cached queue context.",
++          approvalRequired: false,
++          safetyClass: "private",
++          payload: {
++            recommendationEvidence: {
++              sources: [{ name: "score_preview" }, null],
++            },
++          },
++        },
++      ],
++      contextSnapshots: [
++        {
++          id: "snap-ask-internals",
++          runId: "run-ask-internals",
++          repoSignalSnapshotIds: [],
++          freshnessWarnings: ["partial signal coverage only"],
++          decisionPackVersion: "2026-06-01T12:00:00.000Z",
++          payload: {
++            branchEligibility: { stale: false, evidence: "present" },
++            scoreabilityStatus: "ready",
++            evidenceGraph: { sources: [{ source: "computed", freshness: "partial", detail: "Derived contributor signals." }] },
++            baseFreshness: {},
++          },
++        },
++      ],
++      summary: "internals",
++    });
++    expect(sources.map((source) => source.key)).toEqual(
++      expect.arrayContaining(["scoreability_status", "score_preview", "branch_eligibility", "base_freshness", "evidence_graph_computed"]),
++    );
++    expect(sources.find((source) => source.key === "branch_eligibility")?.freshness).toBe("fresh");
++    expect(
++      githubCommandsInternals.snapshotFreshnessFromWarnings({
++        id: "snap",
++        runId: "run-ask-internals",
++        repoSignalSnapshotIds: [],
++        freshnessWarnings: ["partial signal coverage only"],
++        payload: {},
++      }),
++    ).toBe("fresh");
++    expect(
++      githubCommandsInternals.snapshotFreshnessFromWarnings({
++        id: "snap-stale",
++        runId: "run-ask-internals",
++        repoSignalSnapshotIds: [],
++        freshnessWarnings: ["decision pack is stale; rebuild enqueued"],
++        payload: {},
++      }),
++    ).toBe("stale");
++    expect(githubCommandsInternals.formatAskCitation(sources[0]!)).toContain("Source:");
++    expect(
++      githubCommandsInternals.formatAskCitation({
++        key: "empty-detail",
++        label: "metadata-only source",
++        origin: "metadata_only",
++        generatedAt: null,
++        freshness: "unknown",
++        detail: "",
++      }),
++    ).toBe("- Source: metadata-only source; origin: metadata_only; freshness: unknown.");
++
++    const extended = githubCommandsInternals.collectAskContributingSources({
++      run: completedRun("run-ask-internals-extended"),
++      actions: [],
++      contextSnapshots: [
++        {
++          id: "snap-extended",
++          runId: "run-ask-internals-extended",
++          repoSignalSnapshotIds: [],
++          freshnessWarnings: ["decision pack is stale; rebuild enqueued"],
++          payload: {
++            source: "gittensor_api",
++            openPrMonitor: {},
++            branchEligibility: { evidence: "missing" },
++            dataQuality: { signalFidelity: { status: "partial" } },
++            evidenceGraph: {
++              sources: [{ source: "mirror" }, { source: "repo_focus_manifest", freshness: "stale", generatedAt: "2026-06-01T11:00:00.000Z" }],
++            },
++          },
++        },
++      ],
++      summary: "extended",
++    });
++    expect(extended.find((source) => source.key === "branch_eligibility")?.freshness).toBe("missing");
++    expect(extended.some((source) => source.label.includes("Gittensor mirror registry snapshot"))).toBe(true);
++    expect(extended.some((source) => source.detail.includes("Connected contributor evidence graph source"))).toBe(true);
++    expect(extended.some((source) => source.key === "freshness_warnings")).toBe(true);
++    expect(extended.some((source) => source.key === "contributor_decision_pack" && source.detail.includes("gittensor_api"))).toBe(true);
++    expect(extended.find((source) => source.key === "open_pr_monitor")?.freshness).toBe("unknown");
++
++    const askOverflow = buildPublicAgentCommandComment({
++      command: parseGittensoryMentionCommand("@gittensory ask list every connected source?")!,
++      repo: null,
++      issue: { number: 41, title: "PR", state: "open", pull_request: {} },
++      pullRequest: null,
++      actorKind: "author",
++      bundle: askCitedBundle(),
++    });
++    expect(askOverflow).toContain("<summary>Additional safe details</summary>");
++    expect(askOverflow).toContain("origin: open_pr_monitor");
++
++    const askWithoutTimestamps = buildPublicAgentCommandComment({
++      command: parseGittensoryMentionCommand("@gittensory ask what is synced?")!,
++      repo: null,
++      issue: { number: 42, title: "PR", state: "open", pull_request: {} },
++      pullRequest: null,
++      actorKind: "author",
++      bundle: {
++        run: completedRun("run-ask-no-ts"),
++        actions: [],
++        contextSnapshots: [
++          {
++            id: "snap-no-ts",
++            runId: "run-ask-no-ts",
++            repoSignalSnapshotIds: [],
++            freshnessWarnings: [],
++            payload: { baseFreshness: {}, openPrMonitor: {} },
++          },
++        ],
++        summary: "no timestamps",
++      },
++    });
++    expect(askWithoutTimestamps).toContain("Connected source repo sync freshness metadata (metadata_only): freshness unknown.");
++    expect(askWithoutTimestamps).not.toContain("freshness unknown as of");
++
++    const askFourSources = buildPublicAgentCommandComment({
++      command: parseGittensoryMentionCommand("@gittensory ask what sources apply?")!,
++      repo: null,
++      issue: { number: 43, title: "PR", state: "open", pull_request: {} },
++      pullRequest: null,
++      actorKind: "author",
++      bundle: {
++        run: completedRun("run-ask-four"),
++        actions: [],
++        contextSnapshots: [
++          {
++            id: "snap-four",
++            runId: "run-ask-four",
++            repoSignalSnapshotIds: [],
++            freshnessWarnings: [],
++            payload: {
++              evidenceGraph: {
++                sources: [
++                  { source: "github_cache", freshness: "fresh", generatedAt: "2026-06-01T12:00:00.000Z", detail: "a" },
++                  { source: "official_gittensor", freshness: "fresh", generatedAt: "2026-06-01T12:00:00.000Z", detail: "b" },
++                  { source: "mirror", freshness: "fresh", generatedAt: "2026-06-01T12:00:00.000Z", detail: "c" },
++                  { source: "computed", freshness: "fresh", generatedAt: "2026-06-01T12:00:00.000Z", detail: "d" },
++                ],
++              },
++            },
++          },
++        ],
++        summary: "four sources",
++      },
++    });
++    const fourDetails = askFourSources.slice(askFourSources.indexOf("Additional safe details"));
++    expect(fourDetails).toContain("README/docs context is included only when connected repo sources");
++    expect(fourDetails).not.toMatch(/origin: computed/);
++  });
++});
++
++function publicCardFindings(comment: string): string {
++  const start = comment.indexOf("**Findings**");
++  const end = comment.indexOf("**Evidence**");
++  if (start < 0 || end < 0 || end <= start) return comment;
++  return comment.slice(start, end);
++}
++
+ function completedRun(id: string) {
+   return {
+     id,
+@@ -1176,6 +1742,84 @@ function completedRun(id: string) {
+   };
+ }
+ 
++function askCitedBundle(overrides: { actions?: Array<Record<string, unknown>>; contextSnapshots?: Array<Record<string, unknown>> } = {}): import("../../src/services/agent-orchestrator").AgentRunBundle {
++  return {
++    run: completedRun("run-ask-cited"),
++    actions: [
++      {
++        id: "ask-cited-action",
++        runId: "run-ask-cited",
++        actionType: "choose_next_work" as const,
++        status: "recommended" as const,
++        recommendation: "recommendation",
++        why: [],
++        blockedBy: [],
++        publicSafeSummary: "Run local branch preflight first.",
++        rerunWhen: "After tests pass.",
++        approvalRequired: true,
++        safetyClass: "private" as const,
++        payload: {
++          recommendationEvidence: {
++            confidence: "high",
++            sourceSummary: "Decision pack evidence",
++            freshness: "fresh",
++            sources: [
++              {
++                name: "contributor_decision_pack",
++                source: "gittensor_api",
++                generatedAt: "2026-06-01T12:00:00.000Z",
++                freshness: "fresh",
++                summary: "oktofeesh1 decision pack with complete signal fidelity.",
++              },
++              {
++                name: "open_pr_monitor",
++                source: "github_cache",
++                generatedAt: "2026-06-01T12:00:00.000Z",
++                freshness: "fresh",
++                summary: "Open PR monitor queue metadata.",
++              },
++            ],
++          },
++        },
++      },
++    ],
++    contextSnapshots: [
++      {
++        id: "snap-ask-cited",
++        runId: "run-ask-cited",
++        decisionPackVersion: "2026-06-01T12:00:00.000Z",
++        repoSignalSnapshotIds: [],
++        freshnessWarnings: [],
++        payload: {
++          evidenceGraph: {
++            generatedAt: "2026-06-01T12:00:00.000Z",
++            sources: [
++              {
++                source: "github_cache",
++                freshness: "fresh",
++                generatedAt: "2026-06-01T12:00:00.000Z",
++                detail: "Cached GitHub issues, pull requests, reviews, and checks.",
++              },
++              {
++                source: "official_gittensor",
++                freshness: "fresh",
++                generatedAt: "2026-06-01T12:00:00.000Z",
++                detail: "Official Gittensor contributor snapshot.",
++              },
++            ],
++          },
++          dataQuality: {
++            status: "complete",
++            signalFidelity: { status: "complete" },
++          },
++        },
++      },
++    ],
++    summary: "ask cited",
++    ...overrides,
++  } as import("../../src/services/agent-orchestrator").AgentRunBundle;
++}
++
+ function sampleBundle() {
+   return {
+     run: {
+diff --git a/test/unit/security-internals.test.ts b/test/unit/security-internals.test.ts
+index c61700d1..6338171e 100644
+--- a/test/unit/security-internals.test.ts
++++ b/test/unit/security-internals.test.ts
+@@ -1,5 +1,5 @@
+ import { describe, expect, it } from "vitest";
+-import { __securityInternals } from "../../src/auth/security";
++import { __securityInternals, timingSafeEqual } from "../../src/auth/security";
+ 
+ describe("security internals", () => {
+   it("serializes cookies with optional HttpOnly and Secure flags", () => {
+@@ -25,4 +25,9 @@ describe("security internals", () => {
+     expect(strict).toContain("Secure");
+     expect(strict).toContain("SameSite=Strict");
+   });
++
++  it("rejects timing-safe comparisons when either value is missing", async () => {
++    await expect(timingSafeEqual(undefined, "expected")).resolves.toBe(false);
++    await expect(timingSafeEqual("actual", undefined)).resolves.toBe(false);
++  });
+ });

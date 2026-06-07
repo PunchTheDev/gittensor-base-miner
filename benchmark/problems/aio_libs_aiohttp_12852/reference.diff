@@ -1,0 +1,86 @@
+diff --git a/CHANGES/12832.bugfix.rst b/CHANGES/12832.bugfix.rst
+new file mode 100644
+index 00000000000..00562fecd61
+--- /dev/null
++++ b/CHANGES/12832.bugfix.rst
+@@ -0,0 +1 @@
++Fixed the pure-Python HTTP parser not enforcing ``max_line_size`` on a chunk-size line when the whole line arrived in a single read; the limit was only applied to chunk-size metadata split across reads. The complete-line case is now checked too, matching the split-line behavior -- by :user:`bdraco`.
+diff --git a/aiohttp/http_parser.py b/aiohttp/http_parser.py
+index 95a1a3aa8aa..5d48dedaa6c 100644
+--- a/aiohttp/http_parser.py
++++ b/aiohttp/http_parser.py
+@@ -945,6 +945,10 @@ def feed_data(
+                 if self._chunk == ChunkState.PARSE_CHUNKED_SIZE:
+                     pos = chunk.find(SEP)
+                     if pos >= 0:
++                        # Only chunk-size lines reach here; trailers enforce
++                        # _max_field_size separately in PARSE_TRAILERS below.
++                        if pos > self._max_line_size:
++                            raise LineTooLong(chunk[:100] + b"...", self._max_line_size)
+                         i = chunk.find(CHUNK_EXT, 0, pos)
+                         if i >= 0:
+                             size_b = chunk[:i]  # strip chunk-extensions
+diff --git a/tests/test_http_parser.py b/tests/test_http_parser.py
+index 935cf65a493..b9125fa4078 100644
+--- a/tests/test_http_parser.py
++++ b/tests/test_http_parser.py
+@@ -2280,6 +2280,59 @@ async def test_parse_chunked_payload_size_error(
+             p.feed_data(b"blah\r\n")
+         assert isinstance(out.exception(), http_exceptions.TransferEncodingError)
+ 
++    async def test_chunked_chunk_size_line_too_long(
++        self, protocol: BaseProtocol
++    ) -> None:
++        """A complete oversized chunk-size line is rejected with LineTooLong."""
++        out = aiohttp.StreamReader(protocol, 2**16, loop=asyncio.get_running_loop())
++        p = HttpPayloadParser(
++            out, chunked=True, headers_parser=HeadersParser(), max_line_size=32
++        )
++        size_line = b"1;" + b"a" * 4096 + b"\r\n"
++        with pytest.raises(http_exceptions.LineTooLong):
++            p.feed_data(size_line)
++
++    async def test_chunked_chunk_size_line_within_limit(
++        self, protocol: BaseProtocol
++    ) -> None:
++        """A small chunk-size line still parses when max_line_size is low."""
++        out = aiohttp.StreamReader(protocol, 2**16, loop=asyncio.get_running_loop())
++        p = HttpPayloadParser(
++            out, chunked=True, headers_parser=HeadersParser(), max_line_size=32
++        )
++        p.feed_data(b"1\r\nx\r\n0\r\n\r\n")
++        assert out.is_eof()
++        assert b"x" == b"".join(out._buffer)
++
++    async def test_chunked_chunk_size_line_at_limit(
++        self, protocol: BaseProtocol
++    ) -> None:
++        """A chunk-size line of exactly max_line_size bytes is accepted (>, not >=)."""
++        out = aiohttp.StreamReader(protocol, 2**16, loop=asyncio.get_running_loop())
++        p = HttpPayloadParser(
++            out, chunked=True, headers_parser=HeadersParser(), max_line_size=32
++        )
++        # "1;" + 30 * "a" is exactly 32 bytes before the CRLF.
++        size_line = b"1;" + b"a" * 30
++        assert len(size_line) == 32
++        p.feed_data(size_line + b"\r\nx\r\n0\r\n\r\n")
++        assert out.is_eof()
++        assert b"x" == b"".join(out._buffer)
++
++    async def test_chunked_chunk_size_line_one_over_limit(
++        self, protocol: BaseProtocol
++    ) -> None:
++        """A chunk-size line one byte over max_line_size is rejected."""
++        out = aiohttp.StreamReader(protocol, 2**16, loop=asyncio.get_running_loop())
++        p = HttpPayloadParser(
++            out, chunked=True, headers_parser=HeadersParser(), max_line_size=32
++        )
++        # "1;" + 31 * "a" is 33 bytes before the CRLF.
++        size_line = b"1;" + b"a" * 31
++        assert len(size_line) == 33
++        with pytest.raises(http_exceptions.LineTooLong):
++            p.feed_data(size_line + b"\r\nx\r\n0\r\n\r\n")
++
+     async def test_parse_chunked_payload_size_data_mismatch(
+         self, protocol: BaseProtocol
+     ) -> None:

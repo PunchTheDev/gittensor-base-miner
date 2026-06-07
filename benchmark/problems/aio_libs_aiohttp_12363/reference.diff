@@ -1,0 +1,165 @@
+diff --git a/CHANGES/10549.misc.rst b/CHANGES/10549.misc.rst
+new file mode 100644
+index 00000000000..24d30ec5e85
+--- /dev/null
++++ b/CHANGES/10549.misc.rst
+@@ -0,0 +1 @@
++Document and narrow the allowed ``compress`` request values to ``True``/``False``, ``"deflate"``, or ``"gzip"``, and reject unsupported string values.
+diff --git a/CONTRIBUTORS.txt b/CONTRIBUTORS.txt
+index 7c5613648ca..b44514effd9 100644
+--- a/CONTRIBUTORS.txt
++++ b/CONTRIBUTORS.txt
+@@ -340,6 +340,7 @@ Sergey Skripnick
+ Serhii Charykov
+ Serhii Kostel
+ Serhiy Storchaka
++Shensheng Shen
+ Shubh Agarwal
+ Simon Kennedy
+ Sin-Woo Bang
+diff --git a/aiohttp/client.py b/aiohttp/client.py
+index 555d5678d4d..19a284a65e6 100644
+--- a/aiohttp/client.py
++++ b/aiohttp/client.py
+@@ -178,7 +178,7 @@ class _RequestOptions(TypedDict, total=False):
+     auth: BasicAuth | None
+     allow_redirects: bool
+     max_redirects: int
+-    compress: str | bool
++    compress: Literal["deflate", "gzip"] | bool
+     chunked: bool | None
+     expect100: bool
+     raise_for_status: None | bool | Callable[[ClientResponse], Awaitable[None]]
+@@ -479,7 +479,7 @@ async def _request(
+         auth: BasicAuth | None = None,
+         allow_redirects: bool = True,
+         max_redirects: int = 10,
+-        compress: str | bool = False,
++        compress: Literal["deflate", "gzip"] | bool = False,
+         chunked: bool | None = None,
+         expect100: bool = False,
+         raise_for_status: (
+diff --git a/aiohttp/client_reqrep.py b/aiohttp/client_reqrep.py
+index 551b3374c6a..22f0e077f64 100644
+--- a/aiohttp/client_reqrep.py
++++ b/aiohttp/client_reqrep.py
+@@ -11,7 +11,7 @@
+ from hashlib import md5, sha1, sha256
+ from http.cookies import BaseCookie, SimpleCookie
+ from types import MappingProxyType, TracebackType
+-from typing import TYPE_CHECKING, Any, NamedTuple, TypedDict
++from typing import TYPE_CHECKING, Any, Literal, NamedTuple, TypedDict
+ 
+ from multidict import CIMultiDict, CIMultiDictProxy, MultiDict, MultiDictProxy
+ from yarl import URL, Query
+@@ -935,7 +935,7 @@ class ClientRequestArgs(TypedDict, total=False):
+     cookies: BaseCookie[str]
+     auth: BasicAuth | None
+     version: HttpVersion
+-    compress: str | bool
++    compress: Literal["deflate", "gzip"] | bool
+     chunked: bool | None
+     expect100: bool
+     loop: asyncio.AbstractEventLoop
+@@ -979,7 +979,7 @@ def __init__(
+         cookies: BaseCookie[str],
+         auth: BasicAuth | None,
+         version: HttpVersion,
+-        compress: str | bool,
++        compress: Literal["deflate", "gzip"] | bool,
+         chunked: bool | None,
+         expect100: bool,
+         loop: asyncio.AbstractEventLoop,
+@@ -1099,7 +1099,9 @@ def _update_cookies(self, cookies: BaseCookie[str]) -> None:
+ 
+         self.headers[hdrs.COOKIE] = c.output(header="", sep=";").strip()
+ 
+-    def _update_content_encoding(self, data: Any, compress: bool | str) -> None:
++    def _update_content_encoding(
++        self, data: Any, compress: bool | Literal["deflate", "gzip"]
++    ) -> None:
+         """Set request content encoding."""
+         self.compress = None
+         if not data:
+@@ -1111,6 +1113,10 @@ def _update_content_encoding(self, data: Any, compress: bool | str) -> None:
+                     "compress can not be set if Content-Encoding header is set"
+                 )
+         elif compress:
++            if isinstance(compress, str) and compress not in {"deflate", "gzip"}:
++                raise ValueError(
++                    "compress must be one of True, False, 'deflate', or 'gzip'"
++                )
+             self.compress = compress if isinstance(compress, str) else "deflate"
+             self.headers[hdrs.CONTENT_ENCODING] = self.compress
+             self.chunked = True  # enable chunked, no need to deal with length
+diff --git a/docs/client_reference.rst b/docs/client_reference.rst
+index a4018141519..539611efae6 100644
+--- a/docs/client_reference.rst
++++ b/docs/client_reference.rst
+@@ -976,10 +976,13 @@ certification chaining.
+       Ignored when ``allow_redirects=False``.
+       ``10`` by default.
+ 
+-   :param bool compress: Set to ``True`` if request has to be compressed
+-                         with deflate encoding. If `compress` can not be combined
+-                         with a *Content-Encoding* and *Content-Length* headers.
+-                         ``None`` by default (optional).
++   :param compress: Set to ``True`` to compress the request body with
++                    ``deflate`` encoding, or pass ``"deflate"`` or ``"gzip"``
++                    explicitly to choose the content encoding. ``False`` by
++                    default.
++
++                    This parameter cannot be combined with
++                    *Content-Encoding* or *Content-Length* headers.
+ 
+    :param int chunked: Enables chunked transfer encoding.
+       It is up to the developer
+diff --git a/tests/test_client_request.py b/tests/test_client_request.py
+index fc693fc16c3..e44f42e65b2 100644
+--- a/tests/test_client_request.py
++++ b/tests/test_client_request.py
+@@ -1006,6 +1006,22 @@ async def test_content_encoding_dont_set_headers_if_no_body(
+     resp.close()
+ 
+ 
++async def test_content_encoding_rejects_unknown_string(
++    make_client_request: _RequestMaker,
++) -> None:
++    with pytest.raises(
++        ValueError,
++        match="compress must be one of True, False, 'deflate', or 'gzip'",
++    ):
++        make_client_request(
++            "post",
++            URL("http://python.org/"),
++            data="foo",
++            compress="br",  # type: ignore[arg-type]
++            loop=asyncio.get_running_loop(),
++        )
++
++
+ @pytest.mark.usefixtures("parametrize_zlib_backend")
+ async def test_content_encoding_header(  # type: ignore[misc]
+     loop: asyncio.AbstractEventLoop,
+diff --git a/tests/test_client_session.py b/tests/test_client_session.py
+index e40001bb307..a8e7a7da07f 100644
+--- a/tests/test_client_session.py
++++ b/tests/test_client_session.py
+@@ -9,7 +9,7 @@
+ from collections.abc import Awaitable, Callable, Iterator
+ from http.cookies import BaseCookie, SimpleCookie
+ from types import SimpleNamespace
+-from typing import Any, NoReturn, TypedDict, cast
++from typing import Any, Literal, NoReturn, TypedDict, cast
+ from unittest import mock
+ from uuid import uuid4
+ 
+@@ -44,7 +44,7 @@
+ class _Params(TypedDict):
+     headers: dict[str, str]
+     max_redirects: int
+-    compress: str
++    compress: Literal["deflate", "gzip"]
+     chunked: bool
+     expect100: bool
+     read_until_eof: bool

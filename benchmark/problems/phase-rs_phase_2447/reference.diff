@@ -1,0 +1,581 @@
+diff --git a/crates/engine/src/parser/oracle_effect/conditions.rs b/crates/engine/src/parser/oracle_effect/conditions.rs
+index aef5c79fc..d5280c9d5 100644
+--- a/crates/engine/src/parser/oracle_effect/conditions.rs
++++ b/crates/engine/src/parser/oracle_effect/conditions.rs
+@@ -2303,6 +2303,24 @@ pub(super) fn try_nom_condition_as_ability_condition(
+         return Some(condition);
+     }
+ 
++    // CR 608.2c: trailing "this way" outcome gate — "[effect] if at least one
++    // <filter> was <verb> this way". CR 608.2c explicitly defines that later
++    // text on a card may reference an earlier instruction in the same effect
++    // ("if that spell is countered this way") — here "this way" names the set
++    // of objects affected by the immediately-preceding instruction. The suffix
++    // lands here after
++    // `strip_suffix_conditional` peels the effect, so the residual condition
++    // text is the bare existential "<quantifier> <filter> (was|is) <verb> this
++    // way". Delegate to the shared `parse_zone_changed_this_way_clause`
++    // combinator — the same authority the leading-form
++    // `strip_if_you_do_conditional` uses — so prefix ("if a creature card is
++    // exiled this way, …") and suffix ("… if at least one creature card was
++    // exiled this way") forms produce the identical
++    // `AbilityCondition::ZoneChangedThisWay { filter }` representation.
++    if let Some(condition) = parse_outcome_this_way_condition(lower.as_str()) {
++        return Some(condition);
++    }
++
+     if let Some(condition) = parse_target_supertype_condition_text(lower.as_str()) {
+         return Some(condition);
+     }
+@@ -3199,6 +3217,33 @@ fn parse_zone_change_object_matches_filter_condition(lower: &str) -> Option<Abil
+     ))
+ }
+ 
++/// CR 608.2c: "[effect] if at least one <filter> was <verb> this way" — the
++/// trailing (suffix) form of the prior-effect outcome gate. CR 608.2c states
++/// later text on a card may reference an earlier instruction in the same
++/// effect; here "this way" refers to the set of objects affected by the
++/// immediately-preceding instruction, and the condition fires when that set
++/// contains at least one object matching `<filter>`. Kaya, Orzhov Usurper's
++/// +1 ("Exile up to two target
++/// cards from a single graveyard. You gain 2 life if at least one creature
++/// card was exiled this way.") is the motivating case.
++///
++/// The whole condition fragment must be consumed: `parse_zone_changed_this_way_clause`
++/// already covers the existential quantifiers ("at least one"/"one or more"/
++/// article), the type/subtype filter, both tenses, the verb set, and the
++/// negation flag (`wasn't`/`isn't`). Requiring an empty remainder keeps this
++/// matcher from firing on partial overlaps with longer condition phrases.
++fn parse_outcome_this_way_condition(lower: &str) -> Option<AbilityCondition> {
++    let (rest, (filter, negated)) =
++        crate::parser::oracle_nom::condition::parse_zone_changed_this_way_clause(lower).ok()?;
++    if !rest.trim().is_empty() {
++        return None;
++    }
++    Some(maybe_negate(
++        AbilityCondition::ZoneChangedThisWay { filter },
++        negated,
++    ))
++}
++
+ fn parse_zone_change_object_type_text(
+     input: &str,
+ ) -> nom::IResult<&str, (&str, bool), OracleError<'_>> {
+@@ -3576,6 +3621,48 @@ mod tests {
+         }
+     }
+ 
++    #[test]
++    fn suffix_outcome_this_way_kaya_creature_card_exiled() {
++        // Kaya, Orzhov Usurper +1 (PR #2447): "Exile up to two target cards
++        // from a single graveyard. You gain 2 life if at least one creature
++        // card was exiled this way." The trailing outcome gate must re-home
++        // onto the GainLife clause as `ZoneChangedThisWay { creature card }`
++        // — never drop to `condition: null` (which triggers the Condition_If
++        // swallowed-clause warning).
++        let (condition, body) = strip_suffix_conditional(
++            "You gain 2 life if at least one creature card was exiled this way.",
++            &mut ParseContext::default(),
++        );
++        assert_eq!(body, "You gain 2 life");
++        let Some(AbilityCondition::ZoneChangedThisWay { filter }) = condition else {
++            panic!("expected ZoneChangedThisWay condition, got {condition:?}");
++        };
++        let TargetFilter::Typed(TypedFilter { type_filters, .. }) = filter else {
++            panic!("expected Typed creature-card filter, got {filter:?}");
++        };
++        assert!(
++            type_filters
++                .iter()
++                .any(|f| matches!(f, TypeFilter::Creature)),
++            "expected Creature type filter, got {type_filters:?}"
++        );
++    }
++
++    #[test]
++    fn parse_outcome_this_way_negated_returns_not() {
++        // Build-for-the-class coverage: the suffix gate inherits the
++        // combinator's negation flag, so "wasn't exiled this way" maps to
++        // `Not { ZoneChangedThisWay { .. } }`.
++        let cond = parse_outcome_this_way_condition("a creature card wasn't exiled this way");
++        let Some(AbilityCondition::Not { condition }) = cond else {
++            panic!("expected Not, got {cond:?}");
++        };
++        assert!(matches!(
++            *condition,
++            AbilityCondition::ZoneChangedThisWay { .. }
++        ));
++    }
++
+     #[test]
+     fn if_you_cant_parses_as_not_zone_changed_this_way() {
+         // CR 608.2c: "if you can't, draw a card" — the gating condition on the
+diff --git a/crates/engine/src/parser/oracle_effect/mod.rs b/crates/engine/src/parser/oracle_effect/mod.rs
+index 73b81b9e0..459fc4fb5 100644
+--- a/crates/engine/src/parser/oracle_effect/mod.rs
++++ b/crates/engine/src/parser/oracle_effect/mod.rs
+@@ -41674,6 +41674,80 @@ mod tests {
+             None
+         );
+     }
++
++    #[test]
++    fn put_land_cards_that_player_owns_from_exile_scopes_owner_and_type() {
++        // CR 108.3 + CR 109.4 + CR 110.2a: Oblivion Sower — "you may put any
++        // number of land cards that player owns from exile onto the battlefield
++        // under your control." The candidate pool must be the LAND cards owned
++        // by the *target* player, pulled from exile, entering under YOUR control.
++        // Regression for issue #1998: the "that player owns" owner restriction
++        // was dropped, so the put-step offered every land in exile (including
++        // the controller's own exiled cards) rather than only the target's.
++        let effect = parse_effect(
++            "you may put any number of land cards that player owns from exile onto the battlefield under your control",
++        );
++        let Effect::ChangeZone {
++            origin,
++            destination,
++            target,
++            enters_under,
++            up_to,
++            ..
++        } = effect
++        else {
++            panic!("expected ChangeZone, got {effect:#?}");
++        };
++        assert_eq!(origin, Some(Zone::Exile), "candidates come from exile");
++        assert_eq!(destination, Zone::Battlefield);
++        // CR 110.2a: "under your control" routes the entering object to the caster.
++        assert_eq!(enters_under, Some(ControllerRef::You));
++        // CR 608.2d: "any number of" is an optional, variable-count selection.
++        assert!(up_to, "any number of => up_to selection");
++
++        let TargetFilter::Typed(typed) = &target else {
++            panic!("expected a Typed land filter, got {target:#?}");
++        };
++        // CR 305.1: the type filter restricts the pool to land cards.
++        assert_eq!(typed.type_filters, vec![TypeFilter::Land]);
++        // CR 108.3 + CR 109.4: "that player owns" scopes ownership to the
++        // ability's target player, not every owner and not the controller.
++        assert!(
++            typed.properties.iter().any(|prop| matches!(
++                prop,
++                FilterProp::Owned {
++                    controller: ControllerRef::TargetPlayer
++                }
++            )),
++            "target filter must restrict ownership to the target player, got {typed:#?}",
++        );
++    }
++
++    #[test]
++    fn they_own_ownership_suffix_scopes_to_iterating_player() {
++        // CR 109.5: the composed ownership suffix also handles "they own" — the
++        // third-person-plural form used by each-player effects — binding to the
++        // iterating `ScopedPlayer` rather than a target player. Locks in the
++        // subject × action combinator's second subject (review feedback on #1998).
++        let effect = parse_effect(
++            "you may put any number of land cards they own from exile onto the battlefield",
++        );
++        let Effect::ChangeZone { target, .. } = effect else {
++            panic!("expected ChangeZone, got {effect:#?}");
++        };
++        let TargetFilter::Typed(typed) = &target else {
++            panic!("expected a Typed land filter, got {target:#?}");
++        };
++        assert!(
++            typed.properties.iter().any(|prop| matches!(
++                prop,
++                FilterProp::Owned {
++                    controller: ControllerRef::ScopedPlayer
++                }
++            )),
++            "\"they own\" must scope ownership to the iterating player, got {typed:#?}",
++        );
++    }
+ }
+ 
+ /// Snapshot tests locking current `parse_effect_chain` behavior before the
+diff --git a/crates/engine/src/parser/oracle_effect/subject.rs b/crates/engine/src/parser/oracle_effect/subject.rs
+index 80a0c6fb5..5eaacba00 100644
+--- a/crates/engine/src/parser/oracle_effect/subject.rs
++++ b/crates/engine/src/parser/oracle_effect/subject.rs
+@@ -2397,6 +2397,27 @@ fn build_life_lock_clause(scope_filter: TargetFilter) -> ParsedEffectClause {
+     }
+ }
+ 
++/// CR 611.2 + CR 514.2: Recover a duration phrase embedded mid-predicate (not at
++/// the trailing edge `strip_trailing_duration` scans). Granted combat
++/// restrictions place the timing phrase before the restriction body —
++/// "can't be blocked this turn except by <filter>" — so the marker is interior.
++/// Scanned at word boundaries via a nom combinator so "this turn"/"this combat"
++/// matches a complete phrase, never an arbitrary substring. Returns `None` when
++/// no recognized interior duration phrase is present.
++fn embedded_restriction_duration(lower: &str) -> Option<Duration> {
++    let (_, duration, _) = nom_primitives::scan_preceded(lower, |i: &str| {
++        alt((
++            value(
++                Duration::UntilEndOfCombat,
++                tag::<_, _, OracleError<'_>>("this combat"),
++            ),
++            value(Duration::UntilEndOfTurn, tag("this turn")),
++        ))
++        .parse(i)
++    })?;
++    Some(duration)
++}
++
+ fn build_restriction_clause(
+     application: SubjectApplication,
+     predicate: &str,
+@@ -2459,6 +2480,15 @@ fn build_restriction_clause(
+         duration
+     };
+ 
++    // CR 611.2 + CR 509.1b: A duration phrase can sit mid-predicate rather than
++    // trailing — "can't be blocked this turn except by <filter>" (Fast //
++    // Furious) — so `strip_trailing_duration` (which only matches a suffix) left
++    // `duration` as None. Recover the embedded "this turn"/"this combat" marker
++    // so the granted restriction is correctly scoped; without it the static
++    // would persist indefinitely. Only fills an unset duration, so a trailing
++    // phrase the strip already captured is never overridden.
++    let duration = duration.or_else(|| embedded_restriction_duration(&lower));
++
+     let affected = static_affected_for_application(&application);
+     // CR 119.7 + CR 119.8 + CR 104.2b + CR 104.3b + CR 305.1: Player-scoped
+     // life, game-state, and land-play restriction modes (Everybody Lives!:
+@@ -2687,14 +2717,23 @@ pub(crate) fn parse_restriction_modes(lower: &str) -> Option<Vec<StaticMode>> {
+     if lower == "can't block or be blocked" || lower == "cannot block or be blocked" {
+         return Some(vec![StaticMode::CantBlock, StaticMode::CantBeBlocked]);
+     }
+-    // CR 509.1b: "can't be blocked except by ..." — evasion restriction
+-    if let Ok((except_text, _)) = alt((
+-        tag::<_, _, OracleError<'_>>("can't be blocked except by "),
+-        tag("cannot be blocked except by "),
+-        tag("can't be blocked this turn except by "),
+-        tag("cannot be blocked this turn except by "),
+-    ))
+-    .parse(lower)
++    // CR 509.1b + CR 611.2: "can't be blocked [this turn] except by <filter>" —
++    // granted evasion restriction (Fast // Furious: "It can't be blocked this turn
++    // except by Vehicles or by creatures with haste."). The duration phrase can
++    // sit mid-predicate ("blocked this turn except by …"), so it is not removed by
++    // the trailing-duration strip; absorb the optional " this turn" here between
++    // "blocked" and "except by". The filter is classified by the same
++    // `classify_block_exception` authority the printed/static evasion path uses, so
++    // "Vehicles or by creatures with haste" lowers to the full quality `Or`.
++    if let Ok((except_text, _)) = (
++        alt((
++            tag::<_, _, OracleError<'_>>("can't be blocked"),
++            tag("cannot be blocked"),
++        )),
++        opt(tag::<_, _, OracleError<'_>>(" this turn")),
++        tag(" except by "),
++    )
++        .parse(lower)
+     {
+         return Some(vec![StaticMode::CantBeBlockedExceptBy {
+             kind: classify_block_exception(except_text),
+@@ -3159,6 +3198,7 @@ mod tests {
+     use super::*;
+     use crate::types::ability::{AbilityKind, ContinuousModification, Effect, TypeFilter};
+     use crate::types::card_type::Supertype;
++    use crate::types::statics::BlockExceptionKind;
+ 
+     /// CR 702.3b: the subjectless conjunct recognizer accepts every grammatical
+     /// shape the sequence splitter can leave behind ("this turn" optional, both
+@@ -4236,4 +4276,113 @@ mod tests {
+             other => panic!("expected GenericEffect, got {other:?}"),
+         }
+     }
++
++    /// CR 509.1b + CR 611.2: A granted "can't be blocked [this turn] except by
++    /// <filter>" clause (Fast // Furious's second sentence) must lower to a real
++    /// `CantBeBlockedExceptBy` evasion static on the anaphoric "It" subject —
++    /// previously the whole clause fell through to `Effect::Unimplemented`,
++    /// flipping the card unsupported and inflating the swallowed-clause gate.
++    ///
++    /// Asserts the building-block shape: the granted static carries
++    /// `CantBeBlockedExceptBy { kind: Quality(<filter>) }` propagated via
++    /// `AddStaticMode`, the duration is `UntilEndOfTurn` (the mid-predicate "this
++    /// turn"), and the quality filter is an `Or` whose disjuncts cover the Vehicle
++    /// subtype and a has-haste creature.
++    #[test]
++    fn granted_cant_be_blocked_except_by_filter_is_supported() {
++        use crate::parser::oracle_effect::parse_effect_chain;
++
++        let def = parse_effect_chain(
++            "Target creature gains haste until end of turn. It can't be blocked this turn except by Vehicles or by creatures with haste.",
++            AbilityKind::Spell,
++        );
++
++        let sub = def
++            .sub_ability
++            .expect("the can't-be-blocked clause must be a supported sub-ability");
++        assert!(
++            !matches!(*sub.effect, Effect::Unimplemented { .. }),
++            "the evasion clause must not be swallowed as Unimplemented, got {:?}",
++            sub.effect
++        );
++
++        let Effect::GenericEffect {
++            static_abilities,
++            duration,
++            target,
++        } = &*sub.effect
++        else {
++            panic!("expected GenericEffect, got {:?}", sub.effect);
++        };
++
++        // The anaphoric "It" binds to the previously-targeted creature.
++        assert_eq!(*target, Some(TargetFilter::ParentTarget));
++        // CR 611.2: the mid-predicate "this turn" sets the granted duration.
++        assert_eq!(*duration, Some(Duration::UntilEndOfTurn));
++
++        let def = static_abilities
++            .iter()
++            .find_map(|sd| match &sd.modifications[..] {
++                [ContinuousModification::AddStaticMode {
++                    mode: StaticMode::CantBeBlockedExceptBy { kind },
++                }] => Some(kind.clone()),
++                _ => None,
++            })
++            .expect("granted static must carry AddStaticMode(CantBeBlockedExceptBy)");
++
++        let BlockExceptionKind::Quality(filter) = def else {
++            panic!("expected a quality block-exception filter, got {def:?}");
++        };
++        let TargetFilter::Or { filters } = filter else {
++            panic!("expected an Or of Vehicle/has-haste disjuncts, got {filter:?}");
++        };
++        // The union must cover the Vehicle subtype and a has-haste creature; the
++        // repeated "by" ("Vehicles or by creatures with haste") must not truncate
++        // the second disjunct.
++        assert!(
++            filters.iter().any(|f| matches!(
++                f,
++                TargetFilter::Typed(t)
++                    if t.type_filters.contains(&TypeFilter::Subtype("Vehicle".into()))
++            )),
++            "filter union must include the Vehicle subtype, got {filters:?}"
++        );
++        assert!(
++            filters.iter().any(|f| matches!(
++                f,
++                TargetFilter::Typed(t)
++                    if t.properties.contains(&FilterProp::WithKeyword { value: Keyword::Haste })
++            )),
++            "filter union must include a has-haste creature, got {filters:?}"
++        );
++    }
++
++    /// CR 509.1b: `classify_block_exception` is the single authority for the
++    /// "except by <filter>" grammar shared by the printed/static and granted
++    /// evasion paths. The evasion wording repeats the "by" preposition before
++    /// each disjunct ("Vehicles or by creatures with haste"); the redundant "by"
++    /// must be stripped so the full union parses, not just its first disjunct.
++    #[test]
++    fn classify_block_exception_strips_redundant_by() {
++        let kind = classify_block_exception("vehicles or by creatures with haste");
++        let BlockExceptionKind::Quality(TargetFilter::Or { filters }) = kind else {
++            panic!("expected a quality Or filter, got {kind:?}");
++        };
++        assert!(
++            filters.iter().any(|f| matches!(
++                f,
++                TargetFilter::Typed(t)
++                    if t.type_filters.contains(&TypeFilter::Subtype("Vehicle".into()))
++            )),
++            "first disjunct (Vehicle) missing: {filters:?}"
++        );
++        assert!(
++            filters.iter().any(|f| matches!(
++                f,
++                TargetFilter::Typed(t)
++                    if t.properties.contains(&FilterProp::WithKeyword { value: Keyword::Haste })
++            )),
++            "second disjunct (has-haste) dropped by repeated 'by': {filters:?}"
++        );
++    }
+ }
+diff --git a/crates/engine/src/parser/oracle_static/evasion.rs b/crates/engine/src/parser/oracle_static/evasion.rs
+index 0ef019468..1c7fc11aa 100644
+--- a/crates/engine/src/parser/oracle_static/evasion.rs
++++ b/crates/engine/src/parser/oracle_static/evasion.rs
+@@ -66,10 +66,46 @@ pub(crate) fn classify_block_exception(filter_text: &str) -> BlockExceptionKind
+     if let Ok((_, min)) = parse_min_blockers_phrase(trimmed) {
+         BlockExceptionKind::MinBlockers { min }
+     } else {
+-        BlockExceptionKind::Quality(parse_target(trimmed).0)
++        let normalized = strip_redundant_block_exception_by(trimmed);
++        BlockExceptionKind::Quality(parse_target(&normalized).0)
+     }
+ }
+ 
++/// CR 509.1b: The "except by <filter>" evasion grammar repeats the "by"
++/// preposition before each disjunct — "except by Vehicles or by creatures with
++/// haste" (Fast // Furious), mirroring the CR's own "and/or" exception wording.
++/// `parse_target`'s disjunction recursion expects a bare type word after the
++/// connector ("or creatures"), not a second "by", so the repeated preposition
++/// truncates the union to its first disjunct. Strip the redundant "by " that
++/// immediately follows a disjunction connector ("or by", "and by", "and/or by")
++/// so the full union parses. Combinator-scanned, not string-replaced: the "by "
++/// is only removed when it sits right after a recognized connector, never inside
++/// a filter word.
++fn strip_redundant_block_exception_by(filter_text: &str) -> Cow<'_, str> {
++    type VE<'a> = OracleError<'a>;
++
++    // Scan for "<connector> by " at any word boundary; the combinator emits the
++    // connector span so it can be re-inserted while only the redundant "by " is
++    // dropped. `before` is the prefix up to (but not including) the connector.
++    let scan = nom_primitives::scan_preceded(filter_text, |i: &str| {
++        let (after_conn, connector) = alt((
++            tag::<_, _, VE<'_>>("and/or "),
++            tag::<_, _, VE<'_>>("or "),
++            tag::<_, _, VE<'_>>("and "),
++        ))
++        .parse(i)?;
++        let (after_by, _) = tag::<_, _, VE<'_>>("by ").parse(after_conn)?;
++        Ok((after_by, connector))
++    });
++    let Some((before, connector, after)) = scan else {
++        return Cow::Borrowed(filter_text);
++    };
++    // Re-join with the connector preserved but the redundant "by " removed, then
++    // recurse to handle any further "or by" repetitions.
++    let joined = format!("{before}{connector}{after}");
++    Cow::Owned(strip_redundant_block_exception_by(&joined).into_owned())
++}
++
+ /// CR 603.2d: Extract the source-restriction filter from a trigger-doubler's
+ /// Oracle text. Trigger doublers name the doubled ability's source as
+ /// "a triggered ability of <SOURCE>" — e.g. "a Ninja creature you control"
+diff --git a/crates/engine/src/parser/oracle_target.rs b/crates/engine/src/parser/oracle_target.rs
+index 2e477ce3a..e9809ee51 100644
+--- a/crates/engine/src/parser/oracle_target.rs
++++ b/crates/engine/src/parser/oracle_target.rs
+@@ -3723,6 +3723,39 @@ fn parse_ownership_or_controller_suffix(
+             return own_ctrl_offset + phrase.len();
+         }
+     }
++    // CR 108.3 + CR 109.4: anaphoric ownership suffix, composed as subject ×
++    // action so the whole class is one combinator rather than a per-phrase tag.
++    // Each subject `tag` maps directly to its owner scope:
++    //   "that player owns" → the player chosen as the enclosing ability's target
++    //     (Oblivion Sower: "target opponent exiles ... then you may put any
++    //     number of land cards that player owns from exile ..."), resolved at
++    //     runtime against the first `TargetRef::Player` in `ability.targets`, so
++    //     the pool is the cards the *target* player owns — not every card, and
++    //     not the controller's own;
++    //   "they own"        → the iterating player in each-player effects.
++    // Actions are matched longest-first ("own and control" before "owns" before
++    // "own"); the trailing "and control" maps to `true` and additionally pins
++    // the resolved player as the `*controller` of the filtered objects.
++    let subject = alt((
++        tag("that player").map(|_| ControllerRef::TargetPlayer),
++        tag("they").map(|_| ControllerRef::ScopedPlayer),
++    ));
++    let action = alt((
++        tag("own and control").map(|_| true),
++        tag("owns").map(|_| false),
++        tag("own").map(|_| false),
++    ));
++    let parsed: nom::IResult<&str, (ControllerRef, &str, bool), OracleError<'_>> =
++        (subject, space1, action).parse(own_ctrl);
++    if let Ok((rest, (owner, _, also_control))) = parsed {
++        properties.push(FilterProp::Owned {
++            controller: owner.clone(),
++        });
++        if also_control {
++            *controller = Some(owner);
++        }
++        return own_ctrl_offset + (own_ctrl.len() - rest.len());
++    }
+ 
+     let (ctrl, ctrl_len) =
+         parse_controller_suffix(text, ctx).map_or((None, 0), |(ctrl, len)| (Some(ctrl), len));
+diff --git a/crates/engine/src/parser/swallow_check.rs b/crates/engine/src/parser/swallow_check.rs
+index c52ae4850..1d1392b0e 100644
+--- a/crates/engine/src/parser/swallow_check.rs
++++ b/crates/engine/src/parser/swallow_check.rs
+@@ -2281,7 +2281,7 @@ fn effect_name(effect: &Effect) -> &str {
+ 
+ #[cfg(test)]
+ mod tests {
+-    use super::{def_tree_has_optional, trigger_tree_has_optional};
++    use super::{def_tree_has_optional, def_tree_has_unimplemented, trigger_tree_has_optional};
+     use crate::parser::oracle::parse_oracle_text;
+     use crate::parser::oracle_ir::diagnostic::OracleDiagnostic;
+     use crate::types::ability::{AbilityDefinition, Effect, OutsideGameSourcePool};
+@@ -2397,6 +2397,72 @@ mod tests {
+         assert!(!has_swallowed_detector(&parsed, "Optional_YouMay"));
+     }
+ 
++    #[test]
++    fn kaya_orzhov_usurper_plus_one_gates_gain_life_on_creature_exiled_this_way() {
++        // PR #2447 / issue #1998 follow-up. With the +1 conditional now parsed,
++        // Kaya has zero Unimplemented across all three loyalty abilities, so the
++        // swallow detectors un-suppress. The +1's trailing outcome gate
++        // ("You gain 2 life if at least one creature card was exiled this way")
++        // must re-home as `AbilityCondition::ZoneChangedThisWay { creature }`
++        // — otherwise `detect_condition_if` flags a swallowed " if " clause.
++        let parsed = parse_named(
++            "[+1]: Exile up to two target cards from a single graveyard. \
++             You gain 2 life if at least one creature card was exiled this way.\n\
++             [\u{2212}1]: Exile target nonland permanent with mana value 1 or less.\n\
++             [\u{2212}5]: Kaya deals damage to target player equal to the number of \
++             cards that player owns in exile and you gain that much life.",
++            "Kaya, Orzhov Usurper",
++            &["Planeswalker"],
++        );
++
++        // No ability may be Unimplemented (the precondition for the swallow
++        // detectors to run at all — and the whole point of the fix).
++        assert!(
++            !parsed.abilities.iter().any(def_tree_has_unimplemented),
++            "Kaya's loyalty abilities must all parse without Unimplemented"
++        );
++        // The trailing "if ... this way" gate must not be swallowed.
++        assert!(
++            !has_swallowed_detector(&parsed, "Condition_If"),
++            "Kaya +1 trailing outcome gate must not be a swallowed clause"
++        );
++
++        // The +1 GainLife must carry a non-null ZoneChangedThisWay condition.
++        let gated_gain_life = parsed
++            .abilities
++            .iter()
++            .any(def_tree_gates_gain_life_on_this_way);
++        assert!(
++            gated_gain_life,
++            "expected a GainLife gated by ZoneChangedThisWay on Kaya's +1, \
++             parsed abilities: {:#?}",
++            parsed.abilities
++        );
++    }
++
++    /// Walk a def tree looking for a `GainLife` (anywhere in the chain) whose
++    /// owning def carries an `AbilityCondition::ZoneChangedThisWay` gate.
++    fn def_tree_gates_gain_life_on_this_way(def: &AbilityDefinition) -> bool {
++        let gain_here = matches!(&*def.effect, Effect::GainLife { .. })
++            && matches!(
++                def.condition,
++                Some(crate::types::ability::AbilityCondition::ZoneChangedThisWay { .. })
++            );
++        gain_here
++            || def
++                .sub_ability
++                .as_deref()
++                .is_some_and(def_tree_gates_gain_life_on_this_way)
++            || def
++                .else_ability
++                .as_deref()
++                .is_some_and(def_tree_gates_gain_life_on_this_way)
++            || def
++                .mode_abilities
++                .iter()
++                .any(def_tree_gates_gain_life_on_this_way)
++    }
++
+     #[test]
+     fn optional_you_may_accepts_outside_game_face_up_exile_disjunction() {
+         let parsed = parse_named(

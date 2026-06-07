@@ -1,0 +1,253 @@
+diff --git a/celery/backends/redis.py b/celery/backends/redis.py
+index 7ddba5e5d63..89dccd7917a 100644
+--- a/celery/backends/redis.py
++++ b/celery/backends/redis.py
+@@ -5,9 +5,11 @@
+ from ssl import CERT_NONE, CERT_OPTIONAL, CERT_REQUIRED
+ from urllib.parse import unquote
+ 
++from kombu.utils import symbol_by_name
+ from kombu.utils.functional import retry_over_time
+ from kombu.utils.objects import cached_property
+ from kombu.utils.url import _parse_url, maybe_sanitize_url
++from redis import CredentialProvider
+ 
+ from celery import states
+ from celery._state import task_join_will_block
+@@ -230,6 +232,7 @@ def __init__(self, host=None, port=None, db=None, password=None,
+         retry_on_timeout = _get('redis_retry_on_timeout')
+         socket_keepalive = _get('redis_socket_keepalive')
+         health_check_interval = _get('redis_backend_health_check_interval')
++        credential_provider = _get('redis_backend_credential_provider')
+ 
+         self.connparams = {
+             'host': _get('redis_host') or 'localhost',
+@@ -254,6 +257,23 @@ def __init__(self, host=None, port=None, db=None, password=None,
+             #       support for py-redis<3.4.0.
+             self.connparams['username'] = username
+ 
++        if credential_provider:
++            # if credential provider passed as string or query param
++            if isinstance(credential_provider, str):
++                credential_provider_cls = symbol_by_name(credential_provider)
++                credential_provider = credential_provider_cls()
++
++            if not isinstance(credential_provider, CredentialProvider):
++                raise ValueError(
++                    "Credential provider is not an instance of a redis.CredentialProvider or a subclass"
++                )
++
++            self.connparams['credential_provider'] = credential_provider
++
++            # drop username and password if credential provider is configured
++            self.connparams.pop("username", None)
++            self.connparams.pop("password", None)
++
+         if health_check_interval:
+             self.connparams["health_check_interval"] = health_check_interval
+ 
+@@ -350,6 +370,23 @@ def _params_from_url(self, url, defaults):
+         db = db.strip('/') if isinstance(db, str) else db
+         connparams['db'] = int(db)
+ 
++        # credential provider as query string
++        credential_provider = query.pop("credential_provider", None)
++        if credential_provider:
++            if isinstance(credential_provider, str):
++                credential_provider_cls = symbol_by_name(credential_provider)
++                credential_provider = credential_provider_cls()
++
++            if not isinstance(credential_provider, CredentialProvider):
++                raise ValueError(
++                    "Credential provider is not an instance of a redis.CredentialProvider or a subclass"
++                )
++
++            connparams['credential_provider'] = credential_provider
++            # drop username and password if credential provider is configured
++            connparams.pop("username", None)
++            connparams.pop("password", None)
++
+         for key, value in query.items():
+             if key in redis.connection.URL_QUERY_ARGUMENT_PARSERS:
+                 query[key] = redis.connection.URL_QUERY_ARGUMENT_PARSERS[key](
+diff --git a/docs/getting-started/backends-and-brokers/redis.rst b/docs/getting-started/backends-and-brokers/redis.rst
+index 11d42544ec2..aec1232f3f0 100644
+--- a/docs/getting-started/backends-and-brokers/redis.rst
++++ b/docs/getting-started/backends-and-brokers/redis.rst
+@@ -38,6 +38,13 @@ Where the URL is in the format of:
+ all fields after the scheme are optional, and will default to ``localhost``
+ on port 6379, using database 0.
+ 
++If redis credential provider should be used, the URL needs to be in the following format:
++
++.. code-block:: text
++
++    redis://@hostname:port/db_number?credential_provider=mymodule.myfile.myclass
++
++
+ If a Unix socket connection should be used, the URL needs to be in the format:
+ 
+ .. code-block:: text
+diff --git a/docs/userguide/configuration.rst b/docs/userguide/configuration.rst
+index fe01b6ecd95..54ac549bc42 100644
+--- a/docs/userguide/configuration.rst
++++ b/docs/userguide/configuration.rst
+@@ -114,6 +114,7 @@ have been moved into a new  ``task_`` prefix.
+ ``CELERY_REDIS_PASSWORD``                  :setting:`redis_password`
+ ``CELERY_REDIS_PORT``                      :setting:`redis_port`
+ ``CELERY_REDIS_BACKEND_USE_SSL``           :setting:`redis_backend_use_ssl`
++``CELERY_REDIS_BACKEND_CREDENTIAL_PROVIDER`` :setting:`redis_backend_credential_provider`
+ ``CELERY_RESULT_BACKEND``                  :setting:`result_backend`
+ ``CELERY_MAX_CACHED_RESULTS``              :setting:`result_cache_max`
+ ``CELERY_MESSAGE_COMPRESSION``             :setting:`result_compression`
+@@ -763,6 +764,7 @@ Can be one of the following:
+ .. _`AzureBlockBlob`: https://azure.microsoft.com/en-us/services/storage/blobs/
+ .. _`S3`: https://aws.amazon.com/s3/
+ .. _`GCS`: https://cloud.google.com/storage/
++.. _`RedisCredentialProvider`: https://redis.readthedocs.io/en/stable/examples/connection_examples.html#Connecting-to-a-redis-instance-with-standard-credential-provider
+ 
+ 
+ .. setting:: result_backend_always_retry
+@@ -1344,6 +1346,19 @@ the form of a dictionary. The valid key-value pairs are
+ the same as the ones mentioned in the ``redis`` sub-section
+ under :setting:`broker_use_ssl`.
+ 
++.. setting:: redis_backend_credential_provider
++
++.. versionadded:: 5.6
++
++``redis_backend_credential_provider``
++~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
++
++Default: Disabled.
++
++The Redis backend supports credential provider. This value must be set in
++the form of a class path string or a class instance. e.g. ``mymodule.myfile.myclass``
++check more details in `RedisCredentialProvider`_ doc.
++
+ .. setting:: redis_max_connections
+ 
+ ``redis_max_connections``
+diff --git a/requirements/test.txt b/requirements/test.txt
+index 527d975f617..a7b758fbaf8 100644
+--- a/requirements/test.txt
++++ b/requirements/test.txt
+@@ -18,3 +18,5 @@ pre-commit>=4.0.1; python_version >= '3.9'
+ -r extras/mongodb.txt
+ -r extras/gcs.txt
+ -r extras/pydantic.txt
++-r extras/azureblockblob.txt
++-r extras/gevent.txt
+diff --git a/t/unit/backends/test_redis.py b/t/unit/backends/test_redis.py
+index 314327ef174..a4af637e869 100644
+--- a/t/unit/backends/test_redis.py
++++ b/t/unit/backends/test_redis.py
+@@ -10,9 +10,10 @@
+ import pytest
+ 
+ try:
+-    from redis import exceptions
++    from redis import CredentialProvider, exceptions
+ except ImportError:
+     exceptions = None
++    CredentialProvider = None
+ 
+ from celery import signature, states, uuid
+ from celery.canvas import Signature
+@@ -369,6 +370,14 @@ def setup_method(self):
+         self.b = self.Backend(app=self.app)
+ 
+ 
++class MyCredentialProvider(CredentialProvider):
++    pass
++
++
++class NonCredentialProvider:
++    pass
++
++
+ class test_RedisBackend(basetest_RedisBackend):
+     @pytest.mark.usefixtures('depends_on_current_app')
+     def test_reduce(self):
+@@ -397,6 +406,33 @@ def test_username_password_from_redis_conf(self):
+         assert x.connparams['username'] == 'username'
+         assert x.connparams['password'] == 'password'
+ 
++    def test_credential_provider_from_redis_conf(self):
++        self.app.conf.redis_backend_credential_provider = "redis.CredentialProvider"
++        x = self.Backend(app=self.app)
++
++        assert x.connparams
++        assert 'credential_provider' in x.connparams
++        assert 'username' not in x.connparams
++        assert 'password' not in x.connparams
++
++        # with local credential provider
++        self.app.conf.redis_backend_credential_provider = MyCredentialProvider()
++        x = self.Backend(app=self.app)
++        assert x.connparams
++        assert 'credential_provider' in x.connparams
++        assert 'username' not in x.connparams
++        assert 'password' not in x.connparams
++
++        # raise ImportError
++        self.app.conf.redis_backend_credential_provider = "not_exist.CredentialProvider"
++        with pytest.raises(ImportError):
++            self.Backend(app=self.app)
++
++        # raise value Error
++        self.app.conf.redis_backend_credential_provider = NonCredentialProvider()
++        with pytest.raises(ValueError):
++            self.Backend(app=self.app)
++
+     def test_url(self):
+         self.app.conf.redis_socket_timeout = 30.0
+         self.app.conf.redis_socket_connect_timeout = 100.0
+@@ -424,6 +460,47 @@ def test_url(self):
+         assert x.connparams['socket_timeout'] == 30.0
+         assert x.connparams['socket_connect_timeout'] == 100.0
+ 
++    def test_url_with_credential_provider(self):
++        self.app.conf.redis_socket_timeout = 30.0
++        self.app.conf.redis_socket_connect_timeout = 100.0
++        x = self.Backend(
++            'redis://:bosco@vandelay.com:123/1?credential_provider=redis.CredentialProvider', app=self.app,
++        )
++
++        assert x.connparams
++        assert x.connparams['host'] == 'vandelay.com'
++        assert x.connparams['db'] == 1
++        assert x.connparams['port'] == 123
++        assert x.connparams['socket_timeout'] == 30.0
++        assert x.connparams['socket_connect_timeout'] == 100.0
++        assert isinstance(x.connparams['credential_provider'], CredentialProvider)
++        assert "username" not in x.connparams
++        assert "password" not in x.connparams
++
++        # without username and password
++        x = self.Backend(
++            'redis://@vandelay.com:123/1?credential_provider=redis.UsernamePasswordCredentialProvider', app=self.app,
++        )
++        assert x.connparams
++        assert x.connparams['host'] == 'vandelay.com'
++        assert x.connparams['db'] == 1
++        assert x.connparams['port'] == 123
++        assert isinstance(x.connparams['credential_provider'], CredentialProvider)
++
++        # raise importError
++        with pytest.raises(ImportError):
++            self.Backend(
++                'redis://@vandelay.com:123/1?credential_provider=not_exist.CredentialProvider', app=self.app,
++            )
++
++        # raise valueError
++        with pytest.raises(ValueError):
++            # some non-credential provider class
++            # not ideal but serve purpose
++            self.Backend(
++                'redis://@vandelay.com:123/1?credential_provider=abc.ABC', app=self.app,
++            )
++
+     def test_timeouts_in_url_coerced(self):
+         pytest.importorskip('redis')
+ 

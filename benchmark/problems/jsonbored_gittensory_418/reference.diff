@@ -1,0 +1,67 @@
+diff --git a/src/signals/engine.ts b/src/signals/engine.ts
+index 5ee40193..ed13f510 100644
+--- a/src/signals/engine.ts
++++ b/src/signals/engine.ts
+@@ -1062,11 +1062,16 @@ export function buildContributorProfile(
+       ...matchingStats.filter((stat) => stat.pullRequests > 0 || stat.issues > 0).map((stat) => stat.repoFullName),
+     ]),
+   ].sort();
++  // `matchingStats` and the cached authored records are overlapping views of the same activity, so
++  // only fold in stat-derived dominant labels for repos that have no cached authored records --
++  // otherwise a shared repo's labels are double-counted (consistent with how reposTouched dedups and
++  // unlinkedOpenPullRequests maxes the same two sources).
++  const cachedLabelRepos = new Set([...authoredPullRequests, ...authoredIssues].map((record) => record.repoFullName.toLowerCase()));
+   const dominantLabels = topItems(
+     [
+       ...authoredPullRequests.flatMap((record) => record.labels),
+       ...authoredIssues.flatMap((record) => record.labels),
+-      ...matchingStats.flatMap((stat) => stat.dominantLabels),
++      ...matchingStats.filter((stat) => !cachedLabelRepos.has(stat.repoFullName.toLowerCase())).flatMap((stat) => stat.dominantLabels),
+     ],
+     8,
+   );
+@@ -1115,11 +1120,14 @@ function buildGittensorContributorProfile(
+     .filter((repo) => repo.pullRequests + repo.openIssues + repo.closedIssues > 0)
+     .map((repo) => repo.repoFullName)
+     .sort();
++  // The snapshot labels already cover snapshot.repositories; only fold in stat-derived dominant labels
++  // for repos the snapshot does not cover, so shared repos are not double-counted.
++  const snapshotRepos = new Set(snapshot.repositories.map((repo) => repo.repoFullName.toLowerCase()));
+   const dominantLabels = topItems(
+     [
+       ...snapshot.pullRequests.flatMap((pr) => (pr.label ? [pr.label] : [])),
+       ...snapshot.issueLabels,
+-      ...matchingStats.flatMap((stat) => stat.dominantLabels),
++      ...matchingStats.filter((stat) => !snapshotRepos.has(stat.repoFullName.toLowerCase())).flatMap((stat) => stat.dominantLabels),
+     ],
+     8,
+   );
+diff --git a/test/unit/signals-coverage.test.ts b/test/unit/signals-coverage.test.ts
+index d2c398c6..f19b76df 100644
+--- a/test/unit/signals-coverage.test.ts
++++ b/test/unit/signals-coverage.test.ts
+@@ -128,6 +128,24 @@ describe("signal coverage edge cases", () => {
+     expect(strategy.nextActions).toEqual(expect.arrayContaining(["Clean up linked issue/context patterns before adding more open PRs.", "Prefer repos where the changed files match prior language evidence, or keep first submissions small."]));
+   });
+ 
++  it("does not double-count stat-derived dominant labels for repos already covered by cached records", () => {
++    const profile = buildContributorProfile(
++      "dev",
++      { login: "dev", topLanguages: [], source: "github" },
++      [pr("owner/shared", 1, "Real work", { authorLogin: "dev", labels: ["real-label"] })],
++      [],
++      [
++        // Same repo as the cached PR -> its stat-derived dominant labels must not be re-counted.
++        { login: "dev", repoFullName: "owner/shared", pullRequests: 1, mergedPullRequests: 0, openPullRequests: 1, issues: 0, stalePullRequests: 0, unlinkedPullRequests: 0, dominantLabels: ["stat-only-label"] },
++        // No cached records for this repo -> its stat-derived labels still contribute (complementary coverage).
++        { login: "dev", repoFullName: "owner/uncached", pullRequests: 1, mergedPullRequests: 0, openPullRequests: 0, issues: 0, stalePullRequests: 0, unlinkedPullRequests: 0, dominantLabels: ["uncached-label"] },
++      ],
++    );
++    expect(profile.registeredRepoActivity.dominantLabels).toContain("real-label");
++    expect(profile.registeredRepoActivity.dominantLabels).not.toContain("stat-only-label");
++    expect(profile.registeredRepoActivity.dominantLabels).toContain("uncached-label");
++  });
++
+   it("separates cached outcome history, maintainer role sources, and contributor detections", () => {
+     const directRepo = repo("owner/direct");
+     const ownerRepo = repo("owner/project");

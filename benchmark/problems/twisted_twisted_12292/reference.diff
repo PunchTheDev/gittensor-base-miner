@@ -1,0 +1,526 @@
+diff --git a/.github/workflows/test.yaml b/.github/workflows/test.yaml
+index 11caaf06524..9595f0050bc 100644
+--- a/.github/workflows/test.yaml
++++ b/.github/workflows/test.yaml
+@@ -144,10 +144,8 @@ jobs:
+             # FIXME:https://github.com/twisted/twisted/issues/12060
+             # Also add twisted.python
+             # FIXME:https://github.com/twisted/twisted/issues/12061
+-            # Add full twisted.internet
+-            # FIXME:https://github.com/twisted/twisted/issues/12062
+             # Add full twisted.test
+-            trial-target: 'twisted.conch twisted.cred twisted.internet.test.test_process twisted.logger twisted.mail twisted.names twisted.pair twisted.persisted twisted.protocols twisted.runner twisted.spread twisted.test.test_defer twisted.trial twisted.web twisted.words'
++            trial-target: 'twisted.conch twisted.cred twisted.internet twisted.logger twisted.mail twisted.names twisted.pair twisted.persisted twisted.protocols twisted.runner twisted.spread twisted.test.test_defer twisted.trial twisted.web twisted.words'
+             # Disable concurrency for now, since we get occasional segfaults and
+             # this helps debug them:
+             trial-args: '--reactor=default'
+diff --git a/src/twisted/internet/defer.py b/src/twisted/internet/defer.py
+index 62f96d8d68a..951ca87d6b5 100644
+--- a/src/twisted/internet/defer.py
++++ b/src/twisted/internet/defer.py
+@@ -1141,7 +1141,6 @@ def _runCallbacks(self) -> None:
+                 if isinstance(current.result, Failure):
+                     # Stash the Failure in the _debugInfo for unhandled error
+                     # reporting.
+-                    current.result.cleanFailure()
+                     if current._debugInfo is None:
+                         current._debugInfo = DebugInfo()
+                     current._debugInfo.failResult = current.result
+@@ -1189,8 +1188,7 @@ def __iter__(self) -> Generator[Deferred[_SelfResultT], None, _SelfResultT]:
+                 # exception"
+                 assert self._debugInfo is not None
+                 self._debugInfo.failResult = None
+-                result.value.__failure__ = result
+-                raise result.value
++                result.raiseException()
+             else:
+                 return result  # type: ignore[return-value]
+ 
+diff --git a/src/twisted/internet/test/test_inlinecb.py b/src/twisted/internet/test/test_inlinecb.py
+index 355572b566d..1923abb1ad4 100644
+--- a/src/twisted/internet/test/test_inlinecb.py
++++ b/src/twisted/internet/test/test_inlinecb.py
+@@ -1214,7 +1214,6 @@ def calling():
+         self.assertIn("in calling", tb)
+         self.assertIn("in calling2", tb)
+         self.assertIn("in calling3", tb)
+-        self.assertNotIn("throwExceptionIntoGenerator", tb)
+         self.assertIn("Error Marker", tb)
+         self.assertIn("in erroring", f.getTraceback())
+ 
+@@ -1249,7 +1248,6 @@ def calling():
+         self.assertIn("in calling", tb)
+         self.assertIn("in calling2", tb)
+         self.assertIn("in calling3", tb)
+-        self.assertNotIn("throwExceptionIntoGenerator", tb)
+         self.assertIn("Error Marker", tb)
+         self.assertIn("in erroring", f.getTraceback())
+ 
+diff --git a/src/twisted/newsfragments/12234.feature b/src/twisted/newsfragments/12234.feature
+new file mode 100644
+index 00000000000..5fbb1213469
+--- /dev/null
++++ b/src/twisted/newsfragments/12234.feature
+@@ -0,0 +1 @@
++twisted.internet.defer.Deferred no longer removes the traceback object from Failures. This may result in more objects staying in memory if you don't clean up failed Deferreds, but it speeds up error handling and enables improvements to traceback reporting.
+\ No newline at end of file
+diff --git a/src/twisted/newsfragments/12288.feature b/src/twisted/newsfragments/12288.feature
+new file mode 100644
+index 00000000000..cd6724b5da2
+--- /dev/null
++++ b/src/twisted/newsfragments/12288.feature
+@@ -0,0 +1 @@
++Creation of twisted.python.failure.Failure is now faster.
+\ No newline at end of file
+diff --git a/src/twisted/python/failure.py b/src/twisted/python/failure.py
+index 67766b1318c..a9323eecfac 100644
+--- a/src/twisted/python/failure.py
++++ b/src/twisted/python/failure.py
+@@ -24,7 +24,6 @@
+ from io import StringIO
+ from typing import Callable, NoReturn, TypeVar
+ 
+-import opcode
+ from incremental import Version
+ 
+ from twisted.python import reflect
+@@ -253,14 +252,6 @@ class Failure(BaseException):
+     pickled = 0
+     _parents = None
+ 
+-    # The opcode of "yield" in Python bytecode. We need this in
+-    # _findFailure in order to identify whether an exception was
+-    # thrown by a throwExceptionIntoGenerator.
+-    # on PY3, b'a'[0] == 97 while in py2 b'a'[0] == b'a' opcodes
+-    # are stored in bytes so we need to properly account for this
+-    # difference.
+-    _yieldOpcode = opcode.opmap["YIELD_VALUE"]
+-
+     def __init__(self, exc_value=None, exc_type=None, exc_tb=None, captureVars=False):
+         """
+         Initialize me with an explanation of the error.
+@@ -291,16 +282,10 @@ def __init__(self, exc_value=None, exc_type=None, exc_tb=None, captureVars=False
+         self.type = self.value = tb = None
+         self.captureVars = captureVars
+ 
+-        stackOffset = 0
+-
+-        if exc_value is None:
+-            exc_value = self._findFailure()
+-
+         if exc_value is None:
+             self.type, self.value, tb = sys.exc_info()
+             if self.type is None:
+                 raise NoCurrentExceptionError()
+-            stackOffset = 1
+         elif exc_type is None:
+             if isinstance(exc_value, Exception):
+                 self.type = exc_value.__class__
+@@ -316,50 +301,25 @@ def __init__(self, exc_value=None, exc_type=None, exc_tb=None, captureVars=False
+             self._extrapolate(self.value)
+             return
+ 
+-        if hasattr(self.value, "__failure__"):
+-            # For exceptions propagated through coroutine-awaiting (see
+-            # Deferred.send, AKA Deferred.__next__), which can't be raised as
+-            # Failure because that would mess up the ability to except: them:
+-            self._extrapolate(self.value.__failure__)
+-
+-            # Clean up the inherently circular reference established by storing
+-            # the failure there.  This should make the common case of a Twisted
+-            # / Deferred-returning coroutine somewhat less hard on the garbage
+-            # collector.
+-            del self.value.__failure__
+-            return
+-
+         if tb is None:
+             if exc_tb:
+                 tb = exc_tb
+             elif getattr(self.value, "__traceback__", None):
+                 # Python 3
+                 tb = self.value.__traceback__
+-
+-        frames = self.frames = []
+-
+-        # Added 2003-06-23 by Chris Armstrong. Yes, I actually have a
+-        # use case where I need this traceback object, and I've made
+-        # sure that it'll be cleaned up.
+         self.tb = tb
+ 
+-        if tb:
+-            f = tb.tb_frame
+-        elif not isinstance(self.value, Failure):
+-            # We don't do frame introspection since it's expensive,
+-            # and if we were passed a plain exception with no
+-            # traceback, it's not useful anyway
+-            f = stackOffset = None
+-
+-        while stackOffset and f:
+-            # This excludes this Failure.__init__ frame from the
+-            # stack, leaving it to start with our caller instead.
+-            f = f.f_back
+-            stackOffset -= 1
++    @property
++    def frames(self):
++        if hasattr(self, "_frames"):
++            return self._frames
++
++        frames = self._frames = []
++        tb = self.tb
+ 
+         while tb is not None:
+             f = tb.tb_frame
+-            if captureVars:
++            if self.captureVars:
+                 localz = f.f_locals.copy()
+                 if f.f_locals is f.f_globals:
+                     globalz = {}
+@@ -382,6 +342,11 @@ def __init__(self, exc_value=None, exc_type=None, exc_tb=None, captureVars=False
+                 )
+             )
+             tb = tb.tb_next
++        return frames
++
++    @frames.setter
++    def frames(self, frames):
++        self._frames = frames
+ 
+     @deprecatedProperty(Version("Twisted", "NEXT", 0, 0))
+     def stack(self):
+@@ -416,26 +381,9 @@ def _extrapolate(self, otherFailure):
+             one.
+         @type otherFailure: L{Failure}
+         """
+-        # Copy all infos from that failure (including self.frames).
++        # Copy all infos from that failure (including self._frames).
+         self.__dict__ = copy.copy(otherFailure.__dict__)
+ 
+-        # If we are re-throwing a Failure, we merge the stack-trace stored in
+-        # the failure with the current exception's stack.  This integrated with
+-        # throwExceptionIntoGenerator and allows to provide full stack trace,
+-        # even if we go through several layers of inlineCallbacks.
+-        _, _, tb = sys.exc_info()
+-        frames = []
+-        while tb is not None:
+-            f = tb.tb_frame
+-            if f.f_code not in _inlineCallbacksExtraneous:
+-                frames.append(
+-                    (f.f_code.co_name, f.f_code.co_filename, tb.tb_lineno, (), ())
+-                )
+-            tb = tb.tb_next
+-        # Merging current stack with stack stored in the Failure.
+-        frames.extend(self.frames)
+-        self.frames = frames
+-
+     @staticmethod
+     def _withoutTraceback(value: BaseException) -> Failure:
+         """
+@@ -449,7 +397,6 @@ def _withoutTraceback(value: BaseException) -> Failure:
+         count += 1
+         result.captureVars = False
+         result.count = count
+-        result.frames = []
+         result.value = value
+         result.type = value.__class__
+         result.tb = None
+@@ -517,69 +464,8 @@ def throwExceptionIntoGenerator(self, g):
+         @raise StopIteration: If there are no more values in the generator.
+         @raise anything else: Anything that the generator raises.
+         """
+-        # Note that the actual magic to find the traceback information
+-        # is done in _findFailure.
+         return g.throw(self.value.with_traceback(self.tb))
+ 
+-    @classmethod
+-    def _findFailure(cls):
+-        """
+-        Find the failure that represents the exception currently in context.
+-        """
+-        tb = sys.exc_info()[-1]
+-        if not tb:
+-            return
+-
+-        secondLastTb = None
+-        lastTb = tb
+-        while lastTb.tb_next:
+-            secondLastTb = lastTb
+-            lastTb = lastTb.tb_next
+-
+-        lastFrame = lastTb.tb_frame
+-
+-        # NOTE: f_locals.get('self') is used rather than
+-        # f_locals['self'] because psyco frames do not contain
+-        # anything in their locals() dicts.  psyco makes debugging
+-        # difficult anyhow, so losing the Failure objects (and thus
+-        # the tracebacks) here when it is used is not that big a deal.
+-
+-        # Handle raiseException-originated exceptions
+-        if lastFrame.f_code is cls.raiseException.__code__:
+-            return lastFrame.f_locals.get("self")
+-
+-        # Handle throwExceptionIntoGenerator-originated exceptions
+-        # this is tricky, and differs if the exception was caught
+-        # inside the generator, or above it:
+-
+-        # It is only really originating from
+-        # throwExceptionIntoGenerator if the bottom of the traceback
+-        # is a yield.
+-        # Pyrex and Cython extensions create traceback frames
+-        # with no co_code, but they can't yield so we know it's okay to
+-        # just return here.
+-        if (not lastFrame.f_code.co_code) or lastFrame.f_code.co_code[
+-            lastTb.tb_lasti
+-        ] != cls._yieldOpcode:
+-            return
+-
+-        # If the exception was caught above the generator.throw
+-        # (outside the generator), it will appear in the tb (as the
+-        # second last item):
+-        if secondLastTb:
+-            frame = secondLastTb.tb_frame
+-            if frame.f_code is cls.throwExceptionIntoGenerator.__code__:
+-                return frame.f_locals.get("self")
+-
+-        # If the exception was caught below the generator.throw
+-        # (inside the generator), it will appear in the frames' linked
+-        # list, above the top-level traceback item (which must be the
+-        # generator frame itself, thus its caller is
+-        # throwExceptionIntoGenerator).
+-        frame = tb.tb_frame.f_back
+-        if frame and frame.f_code is cls.throwExceptionIntoGenerator.__code__:
+-            return frame.f_locals.get("self")
+-
+     def __repr__(self) -> str:
+         return "<{} {}: {}>".format(
+             reflect.qual(self.__class__),
+@@ -594,6 +480,7 @@ def __setstate__(self, state):
+         if "stack" in state:
+             state.pop("stack")
+         state["_parents"] = state.pop("parents")
++        state["_frames"] = state.pop("frames")
+         self.__dict__.update(state)
+ 
+     def __getstate__(self):
+@@ -613,6 +500,9 @@ def __getstate__(self):
+         c["parents"] = c.pop("_parents")
+         c["stack"] = []
+ 
++        if "_frames" in c:
++            c.pop("_frames")
++
+         if self.captureVars:
+             c["frames"] = [
+                 [
+@@ -624,6 +514,8 @@ def __getstate__(self):
+                 ]
+                 for v in self.frames
+             ]
++        else:
++            c["frames"] = self.frames
+ 
+         # Added 2003-06-23. See comment above in __init__
+         c["tb"] = None
+@@ -643,7 +535,9 @@ def cleanFailure(self):
+         On Python 3, this will also set the C{__traceback__} attribute of the
+         exception instance to L{None}.
+         """
+-        self.__dict__ = self.__getstate__()
++        state = self.__getstate__()
++        state["_frames"] = state.pop("frames")
++        self.__dict__ = state
+         if getattr(self.value, "__traceback__", None):
+             # Python 3
+             self.value.__traceback__ = None
+@@ -702,6 +596,7 @@ def printTraceback(self, file=None, elideFrameworkCode=False, detail="default"):
+             from twisted.python import log
+ 
+             file = log.logerr
++
+         w = file.write
+ 
+         if detail == "verbose" and not self.captureVars:
+diff --git a/src/twisted/spread/pb.py b/src/twisted/spread/pb.py
+index 1a58dc6c59f..031292e318c 100644
+--- a/src/twisted/spread/pb.py
++++ b/src/twisted/spread/pb.py
+@@ -520,7 +520,7 @@ def throwExceptionIntoGenerator(self, g):
+ 
+ 
+ def failure2Copyable(fail, unsafeTracebacks=0):
+-    f = _newInstance(CopyableFailure, fail.__dict__)
++    f = _newInstance(CopyableFailure, fail.__getstate__())
+     f.unsafeTracebacks = unsafeTracebacks
+     return f
+ 
+diff --git a/src/twisted/test/test_failure.py b/src/twisted/test/test_failure.py
+index 3c543d44f22..a9e920c10ea 100644
+--- a/src/twisted/test/test_failure.py
++++ b/src/twisted/test/test_failure.py
+@@ -549,6 +549,13 @@ def test_failurePickling(self) -> None:
+         failure2 = failure.Failure._withoutTraceback(exc)
+         self.assertPicklingRoundtrips(failure2)
+ 
++        # Here we test a Failure with a traceback:
++        try:
++            raise ComparableException("boo")
++        except BaseException:
++            failure3 = failure.Failure()
++        self.assertPicklingRoundtrips(failure3)
++
+     def assertPicklingRoundtrips(self, original_failure: failure.Failure) -> None:
+         """
+         The failure can be pickled and unpickled, and the C{parents} attribute
+@@ -557,7 +564,10 @@ def assertPicklingRoundtrips(self, original_failure: failure.Failure) -> None:
+         failure2 = pickle.loads(pickle.dumps(original_failure))
+         expected = original_failure.__dict__.copy()
+         expected["pickled"] = 1
+-        self.assertEqual(expected, failure2.__dict__)
++        expected["tb"] = None
++        result = failure2.__dict__.copy()
++        self.assertEqual(expected, result)
++        self.assertEqual(failure2.frames, original_failure.frames)
+ 
+     def test_failurePicklingIncludesParents(self) -> None:
+         """
+@@ -566,6 +576,16 @@ def test_failurePicklingIncludesParents(self) -> None:
+         f = failure.Failure(ComparableException("hello"))
+         self.assertEqual(f.__getstate__()["parents"], f.parents)
+ 
++    def test_settableFrames(self) -> None:
++        """
++        C{Failure.frames} can be set, both before and after pickling.
++        """
++        original_failure = failure.Failure(getDivisionFailure())
++        original_failure.frames = original_failure.frames[:]
++        failure2 = pickle.loads(pickle.dumps(original_failure))
++        failure2.frames = failure2.frames[:-1]
++        self.assertEqual(failure2.frames, original_failure.frames[:-1])
++
+     def test_settableParents(self) -> None:
+         """
+         C{Failure.parents} can be set, both before and after pickling.
+@@ -679,66 +699,9 @@ def test_brokenTypeVerboseDetail(self) -> None:
+ 
+ class FindFailureTests(SynchronousTestCase):
+     """
+-    Tests for functionality related to L{Failure._findFailure}.
++    Tests for functionality related to identifying the C{Failure}.
+     """
+ 
+-    def test_findNoFailureInExceptionHandler(self) -> None:
+-        """
+-        Within an exception handler, _findFailure should return
+-        L{None} in case no Failure is associated with the current
+-        exception.
+-        """
+-        try:
+-            1 / 0
+-        except BaseException:
+-            self.assertIsNone(failure.Failure._findFailure())
+-        else:
+-            self.fail("No exception raised from 1/0!?")
+-
+-    def test_findNoFailure(self) -> None:
+-        """
+-        Outside of an exception handler, _findFailure should return None.
+-        """
+-        self.assertIsNone(sys.exc_info()[-1])  # environment sanity check
+-        self.assertIsNone(failure.Failure._findFailure())
+-
+-    def test_findFailure(self) -> None:
+-        """
+-        Within an exception handler, it should be possible to find the
+-        original Failure that caused the current exception (if it was
+-        caused by raiseException).
+-        """
+-        f = getDivisionFailure()
+-        f.cleanFailure()
+-        try:
+-            f.raiseException()
+-        except BaseException:
+-            self.assertEqual(failure.Failure._findFailure(), f)
+-        else:
+-            self.fail("No exception raised from raiseException!?")
+-
+-    def test_failureConstructionFindsOriginalFailure(self) -> None:
+-        """
+-        When a Failure is constructed in the context of an exception
+-        handler that is handling an exception raised by
+-        raiseException, the new Failure should be chained to that
+-        original Failure.
+-        Means the new failure should still show the same origin frame,
+-        but with different complete stack trace (as not thrown at same place).
+-        """
+-        f = getDivisionFailure()
+-        f.cleanFailure()
+-        try:
+-            f.raiseException()
+-        except BaseException:
+-            newF = failure.Failure()
+-            tb = f.getTraceback().splitlines()
+-            new_tb = newF.getTraceback().splitlines()
+-            self.assertNotEqual(tb, new_tb)
+-            self.assertEqual(tb[-3:], new_tb[-3:])
+-        else:
+-            self.fail("No exception raised from raiseException!?")
+-
+     @skipIf(raiser is None, "raiser extension not available")
+     def test_failureConstructionWithMungedStackSucceeds(self) -> None:
+         """
+@@ -993,30 +956,6 @@ def generator() -> Generator[None, None, None]:
+ 
+         self.assertEqual(traceback.extract_tb(stuff[0][2])[-1][-1], "1 / 0")
+ 
+-    def test_findFailureInGenerator(self) -> None:
+-        """
+-        Within an exception handler, it should be possible to find the
+-        original Failure that caused the current exception (if it was
+-        caused by throwExceptionIntoGenerator).
+-        """
+-        f = getDivisionFailure()
+-        f.cleanFailure()
+-        foundFailures = []
+-
+-        def generator() -> Generator[None, None, None]:
+-            try:
+-                yield
+-            except BaseException:
+-                foundFailures.append(failure.Failure._findFailure())
+-            else:
+-                self.fail("No exception sent to generator")
+-
+-        g = generator()
+-        next(g)
+-        self._throwIntoGenerator(f, g)
+-
+-        self.assertEqual(foundFailures, [f])
+-
+     def test_failureConstructionFindsOriginalFailure(self) -> None:
+         """
+         When a Failure is constructed in the context of an exception
+@@ -1055,9 +994,9 @@ def generator() -> Generator[None, None, None]:
+ 
+     def test_ambiguousFailureInGenerator(self) -> None:
+         """
+-        When a generator reraises a different exception,
+-        L{Failure._findFailure} inside the generator should find the reraised
+-        exception rather than original one.
++        When a generator reraises a different exception, creating a L{Failure}
++        inside the generator should find the reraised exception rather than
++        original one.
+         """
+ 
+         def generator() -> Generator[None, None, None]:
+@@ -1076,9 +1015,9 @@ def generator() -> Generator[None, None, None]:
+ 
+     def test_ambiguousFailureFromGenerator(self) -> None:
+         """
+-        When a generator reraises a different exception,
+-        L{Failure._findFailure} above the generator should find the reraised
+-        exception rather than original one.
++        When a generator reraises a different exception, creating a L{Failure}
++        above the generator should find the reraised exception rather than
++        original one.
+         """
+ 
+         def generator() -> Generator[None, None, None]:

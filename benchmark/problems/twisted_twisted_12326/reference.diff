@@ -1,0 +1,183 @@
+diff --git a/src/twisted/internet/endpoints.py b/src/twisted/internet/endpoints.py
+index 7ab1d817319..a98fd2ba43b 100644
+--- a/src/twisted/internet/endpoints.py
++++ b/src/twisted/internet/endpoints.py
+@@ -808,9 +808,18 @@ def __init__(
+             seconds to wait before assuming the connection has failed.
+         @type timeout: L{float} or L{int}
+ 
+-        @param bindAddress: the local address of the network interface to make
+-            the connections from.
+-        @type bindAddress: L{bytes}
++        @param bindAddress: The client socket normally uses whatever
++            local interface (eth0, en0, lo, etc) is best suited for the
++            target address, and a randomly-assigned port. This argument
++            allows that local address/port to be overridden. Providing
++            just an address (as a str) will bind the client socket to
++            whichever interface is assigned that address. Providing a
++            tuple of (str, int) will bind it to both an interface and a
++            specific local port. To bind the port, but leave the
++            interface unbound, use a tuple of ("", port), or ("0.0.0.0",
++            port) for IPv4, or ("::0", port) for IPv6. To leave both
++            interface and port unbound, just use None.
++        @type bindAddress: L{str}, L{tuple}, or None
+ 
+         @param attemptDelay: The number of seconds to delay between connection
+             attempts.
+@@ -827,6 +836,11 @@ def __init__(
+         self._hostStr = self._hostBytes if bytes is str else self._hostText
+         self._port = port
+         self._timeout = timeout
++        if bindAddress is not None:
++            if isinstance(bindAddress, (bytes, str)):
++                bindAddress = (bindAddress, 0)
++            if isinstance(bindAddress[0], bytes):
++                bindAddress = (bindAddress[0].decode(), bindAddress[1])
+         self._bindAddress = bindAddress
+         if attemptDelay is None:
+             attemptDelay = self._DEFAULT_ATTEMPT_DELAY
+@@ -2299,7 +2313,9 @@ def _parseClientTLS(
+         ),
+         clientFromString(reactor, endpoint)
+         if endpoint is not None
+-        else HostnameEndpoint(reactor, _idnaBytes(host), port, timeout, bindAddress),
++        else HostnameEndpoint(
++            reactor, _idnaBytes(host), port, timeout, (bindAddress, 0)
++        ),
+     )
+ 
+ 
+diff --git a/src/twisted/internet/tcp.py b/src/twisted/internet/tcp.py
+index 8f85025556b..018d1912d27 100644
+--- a/src/twisted/internet/tcp.py
++++ b/src/twisted/internet/tcp.py
+@@ -727,6 +727,7 @@ def __init__(self, host, port, bindAddress, connector, reactor=None):
+             whenDone = None
+         if whenDone and bindAddress is not None:
+             try:
++                assert type(bindAddress) == tuple
+                 if abstract.isIPv6Address(bindAddress[0]):
+                     bindinfo = _resolveIPv6(*bindAddress)
+                 else:
+diff --git a/src/twisted/internet/test/test_endpoints.py b/src/twisted/internet/test/test_endpoints.py
+index 7b755e61a39..b47b8181bc4 100644
+--- a/src/twisted/internet/test/test_endpoints.py
++++ b/src/twisted/internet/test/test_endpoints.py
+@@ -58,7 +58,6 @@
+ from twisted.plugin import getPlugins
+ from twisted.protocols import basic, policies
+ from twisted.python import log
+-from twisted.python.compat import nativeString
+ from twisted.python.components import proxyForInterface
+ from twisted.python.failure import Failure
+ from twisted.python.filepath import FilePath
+@@ -2699,6 +2698,41 @@ def test_otherConnectionsCancelled(self):
+         self.assertEqual([], self.mreactor.getDelayedCalls())
+ 
+ 
++class HostnameEndpointBindAddressTypes(unittest.TestCase):
++    """
++    Tests that HostnameEndpoint accepts all specified types for the
++    'bindAddress=' argument.
++    """
++
++    def setUp(self):
++        self.drr = deterministicResolvingReactor(MemoryReactor(), ["127.0.0.1"])
++
++    def test_bytes(self):
++        ba = b"1.2.3.4"
++        ep = endpoints.HostnameEndpoint(self.drr, b"example.com", 80, bindAddress=ba)
++        self.assertEqual(ep._bindAddress, ("1.2.3.4", 0))
++
++    def test_str(self):
++        ba = "1.2.3.4"
++        ep = endpoints.HostnameEndpoint(self.drr, b"example.com", 80, bindAddress=ba)
++        self.assertEqual(ep._bindAddress, ("1.2.3.4", 0))
++
++    def test_tuple_bytes(self):
++        ba = (b"1.2.3.4", 1234)
++        ep = endpoints.HostnameEndpoint(self.drr, b"example.com", 80, bindAddress=ba)
++        self.assertEqual(ep._bindAddress, ("1.2.3.4", 1234))
++
++    def test_tuple_str(self):
++        ba = ("1.2.3.4", 1234)
++        ep = endpoints.HostnameEndpoint(self.drr, b"example.com", 80, bindAddress=ba)
++        self.assertEqual(ep._bindAddress, ("1.2.3.4", 1234))
++
++    def test_none(self):
++        ba = None
++        ep = endpoints.HostnameEndpoint(self.drr, b"example.com", 80, bindAddress=ba)
++        self.assertEqual(ep._bindAddress, None)
++
++
+ @skipIf(skipSSL, skipSSLReason)
+ class SSL4EndpointsTests(EndpointTestCaseMixin, unittest.TestCase):
+     """
+@@ -4189,14 +4223,14 @@ def test_hostnameEndpointConstruction(self):
+         reactor = object()
+         endpoint = endpoints.clientFromString(
+             reactor,
+-            nativeString("tls:example.com:443:timeout=10:bindAddress=127.0.0.1"),
++            "tls:example.com:443:timeout=10:bindAddress=127.0.0.1",
+         )
+         hostnameEndpoint = endpoint._wrappedEndpoint
+         self.assertIs(hostnameEndpoint._reactor, reactor)
+         self.assertEqual(hostnameEndpoint._hostBytes, b"example.com")
+         self.assertEqual(hostnameEndpoint._port, 443)
+         self.assertEqual(hostnameEndpoint._timeout, 10)
+-        self.assertEqual(hostnameEndpoint._bindAddress, nativeString("127.0.0.1"))
++        self.assertEqual(hostnameEndpoint._bindAddress, ("127.0.0.1", 0))
+ 
+     def test_utf8Encoding(self):
+         """
+@@ -4239,14 +4273,18 @@ def test_tls(self):
+         # containing the cert itself for the CAs list.
+         endpoint = endpoints.clientFromString(
+             deterministicResolvingReactor(reactor, ["127.0.0.1"]),
+-            "tls:localhost:4321:privateKey={}:certificate={}:trustRoots={}".format(
++            "tls:localhost:4321:privateKey={}:certificate={}:trustRoots={}:bindAddress=127.0.0.1".format(
+                 escapedPEMPathName,
+                 escapedPEMPathName,
+                 endpoints.quoteStringArgument(pemPath.parent().path),
+-            ).encode("ascii"),
++            ).encode(
++                "ascii"
++            ),
+         )
+         d = endpoint.connect(Factory.forProtocol(Protocol))
+         host, port, factory, timeout, bindAddress = reactor.tcpClients.pop()
++        self.assertIs(type(bindAddress), tuple)
++        self.assertEqual(bindAddress, ("127.0.0.1", 0))
+         clientProtocol = factory.buildProtocol(None)
+         self.assertNoResult(d)
+         assert clientProtocol is not None
+diff --git a/src/twisted/newsfragments/12325.bugfix b/src/twisted/newsfragments/12325.bugfix
+new file mode 100644
+index 00000000000..ed485392441
+--- /dev/null
++++ b/src/twisted/newsfragments/12325.bugfix
+@@ -0,0 +1 @@
++twisted.internet.endpoints.clientFromString for TLS endpoints with "bindAddress="  no longer crashes during connect. twisted.internet.endpoints.HostnameEndpoint() no longer crashes when given a bindAddress= argument that is just a string, and that argument now accepts either address strings or (address, port) tuples.
+\ No newline at end of file
+diff --git a/src/twisted/web/test/test_agent.py b/src/twisted/web/test/test_agent.py
+index d042f9caf7a..fc193fbb1f6 100644
+--- a/src/twisted/web/test/test_agent.py
++++ b/src/twisted/web/test/test_agent.py
+@@ -1256,7 +1256,7 @@ def test_bindAddress(self):
+         agent = client.Agent(self.reactor, bindAddress="192.168.0.1")
+         agent.request(b"GET", b"http://foo/")
+         address = self.reactor.tcpClients.pop()[4]
+-        self.assertEqual("192.168.0.1", address)
++        self.assertEqual(("192.168.0.1", 0), address)
+ 
+     @skipIf(not sslPresent, "SSL not present, cannot run SSL tests.")
+     def test_bindAddressSSL(self):
+@@ -1267,7 +1267,7 @@ def test_bindAddressSSL(self):
+         agent = client.Agent(self.reactor, bindAddress="192.168.0.1")
+         agent.request(b"GET", b"https://foo/")
+         address = self.reactor.tcpClients.pop()[4]
+-        self.assertEqual("192.168.0.1", address)
++        self.assertEqual(("192.168.0.1", 0), address)
+ 
+     def test_responseIncludesRequest(self):
+         """

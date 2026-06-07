@@ -1,0 +1,286 @@
+diff --git a/src/twisted/web/http.py b/src/twisted/web/http.py
+index b08ee9121c4..a65fb37b090 100644
+--- a/src/twisted/web/http.py
++++ b/src/twisted/web/http.py
+@@ -236,6 +236,58 @@
+ monthname_lower = [name and name.lower() for name in monthname]
+ 
+ 
++def _parseRequestLine(line: bytes) -> tuple[bytes, bytes, bytes]:
++    """
++    Parse an HTTP request line, which looks like:
++
++        GET /foo/bar HTTP/1.1
++
++    This function attempts to validate the well-formedness of
++    the line. RFC 9112 section 3 provides this ABNF:
++
++        request-line   = method SP request-target SP HTTP-version
++
++    We allow any method that is a valid token:
++
++        method         = token
++        token          = 1*tchar
++        tchar          = "!" / "#" / "$" / "%" / "&" / "'" / "*"
++                        / "+" / "-" / "." / "^" / "_" / "`" / "|" / "~"
++                        / DIGIT / ALPHA
++
++    We allow any non-empty request-target that contains only printable
++    ASCII characters (no whitespace).
++
++    The RFC defines HTTP-version like this:
++
++        HTTP-version  = HTTP-name "/" DIGIT "." DIGIT
++        HTTP-name     = %s"HTTP"
++
++    However, this function is more strict than the RFC: we only allow
++    HTTP versions of 1.0 and 1.1, as later versions of HTTP don't use
++    a request line.
++
++    @returns: C{(method, request, version)} three-tuple
++
++    @raises: L{ValueError} when malformed
++    """
++    method, request, version = line.split(b" ")
++
++    if not _istoken(method):
++        raise ValueError("Invalid method")
++
++    for c in request:
++        if c <= 32 or c > 176:
++            raise ValueError("Invalid request-target")
++    if request == b"":
++        raise ValueError("Empty request-target")
++
++    if version != b"HTTP/1.1" and version != b"HTTP/1.0":
++        raise ValueError("Invalid version")
++
++    return method, request, version
++
++
+ def _parseContentType(line: bytes) -> bytes:
+     """
+     Parse the Content-Type header.
+@@ -455,6 +507,20 @@ def toChunk(data):
+     return (networkString(f"{len(data):x}"), b"\r\n", data, b"\r\n")
+ 
+ 
++def _istoken(b: bytes) -> bool:
++    """
++    Is the string a token per RFC 9110 section 5.6.2?
++    """
++    for c in b:
++        if c not in (
++            b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz"  # ALPHA
++            b"0123456789"  # DIGIT
++            b"!#$%^'*+-.^_`|~"
++        ):
++            return False
++    return b != b""
++
++
+ def _ishexdigits(b: bytes) -> bool:
+     """
+     Is the string case-insensitively hexidecimal?
+@@ -2320,14 +2386,9 @@ def lineReceived(self, line):
+ 
+             self.__first_line = 0
+ 
+-            parts = line.split()
+-            if len(parts) != 3:
+-                self._respondToBadRequestAndDisconnect()
+-                return
+-            command, request, version = parts
+             try:
+-                command.decode("ascii")
+-            except UnicodeDecodeError:
++                command, request, version = _parseRequestLine(line)
++            except ValueError:
+                 self._respondToBadRequestAndDisconnect()
+                 return
+ 
+@@ -2428,7 +2489,8 @@ def headerReceived(self, line):
+             self._respondToBadRequestAndDisconnect()
+             return False
+ 
+-        if not header or header[-1:].isspace():
++        # Header names must be tokens, per RFC 9110 section 5.1.
++        if not _istoken(header):
+             self._respondToBadRequestAndDisconnect()
+             return False
+ 
+diff --git a/src/twisted/web/newsfragments/12233.bugfix b/src/twisted/web/newsfragments/12233.bugfix
+new file mode 100644
+index 00000000000..bfec79b0316
+--- /dev/null
++++ b/src/twisted/web/newsfragments/12233.bugfix
+@@ -0,0 +1 @@
++The HTTP 1.0/1.1 server provided by twisted.web is now more picky about the first line of a request, improving compliance with RFC 9112.
+diff --git a/src/twisted/web/newsfragments/12235.bugfix b/src/twisted/web/newsfragments/12235.bugfix
+new file mode 100644
+index 00000000000..45b83655c52
+--- /dev/null
++++ b/src/twisted/web/newsfragments/12235.bugfix
+@@ -0,0 +1 @@
++The HTTP 1.0/1.1 server provided by twisted.web now constains the characters set of HTTP header names, improving compliance with RFC 9110.
+diff --git a/src/twisted/web/test/test_http.py b/src/twisted/web/test/test_http.py
+index b88d7c474b6..fa7f3dfa1ba 100644
+--- a/src/twisted/web/test/test_http.py
++++ b/src/twisted/web/test/test_http.py
+@@ -1727,7 +1727,7 @@ def process(self):
+         self.assertTrue(channel.transport.disconnecting)
+         self.assertEqual(processed, [])
+ 
+-    def test_invalidNonAsciiMethod(self):
++    def test_invalidMethodNonAscii(self):
+         """
+         When client sends invalid HTTP method containing
+         non-ascii characters HTTP 400 'Bad Request' status will be returned.
+@@ -1745,6 +1745,114 @@ def process(self):
+         self.assertTrue(channel.transport.disconnecting)
+         self.assertEqual(processed, [])
+ 
++    def test_invalidRequestLineExtraSpaces(self):
++        """
++        The three components of the request line must not be
++        separated by anything other than a single SP character,
++        or a 400 status results.
++        """
++        for requestLine in [
++            b"GET  / HTTP/1.0",
++            b"GET /  HTTP/1.0",
++            b"GET\t/ HTTP/1.0",
++            b"GET /\vHTTP/1.1",
++            b"GET / HTTP/1.1 ",
++            b" GET / HTTP/1.1",
++        ]:
++            self.assertRequestRejected(
++                [requestLine, b"Content-Length: 0", b"Host: foo.example", b"", b""]
++            )
++
++    def test_invalidMethodEmpty(self):
++        """
++        A request with an empty method field is rejected with a
++        400 status code.
++        """
++        self.assertRequestRejected(
++            [
++                b" /foo HTTP/1.1",
++                b"Content-Length: 0",
++                b"Host: foo.example",
++                b"",
++                b"",
++            ]
++        )
++
++    def test_invalidMethodNUL(self):
++        """
++        A request with a method that contains a NUL character
++        is rejected with a 400 status code.
++        """
++        self.assertRequestRejected(
++            [
++                b"GET\0 /foo HTTP/1.1",
++                b"Content-Length: 0",
++                b"Host: foo.example",
++                b"",
++                b"",
++            ]
++        )
++
++    def test_invalidVersion(self):
++        """
++        A request with an invalid HTTP version number is rejected
++        with a 400 status code.
++        """
++        self.assertRequestRejected(
++            [
++                b"HEAD /foo HTTP/1.2",
++                b"Content-Length: 0",
++                b"Host: foo.example",
++                b"",
++                b"",
++            ]
++        )
++
++    def test_invalidRequestTargetEmpty(self):
++        """
++        A request with an empty request-target (URI) is rejected with
++        a 400 status code.
++        """
++        self.assertRequestRejected(
++            [
++                b"POST  HTTP/1.1",
++                b"Content-Length: 0",
++                b"Host: foo.example",
++                b"",
++                b"",
++            ]
++        )
++
++    def test_invalidRequestTargetNUL(self):
++        """
++        A request with an empty request-target (URI) is rejected with
++        a 400 status code.
++        """
++        self.assertRequestRejected(
++            [
++                b"POST /foo\0 HTTP/1.1",
++                b"Content-Length: 0",
++                b"Host: foo.example",
++                b"",
++                b"",
++            ]
++        )
++
++    def test_invalidRequestTargetWhitespace(self):
++        """
++        A request with a request-target (URI) that contains whitespace
++        is rejected with a 400 status code.
++        """
++        self.assertRequestRejected(
++            [
++                b"POST /foo\t/bar HTTP/1.1",
++                b"Content-Length: 0",
++                b"Host: foo.example",
++                b"",
++                b"",
++            ]
++        )
++
+     def test_basicAuth(self):
+         """
+         L{HTTPChannel} provides username and password information supplied in
+@@ -1945,8 +2053,8 @@ def test_invalidHeaderNoColon(self):
+     def test_invalidHeaderOnlyColon(self):
+         """
+         C{HTTPChannel} rejects a request with an empty header name (i.e.
+-        nothing before the colon).  It produces a 400 (Bad Request) response is
+-        generated and closes the connection.
++        nothing before the colon).  It produces a 400 (Bad Request) response
++        and closes the connection.
+         """
+         self.assertRequestRejected(
+             [
+@@ -1973,6 +2081,21 @@ def test_invalidHeaderWhitespaceBeforeColon(self):
+             ]
+         )
+ 
++    def test_invalidHeaderChars(self):
++        """
++        A request with a header that contains invalid characters
++        is rejected with a 400 status code.
++        """
++        for header in [
++            b"foo\x00bar: baz",  # NUL byte
++            b"foo\x1bbar: baz",  # ESC byte
++            b"Foo\vBar: baz",  # exotic whitespace
++            b"foo\xe2\x80\xbdbar: baz",  # non-ASCII bytes
++        ]:
++            self.assertRequestRejected(
++                [b"GET / HTTP/1.1", b"Host: foo.example", header, b"", b""]
++            )
++
+     def test_headerLimitPerRequest(self):
+         """
+         C{HTTPChannel} enforces the limit of C{HTTPChannel.maxHeaders} per

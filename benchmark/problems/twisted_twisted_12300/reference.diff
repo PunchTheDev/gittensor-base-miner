@@ -1,0 +1,426 @@
+diff --git a/src/twisted/conch/newsfragments/12211.feature b/src/twisted/conch/newsfragments/12211.feature
+new file mode 100644
+index 00000000000..75b3a37a32d
+--- /dev/null
++++ b/src/twisted/conch/newsfragments/12211.feature
+@@ -0,0 +1 @@
++twisted.conch.ssh.keys.Key can now load public blob keys of type sk-ssh-ed25519@openssh.com and sk-ecdsa-sha2-nistp256@openssh.com.
+\ No newline at end of file
+diff --git a/src/twisted/conch/ssh/keys.py b/src/twisted/conch/ssh/keys.py
+index e959f022a0b..7d2f1072f47 100644
+--- a/src/twisted/conch/ssh/keys.py
++++ b/src/twisted/conch/ssh/keys.py
+@@ -256,24 +256,38 @@ def _fromString_BLOB(cls, blob):
+         if keyType == b"ssh-rsa":
+             e, n, rest = common.getMP(rest, 2)
+             return cls(rsa.RSAPublicNumbers(e, n).public_key(default_backend()))
+-        elif keyType == b"ssh-dss":
++
++        if keyType == b"ssh-dss":
+             p, q, g, y, rest = common.getMP(rest, 4)
+             return cls(
+                 dsa.DSAPublicNumbers(
+                     y=y, parameter_numbers=dsa.DSAParameterNumbers(p=p, q=q, g=g)
+                 ).public_key(default_backend())
+             )
+-        elif keyType in _curveTable:
++
++        if keyType in _curveTable:
+             return cls(
+                 ec.EllipticCurvePublicKey.from_encoded_point(
+                     _curveTable[keyType], common.getNS(rest, 2)[1]
+                 )
+             )
+-        elif keyType == b"ssh-ed25519":
++
++        if keyType == b"sk-ecdsa-sha2-nistp256@openssh.com":
++            keyObject = cls._fromECEncodedPoint(
++                encodedPoint=common.getNS(rest, 2)[1],
++                curve=b"ecdsa-sha2-nistp256",
++            )
++            keyObject._sk = True
++            return keyObject
++
++        if keyType in [b"ssh-ed25519", b"sk-ssh-ed25519@openssh.com"]:
+             a, rest = common.getNS(rest)
+-            return cls._fromEd25519Components(a)
+-        else:
+-            raise BadKeyError(f"unknown blob type: {keyType}")
++            keyObject = cls._fromEd25519Components(a)
++            if keyType.startswith(b"sk-ssh-"):
++                keyObject._sk = True
++            return keyObject
++
++        raise BadKeyError(f"unknown blob type: {keyType}")
+ 
+     @classmethod
+     def _fromString_PRIVATE_BLOB(cls, blob):
+@@ -676,16 +690,37 @@ def _guessStringType(cls, data):
+         """
+         if data.startswith(b"ssh-") or data.startswith(b"ecdsa-sha2-"):
+             return "public_openssh"
+-        elif data.startswith(b"-----BEGIN"):
++
++        # Twisted doesn't support certificate based keys yet.
++        # https://github.com/openssh/openssh-portable/blob/05f2b141cfcc60c7cdedf9450d2b9d390c19eaad/PROTOCOL.u2f#L96C1-L97C31
++        if data.startswith(b"sk-ecdsa-sha2-nistp256-cert-v01") or data.startswith(
++            b"sk-ssh-ed25519-cert-v01"
++        ):
++            raise BadKeyError("certificate based keys are not supported")
++
++        if data.startswith(b"sk-ecdsa-sha2-nistp256") or data.startswith(
++            b"sk-ssh-ed25519"
++        ):
++            # OpenSSH FIDO2 security keys have similar public format.
++            # They have the extra "application" string,
++            # which for now is ignored.
++            return "public_openssh"
++
++        if data.startswith(b"-----BEGIN"):
+             return "private_openssh"
+-        elif data.startswith(b"{"):
++
++        if data.startswith(b"{"):
+             return "public_lsh"
+-        elif data.startswith(b"("):
++
++        if data.startswith(b"("):
+             return "private_lsh"
+-        elif (
++
++        if (
+             data.startswith(b"\x00\x00\x00\x07ssh-")
+             or data.startswith(b"\x00\x00\x00\x13ecdsa-")
+             or data.startswith(b"\x00\x00\x00\x0bssh-ed25519")
++            or data.startswith(b'\x00\x00\x00"sk-ecdsa-sha2-nistp256@openssh.com')
++            or data.startswith(b"\x00\x00\x00\x1ask-ssh-ed25519@openssh.com")
+         ):
+             ignored, rest = common.getNS(data)
+             count = 0
+@@ -869,6 +904,7 @@ def __init__(self, keyObject):
+         @type keyObject: C{cryptography.hazmat.primitives.asymmetric} key.
+         """
+         self._keyObject = keyObject
++        self._sk = False
+ 
+     def __eq__(self, other: object) -> bool:
+         """
+@@ -1029,16 +1065,25 @@ def sshType(self):
+         @return: The key type format.
+         @rtype: L{bytes}
+         """
++        if self._sk:
++            if self.type() == "EC":
++                return b"sk-ecdsa-sha2-nistp256@openssh.com"
++            # FIXME: https://github.com/twisted/twisted/issues/12304
++            # We only support 2 key types,
++            # so if the key was loaded with success and it's
++            # not ECDSA, it must be an ED25519 key.
++            return b"sk-ssh-ed25519@openssh.com"
++
+         if self.type() == "EC":
+             return (
+                 b"ecdsa-sha2-" + _secToNist[self._keyObject.curve.name.encode("ascii")]
+             )
+-        else:
+-            return {
+-                "RSA": b"ssh-rsa",
+-                "DSA": b"ssh-dss",
+-                "Ed25519": b"ssh-ed25519",
+-            }[self.type()]
++
++        return {
++            "RSA": b"ssh-rsa",
++            "DSA": b"ssh-dss",
++            "Ed25519": b"ssh-ed25519",
++        }[self.type()]
+ 
+     def supportedSignatureAlgorithms(self):
+         """
+@@ -1070,14 +1115,16 @@ def _getHashAlgorithm(self, signatureType):
+                     return hashes.SHA512()
+             else:
+                 return None
+-        else:
+-            return {
+-                ("RSA", b"ssh-rsa"): hashes.SHA1(),
+-                ("RSA", b"rsa-sha2-256"): hashes.SHA256(),
+-                ("RSA", b"rsa-sha2-512"): hashes.SHA512(),
+-                ("DSA", b"ssh-dss"): hashes.SHA1(),
+-                ("Ed25519", b"ssh-ed25519"): hashes.SHA512(),
+-            }.get((self.type(), signatureType))
++
++        if self.type() == "Ed25519":
++            return hashes.SHA512()
++
++        return {
++            ("RSA", b"ssh-rsa"): hashes.SHA1(),
++            ("RSA", b"rsa-sha2-256"): hashes.SHA256(),
++            ("RSA", b"rsa-sha2-512"): hashes.SHA512(),
++            ("DSA", b"ssh-dss"): hashes.SHA1(),
++        }.get((self.type(), signatureType))
+ 
+     def size(self):
+         """
+diff --git a/src/twisted/conch/test/keydata.py b/src/twisted/conch/test/keydata.py
+index 024cefdd082..c64a6b074bf 100644
+--- a/src/twisted/conch/test/keydata.py
++++ b/src/twisted/conch/test/keydata.py
+@@ -105,6 +105,18 @@
+     "curve": b"ecdsa-sha2-nistp256",
+ }
+ 
++SKECDatanistp256 = {
++    "x": int(
++        "239399367768747020111880335553299826848360860410053166887934464"
++        "83115637049597"
++    ),
++    "y": int(
++        "114119006635761413192818806701564910719235784173643448381780025"
++        "223832906554748"
++    ),
++    "curve": b"sk-ecdsa-sha2-nistp256@openssh.com",
++}
++
+ ECDatanistp384 = {
+     "privateValue": int(
+         "280814107134858470598753916394807521398239633534281"
+@@ -153,6 +165,17 @@
+     ),
+ }
+ 
++SKEd25519Data = {
++    "a": (
++        b"\x08}'U\xd2i\x04\x11\xea\x01~+\x165iRM\xdd\xe6R\x7f\xd3\xaf\\\xa8p"
++        b"\xa0LL\xe5\x8a\xa0"
++    ),
++    "k": (
++        b"7/%\xda\x8d\xd4\xa8\x9ax|a\xf0\x98\x01\xc6\xf4^mg\x05i17Li\r\x05U"
++        b"\xbb\xc9DX"
++    ),
++}
++
+ privateECDSA_openssh521 = b"""-----BEGIN EC PRIVATE KEY-----
+ MIHcAgEBBEIAjn0lSVF6QweS4bjOGP9RHwqxUiTastSE0MVuLtFvkxygZqQ712oZ
+ ewMvqKkxthMQgxzSpGtRBcmkL7RqZ94+18qgBwYFK4EEACOhgYkDgYYABAFpX/6B
+@@ -215,6 +238,30 @@
+     b"gkN/34n42F4vpeA= comment"
+ )
+ 
++publicSKECDSA_openssh = (
++    b"sk-ecdsa-sha2-nistp256@openssh.com AAAAInNrLWVjZHNhLXNoYTItbmlzdHAyNTZAb3"
++    b"BlbnNzaC5jb20AAAAIbmlzdHAyNTYAAABBBDTthidmBSzlQiO8aZPfLmUDOS2TSRevW8IrHPK"
++    b"IhYj9/E0RnTyvPIB1eWQx4rQl5iO1mihuBz+u4LkjwVEU3XwAAAAUc3NoOmVjZHNhLWZpZG8y"
++    b"LXRlc3Q= comment"
++)
++
++publicSKEd25519_openssh = (
++    b"sk-ssh-ed25519@openssh.com AAAAGnNrLXNzaC1lZDI1NTE5QG9wZW5zc2guY29tAAAAIA"
++    b"h9J1XSaQQR6gF+KxY1aVJN3eZSf9OvXKhwoExM5YqgAAAABHNzaDo= comment"
++)
++
++publicSKECDSA_cert_openssh = (
++    b"sk-ecdsa-sha2-nistp256-cert-v01@openssh.com AAAAInNrLWVjZHNhLXNoYTItbmlzdHAyNTZAb3"
++    b"BlbnNzaC5jb20AAAAIbmlzdHAyNTYAAABBBDTthidmBSzlQiO8aZPfLmUDOS2TSRevW8IrHPK"
++    b"IhYj9/E0RnTyvPIB1eWQx4rQl5iO1mihuBz+u4LkjwVEU3XwAAAAUc3NoOmVjZHNhLWZpZG8y"
++    b"LXRlc3Q= comment"
++)
++
++publicSKEd25519_cert_openssh = (
++    b"sk-ssh-ed25519-cert-v01@openssh.com AAAAGnNrLXNzaC1lZDI1NTE5QG9wZW5zc2guY29tAAAAIA"
++    b"h9J1XSaQQR6gF+KxY1aVJN3eZSf9OvXKhwoExM5YqgAAAABHNzaDo= comment"
++)
++
+ privateECDSA_openssh = b"""-----BEGIN EC PRIVATE KEY-----
+ MHcCAQEEIEyU1YOT2JxxofwbJXIjGftdNcJK55aQdNrhIt2xYQz0oAoGCCqGSM49
+ AwEHoUQDQgAEqKZfUNnv5CPRKl948xujWlvrIaQBvmXt24LWXznnIPu0R9B+qTtt
+diff --git a/src/twisted/conch/test/test_keys.py b/src/twisted/conch/test/test_keys.py
+index 62944473c01..e479f99c5b0 100644
+--- a/src/twisted/conch/test/test_keys.py
++++ b/src/twisted/conch/test/test_keys.py
+@@ -135,11 +135,17 @@ def test__guessStringType(self):
+         self.assertEqual(
+             keys.Key._guessStringType(keydata.publicECDSA_openssh), "public_openssh"
+         )
+-        if ED25519_SUPPORTED:
+-            self.assertEqual(
+-                keys.Key._guessStringType(keydata.publicEd25519_openssh),
+-                "public_openssh",
+-            )
++        self.assertEqual(
++            keys.Key._guessStringType(keydata.publicSKECDSA_openssh), "public_openssh"
++        )
++        self.assertEqual(
++            keys.Key._guessStringType(keydata.publicEd25519_openssh),
++            "public_openssh",
++        )
++        self.assertEqual(
++            keys.Key._guessStringType(keydata.publicSKEd25519_openssh),
++            "public_openssh",
++        )
+         self.assertEqual(
+             keys.Key._guessStringType(keydata.privateRSA_openssh), "private_openssh"
+         )
+@@ -159,11 +165,10 @@ def test__guessStringType(self):
+             keys.Key._guessStringType(keydata.privateECDSA_openssh_new),
+             "private_openssh",
+         )
+-        if ED25519_SUPPORTED:
+-            self.assertEqual(
+-                keys.Key._guessStringType(keydata.privateEd25519_openssh_new),
+-                "private_openssh",
+-            )
++        self.assertEqual(
++            keys.Key._guessStringType(keydata.privateEd25519_openssh_new),
++            "private_openssh",
++        )
+         self.assertEqual(keys.Key._guessStringType(keydata.publicRSA_lsh), "public_lsh")
+         self.assertEqual(keys.Key._guessStringType(keydata.publicDSA_lsh), "public_lsh")
+         self.assertEqual(
+@@ -188,6 +193,21 @@ def test__guessStringType(self):
+         )
+         self.assertEqual(keys.Key._guessStringType(b"not a key"), None)
+ 
++    def test_OpenSSH_cert_not_supported(self):
++        """
++        OpenSSH certificates are not yet supported.
++        """
++        self.assertRaises(
++            keys.BadKeyError,
++            keys.Key.fromString,
++            keydata.publicSKEd25519_cert_openssh,
++        )
++        self.assertRaises(
++            keys.BadKeyError,
++            keys.Key.fromString,
++            keydata.publicSKECDSA_cert_openssh,
++        )
++
+     def test_public(self):
+         """
+         The L{keys.Key.public} method returns a public key for both
+@@ -236,6 +256,10 @@ def _testPublicPrivateFromString(self, public, private, type, data):
+         self._testPublicFromString(public, type, data)
+         self._testPrivateFromString(private, type, data)
+ 
++    def _testPublicSKFromString(self, public, type, data):
++        self._testPublicFromString(public, type, data)
++        self._testSKFromString(public)
++
+     def _testPublicFromString(self, public, type, data):
+         publicKey = keys.Key.fromString(public)
+         self.assertTrue(publicKey.isPublic())
+@@ -250,6 +274,10 @@ def _testPrivateFromString(self, private, type, data):
+         for k, v in data.items():
+             self.assertEqual(privateKey.data()[k], v)
+ 
++    def _testSKFromString(self, public):
++        publicKey = keys.Key.fromString(public)
++        self.assertTrue(publicKey._sk)
++
+     def test_fromOpenSSH(self):
+         """
+         Test that keys are correctly generated from OpenSSH strings.
+@@ -279,7 +307,19 @@ def test_fromOpenSSH(self):
+             keydata.DSAData,
+         )
+ 
++        self._testPublicSKFromString(
++            keydata.publicSKECDSA_openssh,
++            "EC",
++            keydata.SKECDatanistp256,
++        )
++
+         if ED25519_SUPPORTED:
++            self._testPublicSKFromString(
++                keydata.publicSKEd25519_openssh,
++                "Ed25519",
++                keydata.SKEd25519Data,
++            )
++
+             self._testPublicPrivateFromString(
+                 keydata.publicEd25519_openssh,
+                 keydata.privateEd25519_openssh_new,
+@@ -776,11 +816,23 @@ def test_supportedSignatureAlgorithms(self):
+             keys.Key(self.ecObj).supportedSignatureAlgorithms(),
+             [b"ecdsa-sha2-nistp256"],
+         )
++        self.assertEqual(
++            keys.Key.fromString(
++                keydata.publicSKECDSA_openssh
++            ).supportedSignatureAlgorithms(),
++            [b"sk-ecdsa-sha2-nistp256@openssh.com"],
++        )
+         if ED25519_SUPPORTED:
+             self.assertEqual(
+                 keys.Key(self.ed25519Obj).supportedSignatureAlgorithms(),
+                 [b"ssh-ed25519"],
+             )
++            self.assertEqual(
++                keys.Key.fromString(
++                    keydata.publicSKEd25519_openssh
++                ).supportedSignatureAlgorithms(),
++                [b"sk-ssh-ed25519@openssh.com"],
++            )
+         self.assertRaises(RuntimeError, keys.Key(None).supportedSignatureAlgorithms)
+         self.assertRaises(RuntimeError, keys.Key(self).supportedSignatureAlgorithms)
+ 
+@@ -861,6 +913,33 @@ def test_fromBlobECDSA(self):
+         self.assertTrue(eckey.isPublic())
+         self.assertEqual(ecPublicData, eckey.data())
+ 
++    def test_fromBlobSKECDSA(self):
++        """
++        It can load public SK-ECDSA key from blob format.
++        """
++        from cryptography import utils
++
++        skEcPublicData = {
++            "x": keydata.SKECDatanistp256["x"],
++            "y": keydata.SKECDatanistp256["y"],
++            "curve": keydata.SKECDatanistp256["curve"],
++        }
++
++        skEcblob = (
++            common.NS(keydata.SKECDatanistp256["curve"])
++            + common.NS(keydata.SKECDatanistp256["curve"][-8:])
++            + common.NS(
++                b"\x04"
++                + utils.int_to_bytes(skEcPublicData["x"], 32)
++                + utils.int_to_bytes(skEcPublicData["y"], 32)
++            )
++        )
++
++        skEckey = keys.Key.fromString(skEcblob)
++        self.assertTrue(skEckey.isPublic())
++        self.assertTrue(skEckey._sk)
++        self.assertEqual(skEcPublicData, skEckey.data())
++
+     @skipWithoutEd25519
+     def test_fromBlobEd25519(self):
+         """
+@@ -877,6 +956,24 @@ def test_fromBlobEd25519(self):
+         self.assertTrue(ed25519Key.isPublic())
+         self.assertEqual(ed25519PublicData, ed25519Key.data())
+ 
++    def test_fromBlobSKEd25519(self):
++        """
++        A public SK-Ed25519 key is correctly generated from a public key blob.
++        """
++        skEd25519PublicData = {
++            "a": keydata.SKEd25519Data["a"],
++        }
++
++        skEd25519Blob = common.NS(b"sk-ssh-ed25519@openssh.com") + common.NS(
++            skEd25519PublicData["a"]
++        )
++
++        skEd25519Key = keys.Key.fromString(skEd25519Blob)
++
++        self.assertTrue(skEd25519Key.isPublic())
++        self.assertTrue(skEd25519Key._sk)
++        self.assertEqual(skEd25519PublicData, skEd25519Key.data())
++
+     def test_fromPrivateBlobUnsupportedType(self):
+         """
+         C{BadKeyError} is raised when loading a private blob with an

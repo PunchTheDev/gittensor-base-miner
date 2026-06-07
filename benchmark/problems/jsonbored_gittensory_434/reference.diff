@@ -1,0 +1,70 @@
+diff --git a/src/signals/settings-preview.ts b/src/signals/settings-preview.ts
+index 92959668..5d466f2c 100644
+--- a/src/signals/settings-preview.ts
++++ b/src/signals/settings-preview.ts
+@@ -481,11 +481,11 @@ function writesPrPublicSurface(settings: RepositorySettings, decision: PublicSur
+ }
+ 
+ function requiredInstallPermissions(settings: RepositorySettings, decision: PublicSurfaceDecision): string[] {
+-  // PR conversation comments and PR labels are gated by GitHub on the Pull requests permission (write),
+-  // matching REQUIRED_INSTALLATION_PERMISSIONS; reading PR metadata only needs read.
+-  const writesPrSurface = writesPrPublicSurface(settings, decision);
+-  const permissions = new Set(["metadata: read", writesPrSurface ? "pull_requests: write" : "pull_requests: read"]);
+-  if (writesPrSurface) permissions.add("issues: write");
++  // PR conversation comments and PR labels use GitHub Issues endpoints, so they require issues:write, not
++  // pull_requests:write -- the app only reads PRs. This matches REQUIRED_INSTALLATION_PERMISSIONS
++  // (pull_requests: read) and avoids asking maintainers for broader PR-write scope than the app uses.
++  const permissions = new Set(["metadata: read", "pull_requests: read"]);
++  if (writesPrPublicSurface(settings, decision)) permissions.add("issues: write");
+   if (decision.willCheckRun || settings.checkRunMode === "enabled" || settings.gateCheckMode === "enabled") permissions.add("checks: write");
+   return [...permissions];
+ }
+@@ -494,9 +494,8 @@ function activeMissingPermissions(settings: RepositorySettings, decision: Public
+   if (!installation) return [];
+   const missing = new Set(installation.missingPermissions);
+   const active: string[] = [];
+-  const writesPrSurface = writesPrPublicSurface(settings, decision);
+-  if (writesPrSurface && missing.has("pull_requests")) active.push("pull_requests");
+-  if (writesPrSurface && missing.has("issues")) active.push("issues");
++  // Comment/label output is gated on issues:write (Issues endpoints), not pull_requests:write.
++  if (writesPrPublicSurface(settings, decision) && missing.has("issues")) active.push("issues");
+   if ((decision.willCheckRun || settings.checkRunMode === "enabled" || settings.gateCheckMode === "enabled") && missing.has("checks")) active.push("checks");
+   return active;
+ }
+diff --git a/test/unit/settings-preview.test.ts b/test/unit/settings-preview.test.ts
+index 646f4127..5bc74b20 100644
+--- a/test/unit/settings-preview.test.ts
++++ b/test/unit/settings-preview.test.ts
+@@ -116,7 +116,7 @@ describe("buildRepoSettingsPreview", () => {
+     expect(preview.warnings).toHaveLength(0);
+     expect(preview.installPreview).toMatchObject({
+       status: "ready",
+-      permissions: { status: "ready", required: expect.arrayContaining(["metadata: read", "pull_requests: write", "issues: write"]) },
++      permissions: { status: "ready", required: expect.arrayContaining(["metadata: read", "pull_requests: read", "issues: write"]) },
+       publicOutputs: expect.arrayContaining(["One sanitized sticky PR comment.", 'Configured label "gittensor".']),
+       checklist: expect.arrayContaining([
+         expect.objectContaining({ id: "permissions", status: "ready" }),
+@@ -166,16 +166,18 @@ describe("buildRepoSettingsPreview", () => {
+     });
+   });
+ 
+-  it("explains a missing Pull requests: write permission for PR comment/label output", () => {
++  it("requires only pull_requests:read for PR comment/label output (no PR write overprivilege)", () => {
++    // Installation grants issues:write (everything comment/label output actually needs) but is missing
++    // pull_requests; the app only reads PRs, so this must NOT be flagged as a comment/label blocker.
+     const preview = buildRepoSettingsPreview({
+       ...base,
+       settings: settings(),
+-      installation: { ...healthyInstall, status: "needs_attention", missingPermissions: ["pull_requests"] },
++      installation: { ...healthyInstall, missingPermissions: ["pull_requests"] },
+       sample: { authorLogin: "miner", minerStatus: "confirmed" },
+     });
+-    // PR comments/labels need pull_requests: write; the preview must require it and surface it as missing.
+-    expect(preview.installPreview.permissions.required).toContain("pull_requests: write");
+-    expect(preview.installPreview.permissions).toMatchObject({ status: "needs_attention", missing: ["pull_requests"] });
++    expect(preview.installPreview.permissions.required).toContain("pull_requests: read");
++    expect(preview.installPreview.permissions.required).not.toContain("pull_requests: write");
++    expect(preview.installPreview.permissions.missing).not.toContain("pull_requests");
+   });
+ 
+   it("explains a missing optional Checks: write permission only when check runs are enabled", () => {

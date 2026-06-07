@@ -1,0 +1,402 @@
+diff --git a/celery/apps/worker.py b/celery/apps/worker.py
+index 5558dab8e5f..7286d4b8543 100644
+--- a/celery/apps/worker.py
++++ b/celery/apps/worker.py
+@@ -350,7 +350,7 @@ def during_soft_shutdown(worker: Worker):
+     install_worker_term_hard_handler(worker, sig='SIGQUIT', callback=on_hard_shutdown)
+ 
+     # Cancel all unacked requests and allow the worker to terminate naturally
+-    worker.consumer.cancel_all_unacked_requests()
++    worker.consumer.cancel_active_requests()
+ 
+     # We get here if the worker was in the middle of the soft (cold) shutdown process,
+     # and the matching signal was received. This can typically happen when the worker is
+@@ -409,11 +409,19 @@ def on_cold_shutdown(worker: Worker):
+     # Initiate soft shutdown process (if enabled and tasks are running)
+     worker.wait_for_soft_shutdown()
+ 
++    # Stop consuming new tasks to prevents requeued messages from being immediately redelivered
++    if worker.consumer.task_consumer:
++        worker.consumer.task_consumer.cancel()
++
+     # Cancel all unacked requests and allow the worker to terminate naturally
+-    worker.consumer.cancel_all_unacked_requests()
++    worker.consumer.cancel_active_requests()
++
++    from celery.worker import state
++    state.should_terminate = True
+ 
+     # Stop the pool to allow successful tasks call on_success()
+-    worker.consumer.pool.stop()
++    if worker.consumer.pool:
++        worker.consumer.pool.stop()
+ 
+ 
+ # Allow SIGTERM to be remapped to SIGQUIT to initiate cold shutdown instead of warm shutdown using SIGTERM
+diff --git a/celery/worker/consumer/consumer.py b/celery/worker/consumer/consumer.py
+index 9f843afccf1..95e73707621 100644
+--- a/celery/worker/consumer/consumer.py
++++ b/celery/worker/consumer/consumer.py
+@@ -31,7 +31,8 @@
+ from celery.utils.text import truncate
+ from celery.utils.time import humanize_seconds, rate
+ from celery.worker import loops
+-from celery.worker.state import active_requests, maybe_shutdown, requests, reserved_requests, task_reserved
++from celery.worker.state import (active_requests, maybe_shutdown, requests, reserved_requests, successful_requests,
++                                 task_reserved)
+ 
+ __all__ = ('Consumer', 'Evloop', 'dump_body')
+ 
+@@ -740,9 +741,13 @@ def __repr__(self):
+             self=self, state=self.blueprint.human_state(),
+         )
+ 
+-    def cancel_all_unacked_requests(self):
+-        """Cancel all active requests that either do not require late acknowledgments or,
++    def cancel_active_requests(self):
++        """Cancel active requests during shutdown.
++
++        Cancels all active requests that either do not require late acknowledgments or,
+         if they do, have not been acknowledged yet.
++
++        Does not cancel successful tasks, even if they have not been acknowledged yet.
+         """
+ 
+         def should_cancel(request):
+@@ -752,6 +757,9 @@ def should_cancel(request):
+ 
+             if not request.acknowledged:
+                 # Task is late acknowledged, but it has not been acknowledged yet, cancel it.
++                if request.id in successful_requests:
++                    # Unless it was successful, in which case we don't want to cancel it.
++                    return False
+                 return True
+ 
+             # Task is late acknowledged, but it has already been acknowledged.
+@@ -761,7 +769,10 @@ def should_cancel(request):
+ 
+         if requests_to_cancel:
+             for request in requests_to_cancel:
+-                request.cancel(self.pool)
++                # For acks_late tasks, don't emit RETRY signal since broker will handle redelivery
++                # For non-acks_late tasks, emit RETRY signal as usual
++                emit_retry = not request.task.acks_late
++                request.cancel(self.pool, emit_retry=emit_retry)
+ 
+ 
+ class Evloop(bootsteps.StartStopStep):
+diff --git a/celery/worker/request.py b/celery/worker/request.py
+index df99b549270..2b975266f68 100644
+--- a/celery/worker/request.py
++++ b/celery/worker/request.py
+@@ -422,29 +422,34 @@ def terminate(self, pool, signal=None):
+             if obj is not None:
+                 obj.terminate(signal)
+ 
+-    def cancel(self, pool, signal=None):
++    def cancel(self, pool, signal=None, emit_retry=True):
+         signal = _signals.signum(signal or TERM_SIGNAME)
+         if self.time_start:
+             pool.terminate_job(self.worker_pid, signal)
+-            self._announce_cancelled()
++            self._announce_cancelled(emit_retry=emit_retry)
+ 
+         if self._apply_result is not None:
+             obj = self._apply_result()  # is a weakref
+             if obj is not None:
+                 obj.terminate(signal)
+ 
+-    def _announce_cancelled(self):
++    def _announce_cancelled(self, emit_retry=True):
+         task_ready(self)
+         self.send_event('task-cancelled')
+-        reason = 'cancelled by Celery'
+-        exc = Retry(message=reason)
+-        self.task.backend.mark_as_retry(self.id,
+-                                        exc,
+-                                        request=self._context)
+ 
+-        self.task.on_retry(exc, self.id, self.args, self.kwargs, None)
++        if emit_retry:
++            reason = 'cancelled by Celery'
++            exc = Retry(message=reason)
++            self.task.backend.mark_as_retry(self.id,
++                                            exc,
++                                            request=self._context)
++
++            self.task.on_retry(exc, self.id, self.args, self.kwargs, None)
++
+         self._already_cancelled = True
+-        send_retry(self.task, request=self._context, einfo=None)
++
++        if emit_retry:
++            send_retry(self.task, request=self._context, einfo=None)
+ 
+     def _announce_revoked(self, reason, terminated, signum, expired):
+         task_ready(self)
+@@ -525,14 +530,16 @@ def on_timeout(self, soft, timeout):
+                  timeout, self.name, self.id)
+         else:
+             task_ready(self)
+-            error('Hard time limit (%ss) exceeded for %s[%s]',
+-                  timeout, self.name, self.id)
+-            exc = TimeLimitExceeded(timeout)
+-
+-            self.task.backend.mark_as_failure(
+-                self.id, exc, request=self._context,
+-                store_result=self.store_errors,
+-            )
++            # This is a special case where the task timeout handling is done during
++            # the cold shutdown process.
++            if not state.should_terminate:
++                error('Hard time limit (%ss) exceeded for %s[%s]', timeout, self.name, self.id)
++                exc = TimeLimitExceeded(timeout)
++
++                self.task.backend.mark_as_failure(
++                    self.id, exc, request=self._context,
++                    store_result=self.store_errors,
++                )
+ 
+             if self.task.acks_late and self.task.acks_on_failure_or_timeout:
+                 self.acknowledge()
+@@ -617,6 +624,12 @@ def on_failure(self, exc_info, send_failed_event=True, return_ok=False):
+                 # need to be removed from prefetched local queue
+                 self.reject(requeue=False)
+ 
++        # This is a special case where the task failure handling is done during
++        # the cold shutdown process.
++        if state.should_terminate:
++            return_ok = True
++            send_failed_event = False
++
+         # This is a special case where the process would not have had time
+         # to write the result.
+         if not requeue and (is_worker_lost or not return_ok):
+diff --git a/t/smoke/tests/test_worker.py b/t/smoke/tests/test_worker.py
+index 2165f4296af..617576d1860 100644
+--- a/t/smoke/tests/test_worker.py
++++ b/t/smoke/tests/test_worker.py
+@@ -215,6 +215,68 @@ def test_hard_shutdown_from_soft(self, celery_setup: CeleryTestSetup):
+ 
+             assert_container_exited(worker)
+ 
++        def test_task_completes_during_soft_shutdown(self, celery_setup: CeleryTestSetup):
++            app = celery_setup.app
++            queue = celery_setup.worker.worker_queue
++            worker = celery_setup.worker
++
++            task_duration = app.conf.worker_soft_shutdown_timeout // 2
++            sig = long_running_task.si(task_duration, verbose=True).set(queue=queue)
++            res = sig.delay()
++
++            worker.assert_log_exists("Starting long running task")
++            self.kill_worker(worker, WorkerKill.Method.SIGQUIT)
++            worker.assert_log_exists(
++                f"Initiating Soft Shutdown, terminating in {app.conf.worker_soft_shutdown_timeout} seconds"
++            )
++            worker.assert_log_exists("worker: Cold shutdown (MainProcess)")
++
++            assert_container_exited(worker)
++            assert res.get(RESULT_TIMEOUT)
++            assert res.state == 'SUCCESS'
++
++        class test_time_limit(SuiteOperations):
++            @pytest.fixture
++            def default_worker_app(self, default_worker_app: Celery) -> Celery:
++                app = default_worker_app
++                app.conf.worker_soft_shutdown_timeout = 16
++                app.conf.task_time_limit = 15
++                app.conf.task_soft_time_limit = 10
++                return app
++
++            def test_task_completes_during_soft_shutdown_with_time_limit(self, celery_setup: CeleryTestSetup):
++                app = celery_setup.app
++                queue = celery_setup.worker.worker_queue
++                worker = celery_setup.worker
++
++                task_duration = 8
++                sig = long_running_task.si(task_duration, verbose=True).set(queue=queue)
++                res = sig.delay()
++
++                worker.assert_log_exists("Starting long running task")
++                self.kill_worker(worker, WorkerKill.Method.SIGQUIT)
++
++                worker.assert_log_exists(
++                    f"Initiating Soft Shutdown, terminating in {app.conf.worker_soft_shutdown_timeout} seconds"
++                )
++
++                worker.assert_log_exists("Finished long running task")
++                worker.assert_log_exists(f"long_running_task[{res.id}] succeeded")
++
++                worker.assert_log_does_not_exist(
++                    f"Task handler raised error: TimeLimitExceeded({app.conf.task_time_limit})",
++                    timeout=RESULT_TIMEOUT,
++                )
++                worker.assert_log_does_not_exist(
++                    f"Hard time limit ({app.conf.task_time_limit}s) exceeded for {long_running_task.name}[{res.id}]",
++                    timeout=RESULT_TIMEOUT,
++                )
++                worker.assert_log_exists("worker: Cold shutdown (MainProcess)")
++
++                assert_container_exited(worker)
++                assert res.get(RESULT_TIMEOUT)
++                assert res.state == 'SUCCESS'
++
+         class test_REMAP_SIGTERM(SuiteOperations):
+             @pytest.fixture
+             def default_worker_env(self, default_worker_env: dict) -> dict:
+diff --git a/t/unit/worker/test_consumer.py b/t/unit/worker/test_consumer.py
+index 02e77e9e58e..734efbaef57 100644
+--- a/t/unit/worker/test_consumer.py
++++ b/t/unit/worker/test_consumer.py
+@@ -19,7 +19,7 @@
+ from celery.worker.consumer.heart import Heart
+ from celery.worker.consumer.mingle import Mingle
+ from celery.worker.consumer.tasks import Tasks
+-from celery.worker.state import active_requests
++from celery.worker.state import active_requests, successful_requests
+ 
+ 
+ class ConsumerTestCase:
+@@ -453,7 +453,7 @@ def test_cancel_long_running_tasks_on_connection_loss__warning(self):
+             c.on_connection_error_after_connected(Mock())
+ 
+     @pytest.mark.usefixtures('depends_on_current_app')
+-    def test_cancel_all_unacked_requests(self):
++    def test_cancel_active_requests(self):
+         c = self.get_consumer()
+ 
+         mock_request_acks_late_not_acknowledged = Mock(id='1')
+@@ -469,14 +469,36 @@ def test_cancel_all_unacked_requests(self):
+         active_requests.add(mock_request_acks_late_acknowledged)
+         active_requests.add(mock_request_acks_early)
+ 
+-        c.cancel_all_unacked_requests()
++        c.cancel_active_requests()
+ 
+-        mock_request_acks_late_not_acknowledged.cancel.assert_called_once_with(c.pool)
++        # acks_late unacknowledged tasks should be cancelled without RETRY
++        mock_request_acks_late_not_acknowledged.cancel.assert_called_once_with(c.pool, emit_retry=False)
++        # acks_late acknowledged tasks should NOT be cancelled
+         mock_request_acks_late_acknowledged.cancel.assert_not_called()
+-        mock_request_acks_early.cancel.assert_called_once_with(c.pool)
++        # Non-acks_late tasks should be cancelled normally (with RETRY)
++        mock_request_acks_early.cancel.assert_called_once_with(c.pool, emit_retry=True)
+ 
+         active_requests.clear()
+ 
++    @pytest.mark.usefixtures('depends_on_current_app')
++    def test_cancel_active_requests_preserves_successful_tasks(self):
++        c = self.get_consumer()
++
++        mock_successful_request = Mock(id='successful-task')
++        mock_successful_request.task.acks_late = True
++        mock_successful_request.acknowledged = False
++
++        active_requests.add(mock_successful_request)
++
++        successful_requests.add('successful-task')
++
++        try:
++            c.cancel_active_requests()
++            mock_successful_request.cancel.assert_not_called()
++        finally:
++            active_requests.clear()
++            successful_requests.clear()
++
+     @pytest.mark.parametrize("broker_connection_retry", [True, False])
+     @pytest.mark.parametrize("broker_connection_retry_on_startup", [None, False])
+     @pytest.mark.parametrize("first_connection_attempt", [True, False])
+diff --git a/t/unit/worker/test_request.py b/t/unit/worker/test_request.py
+index 172ca5162ac..fb4354942c3 100644
+--- a/t/unit/worker/test_request.py
++++ b/t/unit/worker/test_request.py
+@@ -575,6 +575,39 @@ def test_cancel__task_reserved(self):
+         pool.terminate_job.assert_not_called()
+         assert job._terminate_on_ack is None
+ 
++    def test_cancel__emit_retry_true(self):
++        pool = Mock()
++        signum = signal.SIGTERM
++        job = self.get_request(self.mytask.s(1, f='x'))
++        job._apply_result = Mock(name='_apply_result')
++        job.task.backend.mark_as_retry = Mock(name='mark_as_retry')
++        job.task.on_retry = Mock(name='on_retry')
++        with self.assert_signal_called(
++                task_retry, sender=job.task, request=job._context,
++                einfo=None):
++            job.time_start = monotonic()
++            job.worker_pid = 314
++            job.cancel(pool, signal='TERM', emit_retry=True)
++            pool.terminate_job.assert_called_with(job.worker_pid, signum)
++            job.task.backend.mark_as_retry.assert_called_once()
++            job.task.on_retry.assert_called_once()
++            assert job._already_cancelled is True
++
++    def test_cancel__emit_retry_false(self):
++        pool = Mock()
++        signum = signal.SIGTERM
++        job = self.get_request(self.mytask.s(1, f='x'))
++        job._apply_result = Mock(name='_apply_result')
++        job.task.backend.mark_as_retry = Mock(name='mark_as_retry')
++        job.task.on_retry = Mock(name='on_retry')
++        job.time_start = monotonic()
++        job.worker_pid = 314
++        job.cancel(pool, signal='TERM', emit_retry=False)
++        pool.terminate_job.assert_called_with(job.worker_pid, signum)
++        job.task.backend.mark_as_retry.assert_not_called()
++        job.task.on_retry.assert_not_called()
++        assert job._already_cancelled is True
++
+     def test_revoked_expires_expired(self):
+         job = self.get_request(self.mytask.s(1, f='x').set(
+             expires=datetime.now(timezone.utc) - timedelta(days=1)
+@@ -870,6 +903,26 @@ def test_on_failure_task_cancelled(self):
+         job.on_failure(exc_info)
+         assert not job.eventer.send.called
+ 
++    def test_on_failure_should_terminate(self):
++        from celery.worker import state
++        original_should_terminate = state.should_terminate
++        state.should_terminate = True
++        job = self.xRequest()
++        job.send_event = Mock(name='send_event')
++        job.task.backend = Mock(name='backend')
++
++        try:
++            try:
++                raise KeyError('foo')
++            except KeyError:
++                exc_info = ExceptionInfo()
++                job.on_failure(exc_info)
++
++            job.send_event.assert_not_called()
++            job.task.backend.mark_as_failure.assert_not_called()
++        finally:
++            state.should_terminate = original_should_terminate
++
+     def test_from_message_invalid_kwargs(self):
+         m = self.TaskMessage(self.mytask.name, args=(), kwargs='foo')
+         req = Request(m, app=self.app)
+@@ -937,6 +990,21 @@ def test_on_soft_timeout(self, patching):
+         job.on_timeout(soft=True, timeout=1336)
+         assert self.mytask.backend.get_status(job.id) == states.PENDING
+ 
++    def test_on_timeout_should_terminate(self, patching):
++        from celery.worker import state
++        warn = patching('celery.worker.request.warn')
++        error = patching('celery.worker.request.error')
++
++        original_should_terminate = state.should_terminate
++        try:
++            state.should_terminate = True
++            job = self.xRequest()
++            job.on_timeout(None, None)
++            warn.assert_not_called()
++            error.assert_not_called()
++        finally:
++            state.should_terminate = original_should_terminate
++
+     def test_fast_trace_task(self):
+         assert self.app.use_fast_trace_task is False
+         setup_worker_optimizations(self.app)

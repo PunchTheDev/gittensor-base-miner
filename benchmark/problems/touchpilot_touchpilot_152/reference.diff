@@ -1,0 +1,367 @@
+diff --git a/app/src/main/java/dev/touchpilot/app/agent/AgentCommandProvider.kt b/app/src/main/java/dev/touchpilot/app/agent/AgentCommandProvider.kt
+index c91d174..39d1c45 100644
+--- a/app/src/main/java/dev/touchpilot/app/agent/AgentCommandProvider.kt
++++ b/app/src/main/java/dev/touchpilot/app/agent/AgentCommandProvider.kt
+@@ -47,15 +47,9 @@ class LocalRouterCommandProvider(
+     private val task: String,
+     private val skill: Skill?
+ ) : AgentCommandProvider {
+-    private var hasObserved = false
+     private var hasActed = false
+ 
+     override fun complete(systemPrompt: String, context: String): String {
+-        if (!hasObserved) {
+-            hasObserved = true
+-            return """{"tool":"observe_screen","args":{}}"""
+-        }
+-
+         if (!hasActed) {
+             val routed = routeTask(task)
+             if (routed != null && isAllowed(routed.tool)) {
+diff --git a/app/src/main/java/dev/touchpilot/app/agent/LocalReasoningCore.kt b/app/src/main/java/dev/touchpilot/app/agent/LocalReasoningCore.kt
+index 7ac23e0..06dd95d 100644
+--- a/app/src/main/java/dev/touchpilot/app/agent/LocalReasoningCore.kt
++++ b/app/src/main/java/dev/touchpilot/app/agent/LocalReasoningCore.kt
+@@ -268,15 +268,13 @@ fun buildCommandProvider(
+     context.exactCommand?.let { command ->
+         return FixedCommandProvider(command)
+     }
+-    val localRouter = LocalRouterCommandProvider(task, context.skill)
+     return when (context.providerMode) {
+         AgentProviderMode.LOCAL_MODEL -> LocalModelCommandProvider(
+             runtime = localModelRuntime,
+-            fallback = localRouter,
+             task = task,
+             skill = context.skill
+         )
+-        AgentProviderMode.LOCAL_ROUTER -> localRouter
++        AgentProviderMode.LOCAL_ROUTER -> LocalRouterCommandProvider(task, context.skill)
+     }
+ }
+ 
+diff --git a/app/src/main/java/dev/touchpilot/app/localinference/LocalCommandModelRuntime.kt b/app/src/main/java/dev/touchpilot/app/localinference/LocalCommandModelRuntime.kt
+index d21a467..89e8700 100644
+--- a/app/src/main/java/dev/touchpilot/app/localinference/LocalCommandModelRuntime.kt
++++ b/app/src/main/java/dev/touchpilot/app/localinference/LocalCommandModelRuntime.kt
+@@ -2,7 +2,6 @@ package dev.touchpilot.app.localinference
+ 
+ import android.content.Context
+ import dev.touchpilot.app.agent.AgentCommandProvider
+-import dev.touchpilot.app.agent.LocalRouterCommandProvider
+ import dev.touchpilot.app.memory.Skill
+ import org.json.JSONObject
+ import org.tensorflow.lite.Interpreter
+@@ -52,7 +51,7 @@ class LiteRtCommandModelRuntime(
+                 runtime = loadedManifest.runtime,
+                 modelAsset = loadedManifest.modelAsset,
+                 version = loadedManifest.version,
+-                message = "LiteRT model asset is missing; deterministic local router will be used."
++                message = "LiteRT model asset is missing; the run will stop with a final answer."
+             )
+         }
+ 
+@@ -71,7 +70,7 @@ class LiteRtCommandModelRuntime(
+                 runtime = loadedManifest.runtime,
+                 modelAsset = loadedManifest.modelAsset,
+                 version = loadedManifest.version,
+-                message = "LiteRT model asset could not be loaded; deterministic local router will be used."
++                message = "LiteRT model asset could not be loaded; the run will stop with a final answer."
+             )
+         }
+     }
+@@ -82,7 +81,8 @@ class LiteRtCommandModelRuntime(
+             error(status.message)
+         }
+ 
+-        val input = buildFeatures(task)
++        val dispatched = extractDispatchedTools(context)
++        val input = buildFeatures(task, dispatched)
+         val output = Array(1) { FloatArray(RouteLabels.size) }
+         val loadedInterpreter = interpreter ?: error(status.message)
+         synchronized(loadedInterpreter) {
+@@ -91,6 +91,13 @@ class LiteRtCommandModelRuntime(
+         return output[0].toCommandJson(task, skill)
+     }
+ 
++    private fun extractDispatchedTools(context: String): Set<String> {
++        return Regex(""""tool"\s*:\s*"([^"]+)"""")
++            .findAll(context)
++            .map { it.groupValues[1] }
++            .toSet()
++    }
++
+     private fun loadManifest(): LocalModelManifest? {
+         if (!assetExists(manifestAsset)) return null
+         val json = context.assets.open(manifestAsset).bufferedReader().use { it.readText() }
+@@ -125,16 +132,16 @@ class LiteRtCommandModelRuntime(
+         }
+     }
+ 
+-    private fun buildFeatures(task: String): Array<FloatArray> {
++    private fun buildFeatures(task: String, dispatched: Set<String>): Array<FloatArray> {
+         val normalized = task.trim().lowercase()
+         val features = FloatArray(RouteLabels.size)
+         when {
+-            "back" in normalized -> features[RouteIndexBack] = 1f
+-            "home" in normalized -> features[RouteIndexHome] = 1f
+-            "scroll up" in normalized -> features[RouteIndexScrollUp] = 1f
+-            "scroll" in normalized -> features[RouteIndexScrollDown] = 1f
+-            OpenPattern.containsMatchIn(normalized) -> features[RouteIndexOpenApp] = 1f
+-            TapPattern.containsMatchIn(normalized) -> features[RouteIndexTapText] = 1f
++            "back" in normalized && "press_back" !in dispatched -> features[RouteIndexBack] = 1f
++            "home" in normalized && "press_home" !in dispatched -> features[RouteIndexHome] = 1f
++            "scroll up" in normalized && "scroll" !in dispatched -> features[RouteIndexScrollUp] = 1f
++            "scroll" in normalized && "scroll" !in dispatched -> features[RouteIndexScrollDown] = 1f
++            OpenPattern.containsMatchIn(normalized) && "open_app" !in dispatched -> features[RouteIndexOpenApp] = 1f
++            TapPattern.containsMatchIn(normalized) && "tap" !in dispatched -> features[RouteIndexTapText] = 1f
+         }
+         return arrayOf(features)
+     }
+@@ -210,26 +217,15 @@ class LiteRtCommandModelRuntime(
+ 
+ class LocalModelCommandProvider(
+     private val runtime: LocalCommandModelRuntime,
+-    private val fallback: LocalRouterCommandProvider,
+     private val task: String,
+     private val skill: Skill?
+ ) : AgentCommandProvider {
+-    private var attemptedModel = false
+-
+     override fun complete(systemPrompt: String, context: String): String {
+-        if (!attemptedModel) {
+-            attemptedModel = true
+-            val modelResult = runCatching {
+-                runtime.route(task, context, skill)
+-            }.getOrNull()
+-
+-            val validOutput = modelResult?.let { validateModelOutput(it) }
+-            if (validOutput != null) {
+-                return validOutput.toCommandJson()
+-            }
+-        }
+-
+-        return fallback.complete(systemPrompt, context)
++        val modelResult = runCatching {
++            runtime.route(task, context, skill)
++        }.getOrNull()
++        val validOutput = modelResult?.let { validateModelOutput(it) }
++        return validOutput?.toCommandJson() ?: FinalFallback
+     }
+ 
+     private fun validateModelOutput(raw: String): LocalModelOutput? {
+@@ -242,4 +238,8 @@ class LocalModelCommandProvider(
+             is LocalModelOutputValidation.Invalid -> null
+         }
+     }
++
++    companion object {
++        private const val FinalFallback = """{"final":"Local model could not route this task safely."}"""
++    }
+ }
+diff --git a/app/src/test/java/dev/touchpilot/app/agent/LocalModelApprovalGateTest.kt b/app/src/test/java/dev/touchpilot/app/agent/LocalModelApprovalGateTest.kt
+index f9ee56e..513eedc 100644
+--- a/app/src/test/java/dev/touchpilot/app/agent/LocalModelApprovalGateTest.kt
++++ b/app/src/test/java/dev/touchpilot/app/agent/LocalModelApprovalGateTest.kt
+@@ -21,7 +21,6 @@ class LocalModelApprovalGateTest {
+     fun localModelMediumRiskCommandRoutesToApproval() {
+         val provider = LocalModelCommandProvider(
+             runtime = StubRuntime("""{"tool":"open_app","args":{"target":"Settings"}}"""),
+-            fallback = LocalRouterCommandProvider("open Settings", null),
+             task = "open Settings",
+             skill = null
+         )
+@@ -46,7 +45,6 @@ class LocalModelApprovalGateTest {
+     fun localModelLowRiskCommandSkipsApproval() {
+         val provider = LocalModelCommandProvider(
+             runtime = StubRuntime("""{"tool":"observe_screen","args":{}}"""),
+-            fallback = LocalRouterCommandProvider("look around", null),
+             task = "look around",
+             skill = null
+         )
+diff --git a/app/src/test/java/dev/touchpilot/app/agent/LocalReasoningCoreTest.kt b/app/src/test/java/dev/touchpilot/app/agent/LocalReasoningCoreTest.kt
+index 49478b6..8ab07a1 100644
+--- a/app/src/test/java/dev/touchpilot/app/agent/LocalReasoningCoreTest.kt
++++ b/app/src/test/java/dev/touchpilot/app/agent/LocalReasoningCoreTest.kt
+@@ -155,7 +155,24 @@ class LocalReasoningCoreTest {
+ 
+         assertIs<LocalRouterCommandProvider>(provider)
+         val first = AgentCommandParser.parse(provider.complete("", ""))
+-        assertEquals("observe_screen", first.tool)
++        assertNull(first.tool)
++        assertEquals(
++            "Local router completed its safe routing pass. Try a more specific request, a skill, or local model mode for ambiguous tasks.",
++            first.finalAnswer
++        )
++    }
++
++    @Test
++    fun localRouterRoutesDirectlyInOneStepWhenAllowed() {
++        val provider = buildCommandProvider(
++            task = "go home",
++            context = defaultContext,
++            localModelRuntime = NeverCalledRuntime
++        )
++
++        assertIs<LocalRouterCommandProvider>(provider)
++        val first = AgentCommandParser.parse(provider.complete("", ""))
++        assertEquals("press_home", first.tool)
+         val second = AgentCommandParser.parse(provider.complete("", ""))
+         assertNull(second.tool)
+         assertEquals(
+diff --git a/app/src/test/java/dev/touchpilot/app/localinference/LocalModelCommandProviderContractTest.kt b/app/src/test/java/dev/touchpilot/app/localinference/LocalModelCommandProviderContractTest.kt
+index a5a9fc7..811f83d 100644
+--- a/app/src/test/java/dev/touchpilot/app/localinference/LocalModelCommandProviderContractTest.kt
++++ b/app/src/test/java/dev/touchpilot/app/localinference/LocalModelCommandProviderContractTest.kt
+@@ -1,10 +1,10 @@
+ package dev.touchpilot.app.localinference
+ 
+ import dev.touchpilot.app.agent.AgentCommandParser
+-import dev.touchpilot.app.agent.LocalRouterCommandProvider
+ import dev.touchpilot.app.memory.Skill
+ import kotlin.test.Test
+ import kotlin.test.assertEquals
++import kotlin.test.assertNull
+ 
+ class LocalModelCommandProviderContractTest {
+     @Test
+@@ -27,25 +27,27 @@ class LocalModelCommandProviderContractTest {
+     }
+ 
+     @Test
+-    fun fallsBackOnMalformedModelOutput() {
++    fun returnsFinalAnswerOnMalformedModelOutput() {
+         val provider = providerFor("not json", task = "go back")
+ 
+         val command = AgentCommandParser.parse(provider.complete("", "screen"))
+ 
+-        assertEquals("observe_screen", command.tool)
++        assertNull(command.tool)
++        assertEquals("Local model could not route this task safely.", command.finalAnswer)
+     }
+ 
+     @Test
+-    fun fallsBackOnUnknownToolOutput() {
++    fun returnsFinalAnswerOnUnknownToolOutput() {
+         val provider = providerFor("""{"tool":"unknown_tool","args":{}}""", task = "go home")
+ 
+         val command = AgentCommandParser.parse(provider.complete("", "screen"))
+ 
+-        assertEquals("observe_screen", command.tool)
++        assertNull(command.tool)
++        assertEquals("Local model could not route this task safely.", command.finalAnswer)
+     }
+ 
+     @Test
+-    fun fallsBackOnInvalidArgumentOutput() {
++    fun returnsFinalAnswerOnInvalidArgumentOutput() {
+         val provider = providerFor(
+             """{"tool":"scroll","args":{"direction":"sideways"}}""",
+             task = "scroll"
+@@ -53,11 +55,12 @@ class LocalModelCommandProviderContractTest {
+ 
+         val command = AgentCommandParser.parse(provider.complete("", "screen"))
+ 
+-        assertEquals("observe_screen", command.tool)
++        assertNull(command.tool)
++        assertEquals("Local model could not route this task safely.", command.finalAnswer)
+     }
+ 
+     @Test
+-    fun fallsBackOnSkillDisallowedOutput() {
++    fun returnsFinalAnswerOnSkillDisallowedOutput() {
+         val skill = Skill(
+             id = "observe-only",
+             title = "Observe Only",
+@@ -72,7 +75,8 @@ class LocalModelCommandProviderContractTest {
+ 
+         val command = AgentCommandParser.parse(provider.complete("", "screen"))
+ 
+-        assertEquals("observe_screen", command.tool)
++        assertNull(command.tool)
++        assertEquals("Local model could not route this task safely.", command.finalAnswer)
+     }
+ 
+     private fun providerFor(
+@@ -82,7 +86,6 @@ class LocalModelCommandProviderContractTest {
+     ): LocalModelCommandProvider {
+         return LocalModelCommandProvider(
+             runtime = StubRuntime(output),
+-            fallback = LocalRouterCommandProvider(task, skill),
+             task = task,
+             skill = skill
+         )
+diff --git a/app/src/test/java/dev/touchpilot/app/localinference/LocalModelCommandProviderTest.kt b/app/src/test/java/dev/touchpilot/app/localinference/LocalModelCommandProviderTest.kt
+index 90994b4..7c3db40 100644
+--- a/app/src/test/java/dev/touchpilot/app/localinference/LocalModelCommandProviderTest.kt
++++ b/app/src/test/java/dev/touchpilot/app/localinference/LocalModelCommandProviderTest.kt
+@@ -1,34 +1,34 @@
+ package dev.touchpilot.app.localinference
+ 
+-import dev.touchpilot.app.agent.LocalRouterCommandProvider
++import dev.touchpilot.app.agent.AgentCommandParser
+ import kotlin.test.Test
+ import kotlin.test.assertEquals
+-import kotlin.test.assertTrue
++import kotlin.test.assertNull
+ 
+ class LocalModelCommandProviderTest {
+     @Test
+-    fun usesValidModelCommandBeforeFallback() {
++    fun usesModelCommandOnEveryStep() {
+         val provider = LocalModelCommandProvider(
+             runtime = FakeRuntime("""{"tool":"observe_screen","args":{}}"""),
+-            fallback = LocalRouterCommandProvider("go back", null),
+             task = "go home",
+             skill = null
+         )
+ 
+         assertEquals("""{"tool":"observe_screen","args":{}}""", provider.complete("", ""))
++        assertEquals("""{"tool":"observe_screen","args":{}}""", provider.complete("", ""))
+     }
+ 
+     @Test
+-    fun fallsBackWhenRuntimeUnavailable() {
++    fun returnsCannotRouteFinalAnswerWhenRuntimeUnavailable() {
+         val provider = LocalModelCommandProvider(
+             runtime = FakeRuntime(null),
+-            fallback = LocalRouterCommandProvider("go back", null),
+             task = "go back",
+             skill = null
+         )
+ 
+-        assertEquals("""{"tool":"observe_screen","args":{}}""", provider.complete("", ""))
+-        assertTrue(provider.complete("", "").contains("press_back"))
++        val command = AgentCommandParser.parse(provider.complete("", ""))
++        assertNull(command.tool)
++        assertEquals("Local model could not route this task safely.", command.finalAnswer)
+     }
+ 
+     private class FakeRuntime(
+diff --git a/docs/LOCAL_INFERENCE.md b/docs/LOCAL_INFERENCE.md
+index d5256b2..af8cf78 100644
+--- a/docs/LOCAL_INFERENCE.md
++++ b/docs/LOCAL_INFERENCE.md
+@@ -53,9 +53,9 @@ The Android app should keep all core runtime modes local:
+ 
+ - Local router: default offline deterministic routing for simple commands such
+   as observe, back, home, scroll, open app, and tap text.
+-- Local model: LiteRT command-routing runtime. If the model cannot be loaded,
+-  it falls back to the deterministic local router and reports that fallback in
+-  the runtime UI.
++- Local model: LiteRT command-routing runtime. If the model cannot be loaded
++  or returns invalid output, the run stops with a final answer. No fallback to
++  the deterministic router occurs.
+ - Future local LLM/VLM: broader local reasoning, planning, and visual fallback
+   behind the same tool and policy contract.
+ 
+@@ -72,8 +72,8 @@ Local inference work should keep one stable contract: command providers emit a
+ structured JSON command or a final answer, and Android tool execution remains
+ behind validation, skill allowlists, approval policy, and local logs.
+ 
+-- Deterministic local router: current default and fallback when the LiteRT model
+-  cannot be loaded.
++- Deterministic local router: current default. Not used as a fallback when the
++  LiteRT model cannot be loaded — those runs stop with a final answer instead.
+ - Small local routing model: current LiteRT path for command route logits and
+   future target for richer classification and structured argument extraction.
+ - Local LLM runtime: future broader reasoning path for multi-step workflows.

@@ -1,0 +1,879 @@
+diff --git a/crates/engine/src/game/coverage.rs b/crates/engine/src/game/coverage.rs
+index 88192b2a2e..4de28890df 100644
+--- a/crates/engine/src/game/coverage.rs
++++ b/crates/engine/src/game/coverage.rs
+@@ -558,6 +558,7 @@ fn fmt_typed_filter(tf: &TypedFilter) -> String {
+                     ControllerRef::TargetPlayer => "target player's",
+                     ControllerRef::ParentTargetController => "parent target's",
+                     ControllerRef::DefendingPlayer => "defending player's",
++                    ControllerRef::SourceChosenPlayer => "the chosen player's",
+                     ControllerRef::ChosenPlayer { .. } => "chosen player's",
+                     ControllerRef::TriggeringPlayer => "triggering player's",
+                 };
+@@ -658,6 +659,7 @@ fn fmt_typed_filter(tf: &TypedFilter) -> String {
+                 ControllerRef::TargetPlayer => "target player",
+                 ControllerRef::ParentTargetController => "parent target's controller",
+                 ControllerRef::DefendingPlayer => "defending player",
++                ControllerRef::SourceChosenPlayer => "the chosen player",
+                 ControllerRef::ChosenPlayer { .. } => "chosen player",
+                 ControllerRef::TriggeringPlayer => "triggering player",
+             };
+@@ -725,6 +727,7 @@ fn fmt_controller(ctrl: &ControllerRef) -> String {
+         ControllerRef::TargetPlayer => "target player controls",
+         ControllerRef::ParentTargetController => "parent target's controller controls",
+         ControllerRef::DefendingPlayer => "defending player controls",
++        ControllerRef::SourceChosenPlayer => "the chosen player controls",
+         ControllerRef::ChosenPlayer { .. } => "chosen player controls",
+         ControllerRef::TriggeringPlayer => "triggering player controls",
+     }
+@@ -847,6 +850,7 @@ fn fmt_player_scope(scope: &PlayerScope) -> String {
+         PlayerScope::Target => "target player".to_string(),
+         PlayerScope::RecipientController => "recipient's controller".to_string(),
+         PlayerScope::DefendingPlayer => "defending player".to_string(),
++        PlayerScope::SourceChosenPlayer => "the chosen player".to_string(),
+         PlayerScope::ParentObjectTargetController => "parent target's controller".to_string(),
+         PlayerScope::Opponent { aggregate } => {
+             format!("{} of opponents", fmt_aggregate_function(*aggregate))
+@@ -1176,6 +1180,7 @@ fn fmt_quantity_ref(qty: &QuantityRef) -> String {
+             let scope_s = match scope {
+                 CountScope::Controller | CountScope::Owner => "you have",
+                 CountScope::ScopedPlayer => "the scoped player has",
++                CountScope::SourceChosenPlayer => "the chosen player has",
+                 CountScope::Opponents => "each opponent has",
+                 CountScope::All => "each player has",
+             };
+@@ -1491,6 +1496,7 @@ fn fmt_count_scope(scope: &CountScope) -> &'static str {
+     match scope {
+         CountScope::Controller | CountScope::Owner => "your",
+         CountScope::ScopedPlayer => "their",
++        CountScope::SourceChosenPlayer => "the chosen player's",
+         CountScope::All => "all",
+         CountScope::Opponents => "opponents'",
+     }
+diff --git a/crates/engine/src/game/effects/deal_damage.rs b/crates/engine/src/game/effects/deal_damage.rs
+index 536466776c..4c02920248 100644
+--- a/crates/engine/src/game/effects/deal_damage.rs
++++ b/crates/engine/src/game/effects/deal_damage.rs
+@@ -43,7 +43,8 @@ fn player_context_target(
+     if matches!(target_filter, TargetFilter::SourceChosenPlayer) {
+         // CR 607.2d + CR 608.2c: Resolve "the chosen player" from the
+         // source's linked persisted choice.
+-        return super::source_chosen_player(state, ability.source_id).map(TargetRef::Player);
++        return crate::game::game_object::source_chosen_player(state, ability.source_id)
++            .map(TargetRef::Player);
+     }
+ 
+     if matches!(
+diff --git a/crates/engine/src/game/effects/mod.rs b/crates/engine/src/game/effects/mod.rs
+index c40b6dd3d3..73bc8e2cba 100644
+--- a/crates/engine/src/game/effects/mod.rs
++++ b/crates/engine/src/game/effects/mod.rs
+@@ -4,11 +4,10 @@ use std::collections::HashMap;
+ use crate::game::filter;
+ use crate::game::speed::has_max_speed;
+ use crate::types::ability::{
+-    AbilityCondition, AbilityCost, AbilityKind, ChosenAttribute, ControllerRef,
+-    CopyRetargetPermission, CostPaidObjectSnapshot, Effect, EffectError, EffectKind,
+-    EffectOutcomeSignal, FilterProp, PlayerFilter, PlayerScope, QuantityExpr, QuantityRef,
+-    RepeatContinuation, ResolvedAbility, SharedQuality, SharedQualityRelation, SubAbilityLink,
+-    TargetFilter, TargetRef,
++    AbilityCondition, AbilityCost, AbilityKind, ControllerRef, CopyRetargetPermission,
++    CostPaidObjectSnapshot, Effect, EffectError, EffectKind, EffectOutcomeSignal, FilterProp,
++    PlayerFilter, PlayerScope, QuantityExpr, QuantityRef, RepeatContinuation, ResolvedAbility,
++    SharedQuality, SharedQualityRelation, SubAbilityLink, TargetFilter, TargetRef,
+ };
+ use crate::types::events::GameEvent;
+ use crate::types::game_state::{
+@@ -2481,7 +2480,9 @@ pub(crate) fn resolve_player_for_context_ref(
+     if matches!(target_filter, TargetFilter::SourceChosenPlayer) {
+         // CR 607.2d + CR 608.2c: Resolve "the chosen player" from the
+         // source's linked persisted choice.
+-        if let Some(player) = source_chosen_player(state, ability.source_id) {
++        if let Some(player) =
++            crate::game::game_object::source_chosen_player(state, ability.source_id)
++        {
+             return player;
+         }
+     }
+@@ -2524,30 +2525,6 @@ pub(crate) fn resolve_player_for_context_ref(
+     ability.controller
+ }
+ 
+-/// CR 607.2d + CR 608.2c: Resolve "the chosen player" from the source's
+-/// linked persisted choice. Triggered abilities may resolve after the source
+-/// left the battlefield; in that case the LKI cache carries the source choices
+-/// as they last existed in the public zone.
+-pub(crate) fn source_chosen_player(state: &GameState, source_id: ObjectId) -> Option<PlayerId> {
+-    state
+-        .objects
+-        .get(&source_id)
+-        .and_then(|obj| {
+-            obj.chosen_attributes.iter().find_map(|attr| match attr {
+-                ChosenAttribute::Player(player) => Some(*player),
+-                _ => None,
+-            })
+-        })
+-        .or_else(|| {
+-            state.lki_cache.get(&source_id).and_then(|lki| {
+-                lki.chosen_attributes.iter().find_map(|attr| match attr {
+-                    ChosenAttribute::Player(player) => Some(*player),
+-                    _ => None,
+-                })
+-            })
+-        })
+-}
+-
+ /// CR 117.3a: Determine which player receives the "may" prompt for an optional
+ /// effect. Most optional effects go to the caster (CR 609.3). Subject-anchored
+ /// optional effects — "its controller may search their library" (Assassin's
+@@ -5346,7 +5323,7 @@ mod tests {
+         );
+ 
+         assert_eq!(
+-            source_chosen_player(&state, ability.source_id),
++            crate::game::game_object::source_chosen_player(&state, ability.source_id),
+             Some(PlayerId(1))
+         );
+ 
+@@ -5373,7 +5350,7 @@ mod tests {
+         );
+ 
+         assert_eq!(
+-            source_chosen_player(&state, ability.source_id),
++            crate::game::game_object::source_chosen_player(&state, ability.source_id),
+             Some(PlayerId(1))
+         );
+     }
+diff --git a/crates/engine/src/game/effects/phase_out.rs b/crates/engine/src/game/effects/phase_out.rs
+index b6b5c71ecc..ee0ff6dcda 100644
+--- a/crates/engine/src/game/effects/phase_out.rs
++++ b/crates/engine/src/game/effects/phase_out.rs
+@@ -155,6 +155,9 @@ fn collect_player_targets(
+                     Some(ControllerRef::TargetPlayer) => false,
+                     Some(ControllerRef::ParentTargetController) => false,
+                     Some(ControllerRef::DefendingPlayer) => false,
++                    // CR 613.1: no phase-out card scopes to a persisted chosen
++                    // player; fail closed (mirrors DefendingPlayer).
++                    Some(ControllerRef::SourceChosenPlayer) => false,
+                     // CR 608.2c + CR 109.4: Player chosen by an earlier
+                     // `Choose(Player)` in this resolution.
+                     Some(ControllerRef::ChosenPlayer { index }) => {
+diff --git a/crates/engine/src/game/effects/sacrifice.rs b/crates/engine/src/game/effects/sacrifice.rs
+index 32ff7135c9..20fd197daf 100644
+--- a/crates/engine/src/game/effects/sacrifice.rs
++++ b/crates/engine/src/game/effects/sacrifice.rs
+@@ -66,6 +66,13 @@ fn resolve_sacrifice_scope(
+                 .map(|pid| vec![pid])
+                 .unwrap_or_default()
+         }
++        // CR 613.1: Player persisted on the source via an "as ~ enters, choose
++        // a player" replacement.
++        Some(ControllerRef::SourceChosenPlayer) => {
++            crate::game::game_object::source_chosen_player(state, ability.source_id)
++                .map(|pid| vec![pid])
++                .unwrap_or_default()
++        }
+         // CR 608.2c + CR 109.4: Player chosen by an earlier `Choose(Player)`
+         // in this resolution.
+         Some(ControllerRef::ChosenPlayer { index }) => ability
+diff --git a/crates/engine/src/game/engine_resolution_choices.rs b/crates/engine/src/game/engine_resolution_choices.rs
+index 7c14bb91e6..e321145c8b 100644
+--- a/crates/engine/src/game/engine_resolution_choices.rs
++++ b/crates/engine/src/game/engine_resolution_choices.rs
+@@ -2318,6 +2318,12 @@ pub(super) fn handle_resolution_choice(
+                                 | ChoiceType::BasicLandType
+                                 | ChoiceType::Color { .. }
+                                 | ChoiceType::Keyword { .. }
++                                // CR 613.1: a persisted "choose a player" gates
++                                // CDA P/T that count the chosen player's objects
++                                // or zones (Sewer Nemesis, Skyshroud War Beast) —
++                                // recompute layers immediately.
++                                | ChoiceType::Player
++                                | ChoiceType::Opponent
+                         ) {
+                             crate::game::layers::mark_layers_full(state);
+                         }
+diff --git a/crates/engine/src/game/filter.rs b/crates/engine/src/game/filter.rs
+index 39376a32ed..bf582f9388 100644
+--- a/crates/engine/src/game/filter.rs
++++ b/crates/engine/src/game/filter.rs
+@@ -652,6 +652,11 @@ fn controller_ref_player(
+         ControllerRef::ChosenPlayer { index } => {
+             ability.and_then(|a| a.chosen_players.get(*index as usize).copied())
+         }
++        // CR 613.1: The player persisted on the source via an "as ~ enters,
++        // choose a player" replacement — read durably from the source object.
++        ControllerRef::SourceChosenPlayer => {
++            crate::game::game_object::source_chosen_player(state, source_id)
++        }
+         // CR 603.2 + CR 109.4: The player identified by the triggering event.
+         ControllerRef::TriggeringPlayer => crate::game::quantity::triggering_event_player(state),
+     }
+@@ -1110,6 +1115,14 @@ fn filter_inner_for_object(
+                             _ => return false,
+                         }
+                     }
++                    // CR 613.1: "the chosen player controls" — match against the
++                    // player persisted on the source.
++                    ControllerRef::SourceChosenPlayer => {
++                        match crate::game::game_object::source_chosen_player(state, source_id) {
++                            Some(pid) if pid == obj_ctrl => {}
++                            _ => return false,
++                        }
++                    }
+                     // CR 608.2c + CR 109.4: "a creature they control" following a
+                     // `Choose(Player)` — match the object's controller against the
+                     // resolution-scoped chosen player.
+@@ -1674,6 +1687,9 @@ pub fn spell_record_matches_filter(
+                     ControllerRef::TargetPlayer => return false,
+                     ControllerRef::ParentTargetController => return false,
+                     ControllerRef::DefendingPlayer => return false,
++                    // CR 613.1: "the chosen player" has no meaning for a
++                    // spell-history record. Fail closed.
++                    ControllerRef::SourceChosenPlayer => return false,
+                     // CR 109.4: A chosen-player scope has no meaning for a
+                     // spell-history record (no resolution context). Fail closed.
+                     ControllerRef::ChosenPlayer { .. } => return false,
+@@ -2581,6 +2597,7 @@ fn matches_filter_prop(
+                         perm.controller == pid
+                     }
+                     (Some(ControllerRef::DefendingPlayer), Some(pid)) => perm.controller == pid,
++                    (Some(ControllerRef::SourceChosenPlayer), Some(pid)) => perm.controller == pid,
+                     (Some(ControllerRef::ChosenPlayer { .. }), Some(pid)) => perm.controller == pid,
+                     // CR 603.2 + CR 109.4: triggering-player-scoped name match.
+                     (Some(ControllerRef::TriggeringPlayer), Some(pid)) => perm.controller == pid,
+@@ -2619,6 +2636,11 @@ fn matches_filter_prop(
+                 crate::game::combat::defending_player_for_attacker(state, source.id)
+                     .is_some_and(|pid| pid == obj.owner)
+             }
++            // CR 613.1: Ownership relative to the source's persisted chosen player.
++            ControllerRef::SourceChosenPlayer => {
++                crate::game::game_object::source_chosen_player(state, source.id)
++                    .is_some_and(|pid| pid == obj.owner)
++            }
+             // CR 608.2c + CR 109.4: Ownership relative to a resolution-chosen player.
+             ControllerRef::ChosenPlayer { index } => source
+                 .ability
+@@ -3124,6 +3146,11 @@ fn zone_change_record_matches_property(
+                 crate::game::combat::defending_player_for_attacker(state, source.id)
+                     .is_some_and(|pid| pid == record.owner)
+             }
++            // CR 613.1: Ownership relative to the source's persisted chosen player.
++            ControllerRef::SourceChosenPlayer => {
++                crate::game::game_object::source_chosen_player(state, source.id)
++                    .is_some_and(|pid| pid == record.owner)
++            }
+             // CR 608.2c + CR 109.4: Ownership relative to a resolution-chosen player.
+             ControllerRef::ChosenPlayer { index } => source
+                 .ability
+@@ -3316,6 +3343,11 @@ fn attachment_controller_matches(
+             combat::defending_player_for_attacker(state, source.id)
+                 .is_some_and(|pid| pid == attachment_controller)
+         }
++        // CR 613.1: Attachment controller relative to the source's chosen player.
++        Some(ControllerRef::SourceChosenPlayer) => {
++            crate::game::game_object::source_chosen_player(state, source.id)
++                .is_some_and(|pid| pid == attachment_controller)
++        }
+         // CR 608.2c + CR 109.4: Attachment controller relative to a chosen player.
+         Some(ControllerRef::ChosenPlayer { index }) => source
+             .ability
+@@ -3788,6 +3820,9 @@ pub fn player_matches_target_filter(
+             Some(ControllerRef::TargetPlayer) => false,
+             Some(ControllerRef::ParentTargetController) => false,
+             Some(ControllerRef::DefendingPlayer) => false,
++            // CR 613.1: "the chosen player" has no meaning in this name-filter
++            // context. Fail closed (mirrors `TargetPlayer`).
++            Some(ControllerRef::SourceChosenPlayer) => false,
+             // CR 109.4: Chosen-player scope has no meaning without resolution
+             // context. Fail closed (mirrors `TargetPlayer`).
+             Some(ControllerRef::ChosenPlayer { .. }) => false,
+diff --git a/crates/engine/src/game/game_object.rs b/crates/engine/src/game/game_object.rs
+index 892d42bbce..25cab73a27 100644
+--- a/crates/engine/src/game/game_object.rs
++++ b/crates/engine/src/game/game_object.rs
+@@ -12,7 +12,7 @@ use crate::types::card::{LayoutKind, PrintedCardRef, TokenImageRef};
+ use crate::types::card_type::{CardType, CoreType};
+ use crate::types::counter::CounterType;
+ use crate::types::definitions::Definitions;
+-use crate::types::game_state::LKISnapshot;
++use crate::types::game_state::{GameState, LKISnapshot};
+ use crate::types::identifiers::{CardId, ObjectId};
+ use crate::types::keywords::{Keyword, KeywordKind};
+ use crate::types::mana::{ColoredManaCount, ManaColor, ManaCost, ManaPip};
+@@ -1215,6 +1215,16 @@ impl GameObject {
+         if !self.card_types.core_types.contains(&CoreType::Battle) {
+             return None;
+         }
++        self.chosen_player()
++    }
++
++    /// CR 613.1: The player persisted on this permanent via
++    /// `ChosenAttribute::Player` — the player chosen by an "as ~ enters the
++    /// battlefield, choose a player" replacement. Single authority for the
++    /// durable chosen player: used by `protector` (Battles) and by the
++    /// `SourceChosenPlayer` controller-ref / player-scope for CDAs such as
++    /// Sewer Nemesis and Skyshroud War Beast.
++    pub fn chosen_player(&self) -> Option<PlayerId> {
+         self.chosen_attributes.iter().find_map(|a| match a {
+             ChosenAttribute::Player(p) => Some(*p),
+             _ => None,
+@@ -1280,6 +1290,25 @@ fn is_zero_u32_field(n: &u32) -> bool {
+     *n == 0
+ }
+ 
++/// CR 607.2d + CR 608.2c: Resolve "the chosen player" from the source's
++/// linked persisted choice. Triggered abilities may resolve after the source
++/// left the battlefield; in that case the LKI cache carries the source choices
++/// as they last existed in the public zone.
++pub(crate) fn source_chosen_player(state: &GameState, source_id: ObjectId) -> Option<PlayerId> {
++    state
++        .objects
++        .get(&source_id)
++        .and_then(GameObject::chosen_player)
++        .or_else(|| {
++            state.lki_cache.get(&source_id).and_then(|lki| {
++                lki.chosen_attributes.iter().find_map(|attr| match attr {
++                    ChosenAttribute::Player(player) => Some(*player),
++                    _ => None,
++                })
++            })
++        })
++}
++
+ #[cfg(test)]
+ mod tests {
+     use super::*;
+diff --git a/crates/engine/src/game/players.rs b/crates/engine/src/game/players.rs
+index b43c2a3f33..b23f52be86 100644
+--- a/crates/engine/src/game/players.rs
++++ b/crates/engine/src/game/players.rs
+@@ -164,6 +164,7 @@ pub fn apnap_order_from(
+             | ControllerRef::TargetPlayer
+             | ControllerRef::ParentTargetController
+             | ControllerRef::DefendingPlayer
++            | ControllerRef::SourceChosenPlayer
+             | ControllerRef::ChosenPlayer { .. }
+             | ControllerRef::TriggeringPlayer,
+         ) => state.active_player,
+diff --git a/crates/engine/src/game/quantity.rs b/crates/engine/src/game/quantity.rs
+index 68711f56c8..de5a270eed 100644
+--- a/crates/engine/src/game/quantity.rs
++++ b/crates/engine/src/game/quantity.rs
+@@ -1484,8 +1484,9 @@ fn resolve_ref(
+                     ZoneRef::Exile => {
+                         for &obj_id in &state.exile {
+                             if let Some(obj) = state.objects.get(&obj_id) {
+-                                let owner_matches =
+-                                    count_scope_owner_matches(scope, ctx, controller, obj.owner);
++                                let owner_matches = count_scope_owner_matches(
++                                    state, scope, ctx, controller, obj.owner,
++                                );
+                                 if owner_matches {
+                                     for ct in &obj.card_types.core_types {
+                                         seen.insert(*ct);
+@@ -1576,7 +1577,7 @@ fn resolve_ref(
+                     for &obj_id in &state.exile {
+                         if let Some(obj) = state.objects.get(&obj_id) {
+                             let owner_matches =
+-                                count_scope_owner_matches(scope, ctx, controller, obj.owner);
++                                count_scope_owner_matches(state, scope, ctx, controller, obj.owner);
+                             if owner_matches && matches_zone_card_filter(state, obj_id, card_types)
+                             {
+                                 count += 1;
+@@ -1784,6 +1785,11 @@ fn resolve_ref(
+                             crate::game::combat::defending_player_for_attacker(state, ctx.source)
+                                 .is_some_and(|pid| pid == obj.controller)
+                         }
++                        // CR 613.1: Land controlled by the source's chosen player.
++                        ControllerRef::SourceChosenPlayer => {
++                            crate::game::game_object::source_chosen_player(state, ctx.source)
++                                .is_some_and(|pid| pid == obj.controller)
++                        }
+                         // CR 608.2c + CR 109.4: Land controlled by a chosen player.
+                         ControllerRef::ChosenPlayer { index } => ability
+                             .and_then(|a| a.chosen_players.get(*index as usize).copied())
+@@ -2009,7 +2015,7 @@ fn resolve_ref(
+                 .counter_added_this_turn
+                 .iter()
+                 .filter(|record| {
+-                    counter_added_actor_matches(actor, ctx, controller, record.actor)
++                    counter_added_actor_matches(state, actor, ctx, controller, record.actor)
+                         && counters.matches(&record.counter_type)
+                         && matches_target_filter_on_counter_added_record(
+                             state,
+@@ -2151,6 +2157,11 @@ fn resolve_ref(
+                             crate::game::combat::defending_player_for_attacker(state, ctx.source)
+                                 .is_some_and(|pid| pid == snap.controller)
+                         }
++                        // CR 613.1: Attachment controlled by the source's chosen player.
++                        Some(ControllerRef::SourceChosenPlayer) => {
++                            crate::game::game_object::source_chosen_player(state, ctx.source)
++                                .is_some_and(|pid| pid == snap.controller)
++                        }
+                         // CR 608.2c + CR 109.4: Attachment controlled by a chosen player.
+                         Some(ControllerRef::ChosenPlayer { index }) => ability
+                             .and_then(|a| a.chosen_players.get(*index as usize).copied())
+@@ -2204,6 +2215,11 @@ fn damage_source_controller_matches(
+             crate::game::combat::defending_player_for_attacker(state, ctx.source)
+                 .is_some_and(|player| actual == player)
+         }
++        // CR 613.1: Damage source controlled by the source's chosen player.
++        ControllerRef::SourceChosenPlayer => {
++            crate::game::game_object::source_chosen_player(state, ctx.source)
++                .is_some_and(|player| actual == player)
++        }
+         // CR 608.2c + CR 109.4: Damage source controlled by a chosen player.
+         ControllerRef::ChosenPlayer { index } => ability
+             .and_then(|ability| ability.chosen_players.get(*index as usize).copied())
+@@ -2254,6 +2270,10 @@ fn scoped_players<'a>(
+     state.players.iter().filter(move |p| match scope {
+         CountScope::Controller | CountScope::Owner => p.id == controller,
+         CountScope::ScopedPlayer => p.id == scoped_player,
++        CountScope::SourceChosenPlayer => {
++            crate::game::game_object::source_chosen_player(state, ctx.source)
++                .is_some_and(|player| p.id == player)
++        }
+         CountScope::All => true,
+         CountScope::Opponents => p.id != controller,
+     })
+@@ -2263,6 +2283,7 @@ fn scoped_players<'a>(
+ /// known object owner. Mirrors `scoped_players` for global zones (exile)
+ /// where iteration over players is replaced by per-object owner predication.
+ fn count_scope_owner_matches(
++    state: &GameState,
+     scope: &CountScope,
+     ctx: QuantityContext,
+     controller: PlayerId,
+@@ -2271,12 +2292,17 @@ fn count_scope_owner_matches(
+     match scope {
+         CountScope::Controller | CountScope::Owner => owner == controller,
+         CountScope::ScopedPlayer => owner == ctx.scoped_player.unwrap_or(controller),
++        CountScope::SourceChosenPlayer => {
++            crate::game::game_object::source_chosen_player(state, ctx.source)
++                .is_some_and(|player| owner == player)
++        }
+         CountScope::All => true,
+         CountScope::Opponents => owner != controller,
+     }
+ }
+ 
+ fn counter_added_actor_matches(
++    state: &GameState,
+     scope: &CountScope,
+     ctx: QuantityContext,
+     controller: PlayerId,
+@@ -2285,6 +2311,10 @@ fn counter_added_actor_matches(
+     match scope {
+         CountScope::Controller | CountScope::Owner => actor == controller,
+         CountScope::ScopedPlayer => actor == ctx.scoped_player.unwrap_or(controller),
++        CountScope::SourceChosenPlayer => {
++            crate::game::game_object::source_chosen_player(state, ctx.source)
++                .is_some_and(|player| actor == player)
++        }
+         CountScope::All => true,
+         CountScope::Opponents => actor != controller,
+     }
+@@ -2947,6 +2977,11 @@ fn resolve_single_player_scope(
+         PlayerScope::ParentObjectTargetController => {
+             ability.and_then(|a| crate::game::ability_utils::parent_target_controller(a, state))
+         }
++        // CR 613.1: the player persisted on the source via an "as ~ enters,
++        // choose a player" replacement (Entropic Specter, Sewer Nemesis).
++        PlayerScope::SourceChosenPlayer => {
++            crate::game::game_object::source_chosen_player(state, ctx.source)
++        }
+         // Aggregate scopes have no single-player reading.
+         PlayerScope::Opponent { .. } | PlayerScope::AllPlayers { .. } => None,
+     }
+@@ -3021,6 +3056,13 @@ where
+             .and_then(|a| crate::game::ability_utils::parent_target_controller(a, state))
+             .and_then(|pid| state.players.iter().find(|p| p.id == pid))
+             .map_or(0, &mut extract),
++        // CR 613.1: the player persisted on the source via an "as ~ enters,
++        // choose a player" replacement (Entropic Specter, Sewer Nemesis).
++        PlayerScope::SourceChosenPlayer => {
++            crate::game::game_object::source_chosen_player(state, ctx.source)
++                .and_then(|pid| state.players.iter().find(|p| p.id == pid))
++                .map_or(0, &mut extract)
++        }
+         PlayerScope::Opponent { aggregate } => aggregate_over_players(
+             state.players.iter().filter(|p| p.id != controller),
+             *aggregate,
+@@ -5221,6 +5263,83 @@ mod tests {
+         );
+     }
+ 
++    /// CR 613.1: `CountScope::SourceChosenPlayer` resolves to the player
++    /// persisted on the source via `ChosenAttribute::Player`, so CDA P/T can
++    /// track any chosen-player zone.
++    #[test]
++    fn resolve_quantity_source_chosen_player_zone_counts() {
++        let mut state = GameState::new_two_player(42);
++        // The CDA source, controlled by player 0, with player 1 chosen.
++        let src = create_object(
++            &mut state,
++            CardId(1),
++            PlayerId(0),
++            "Sewer Nemesis".to_string(),
++            Zone::Battlefield,
++        );
++        state
++            .objects
++            .get_mut(&src)
++            .unwrap()
++            .chosen_attributes
++            .push(crate::types::ability::ChosenAttribute::Player(PlayerId(1)));
++        // Player 1: 2 cards in hand, 3 in graveyard, 4 in library, 1 in exile.
++        for i in 0..2 {
++            create_object(
++                &mut state,
++                CardId(10 + i),
++                PlayerId(1),
++                format!("H{i}"),
++                Zone::Hand,
++            );
++        }
++        for i in 0..3 {
++            create_object(
++                &mut state,
++                CardId(20 + i),
++                PlayerId(1),
++                format!("G{i}"),
++                Zone::Graveyard,
++            );
++        }
++        for i in 0..4 {
++            create_object(
++                &mut state,
++                CardId(30 + i),
++                PlayerId(1),
++                format!("L{i}"),
++                Zone::Library,
++            );
++        }
++        create_object(
++            &mut state,
++            CardId(40),
++            PlayerId(1),
++            "E0".to_string(),
++            Zone::Exile,
++        );
++
++        for (zone, expected, label) in [
++            (ZoneRef::Hand, 2, "chosen player's hand"),
++            (ZoneRef::Graveyard, 3, "chosen player's graveyard"),
++            (ZoneRef::Library, 4, "chosen player's library"),
++            (ZoneRef::Exile, 1, "chosen player's exile"),
++        ] {
++            let qty = QuantityExpr::Ref {
++                qty: QuantityRef::ZoneCardCount {
++                    zone,
++                    card_types: Vec::new(),
++                    scope: CountScope::SourceChosenPlayer,
++                },
++            };
++            assert_eq!(
++                resolve_quantity(&state, &qty, PlayerId(0), src),
++                expected,
++                "{label}"
++            );
++        }
++    }
++
+     #[test]
+     fn resolve_quantity_object_count_creatures_you_control() {
+         let mut state = GameState::new_two_player(42);
+diff --git a/crates/engine/src/game/replacement.rs b/crates/engine/src/game/replacement.rs
+index 115fb5173a..63369119d7 100644
+--- a/crates/engine/src/game/replacement.rs
++++ b/crates/engine/src/game/replacement.rs
+@@ -2391,7 +2391,7 @@ fn matches_damage_target_filter(
+                 // CR 607.2d + CR 614.1a: A damage replacement can scope
+                 // "the chosen player" through the replacement source's linked
+                 // persisted choice.
+-                crate::game::effects::source_chosen_player(state, repl_source)
++                crate::game::game_object::source_chosen_player(state, repl_source)
+                     .is_some_and(|chosen| player == chosen)
+             }
+             DamageTargetPlayerScope::Specific(specific) => player == *specific,
+@@ -2540,6 +2540,9 @@ fn evaluate_replacement_condition(
+                 Some(ControllerRef::TargetPlayer) => false,
+                 Some(ControllerRef::ParentTargetController) => false,
+                 Some(ControllerRef::DefendingPlayer) => false,
++                // CR 613.1: "the chosen player" is undefined at replacement-check
++                // time here. Fail closed.
++                Some(ControllerRef::SourceChosenPlayer) => false,
+                 // CR 109.4: Chosen-player scope is undefined at replacement-check
+                 // time (no resolution context). Fail closed.
+                 Some(ControllerRef::ChosenPlayer { .. }) => false,
+@@ -2572,6 +2575,9 @@ fn evaluate_replacement_condition(
+                 Some(ControllerRef::TargetPlayer) => false,
+                 Some(ControllerRef::ParentTargetController) => false,
+                 Some(ControllerRef::DefendingPlayer) => false,
++                // CR 613.1: "the chosen player" is undefined at replacement-check
++                // time here. Fail closed.
++                Some(ControllerRef::SourceChosenPlayer) => false,
+                 // CR 109.4: Chosen-player scope is undefined at replacement-check
+                 // time (no resolution context). Fail closed.
+                 Some(ControllerRef::ChosenPlayer { .. }) => false,
+@@ -2700,6 +2706,7 @@ fn evaluate_replacement_condition(
+                 | ControllerRef::TargetPlayer
+                 | ControllerRef::ParentTargetController
+                 | ControllerRef::DefendingPlayer
++                | ControllerRef::SourceChosenPlayer
+                 | ControllerRef::ChosenPlayer { .. }
+                 | ControllerRef::TriggeringPlayer => false,
+             }
+@@ -2972,6 +2979,9 @@ pub fn find_applicable_replacements(
+                                     false
+                                 }
+                                 crate::types::ability::ControllerRef::DefendingPlayer => false,
++                                // CR 613.1: chosen-player scope has no meaning
++                                // for static token-creation replacements.
++                                crate::types::ability::ControllerRef::SourceChosenPlayer => false,
+                                 // CR 109.4: Chosen-player scope has no meaning
+                                 // for static token-creation replacements.
+                                 crate::types::ability::ControllerRef::ChosenPlayer { .. } => false,
+diff --git a/crates/engine/src/game/sba.rs b/crates/engine/src/game/sba.rs
+index 100c3b4bb6..5a06de6f7a 100644
+--- a/crates/engine/src/game/sba.rs
++++ b/crates/engine/src/game/sba.rs
+@@ -337,6 +337,8 @@ fn static_affects_player(
+             Some(ControllerRef::TargetPlayer) => false,
+             Some(ControllerRef::ParentTargetController) => false,
+             Some(ControllerRef::DefendingPlayer) => false,
++            // CR 613.1: chosen-player scope has no meaning here. Fail closed.
++            Some(ControllerRef::SourceChosenPlayer) => false,
+             // CR 109.4: Chosen-player scope has no resolution context here.
+             // Fail closed.
+             Some(ControllerRef::ChosenPlayer { .. }) => false,
+diff --git a/crates/engine/src/game/static_abilities.rs b/crates/engine/src/game/static_abilities.rs
+index 278bff095b..e97980c883 100644
+--- a/crates/engine/src/game/static_abilities.rs
++++ b/crates/engine/src/game/static_abilities.rs
+@@ -1150,6 +1150,8 @@ pub(crate) fn static_filter_matches(
+                         crate::types::ability::ControllerRef::TargetPlayer => false,
+                         crate::types::ability::ControllerRef::ParentTargetController => false,
+                         crate::types::ability::ControllerRef::DefendingPlayer => false,
++                        // CR 613.1: chosen-player scope has no static context here.
++                        crate::types::ability::ControllerRef::SourceChosenPlayer => false,
+                         // CR 109.4: Chosen-player scope has no static context.
+                         crate::types::ability::ControllerRef::ChosenPlayer { .. } => false,
+                         // CR 603.2 + CR 109.4: Triggering-player scope has no
+diff --git a/crates/engine/src/game/targeting.rs b/crates/engine/src/game/targeting.rs
+index e9ccb97f25..4578674a0d 100644
+--- a/crates/engine/src/game/targeting.rs
++++ b/crates/engine/src/game/targeting.rs
+@@ -151,6 +151,9 @@ fn find_legal_targets_with_context(
+                     Some(ControllerRef::TargetPlayer) => false,
+                     Some(ControllerRef::ParentTargetController) => false,
+                     Some(ControllerRef::DefendingPlayer) => false,
++                    // CR 613.1: a persisted chosen player isn't a target
++                    // candidate here. Fail closed.
++                    Some(ControllerRef::SourceChosenPlayer) => false,
+                     // CR 109.4: A chosen player is fixed during resolution, not
+                     // enumerated as a target candidate. Fail closed.
+                     Some(ControllerRef::ChosenPlayer { .. }) => false,
+diff --git a/crates/engine/src/parser/oracle_nom/quantity.rs b/crates/engine/src/parser/oracle_nom/quantity.rs
+index 516cfecde1..e337f13ab2 100644
+--- a/crates/engine/src/parser/oracle_nom/quantity.rs
++++ b/crates/engine/src/parser/oracle_nom/quantity.rs
+@@ -590,6 +590,9 @@ fn parse_number_of_inner(input: &str) -> OracleResult<'_, QuantityRef> {
+         // possessive routes to `TargetZoneCardCount` (resolves against the player
+         // target in scope) instead of falling back to a controller-less
+         // `InZone` filter that counts every player's cards.
++        // CR 613.1: "cards in the chosen player's <zone>" — the persisted ETB
++        // choice; must precede the generic target/zone arms below.
++        parse_number_of_cards_in_chosen_player_zone,
+         parse_number_of_cards_in_target_zone,
+         parse_number_of_cards_in_all_players_hands,
+         parse_number_of_cards_in_zone,
+@@ -725,10 +728,20 @@ fn parse_controlled_by_extremum_player(input: &str) -> OracleResult<'_, Quantity
+     ))
+ }
+ 
+-/// Parse "[type(s)] you control" after "the number of".
++/// Parse "[type(s)] you control" / "[type(s)] the chosen player controls" after
++/// "the number of". CR 613.1: "the chosen player" is the player persisted on the
++/// source via `ChosenAttribute::Player` (Skyshroud War Beast, Lost Order of
++/// Jarkeld), distinct from the controller ("you control").
+ fn parse_number_of_controlled_type(input: &str) -> OracleResult<'_, QuantityRef> {
+     let (rest, head) = parse_type_filter_word(input)?;
+-    let (rest, _) = tag(" you control").parse(rest)?;
++    let (rest, controller) = alt((
++        value(ControllerRef::You, tag(" you control")),
++        value(
++            ControllerRef::SourceChosenPlayer,
++            tag(" the chosen player controls"),
++        ),
++    ))
++    .parse(rest)?;
+     // CR 205.2b: "<head> you control that are <t1> and/or <t2>" restricts the
+     // controlled population to objects that have any of the listed card types.
+     // CR 205.2b makes a multi-type object satisfy any of its types, so a
+@@ -748,13 +761,29 @@ fn parse_number_of_controlled_type(input: &str) -> OracleResult<'_, QuantityRef>
+         QuantityRef::ObjectCount {
+             filter: TargetFilter::Typed(TypedFilter {
+                 type_filters,
+-                controller: Some(ControllerRef::You),
++                controller: Some(controller),
+                 properties: Vec::new(),
+             }),
+         },
+     ))
+ }
+ 
++/// CR 613.1: Parse "cards in the chosen player's <zone>" after "the number of"
++/// into the general zone-count building block scoped to the source's persisted
++/// chosen player.
++fn parse_number_of_cards_in_chosen_player_zone(input: &str) -> OracleResult<'_, QuantityRef> {
++    let (rest, _) = tag("cards in the chosen player's ").parse(input)?;
++    let (rest, zone) = parse_zone_ref_singular(rest)?;
++    Ok((
++        rest,
++        QuantityRef::ZoneCardCount {
++            zone,
++            card_types: Vec::new(),
++            scope: CountScope::SourceChosenPlayer,
++        },
++    ))
++}
++
+ /// Parse "cards in your graveyard" / "creature cards in your graveyard" after "the number of".
+ fn parse_number_of_cards_in_zone(input: &str) -> OracleResult<'_, QuantityRef> {
+     parse_zone_card_count(input)
+@@ -3394,6 +3423,57 @@ mod tests {
+         assert_eq!(rest, "");
+     }
+ 
++    /// CR 613.1: the en-Kor… no — the CDA "chosen player" cycle. "the chosen
++    /// player" is the player persisted on the source via `ChosenAttribute::Player`
++    /// (Skyshroud War Beast, Lost Order of Jarkeld, Entropic Specter, Sewer
++    /// Nemesis). Controls-counts route through `ControllerRef::SourceChosenPlayer`;
++    /// zone-counts through `CountScope::SourceChosenPlayer`.
++    #[test]
++    fn parse_quantity_ref_chosen_player_cda_forms() {
++        let (rest, q) =
++            parse_quantity_ref("the number of creatures the chosen player controls").unwrap();
++        assert_eq!(rest, "");
++        match q {
++            QuantityRef::ObjectCount {
++                filter: TargetFilter::Typed(tf),
++            } => {
++                assert_eq!(tf.controller, Some(ControllerRef::SourceChosenPlayer));
++                assert_eq!(tf.type_filters, vec![TypeFilter::Creature]);
++            }
++            other => panic!("expected ObjectCount, got {other:?}"),
++        }
++
++        for (text, zone) in [
++            (
++                "the number of cards in the chosen player's hand",
++                ZoneRef::Hand,
++            ),
++            (
++                "the number of cards in the chosen player's graveyard",
++                ZoneRef::Graveyard,
++            ),
++            (
++                "the number of cards in the chosen player's library",
++                ZoneRef::Library,
++            ),
++            (
++                "the number of cards in the chosen player's exile",
++                ZoneRef::Exile,
++            ),
++        ] {
++            let (rest, q) = parse_quantity_ref(text).unwrap();
++            assert_eq!(rest, "");
++            assert_eq!(
++                q,
++                QuantityRef::ZoneCardCount {
++                    zone,
++                    card_types: Vec::new(),
++                    scope: CountScope::SourceChosenPlayer,
++                }
++            );
++        }
++    }
++
+     #[test]
+     fn parse_quantity_ref_total_cards_in_all_players_hands() {
+         let (rest, q) =
+diff --git a/crates/engine/src/parser/oracle_static/static_helpers.rs b/crates/engine/src/parser/oracle_static/static_helpers.rs
+index 4f59c0e122..305825fe75 100644
+--- a/crates/engine/src/parser/oracle_static/static_helpers.rs
++++ b/crates/engine/src/parser/oracle_static/static_helpers.rs
+@@ -346,6 +346,8 @@ pub(crate) fn try_parse_cost_modification(text: &str, lower: &str) -> Option<Sta
+             Some(ControllerRef::TargetPlayer) => TargetFilter::Typed(TypedFilter::card()),
+             Some(ControllerRef::ParentTargetController) => TargetFilter::Typed(TypedFilter::card()),
+             Some(ControllerRef::DefendingPlayer) => TargetFilter::Typed(TypedFilter::card()),
++            // CR 613.1: chosen-player scope is not emitted for cost statics.
++            Some(ControllerRef::SourceChosenPlayer) => TargetFilter::Typed(TypedFilter::card()),
+             // CR 109.4: Chosen-player scope is not emitted for cost statics.
+             Some(ControllerRef::ChosenPlayer { .. }) => TargetFilter::Typed(TypedFilter::card()),
+             // CR 603.2 + CR 109.4: Triggering-player scope is not emitted for
+diff --git a/crates/engine/src/types/ability.rs b/crates/engine/src/types/ability.rs
+index adf5cefd5c..8e51a3bab2 100644
+--- a/crates/engine/src/types/ability.rs
++++ b/crates/engine/src/types/ability.rs
+@@ -755,6 +755,10 @@ pub enum CountScope {
+     /// from "your library" (always caster). Falls back to `Controller`
+     /// outside iteration.
+     ScopedPlayer,
++    /// CR 607.2d + CR 608.2c: The source's linked persisted chosen player —
++    /// "the chosen player's <zone>" on cards whose source stored
++    /// `ChosenAttribute::Player`.
++    SourceChosenPlayer,
+     All,
+     Opponents,
+ }
+@@ -1886,6 +1890,16 @@ pub enum ControllerRef {
+     ChosenPlayer {
+         index: u8,
+     },
++    /// CR 613.1 + CR 109.4: Filter controller is the player PERSISTED on the
++    /// source via `ChosenAttribute::Player` — the player chosen by an
++    /// "as ~ enters the battlefield, choose a player" replacement. Read at
++    /// filter / layer-evaluation time from the source's `chosen_attributes`
++    /// (mirrors `GameObject::protector`). Distinct from `ChosenPlayer { index }`,
++    /// which is resolution-scoped (valid only mid-resolution); this is a durable
++    /// characteristic readable continuously, as a CDA requires. Powers
++    /// "~'s power and toughness are each equal to the number of <X> the chosen
++    /// player controls" (Skyshroud War Beast, Lost Order of Jarkeld).
++    SourceChosenPlayer,
+     /// CR 603.2 + CR 109.4: Filter controller is the player identified by the
+     /// triggering event (the drawer, life-gainer, attacker, etc.). Resolved
+     /// against `state.current_trigger_event` via `extract_player_from_event`.
+@@ -2752,6 +2766,13 @@ pub enum PlayerScope {
+     /// `ControllerRef::ParentTargetController`. Resolved via
+     /// `ability_utils::parent_target_controller`.
+     ParentObjectTargetController,
++    /// CR 613.1 + CR 109.4: The player PERSISTED on the source via
++    /// `ChosenAttribute::Player` (an "as ~ enters the battlefield, choose a
++    /// player" replacement). The player-scalar-axis analogue of
++    /// `ControllerRef::SourceChosenPlayer`, read continuously from the source's
++    /// `chosen_attributes` so a CDA P/T can track e.g. the chosen player's hand
++    /// or graveyard size (Entropic Specter, Sewer Nemesis).
++    SourceChosenPlayer,
+ }
+ 
+ /// Scope selector for object-axis quantities (Round Π-5). Picks WHICH object
+diff --git a/crates/mtgish-import/src/convert/player_effect.rs b/crates/mtgish-import/src/convert/player_effect.rs
+index 69c1046991..feb4b06888 100644
+--- a/crates/mtgish-import/src/convert/player_effect.rs
++++ b/crates/mtgish-import/src/convert/player_effect.rs
+@@ -275,6 +275,12 @@ fn controller_to_scope(c: &ControllerRef) -> ConvResult<ProhibitionScope> {
+             engine_type: "ProhibitionScope",
+             needed_variant: "DefendingPlayer".into(),
+         }),
++        // CR 613.1: A persisted "as ~ enters, choose a player" reference has no
++        // static `ProhibitionScope` meaning — strict-fail (mirrors DefendingPlayer).
++        ControllerRef::SourceChosenPlayer => Err(ConversionGap::EnginePrerequisiteMissing {
++            engine_type: "ProhibitionScope",
++            needed_variant: "SourceChosenPlayer".into(),
++        }),
+         // CR 608.2c: A resolution-time chosen player has no static
+         // `ProhibitionScope` meaning — strict-fail.
+         ControllerRef::ChosenPlayer { .. } => Err(ConversionGap::EnginePrerequisiteMissing {

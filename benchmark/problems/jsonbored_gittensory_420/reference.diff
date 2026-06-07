@@ -1,0 +1,66 @@
+diff --git a/src/signals/settings-preview.ts b/src/signals/settings-preview.ts
+index 3e304356..92959668 100644
+--- a/src/signals/settings-preview.ts
++++ b/src/signals/settings-preview.ts
+@@ -476,9 +476,16 @@ function buildRepoInstallPreview(args: {
+   };
+ }
+ 
++function writesPrPublicSurface(settings: RepositorySettings, decision: PublicSurfaceDecision): boolean {
++  return decision.willComment || decision.willLabel || shouldPublishPrComment(settings) || shouldApplyPrLabel(settings, "confirmed");
++}
++
+ function requiredInstallPermissions(settings: RepositorySettings, decision: PublicSurfaceDecision): string[] {
+-  const permissions = new Set(["metadata: read", "pull_requests: read"]);
+-  if (decision.willComment || decision.willLabel || shouldPublishPrComment(settings) || shouldApplyPrLabel(settings, "confirmed")) permissions.add("issues: write");
++  // PR conversation comments and PR labels are gated by GitHub on the Pull requests permission (write),
++  // matching REQUIRED_INSTALLATION_PERMISSIONS; reading PR metadata only needs read.
++  const writesPrSurface = writesPrPublicSurface(settings, decision);
++  const permissions = new Set(["metadata: read", writesPrSurface ? "pull_requests: write" : "pull_requests: read"]);
++  if (writesPrSurface) permissions.add("issues: write");
+   if (decision.willCheckRun || settings.checkRunMode === "enabled" || settings.gateCheckMode === "enabled") permissions.add("checks: write");
+   return [...permissions];
+ }
+@@ -487,7 +494,9 @@ function activeMissingPermissions(settings: RepositorySettings, decision: Public
+   if (!installation) return [];
+   const missing = new Set(installation.missingPermissions);
+   const active: string[] = [];
+-  if ((decision.willComment || decision.willLabel || shouldPublishPrComment(settings) || shouldApplyPrLabel(settings, "confirmed")) && missing.has("issues")) active.push("issues");
++  const writesPrSurface = writesPrPublicSurface(settings, decision);
++  if (writesPrSurface && missing.has("pull_requests")) active.push("pull_requests");
++  if (writesPrSurface && missing.has("issues")) active.push("issues");
+   if ((decision.willCheckRun || settings.checkRunMode === "enabled" || settings.gateCheckMode === "enabled") && missing.has("checks")) active.push("checks");
+   return active;
+ }
+diff --git a/test/unit/settings-preview.test.ts b/test/unit/settings-preview.test.ts
+index 7df655a8..646f4127 100644
+--- a/test/unit/settings-preview.test.ts
++++ b/test/unit/settings-preview.test.ts
+@@ -116,7 +116,7 @@ describe("buildRepoSettingsPreview", () => {
+     expect(preview.warnings).toHaveLength(0);
+     expect(preview.installPreview).toMatchObject({
+       status: "ready",
+-      permissions: { status: "ready", required: expect.arrayContaining(["metadata: read", "pull_requests: read", "issues: write"]) },
++      permissions: { status: "ready", required: expect.arrayContaining(["metadata: read", "pull_requests: write", "issues: write"]) },
+       publicOutputs: expect.arrayContaining(["One sanitized sticky PR comment.", 'Configured label "gittensor".']),
+       checklist: expect.arrayContaining([
+         expect.objectContaining({ id: "permissions", status: "ready" }),
+@@ -166,6 +166,18 @@ describe("buildRepoSettingsPreview", () => {
+     });
+   });
+ 
++  it("explains a missing Pull requests: write permission for PR comment/label output", () => {
++    const preview = buildRepoSettingsPreview({
++      ...base,
++      settings: settings(),
++      installation: { ...healthyInstall, status: "needs_attention", missingPermissions: ["pull_requests"] },
++      sample: { authorLogin: "miner", minerStatus: "confirmed" },
++    });
++    // PR comments/labels need pull_requests: write; the preview must require it and surface it as missing.
++    expect(preview.installPreview.permissions.required).toContain("pull_requests: write");
++    expect(preview.installPreview.permissions).toMatchObject({ status: "needs_attention", missing: ["pull_requests"] });
++  });
++
+   it("explains a missing optional Checks: write permission only when check runs are enabled", () => {
+     const withChecks = buildRepoSettingsPreview({
+       ...base,

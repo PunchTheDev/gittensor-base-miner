@@ -1,0 +1,239 @@
+diff --git a/src/api/routes.ts b/src/api/routes.ts
+index 5eef23d5..0eda6df7 100644
+--- a/src/api/routes.ts
++++ b/src/api/routes.ts
+@@ -182,7 +182,8 @@ import { buildContributorOpenPrMonitor } from "../signals/contributor-open-pr-mo
+ import { buildPullRequestReviewability, type PullRequestReviewability } from "../signals/reward-risk";
+ import { buildLocalBranchAnalysis, findCurrentBranchPullRequest } from "../signals/local-branch";
+ import { MAX_LOCAL_SCORER_WARNING_CHARS, MAX_LOCAL_SCORER_WARNING_COUNT } from "../signals/local-scorer-diagnostics";
+-import { loadRepoFocusManifest } from "../signals/focus-manifest-loader";
++import { compileFocusManifestPolicy } from "../signals/focus-manifest";
++import { loadRepoFocusManifest, upsertRepoFocusManifest } from "../signals/focus-manifest-loader";
+ import { buildRepoOnboardingPackPreviewForRepo } from "../services/repo-onboarding-pack";
+ import { buildRepoSettingsPreview, type PublicSurfaceSkipReason } from "../signals/settings-preview";
+ import {
+@@ -2223,6 +2224,32 @@ export function createApp() {
+     );
+   });
+ 
++  app.get("/v1/internal/repos/:owner/:repo/contribution-policy", async (c) => {
++    const fullName = `${c.req.param("owner")}/${c.req.param("repo")}`;
++    const focusManifest = await loadRepoFocusManifest(c.env, fullName, { fetcher: async () => null });
++    const generatedAt = nowIso();
++    return c.json({
++      repoFullName: fullName,
++      generatedAt,
++      focusManifest,
++      policy: compileFocusManifestPolicy(fullName, focusManifest, { generatedAt }),
++    });
++  });
++
++  app.post("/v1/internal/repos/:owner/:repo/contribution-policy", async (c) => {
++    const body = await c.req.json().catch(() => null);
++    if (body === null) return c.json({ error: "invalid_contribution_policy_json" }, 400);
++    const fullName = `${c.req.param("owner")}/${c.req.param("repo")}`;
++    const focusManifest = await upsertRepoFocusManifest(c.env, fullName, body, "api_record");
++    const generatedAt = nowIso();
++    return c.json({
++      repoFullName: fullName,
++      generatedAt,
++      focusManifest,
++      policy: compileFocusManifestPolicy(fullName, focusManifest, { generatedAt }),
++    });
++  });
++
+   return app;
+ }
+ 
+diff --git a/src/signals/focus-manifest-loader.ts b/src/signals/focus-manifest-loader.ts
+index 8a7ed682..ade1aa43 100644
+--- a/src/signals/focus-manifest-loader.ts
++++ b/src/signals/focus-manifest-loader.ts
+@@ -90,8 +90,14 @@ export async function upsertRepoFocusManifest(env: Env, repoFullName: string, ra
+ async function readCachedManifest(env: Env, repoFullName: string, maxAgeMs: number): Promise<FocusManifest | null> {
+   const [latest] = await listSignalSnapshots(env, REPO_FOCUS_MANIFEST_SIGNAL, repoFullName);
+   if (!latest) return null;
++  const manifest = parseFocusManifest(latest.payload);
++  const explicitSource =
++    latest.payload !== null && typeof latest.payload === "object" && !Array.isArray(latest.payload)
++      ? (latest.payload as Record<string, JsonValue>).source
++      : undefined;
++  if (explicitSource === "api_record") return manifest;
+   if (snapshotAgeMs(latest.generatedAt) > maxAgeMs) return null;
+-  return parseFocusManifest(latest.payload);
++  return manifest;
+ }
+ 
+ async function persistRepoFocusManifest(env: Env, repoFullName: string, manifest: FocusManifest): Promise<void> {
+diff --git a/test/integration/api.test.ts b/test/integration/api.test.ts
+index 7618fd9f..d1146237 100644
+--- a/test/integration/api.test.ts
++++ b/test/integration/api.test.ts
+@@ -5122,6 +5122,152 @@ describe("api routes", () => {
+       commandAuthorizationPreview: { commandName: "preflight", decision: { authorized: true, reason: "allowed_pr_author", matchedRole: "pr_author" } },
+     });
+   });
++
++  it("persists repo-owner contribution policy snapshots through protected internal API", async () => {
++    const app = createApp();
++    const env = createTestEnv();
++
++    const rejected = await app.request(
++      "/v1/internal/repos/entrius/allways-ui/contribution-policy",
++      {
++        method: "POST",
++        body: JSON.stringify({ wantedPaths: ["src/"] }),
++      },
++      env,
++    );
++    expect(rejected.status).toBe(401);
++
++    const invalidJson = await app.request(
++      "/v1/internal/repos/entrius/allways-ui/contribution-policy",
++      {
++        method: "POST",
++        headers: internalHeaders(env),
++        body: "{",
++      },
++      env,
++    );
++    expect(invalidJson.status).toBe(400);
++    await expect(invalidJson.json()).resolves.toEqual({ error: "invalid_contribution_policy_json" });
++
++    const privateNote = "Internal: wallet and hotkey evidence stays private.";
++    const updated = await app.request(
++      "/v1/internal/repos/entrius/allways-ui/contribution-policy",
++      {
++        method: "POST",
++        headers: internalHeaders(env),
++        body: JSON.stringify({
++          wantedPaths: ["src/"],
++          blockedPaths: ["dist/"],
++          preferredLabels: ["bug"],
++          linkedIssuePolicy: "required",
++          issueDiscoveryPolicy: "discouraged",
++          testExpectations: ["Run npm run test:ci."],
++          maintainerNotes: [privateNote],
++          publicNotes: ["Prefer small, focused PRs."],
++        }),
++      },
++      env,
++    );
++    expect(updated.status).toBe(200);
++    const updatedPayload = (await updated.json()) as {
++      generatedAt: string;
++      policy: { generatedAt: string; publicSafe: { contributionLanes: unknown[] } };
++    };
++    expect(updatedPayload.policy.generatedAt).toBe(updatedPayload.generatedAt);
++    expect(updatedPayload).toMatchObject({
++      repoFullName: "entrius/allways-ui",
++      focusManifest: {
++        present: true,
++        source: "api_record",
++        wantedPaths: ["src/"],
++        blockedPaths: ["dist/"],
++        maintainerNotes: [privateNote],
++      },
++      policy: {
++        repoFullName: "entrius/allways-ui",
++        present: true,
++        source: "api_record",
++        publicSafe: {
++          contributionLanes: [
++            expect.objectContaining({
++              id: "direct-pr",
++              preference: "preferred",
++              preferredPaths: ["src/"],
++              discouragedPaths: ["dist/"],
++              validationExpectations: ["Run npm run test:ci."],
++              publicNotes: ["Prefer small, focused PRs."],
++            }),
++            expect.objectContaining({
++              id: "issue-discovery",
++              preference: "discouraged",
++              preferredPaths: [],
++              discouragedPaths: ["dist/"],
++            }),
++          ],
++          labelPolicy: { preferredLabels: ["bug"], required: true },
++          validation: { expectations: ["Run npm run test:ci."], linkedIssuePolicy: "required" },
++          issueDiscoveryPolicy: "discouraged",
++          publicNotes: ["Prefer small, focused PRs."],
++        },
++        authenticated: { maintainerContext: [privateNote] },
++      },
++    });
++
++    const readback = await app.request("/v1/internal/repos/entrius/allways-ui/contribution-policy", { headers: internalHeaders(env) }, env);
++    expect(readback.status).toBe(200);
++    await expect(readback.json()).resolves.toMatchObject({
++      policy: {
++        publicSafe: { summary: expect.stringMatching(/direct PRs/i) },
++        authenticated: { maintainerContext: [privateNote] },
++      },
++    });
++
++    const readiness = await app.request("/v1/repos/entrius/allways-ui/registration-readiness", { headers: apiHeaders(env) }, env);
++    expect(readiness.status).toBe(200);
++    const readinessPayload = (await readiness.json()) as { policyReadiness: Record<string, unknown> };
++    expect(readinessPayload.policyReadiness).toMatchObject({
++      source: "focus_manifest_policy",
++      present: true,
++    });
++    expect(readinessPayload.policyReadiness).not.toHaveProperty("ownerContext");
++    expect(JSON.stringify(readinessPayload)).not.toContain(privateNote);
++    expect(JSON.stringify(readinessPayload)).not.toMatch(/privateNoteCount|blockedPathCount|validationExpectationCount/i);
++    expect(JSON.stringify(readinessPayload)).not.toMatch(FORBIDDEN_PUBLIC_REPORT_TERMS);
++
++    const malformed = await app.request(
++      "/v1/internal/repos/entrius/allways-ui/contribution-policy",
++      {
++        method: "POST",
++        headers: internalHeaders(env),
++        body: JSON.stringify({
++          wantedPaths: "src/",
++          preferredLabels: [123, "bug"],
++          linkedIssuePolicy: "sometimes",
++          publicNotes: ["reward estimate", "Keep scope focused."],
++        }),
++      },
++      env,
++    );
++    expect(malformed.status).toBe(200);
++    const malformedPayload = (await malformed.json()) as {
++      focusManifest: { warnings: string[] };
++      policy: { publicSafe: Record<string, unknown> };
++    };
++    expect(malformedPayload.focusManifest).toMatchObject({
++      present: true,
++      wantedPaths: [],
++      preferredLabels: ["bug"],
++      linkedIssuePolicy: "optional",
++    });
++    expect(malformedPayload.focusManifest.warnings).toEqual(
++      expect.arrayContaining([
++        expect.stringContaining("wantedPaths"),
++        expect.stringContaining("preferredLabels"),
++        expect.stringContaining("linkedIssuePolicy"),
++      ]),
++    );
++    expect(JSON.stringify(malformedPayload.policy.publicSafe)).not.toMatch(FORBIDDEN_PUBLIC_REPORT_TERMS);
++  });
+ });
+ 
+ async function signWebhook(body: string, secret: string): Promise<string> {
+diff --git a/test/unit/focus-manifest-loader.test.ts b/test/unit/focus-manifest-loader.test.ts
+index 8c57af12..470dce48 100644
+--- a/test/unit/focus-manifest-loader.test.ts
++++ b/test/unit/focus-manifest-loader.test.ts
+@@ -73,8 +73,9 @@ describe("focus-manifest loader", () => {
+     const saved = await upsertRepoFocusManifest(env, "owner/api", { wantedPaths: ["lib/"] });
+     expect(saved.present).toBe(true);
+     expect(saved.source).toBe("api_record");
+-    // A subsequent load (without forcing refresh) returns the persisted manifest without calling the fetcher.
++    // API-backed settings snapshots are durable and do not age out like repo-file fetch caches.
+     const reloaded = await loadRepoFocusManifest(env, "owner/api", {
++      maxAgeMs: -1,
+       fetcher: async () => {
+         throw new Error("should not be called");
+       },

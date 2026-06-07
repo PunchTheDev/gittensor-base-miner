@@ -1,0 +1,308 @@
+diff --git a/celery/app/trace.py b/celery/app/trace.py
+index ecd26994288..0641415c236 100644
+--- a/celery/app/trace.py
++++ b/celery/app/trace.py
+@@ -154,6 +154,28 @@ def get_task_name(request, default):
+     return getattr(request, 'shadow', None) or default
+ 
+ 
++def get_actual_ignore_result(task, req):
++    """Return the effective ignore_result, with request overriding task.
++
++    If req provides an explicit ignore_result, that value is used;
++    otherwise task.ignore_result is returned.
++    """
++    if req is None:
++        return task.ignore_result
++
++    actual = getattr(req, 'ignore_result', None)
++
++    # Context defines `ignore_result = False` at class level (see Context
++    # in celery/app/task.py). getattr() above would return the class default
++    # (False) even when the request never set it explicitly, making it
++    # impossible to distinguish "override=False" from "not set". We check
++    # __dict__ to detect only instance-level (i.e., explicitly set) values.
++    if isinstance(req, Context) and 'ignore_result' not in req.__dict__:
++        actual = None
++
++    return actual if actual is not None else task.ignore_result
++
++
+ class TraceInfo:
+     """Information about task execution."""
+ 
+@@ -165,7 +187,9 @@ def __init__(self, state, retval=None):
+ 
+     def handle_error_state(self, task, req,
+                            eager=False, call_errbacks=True):
+-        if task.ignore_result:
++        ignore_result = get_actual_ignore_result(task, req)
++
++        if ignore_result:
+             store_errors = task.store_errors_even_if_ignored
+         elif eager and task.store_eager_result:
+             store_errors = True
+@@ -353,16 +377,6 @@ def build_tracer(name, task, loader=None, hostname=None, store_errors=True,
+     fun = task if task_has_custom(task, '__call__') else task.run
+ 
+     loader = loader or app.loader
+-    ignore_result = task.ignore_result
+-    track_started = task.track_started
+-    track_started = not eager and (task.track_started and not ignore_result)
+-
+-    # #6476
+-    if eager and not ignore_result and task.store_eager_result:
+-        publish_result = True
+-    else:
+-        publish_result = not eager and not ignore_result
+-
+     deduplicate_successful_tasks = ((app.conf.task_acks_late or task.acks_late)
+                                     and app.conf.worker_deduplicate_successful_tasks
+                                     and app.backend.persistent)
+@@ -483,6 +497,14 @@ def trace_task(uuid, args, kwargs, request=None):
+             task_request = Context(request or {}, args=args,
+                                    called_directly=False, kwargs=kwargs)
+ 
++            ignore_result = get_actual_ignore_result(task, task_request)
++            track_started = not eager and (task.track_started and not ignore_result)
++            # #6476
++            if eager and not ignore_result and task.store_eager_result:
++                publish_result = True
++            else:
++                publish_result = not eager and not ignore_result
++
+             redelivered = (task_request.delivery_info
+                            and task_request.delivery_info.get('redelivered', False))
+             if deduplicate_successful_tasks and redelivered:
+diff --git a/celery/worker/request.py b/celery/worker/request.py
+index 3979101901b..a26eb42ce4f 100644
+--- a/celery/worker/request.py
++++ b/celery/worker/request.py
+@@ -125,7 +125,10 @@ def __init__(self, message, on_ack=noop,
+         self._eventer = eventer
+         self._connection_errors = connection_errors or ()
+         self._task = task or self._app.tasks[self._type]
+-        self._ignore_result = self._request_dict.get('ignore_result', False)
++        ignore_result = self._request_dict.get('ignore_result', None)
++        if ignore_result is None:
++            ignore_result = self._task.ignore_result
++        self._ignore_result = ignore_result
+ 
+         # timezone means the message is timezone-aware, and the only timezone
+         # supported at this point is UTC.
+@@ -287,7 +290,7 @@ def tzlocal(self):
+ 
+     @property
+     def store_errors(self):
+-        return (not self.task.ignore_result or
++        return (not self._ignore_result or
+                 self.task.store_errors_even_if_ignored)
+ 
+     @property
+diff --git a/docs/userguide/tasks.rst b/docs/userguide/tasks.rst
+index 8144f5db0fd..0a29e0982d9 100644
+--- a/docs/userguide/tasks.rst
++++ b/docs/userguide/tasks.rst
+@@ -1042,6 +1042,13 @@ General
+     If :const:`True`, errors will be stored even if the task is configured
+     to ignore results.
+ 
++    .. versionchanged:: 5.7
++        Previously, if the ``ignore_result`` key was missing from the request 
++        message, ``store_errors`` would default to ``True``, ignoring the 
++        task's own ``ignore_result`` setting. The worker now correctly 
++        falls back to ``Task.ignore_result`` when no per-request override 
++        is present.
++
+ .. attribute:: Task.serializer
+ 
+     A string identifying the default serialization
+diff --git a/t/unit/tasks/test_trace.py b/t/unit/tasks/test_trace.py
+index 641fe25d7e3..5f7172383dd 100644
+--- a/t/unit/tasks/test_trace.py
++++ b/t/unit/tasks/test_trace.py
+@@ -1081,6 +1081,53 @@ def fail_on_second_call(self_):
+         successful_requests.discard(task_id)
+         self.app.conf.worker_deduplicate_successful_tasks = False
+ 
++    def test_ignore_result_priority__request_overrides_task_true(self):
++        @self.app.task(shared=False)
++        def add(x, y):
++            return x + y
++
++        add.backend = Mock(name='backend')
++        add.ignore_result = True
++        request = {'ignore_result': False}
++
++        self.trace(add, (2, 2), {}, request=request, eager=False)
++
++        add.backend.mark_as_done.assert_called_with(ANY, 4, ANY, True)
++
++    def test_ignore_result_priority__request_overrides_task_false(self):
++        @self.app.task(shared=False)
++        def add(x, y):
++            return x + y
++
++        add.backend = Mock(name='backend')
++        add.ignore_result = False
++        request = {'ignore_result': True}
++
++        self.trace(add, (2, 2), {}, request=request, eager=False)
++
++        add.backend.mark_as_done.assert_called_with(ANY, 4, ANY, False)
++
++    def test_ignore_result_priority__request_overrides_app_config(self):
++        prev_ignore = self.app.conf.task_ignore_result
++
++        try:
++            self.app.conf.task_ignore_result = True
++
++            @self.app.task(shared=False)
++            def add(x, y):
++                return x + y
++
++            add.backend = Mock(name='backend')
++
++            assert add.ignore_result is True
++
++            request = {'ignore_result': False}
++            self.trace(add, (2, 2), {}, request=request, eager=False)
++
++            add.backend.mark_as_done.assert_called_with(ANY, 4, ANY, True)
++        finally:
++            self.app.conf.task_ignore_result = prev_ignore
++
+ 
+ class test_TraceInfo(TraceCase):
+     class TI(TraceInfo):
+@@ -1123,6 +1170,35 @@ def test_handle_error_for_eager_saved_to_backend(self):
+             call_errbacks=True,
+         )
+ 
++    def test_handle_error_state_missing_request_store_errors_false_while_task_ignore_result_true(self):
++        x = self.TI(states.FAILURE)
++        x.handle_failure = Mock()
++
++        self.add.ignore_result = True
++        self.add.store_errors_even_if_ignored = False
++
++        x.handle_error_state(self.add, None)
++        x.handle_failure.assert_called_once_with(
++            self.add,
++            None,
++            store_errors=False,
++            call_errbacks=True,
++        )
++
++    def test_handle_error_state_missing_request_store_errors_true_while_task_ignore_result_false(self):
++        x = self.TI(states.FAILURE)
++        x.handle_failure = Mock()
++
++        self.add.ignore_result = False
++
++        x.handle_error_state(self.add, None)
++        x.handle_failure.assert_called_once_with(
++            self.add,
++            None,
++            store_errors=True,
++            call_errbacks=True,
++        )
++
+     @patch('celery.app.trace.ExceptionInfo')
+     def test_handle_reject(self, ExceptionInfo):
+         x = self.TI(states.FAILURE)
+diff --git a/t/unit/worker/test_request.py b/t/unit/worker/test_request.py
+index 70acb170cdc..89e7a1affd2 100644
+--- a/t/unit/worker/test_request.py
++++ b/t/unit/worker/test_request.py
+@@ -188,13 +188,14 @@ def get_request(self,
+                     sig,
+                     Request=Request,
+                     exclude_headers=None,
++                    headers=None,
+                     **kwargs):
+         msg = self.task_message_from_sig(self.app, sig)
+-        headers = None
+-        if exclude_headers:
+-            headers = msg.headers
+-            for header in exclude_headers:
+-                headers.pop(header)
++        if headers is None:
++            headers = msg.headers.copy()
++            if exclude_headers:
++                for header in exclude_headers:
++                    headers.pop(header, None)
+         return Request(
+             msg,
+             on_ack=Mock(name='on_ack'),
+@@ -447,6 +448,34 @@ def test_tzlocal_is_cached(self):
+         req._tzlocal = 'foo'
+         assert req.tzlocal == 'foo'
+ 
++    def test_ignore_result_from_request_true(self):
++        req = self.get_request(self.add.s(2, 2).set(ignore_result=True))
++        assert req.ignore_result is True
++
++    def test_ignore_result_from_request_false(self):
++        req = self.get_request(self.add.s(2, 2).set(ignore_result=False))
++        assert req.ignore_result is False
++
++    def test_ignore_result_default_from_task_false(self):
++        req = self.get_request(self.add.s(2, 2))
++        assert req.ignore_result is False
++
++    def test_ignore_result_default_from_task_true(self):
++        self.add.ignore_result = True
++        try:
++            req = self.get_request(self.add.s(2, 2))
++            assert req.ignore_result is True
++        finally:
++            self.add.ignore_result = False
++
++    def test_ignore_result_request_overrides_task_true(self):
++        self.add.ignore_result = True
++        try:
++            req = self.get_request(self.add.s(2, 2).set(ignore_result=False))
++            assert req.ignore_result is False
++        finally:
++            self.add.ignore_result = False
++
+     def test_task_wrapper_repr(self):
+         assert repr(self.xRequest())
+ 
+@@ -459,6 +488,35 @@ def test_sets_store_errors(self):
+         job = self.xRequest()
+         assert job.store_errors
+ 
++    def test_store_errors_default(self):
++        self.mytask.ignore_result = False
++        job = self.xRequest()
++        assert job.store_errors
++
++    def test_store_errors_task_ignore_result(self):
++        self.mytask.ignore_result = True
++        job = self.xRequest()
++        assert not job.store_errors
++
++    def test_store_errors_request_overrides_task_ignore_result(self):
++        self.mytask.ignore_result = True
++        msg = self.task_message_from_sig(self.app, self.mytask.s())
++        headers = msg.headers.copy()
++        headers['ignore_result'] = False
++        job = self.get_request(
++            self.mytask.s(),
++            headers=headers,
++        )
++        assert job.store_errors
++
++    def test_ignore_result_from_request_none(self):
++        self.mytask.ignore_result = True
++        msg = self.task_message_from_sig(self.app, self.mytask.s())
++        headers = msg.headers.copy()
++        headers['ignore_result'] = None
++        job = self.get_request(self.mytask.s(), headers=headers)
++        assert job._ignore_result is True
++
+     def test_send_event(self):
+         job = self.xRequest()
+         job.eventer = Mock(name='.eventer')
